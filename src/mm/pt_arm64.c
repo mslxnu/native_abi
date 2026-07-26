@@ -53,7 +53,8 @@
  * pages' worth of room.
  */
 struct s2_chunk {
-  void    *hva;
+  void    *hva;       /* where this process sees it */
+  off_t    off;       /* where it lives in the arena - what survives a handover */
   gaddr_t  ipa;
   unsigned used;      /* 4KiB slots handed out, 0..PAGES_PER_CHUNK */
 };
@@ -108,15 +109,19 @@ static void *
 alloc_guest_page(gaddr_t *ipa_out)
 {
   if (cur_chunk.hva == NULL || cur_chunk.used == PAGES_PER_CHUNK) {
-    void *hva = NULL;
-    /* Host allocation must be 16KiB-aligned for hv_vm_map. On Apple Silicon
-     * that is simply the host page size, but say so explicitly rather than
-     * relying on it. */
-    if (posix_memalign(&hva, STAGE2_GRANULE, STAGE2_GRANULE) != 0)
-      panic("out of memory allocating a stage-2 chunk");
-    memset(hva, 0, STAGE2_GRANULE);
+    /*
+     * From the guest-physical arena, not the C heap. The arena is file-backed,
+     * so this chunk can be handed to a process that has had to exec - which is
+     * how fork has to work on Apple Silicon (see src/mm/arena.c). It is also
+     * simply the right home for memory owned by the guest rather than by us:
+     * hv_vm_map needs it 16KiB-aligned, which the arena guarantees, and a fresh
+     * arena range reads as zero.
+     */
+    off_t arena_off;
+    void *hva = arena_alloc(STAGE2_GRANULE, &arena_off);
 
     cur_chunk.hva  = hva;
+    cur_chunk.off  = arena_off;
     cur_chunk.ipa  = ipa_brk;
     cur_chunk.used = 0;
     ipa_brk += STAGE2_GRANULE;

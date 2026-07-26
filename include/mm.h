@@ -71,4 +71,16 @@ int do_munmap(gaddr_t gaddr, size_t size);
 int hv_mflag_to_linux_mprot(hv_memory_flags_t mflag);
 hv_memory_flags_t linux_mprot_to_hv_mflag(int mprot);
 
+/*
+ * The guest-physical memory arena (src/mm/arena.c). Guest memory is carved out
+ * of one unlinked, file-backed arena so that a descriptor - which survives
+ * exec - names it, which is what lets a fork's child reach the parent's guest
+ * memory after it has had to exec. See spike/arm64-fork/.
+ */
+void  arena_init(void);
+void *arena_alloc(size_t size, off_t *off_out);
+void *arena_map_private(off_t off, size_t size);
+void  arena_adopt(int fd);
+int   arena_fd(void);
+
 #endif

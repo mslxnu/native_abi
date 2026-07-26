@@ -125,6 +125,7 @@ COMMON_SRCS := src/main.c \
                src/sys/time.c \
                src/mm/mm.c \
                src/mm/mmap.c \
+               src/mm/arena.c \
                src/mm/malloc.c \
                src/mm/shm.c
 
@@ -208,10 +209,10 @@ $(ARM64_TEST): test/arch/test_arm64_backend.c lib/vmm_arm64.c lib/vmm_arm64_exit
 
 MMU_TEST := $(OUT)/test_arm64_mmu
 
-$(MMU_TEST): test/arch/test_arm64_mmu.c src/mm/pt_arm64.c src/mm/mm_arm64.c lib/vmm_arm64.c lib/vmm_arm64_exit.c $(HEADERS) | $(OUT)
+$(MMU_TEST): test/arch/test_arm64_mmu.c src/mm/pt_arm64.c src/mm/arena.c src/mm/mm_arm64.c lib/vmm_arm64.c lib/vmm_arm64_exit.c $(HEADERS) | $(OUT)
 	$(CC) -arch arm64 -std=gnu11 -O0 -g \
 	    -Wall -Wextra -Wno-unused-parameter -Iinclude \
-	    -o $@ test/arch/test_arm64_mmu.c src/mm/pt_arm64.c src/mm/mm_arm64.c lib/vmm_arm64.c lib/vmm_arm64_exit.c \
+	    -o $@ test/arch/test_arm64_mmu.c src/mm/pt_arm64.c src/mm/arena.c src/mm/mm_arm64.c lib/vmm_arm64.c lib/vmm_arm64_exit.c \
 	    -framework Hypervisor
 	$(CODESIGN) --force --sign $(SIGNCERT) --entitlements $(ENTITLEMENTS) $@
 
@@ -220,28 +221,28 @@ $(MMU_TEST): test/arch/test_arm64_mmu.c src/mm/pt_arm64.c src/mm/mm_arm64.c lib/
 # guarded.
 VMMAP_TEST := $(OUT)/test_arm64_vmmap
 
-$(VMMAP_TEST): test/arch/test_arm64_vmmap.c src/mm/pt_arm64.c lib/vmm_arm64.c lib/vmm_arm64_exit.c $(HEADERS) | $(OUT)
+$(VMMAP_TEST): test/arch/test_arm64_vmmap.c src/mm/pt_arm64.c src/mm/arena.c lib/vmm_arm64.c lib/vmm_arm64_exit.c $(HEADERS) | $(OUT)
 	$(CC) -arch arm64 -std=gnu11 -O0 -g \
 	    -Wall -Wextra -Wno-unused-parameter -Iinclude \
-	    -o $@ test/arch/test_arm64_vmmap.c src/mm/pt_arm64.c lib/vmm_arm64.c lib/vmm_arm64_exit.c \
+	    -o $@ test/arch/test_arm64_vmmap.c src/mm/pt_arm64.c src/mm/arena.c lib/vmm_arm64.c lib/vmm_arm64_exit.c \
 	    -framework Hypervisor
 	$(CODESIGN) --force --sign $(SIGNCERT) --entitlements $(ENTITLEMENTS) $@
 
 BOOT_TEST := $(OUT)/test_arm64_boot
 
-$(BOOT_TEST): test/arch/test_arm64_boot.c src/main_arm64.c src/mm/pt_arm64.c lib/vmm_arm64.c lib/vmm_arm64_exit.c $(HEADERS) | $(OUT)
+$(BOOT_TEST): test/arch/test_arm64_boot.c src/main_arm64.c src/mm/pt_arm64.c src/mm/arena.c lib/vmm_arm64.c lib/vmm_arm64_exit.c $(HEADERS) | $(OUT)
 	$(CC) -arch arm64 -std=gnu11 -O0 -g \
 	    -Wall -Wextra -Wno-unused-parameter -Iinclude \
-	    -o $@ test/arch/test_arm64_boot.c src/main_arm64.c src/mm/pt_arm64.c lib/vmm_arm64.c lib/vmm_arm64_exit.c \
+	    -o $@ test/arch/test_arm64_boot.c src/main_arm64.c src/mm/pt_arm64.c src/mm/arena.c lib/vmm_arm64.c lib/vmm_arm64_exit.c \
 	    -framework Hypervisor
 	$(CODESIGN) --force --sign $(SIGNCERT) --entitlements $(ENTITLEMENTS) $@
 
 MUNMAP_TEST := $(OUT)/test_arm64_munmap
 
-$(MUNMAP_TEST): test/arch/test_arm64_munmap.c src/mm/pt_arm64.c lib/vmm_arm64.c lib/vmm_arm64_exit.c $(HEADERS) | $(OUT)
+$(MUNMAP_TEST): test/arch/test_arm64_munmap.c src/mm/pt_arm64.c src/mm/arena.c lib/vmm_arm64.c lib/vmm_arm64_exit.c $(HEADERS) | $(OUT)
 	$(CC) -arch arm64 -std=gnu11 -O0 -g \
 	    -Wall -Wextra -Wno-unused-parameter -Iinclude \
-	    -o $@ test/arch/test_arm64_munmap.c src/mm/pt_arm64.c lib/vmm_arm64.c lib/vmm_arm64_exit.c \
+	    -o $@ test/arch/test_arm64_munmap.c src/mm/pt_arm64.c src/mm/arena.c lib/vmm_arm64.c lib/vmm_arm64_exit.c \
 	    -framework Hypervisor
 	$(CODESIGN) --force --sign $(SIGNCERT) --entitlements $(ENTITLEMENTS) $@
 
@@ -249,18 +250,26 @@ $(MUNMAP_TEST): test/arch/test_arm64_munmap.c src/mm/pt_arm64.c lib/vmm_arm64.c 
 # replay / restore) in-process. Same link set as the boot test.
 REENTRY_TEST := $(OUT)/test_arm64_reentry
 
-$(REENTRY_TEST): test/arch/test_arm64_reentry.c src/main_arm64.c src/mm/pt_arm64.c lib/vmm_arm64.c lib/vmm_arm64_exit.c $(HEADERS) | $(OUT)
+$(REENTRY_TEST): test/arch/test_arm64_reentry.c src/main_arm64.c src/mm/pt_arm64.c src/mm/arena.c lib/vmm_arm64.c lib/vmm_arm64_exit.c $(HEADERS) | $(OUT)
 	$(CC) -arch arm64 -std=gnu11 -O0 -g \
 	    -Wall -Wextra -Wno-unused-parameter -Iinclude \
-	    -o $@ test/arch/test_arm64_reentry.c src/main_arm64.c src/mm/pt_arm64.c lib/vmm_arm64.c lib/vmm_arm64_exit.c \
+	    -o $@ test/arch/test_arm64_reentry.c src/main_arm64.c src/mm/pt_arm64.c src/mm/arena.c lib/vmm_arm64.c lib/vmm_arm64_exit.c \
 	    -framework Hypervisor
 	$(CODESIGN) --force --sign $(SIGNCERT) --entitlements $(ENTITLEMENTS) $@
 
-check-arm64: $(ARM64_TEST) $(MMU_TEST) $(VMMAP_TEST) $(BOOT_TEST) $(MUNMAP_TEST) $(REENTRY_TEST)
+# The arena is plain VM plumbing - no VM, no entitlement, runs anywhere.
+ARENA_TEST := $(OUT)/test_arena
+
+$(ARENA_TEST): test/arch/test_arena.c src/mm/arena.c $(HEADERS) | $(OUT)
+	$(CC) -arch $(NATIVE_ARCH) -std=gnu11 -O0 -g \
+	    -Wall -Wextra -Wno-unused-parameter -Iinclude \
+	    -o $@ test/arch/test_arena.c src/mm/arena.c
+
+check-arm64: $(ARM64_TEST) $(MMU_TEST) $(VMMAP_TEST) $(BOOT_TEST) $(MUNMAP_TEST) $(REENTRY_TEST) $(ARENA_TEST)
 	@if [ "$(NATIVE_ARCH)" != "arm64" ]; then \
 		echo "SKIP: the aarch64 backend tests need Apple Silicon to run."; \
 	else \
-		$(ARM64_TEST) && $(MMU_TEST) && $(VMMAP_TEST) && $(BOOT_TEST) && $(MUNMAP_TEST) && $(REENTRY_TEST); \
+		$(ARENA_TEST) && $(ARM64_TEST) && $(MMU_TEST) && $(VMMAP_TEST) && $(BOOT_TEST) && $(MUNMAP_TEST) && $(REENTRY_TEST); \
 	fi
 
 # End-to-end: run committed aarch64 binaries under a natively-built nabi. Needs

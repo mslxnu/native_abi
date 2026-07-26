@@ -565,10 +565,19 @@ running guest, so every open file would have to be re-opened and re-positioned
 from serialized state — more code, and not reliably possible for pipes, sockets
 and unlinked files.
 
-The shape would be: guest memory into a shared-memory arena, process state (mm
+The shape is: guest memory into a shared-memory arena, process state (mm
 regions, fd table, credentials, sigactions, task, brk, vCPU snapshot) serialized,
-and `__do_clone_process` becomes fork + `exec` of `nabi --resume <fd>`. Not
-attempted here. Until then `forktest` and `clonetid` make the smoke suite
+and `__do_clone_process` becomes fork + `exec` of `nabi --resume <fd>`.
+
+**Step 1 of that is done**: [src/mm/arena.c](src/mm/arena.c). Guest-physical
+memory now comes from a single unlinked, file-backed arena rather than the C
+heap, so a *descriptor* names it - and descriptors survive `exec` where pointers
+do not. The running guest maps it `MAP_SHARED`; a resuming child will map the
+same offsets `MAP_PRIVATE`, which is precisely fork's memory semantics: it starts
+from the parent's bytes and diverges copy-on-write, with no eager copy of the
+address space. `make check-arm64` covers the arena's contract, including that
+copy-on-write divergence, and it needs no VM to run. The rest - serializing
+process state and the `--resume` path - is still ahead. Until then `forktest` and `clonetid` make the smoke suite
 intermittently red, and that is honest: `fork` really is broken about one time in
 eight.
 
