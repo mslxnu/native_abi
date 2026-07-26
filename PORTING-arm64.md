@@ -2,11 +2,16 @@
 
 **Target:** run **aarch64** Linux binaries on arm64 macOS via Hypervisor.framework's ARM API.
 
-**Status** (M5, macOS 26): **a native arm64 `nabi` runs real aarch64 Linux
-binaries end to end**, static and **dynamically linked** - `make check-smoke`
-covers the static ELFs, and a Debian trixie `/bin/echo` (via
-`ld-linux-aarch64.so.1` and glibc) prints its arguments, with `/bin/true` and
-`/bin/false` returning 0 and 1 and `uname -m` reporting `aarch64`.
+**Status** (M5, macOS 26): **a native arm64 `nabi` runs Debian's `bash`.** Static
+and dynamically-linked aarch64 binaries both work - `make check-smoke` covers the
+static ELFs, and under a real `ld-linux-aarch64.so.1` + glibc, `bash` runs
+external commands, pipelines (`echo x | tr a-z A-Z`), command substitution,
+loops, conditionals and redirections.
+
+Known rough edges: `fork` is intermittently (~10%) wrong, a regression from
+enabling the caches (§3.5.5) that `forktest`/`clonetid` catch; `mprotect` is an
+over-permissive no-op (§3.5.6); and `-m <root>` does not confine a guest whose
+rootfs contains absolute symlinks.
 
 | Phase | State |
 |---|---|
@@ -15,7 +20,7 @@ covers the static ELFs, and a Debian trixie `/bin/echo` (via
 | 2 — arm64 VMM backend | **done** — backend, stage-1 translation, two-stage `vmm_mmap`, guest boot to EL0, all hardware-verified (`make check-arm64`) |
 | 3 — syscall table + ABI | **done for the static case** — generated aarch64 table (§3.2), exec.c ported, code-cache sync wired in, TLS via `TPIDR_EL0`, `struct stat` corrected to the aarch64 layout (§3.5.4), `statx`/`prlimit64` wired. A static ELF loads, runs, stats, syscalls and exits (`make check-smoke`). `ppoll`/`epoll_*` and the dynamic linker still to come |
 | 4 — signals, fork, threads | **signals and fork done** — a guest takes a signal, runs the handler at EL0 and resumes; and a guest `fork`s, both sides rebuilding the VM (snapshot / `hv_vm_destroy` / host fork / reentry, `make check-arm64` reentry test + `check-smoke` forktest). Multi-threaded `clone` (a second live vCPU) is still guarded off |
-| 5 — dynamic linking and rootfs | **running** — a real dynamically-linked Debian aarch64 binary works: `/bin/echo` prints its arguments, `/bin/true`/`/bin/false` return 0/1, `uname -m` says `aarch64`, busybox runs. Needed file-backed mmap by copy, a 16KiB guest-page model, and the caches on (§3.5.5). Rootfs built offline from the netinst ISO |
+| 5 — dynamic linking and rootfs | **bash runs** — Debian trixie `bash` executes external commands, pipelines, command substitution, loops and redirections under a real `ld-linux-aarch64.so.1` + glibc. Needed file-backed mmap by copy, a 16KiB guest-page model, the caches on (§3.5.5) and `VREG_PC` via `ELR_EL1` (§3.5.7). Rootfs built offline from the netinst ISO |
 | 6 | test port — not started |
 
 `make ARCH=arm64` produces a signed arm64 binary that **runs real static aarch64
@@ -493,6 +498,31 @@ Still open on this path: `mprotect` is an over-permissive no-op on arm64 (the x8
 call passes a guest VA to `hv_vm_protect`, which wants an IPA, and never touches
 stage 1 — a correct version walks the stage-1 tables), and `MAP_SHARED` file
 write-back is not preserved by the copy.
+
+### 3.5.7 `VREG_PC` and the trampoline — **fixed**
+
+`execve` silently did nothing: the new program never ran, and the guest wandered
+off with no fault, no syscall and no output. The cause is the EL1 trampoline
+leaking through the arch-neutral register interface.
+
+Whenever the host is looking at the vCPU after a trap, the vCPU is *parked in the
+trampoline*: the guest's `svc` took it to EL1, the stub bounced out with `hvc`,
+and `HV_REG_PC` is the stub's own `eret` while `CPSR` reads EL1h. The guest's
+real program counter is banked in `ELR_EL1` — which that `eret` is about to
+consume. `vmm_set_reg(VREG_PC, entry)` wrote `HV_REG_PC`, so the `eret` discarded
+the new entry point and returned to the *old* image's address, whose mappings
+`prepare_newproc` had just torn down.
+
+`VREG_PC` now reads and writes `ELR_EL1` while parked at EL1, the same way
+`VREG_SP` already resolves to `SP_EL0` — the trampoline is a backend detail and
+has no business being visible to `exec.c`. Startup exec was unaffected and hid
+the bug: it runs before the guest has ever trapped, so `CPSR` is EL0t and
+`vmm_arm64_enter_el0` sets `ELR_EL1` explicitly.
+
+This is the third instance of the same trap (see §3.4 for the signal-frame one):
+on aarch64, *any* host code that touches the guest's PC or PSTATE must ask which
+exception level the vCPU is parked at first. The `exectest` smoke binary guards
+it.
 
 ### 3.6 Segmentation, IDT, FPU, CPUID, TSC
 

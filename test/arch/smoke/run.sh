@@ -127,6 +127,17 @@ else
     fail=1
 fi
 
+# exectest: execve /hello and let the new image produce the output. Guards the
+# guest PC being set through ELR_EL1 rather than the trampoline's HV_REG_PC.
+cp "$here/exectest" "$root/"; chmod +x "$root/exectest"
+out=$("$NABI" -m "$root" /exectest); rc=$?
+if [ "$rc" -eq 0 ] && [ "$out" = "hello arm64!" ]; then
+    echo "  ok  exectest -> execve ran /hello, exit 0"
+else
+    echo "  FAIL exectest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 if [ "$fail" -eq 0 ]; then
     echo "smoke: PASS"
 else

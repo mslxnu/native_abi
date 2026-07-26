@@ -69,6 +69,22 @@ static const hv_reg_t vreg_map[NR_VREG] = {
   [VREG_ARG5]  = HV_REG_X5,
 };
 
+/*
+ * Is the vCPU parked in the EL1 trampoline rather than running guest code?
+ *
+ * True whenever the host is looking at the vCPU after a trap: the guest's `svc`
+ * took it to EL1, the stub bounced to us with `hvc`, and HV_REG_PC/CPSR now
+ * describe the *stub* - PC is its `eret`, CPSR is EL1h. The guest's own PC is
+ * banked in ELR_EL1, which that `eret` will consume.
+ */
+static bool
+parked_at_el1(void)
+{
+  uint64_t cpsr;
+  vmm_arm64_read_reg(HV_REG_CPSR, &cpsr);
+  return (cpsr & 0xfu) != PSR_MODE_EL0t;
+}
+
 void
 vmm_get_reg(enum vreg reg, uint64_t *val)
 {
@@ -76,6 +92,18 @@ vmm_get_reg(enum vreg reg, uint64_t *val)
   /* The guest runs at EL0, so SP_EL0 is its stack pointer. */
   if (reg == VREG_SP) {
     vmm_arm64_read_sysreg(HV_SYS_REG_SP_EL0, val);
+    return;
+  }
+  /*
+   * VREG_PC is the *guest's* program counter, so the EL1 trampoline has to stay
+   * invisible here: while parked in it the guest's PC lives in ELR_EL1, and
+   * HV_REG_PC is the stub's own `eret`. Callers that set a new PC - execve
+   * pointing at the new image's entry, most importantly - would otherwise write
+   * a register the `eret` immediately discards, and the guest would resume at
+   * the old address instead.
+   */
+  if (reg == VREG_PC && parked_at_el1()) {
+    vmm_arm64_read_sysreg(HV_SYS_REG_ELR_EL1, val);
     return;
   }
   assert(vreg_map[reg] != VREG_NOT_A_GPR);
@@ -88,6 +116,10 @@ vmm_set_reg(enum vreg reg, uint64_t val)
   assert(reg < NR_VREG);
   if (reg == VREG_SP) {
     vmm_arm64_write_sysreg(HV_SYS_REG_SP_EL0, val);
+    return;
+  }
+  if (reg == VREG_PC && parked_at_el1()) {
+    vmm_arm64_write_sysreg(HV_SYS_REG_ELR_EL1, val);
     return;
   }
   assert(vreg_map[reg] != VREG_NOT_A_GPR);

@@ -28,6 +28,10 @@ guest-code cache sync.
 - `atomic` — load/store-exclusive and an LSE atomic on normal memory. Guards
   `SCTLR_EL1.C`/`.I` being enabled: exclusives are unsupported on Non-cacheable
   memory, and every real libc locks, so this gates running any glibc binary.
+- `exectest` — `execve`s `/hello` and lets the new image print. Guards the guest
+  PC being set through `ELR_EL1` rather than the EL1 trampoline's `HV_REG_PC`,
+  without which `execve` returns to the old image and the guest wanders off
+  silently. Runs `hello`, so the two are paired.
 
 The ELF binaries are committed prebuilt (as the x86 guest tests under
 `test/*/build/` are), so the check needs no cross-toolchain. The `.s` sources
