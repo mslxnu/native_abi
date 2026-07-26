@@ -3,8 +3,10 @@
 **Target:** run **aarch64** Linux binaries on arm64 macOS via Hypervisor.framework's ARM API.
 
 **Status** (M5, macOS 26): **a native arm64 `nabi` runs real aarch64 Linux
-binaries end to end** - `make check-smoke` loads and runs static ELFs that
-`write` and `exit`, output and exit codes propagating.
+binaries end to end**, static and **dynamically linked** - `make check-smoke`
+covers the static ELFs, and a Debian trixie `/bin/echo` (via
+`ld-linux-aarch64.so.1` and glibc) prints its arguments, with `/bin/true` and
+`/bin/false` returning 0 and 1 and `uname -m` reporting `aarch64`.
 
 | Phase | State |
 |---|---|
@@ -13,7 +15,8 @@ binaries end to end** - `make check-smoke` loads and runs static ELFs that
 | 2 — arm64 VMM backend | **done** — backend, stage-1 translation, two-stage `vmm_mmap`, guest boot to EL0, all hardware-verified (`make check-arm64`) |
 | 3 — syscall table + ABI | **done for the static case** — generated aarch64 table (§3.2), exec.c ported, code-cache sync wired in, TLS via `TPIDR_EL0`, `struct stat` corrected to the aarch64 layout (§3.5.4), `statx`/`prlimit64` wired. A static ELF loads, runs, stats, syscalls and exits (`make check-smoke`). `ppoll`/`epoll_*` and the dynamic linker still to come |
 | 4 — signals, fork, threads | **signals and fork done** — a guest takes a signal, runs the handler at EL0 and resumes; and a guest `fork`s, both sides rebuilding the VM (snapshot / `hv_vm_destroy` / host fork / reentry, `make check-arm64` reentry test + `check-smoke` forktest). Multi-threaded `clone` (a second live vCPU) is still guarded off |
-| 5–6 | rootfs, dynamic linking, test port — not started |
+| 5 — dynamic linking and rootfs | **running** — a real dynamically-linked Debian aarch64 binary works: `/bin/echo` prints its arguments, `/bin/true`/`/bin/false` return 0/1, `uname -m` says `aarch64`, busybox runs. Needed file-backed mmap by copy, a 16KiB guest-page model, and the caches on (§3.5.5). Rootfs built offline from the netinst ISO |
+| 6 | test port — not started |
 
 `make ARCH=arm64` produces a signed arm64 binary that **runs real static aarch64
 Linux ELFs** - proven by `make check-smoke`. Bounds today: a **single-threaded,
@@ -443,6 +446,53 @@ and `cat`/`ls`-style programs break immediately. The smoke binaries never
 now `#if`-split by host arch (the guest ABI follows the host), and the
 `stattest` smoke binary asserts a file reads back as `S_IFREG` with a nonzero
 size.
+
+### 3.5.5 The caches must be on, or atomics fault — **fixed**
+
+`pt_enable` originally set only `SCTLR_EL1.M`. That runs, and every freestanding
+test passed, because nothing they did needed a cache. But with `SCTLR_EL1.C`
+clear the CPU treats **every** access as Non-cacheable regardless of what MAIR
+and the descriptors say — and load/store-exclusive and the LSE atomics are not
+supported on Non-cacheable memory. The guest's first `LDXR`/`STXR` therefore
+takes a data abort with `ESR` DFSC `0x35`, "unsupported exclusive or atomic
+access".
+
+The symptom is maximally misleading: an unkillable loop of identical faults
+(millions per second) at an address whose stage-1 descriptor is valid and
+readable and whose stage-2 mapping is present and readable — nothing points at
+caches. And because every real libc takes a lock during startup, this gated
+running *any* glibc binary while leaving hand-written assembly tests perfectly
+happy.
+
+`pt_enable` now sets `SCTLR_EL1.C` and `.I` along with `.M`. The tables already
+requested Normal Write-Back Inner-Shareable memory; enabling the caches is what
+lets those attributes take effect. The `atomic` smoke binary guards it.
+
+### 3.5.6 Loading a dynamically-linked binary — **working**
+
+Three things had to change before `ld-linux-aarch64.so.1` could load a library
+(all in [src/mm/mmap.c](src/mm/mmap.c) and [src/proc/exec.c](src/proc/exec.c)):
+
+- **File-backed mmap is a copy, not a mapping.** Apple Silicon refuses to map an
+  arbitrary file `PROT_EXEC` (EPERM under the hardened runtime) and wants
+  16KiB-aligned file offsets, while a guest's ld.so maps library segments R-X at
+  4KiB-aligned offsets. So a file map is backed by anonymous host memory with the
+  bytes `pread` in; the guest's R/W/X comes from stage 2 either way. Executable
+  file maps are icache-synced, exactly as the ELF loader does for its own PF_X
+  segments — without it the guest executes stale library text, which presents as
+  a *nondeterministic* hang.
+- **The guest is a 16KiB-page machine.** `AT_PAGESZ` is `STAGE2_GRANULE`, and
+  mmap regions, `alloc_region`, mmap/munmap lengths and ELF segment loading are
+  all 16KiB-granular, so no segment shares a 16KiB stage-2 block with its
+  neighbour (which `vmm_munmap` cannot split, §3.5.3).
+- **munmap rounds its length up** to that granule, as the kernel does: glibc's
+  ld.so passes raw, unrounded segment lengths and relies on the kernel to extend
+  them to a whole page.
+
+Still open on this path: `mprotect` is an over-permissive no-op on arm64 (the x86
+call passes a guest VA to `hv_vm_protect`, which wants an IPA, and never touches
+stage 1 — a correct version walks the stage-1 tables), and `MAP_SHARED` file
+write-back is not preserved by the copy.
 
 ### 3.6 Segmentation, IDT, FPU, CPUID, TSC
 

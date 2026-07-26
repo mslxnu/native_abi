@@ -446,7 +446,13 @@ DEFINE_SYSCALL(uname, gaddr_t, buf_ptr)
   strncpy(buf.sysname, "Linux", sizeof buf.sysname - 1);
   strncpy(buf.release, LINUX_RELEASE, sizeof buf.release - 1);
   strncpy(buf.version, LINUX_VERSION, sizeof buf.version - 1);
+  /* The guest architecture, not the host's - a guest that reads this picks its
+   * library paths and JIT backend from it. */
+#if defined(__aarch64__) || defined(__arm64__)
+  strncpy(buf.machine, "aarch64", sizeof buf.machine - 1);
+#else
   strncpy(buf.machine, "x86_64", sizeof buf.machine - 1);
+#endif
   strncpy(buf.domainname, "GNU/Linux", sizeof buf.domainname - 1);
 
   int err = syswrap(gethostname(buf.nodename, sizeof buf.nodename - 1));

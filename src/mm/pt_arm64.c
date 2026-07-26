@@ -303,18 +303,29 @@ pt_init(void)
 }
 
 /*
- * Turn stage-1 translation on.
+ * Turn stage-1 translation on, with the caches enabled.
  *
  * Separate from pt_init so the caller controls the moment: everything the guest
  * touches next - its code, its stack, the trampoline - must already be mapped,
  * or the first fetch after this faults with no way to make progress.
+ *
+ * SCTLR_EL1.C and .I are not an optimization here, they are correctness. With
+ * .C clear the CPU treats every access as Non-cacheable no matter what MAIR
+ * says, and load/store-exclusive and the LSE atomics are not supported on
+ * Non-cacheable memory: the guest's first LDXR/STXR (or a glibc lock) takes a
+ * data abort with DFSC 0x35, "unsupported exclusive or atomic access", which
+ * presents as an unkillable fault loop rather than anything mentioning caches.
+ * The page tables already ask for Normal Write-Back Inner-Shareable memory
+ * (MAIR_ATTR_NORMAL + PTE_SH_INNER), so enabling the caches is what makes the
+ * attributes the descriptors request actually take effect.
  */
 void
 pt_enable(void)
 {
   uint64_t sctlr;
   vmm_arm64_read_sysreg(HV_SYS_REG_SCTLR_EL1, &sctlr);
-  vmm_arm64_write_sysreg(HV_SYS_REG_SCTLR_EL1, sctlr | SCTLR_EL1_M);
+  vmm_arm64_write_sysreg(HV_SYS_REG_SCTLR_EL1,
+                         sctlr | SCTLR_EL1_M | SCTLR_EL1_C | SCTLR_EL1_I);
 }
 
 gaddr_t

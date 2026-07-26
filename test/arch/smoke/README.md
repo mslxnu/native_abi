@@ -25,6 +25,9 @@ guest-code cache sync.
   fork / reentry cycle.
 - `clonetid` — `clone` with `CHILD_SETTID` in aarch64 argument order (as glibc's
   `fork` issues it); the child's tid must land in the `child_tid` pointer.
+- `atomic` — load/store-exclusive and an LSE atomic on normal memory. Guards
+  `SCTLR_EL1.C`/`.I` being enabled: exclusives are unsupported on Non-cacheable
+  memory, and every real libc locks, so this gates running any glibc binary.
 
 The ELF binaries are committed prebuilt (as the x86 guest tests under
 `test/*/build/` are), so the check needs no cross-toolchain. The `.s` sources

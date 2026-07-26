@@ -116,6 +116,17 @@ else
     fail=1
 fi
 
+# atomic: load/store-exclusive and an LSE atomic. Guards the caches being on
+# (SCTLR_EL1.C/.I) - exclusives are unsupported on Non-cacheable memory.
+cp "$here/atomic" "$root/"; chmod +x "$root/atomic"
+out=$("$NABI" -m "$root" /atomic); rc=$?
+if [ "$rc" -eq 0 ] && [ "$out" = "atomics ok" ]; then
+    echo "  ok  atomic -> \"$out\", exit 0"
+else
+    echo "  FAIL atomic -> \"$out\", exit $rc"
+    fail=1
+fi
+
 if [ "$fail" -eq 0 ]; then
     echo "smoke: PASS"
 else
