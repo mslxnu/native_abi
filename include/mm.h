@@ -87,6 +87,7 @@ hv_memory_flags_t linux_mprot_to_hv_mflag(int mprot);
 void  arena_init(void);
 void *arena_alloc(size_t size, off_t *off_out);
 void  arena_free(off_t off, size_t size);
+off_t arena_offset_of(void *addr);
 void *arena_map_private(off_t off, size_t size);
 void  arena_adopt(int fd);
 int   arena_fd(void);

@@ -68,6 +68,56 @@ static int    arena_backing_fd = -1;
 static off_t  arena_brk;        /* next unallocated offset */
 static off_t  arena_capacity;   /* how far the file has been grown */
 
+/*
+ * Live allocations, so a host address can be turned back into the offset that
+ * names it elsewhere. Checkpointing needs exactly that direction: the stage-2
+ * registry and the region list both hold host pointers, and a pointer is the one
+ * thing that cannot be handed to another process.
+ *
+ * A flat array is enough - this is walked when a mapping is created or a
+ * checkpoint is taken, never on a fault path.
+ */
+struct arena_span { void *addr; size_t size; off_t off; };
+#define ARENA_MAX_SPANS 16384
+static struct arena_span arena_spans[ARENA_MAX_SPANS];
+static size_t nr_arena_spans;
+
+static void
+arena_span_record(void *addr, size_t size, off_t off)
+{
+  if (nr_arena_spans == ARENA_MAX_SPANS)
+    panic("too many live arena spans");
+  arena_spans[nr_arena_spans++] = (struct arena_span){ addr, size, off };
+}
+
+static void
+arena_span_forget(off_t off)
+{
+  for (size_t i = 0; i < nr_arena_spans; i++) {
+    if (arena_spans[i].off == off) {
+      arena_spans[i] = arena_spans[--nr_arena_spans];
+      return;
+    }
+  }
+}
+
+/*
+ * The arena offset backing a host address, or -1 if it is not arena memory
+ * (SysV shared segments and the vkernel's own bookkeeping are not). Interior
+ * addresses resolve to their span's offset plus the distance in, so a caller
+ * holding a pointer into the middle of a region gets a usable answer.
+ */
+off_t
+arena_offset_of(void *addr)
+{
+  for (size_t i = 0; i < nr_arena_spans; i++) {
+    char *base = arena_spans[i].addr;
+    if ((char *) addr >= base && (char *) addr < base + arena_spans[i].size)
+      return arena_spans[i].off + ((char *) addr - base);
+  }
+  return -1;
+}
+
 int
 arena_fd(void)
 {
@@ -136,6 +186,8 @@ arena_alloc(size_t size, off_t *off_out)
     panic("could not map guest memory arena offset %lld: %s",
           (long long) off, strerror(errno));
 
+  arena_span_record(p, size, off);
+
   if (off_out)
     *off_out = off;
   return p;
@@ -162,6 +214,7 @@ arena_free(off_t off, size_t size)
     return;
 
   size = roundup(size, ARENA_GRANULE);
+  arena_span_forget(off);
   struct fpunchhole hole = {
     .fp_flags = 0,
     .reserved = 0,

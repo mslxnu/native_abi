@@ -27,6 +27,7 @@
 #include <libkern/OSCacheControl.h>
 
 #include "arm64/vm.h"
+#include "checkpoint.h"
 
 /*
  * Stage-2 mapping registry.
@@ -119,6 +120,30 @@ vmm_arm64_unmap_stage2(gaddr_t ipa, size_t size)
   assert((size & (STAGE2_GRANULE - 1)) == 0);
   hv_vm_unmap(ipa, size);
   s2_forget(ipa, size);
+}
+
+/*
+ * The stage-2 registry as arena offsets, for a handover. The registry holds host
+ * addresses, which are meaningless in another process, so each is translated
+ * back to the arena offset naming the same bytes. Returns the number of entries
+ * the registry holds, which may exceed `max`.
+ */
+size_t
+vmm_arm64_s2_snapshot(struct checkpoint_s2 *out, size_t max)
+{
+  gaddr_t ipa;
+  struct s2_ent ent;
+  size_t n = 0;
+  kh_foreach(s2_map, ipa, ent, {
+    if (n < max) {
+      out[n].ipa       = ipa;
+      out[n].arena_off = arena_offset_of(ent.haddr);
+      out[n].prot      = ent.prot;
+      out[n]._pad      = 0;
+    }
+    n++;
+  });
+  return n;
 }
 
 /* Replay the whole registry into the current (freshly created) VM. Used by

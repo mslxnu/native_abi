@@ -43,7 +43,7 @@ ARCH ?= $(NATIVE_ARCH)
 ifeq ($(ARCH),x86_64)
     ARCH_SRCS := lib/vmm_x86.c lib/vmm_x86_exit.c src/mm/mm_x86.c src/main_x86.c src/ipc/signal_x86.c
 else
-    ARCH_SRCS := lib/vmm_arm64.c lib/vmm_arm64_exit.c src/mm/mm_arm64.c src/mm/pt_arm64.c src/main_arm64.c src/ipc/signal_arm64.c
+    ARCH_SRCS := lib/vmm_arm64.c lib/vmm_arm64_exit.c src/mm/mm_arm64.c src/mm/pt_arm64.c src/main_arm64.c src/ipc/signal_arm64.c src/proc/checkpoint.c
 endif
 
 # The arch guard is a parse-time $(error), so it has to be skipped for goals
@@ -203,7 +203,7 @@ ARM64_TEST := $(OUT)/test_arm64_backend
 $(ARM64_TEST): test/arch/test_arm64_backend.c lib/vmm_arm64.c lib/vmm_arm64_exit.c $(HEADERS) | $(OUT)
 	$(CC) -arch arm64 -std=gnu11 -O0 -g \
 	    -Wall -Wextra -Wno-unused-parameter -Iinclude \
-	    -o $@ test/arch/test_arm64_backend.c lib/vmm_arm64.c lib/vmm_arm64_exit.c \
+	    -o $@ test/arch/test_arm64_backend.c lib/vmm_arm64.c lib/vmm_arm64_exit.c src/mm/arena.c \
 	    -framework Hypervisor
 	$(CODESIGN) --force --sign $(SIGNCERT) --entitlements $(ENTITLEMENTS) $@
 
@@ -265,11 +265,18 @@ $(ARENA_TEST): test/arch/test_arena.c src/mm/arena.c $(HEADERS) | $(OUT)
 	    -Wall -Wextra -Wno-unused-parameter -Iinclude \
 	    -o $@ test/arch/test_arena.c src/mm/arena.c
 
-check-arm64: $(ARM64_TEST) $(MMU_TEST) $(VMMAP_TEST) $(BOOT_TEST) $(MUNMAP_TEST) $(REENTRY_TEST) $(ARENA_TEST)
+CKPT_TEST := $(OUT)/test_checkpoint
+
+$(CKPT_TEST): test/arch/test_checkpoint.c src/proc/checkpoint.c $(HEADERS) | $(OUT)
+	$(CC) -arch $(NATIVE_ARCH) -std=gnu11 -O0 -g \
+	    -Wall -Wextra -Wno-unused-parameter -Iinclude \
+	    -o $@ test/arch/test_checkpoint.c src/proc/checkpoint.c
+
+check-arm64: $(CKPT_TEST) $(ARM64_TEST) $(MMU_TEST) $(VMMAP_TEST) $(BOOT_TEST) $(MUNMAP_TEST) $(REENTRY_TEST) $(ARENA_TEST)
 	@if [ "$(NATIVE_ARCH)" != "arm64" ]; then \
 		echo "SKIP: the aarch64 backend tests need Apple Silicon to run."; \
 	else \
-		$(ARENA_TEST) && $(ARM64_TEST) && $(MMU_TEST) && $(VMMAP_TEST) && $(BOOT_TEST) && $(MUNMAP_TEST) && $(REENTRY_TEST); \
+		$(ARENA_TEST) && $(CKPT_TEST) && $(ARM64_TEST) && $(MMU_TEST) && $(VMMAP_TEST) && $(BOOT_TEST) && $(MUNMAP_TEST) && $(REENTRY_TEST); \
 	fi
 
 # End-to-end: run committed aarch64 binaries under a natively-built nabi. Needs

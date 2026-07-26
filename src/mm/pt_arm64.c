@@ -47,6 +47,7 @@
 #include "page.h"
 #include "arm64/vm.h"
 #include "linux/mman.h"
+#include "checkpoint.h"
 
 /*
  * A 16KiB stage-2 chunk: one host allocation, one hv_vm_map, four 4KiB guest
@@ -488,4 +489,29 @@ vmm_munmap(gaddr_t gaddr, size_t size)
     *pte = 0;
     vmm_arm64_unmap_stage2(ipa & ~(STAGE2_GRANULE - 1), STAGE2_GRANULE);
   }
+}
+
+/*
+ * The stage-1 allocator's state, for a handover.
+ *
+ * The tables are guest pages living in the arena, so their *contents* travel
+ * with it; what has to be described is where each chunk sits, since ipa_to_host
+ * is the only way a descriptor in one table can be followed to the next and it
+ * is pure bookkeeping. Returns the number of chunks written.
+ */
+size_t
+pt_snapshot(uint64_t *ipa_brk_out, uint64_t *l1_ipa_out,
+            struct checkpoint_pt_chunk *out, size_t max)
+{
+  if (ipa_brk_out) *ipa_brk_out = ipa_brk;
+  if (l1_ipa_out)  *l1_ipa_out  = l1_table.ipa;
+
+  size_t n = nr_chunks < max ? nr_chunks : max;
+  for (size_t i = 0; i < n; i++) {
+    out[i].ipa       = chunks[i].ipa;
+    out[i].arena_off = chunks[i].off;
+    out[i].used      = chunks[i].used;
+    out[i]._pad      = 0;
+  }
+  return nr_chunks;
 }
