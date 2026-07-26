@@ -332,7 +332,21 @@ darwinfs_lseek(struct file *file, l_off_t offset, int whence)
 ssize_t
 darwin_to_linux_dent(struct dirent *d_dent, void *l_dent, size_t buflen, int is64)
 {
-  unsigned reclen = roundup(is64 ? offsetof(struct l_dirent64, d_name) : offsetof(struct l_dirent, d_name) + d_dent->d_namlen + 2, 8);
+  /*
+   * The name has to be counted in both cases. Without the parentheses the
+   * "+ d_namlen + 2" bound to the else branch alone, so a 64-bit record was a
+   * fixed roundup(offsetof(d_name), 8) = 24 bytes however long the name was -
+   * room for five characters. Longer names ran past the record and the next
+   * entry's d_ino overwrote their tail, so a directory listing came back with
+   * some names silently mangled ("lost+found" -> "lost+@�C") and others
+   * intact, depending on whether the clobbering inode happened to start with a
+   * zero byte. The +2 covers the NUL and, for the 32-bit layout, the d_type
+   * byte stored at reclen-1; one spare byte in the 64-bit case is free after
+   * the 8-byte roundup.
+   */
+  unsigned reclen = roundup((is64 ? offsetof(struct l_dirent64, d_name)
+                                  : offsetof(struct l_dirent, d_name))
+                            + d_dent->d_namlen + 2, 8);
   if (reclen > buflen) {
     return -1;
   }
@@ -818,7 +832,9 @@ DEFINE_SYSCALL(getdents64, unsigned int, fd, gaddr_t, dirent_ptr, unsigned int, 
   if (r < 0) {
     goto out;
   }
-  if (copy_to_user(dirent_ptr, buf, count)) {
+  /* Only the r bytes actually filled: copying the whole buffer would hand the
+   * guest whatever was in the uninitialized tail of a host malloc. */
+  if (copy_to_user(dirent_ptr, buf, r)) {
     r = -LINUX_EFAULT;
   }
 out:
@@ -836,7 +852,8 @@ DEFINE_SYSCALL(getdents, unsigned int, fd, gaddr_t, dirent_ptr, unsigned int, co
   if (r < 0) {
     goto out;
   }
-  if (copy_to_user(dirent_ptr, buf, count)) {
+  /* See getdents64: only the bytes actually filled. */
+  if (copy_to_user(dirent_ptr, buf, r)) {
     r = -LINUX_EFAULT;
   }
 out:
