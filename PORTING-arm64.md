@@ -8,8 +8,10 @@ static ELFs, and under a real `ld-linux-aarch64.so.1` + glibc, `bash` runs
 external commands, pipelines (`echo x | tr a-z A-Z`), command substitution,
 loops, conditionals and redirections.
 
-Known rough edges: `fork` is intermittently (~10%) wrong, a regression from
-enabling the caches (§3.5.5) that `forktest`/`clonetid` catch; `mprotect` is an
+Known rough edges: `fork` fails about one time in eight - a Hypervisor.framework
+limitation, not a NABI bug, reproduced standalone in
+[spike/arm64-fork/](spike/arm64-fork/) and diagnosed in §3.5.8, which
+`forktest`/`clonetid` catch; `mprotect` is an
 over-permissive no-op (§3.5.6); and `-m <root>` does not confine a guest whose
 rootfs contains absolute symlinks.
 
@@ -19,14 +21,15 @@ rootfs contains absolute symlinks.
 | 1 — arch abstraction | **done**, [include/arch.h](include/arch.h) |
 | 2 — arm64 VMM backend | **done** — backend, stage-1 translation, two-stage `vmm_mmap`, guest boot to EL0, all hardware-verified (`make check-arm64`) |
 | 3 — syscall table + ABI | **done for the static case** — generated aarch64 table (§3.2), exec.c ported, code-cache sync wired in, TLS via `TPIDR_EL0`, `struct stat` corrected to the aarch64 layout (§3.5.4), `statx`/`prlimit64` wired. A static ELF loads, runs, stats, syscalls and exits (`make check-smoke`). `ppoll`/`epoll_*` and the dynamic linker still to come |
-| 4 — signals, fork, threads | **signals and fork done** — a guest takes a signal, runs the handler at EL0 and resumes; and a guest `fork`s, both sides rebuilding the VM (snapshot / `hv_vm_destroy` / host fork / reentry, `make check-arm64` reentry test + `check-smoke` forktest). Multi-threaded `clone` (a second live vCPU) is still guarded off |
+| 4 — signals, fork, threads | **signals done; fork works but is unreliable** — a guest takes a signal, runs the handler at EL0 and resumes. `fork` rebuilds the VM on both sides (snapshot / `hv_vm_destroy` / host fork / reentry) and the mechanism is verified by the `check-arm64` reentry test, but about one child in eight dies in the framework (§3.5.8). Multi-threaded `clone` (a second live vCPU) is still guarded off |
 | 5 — dynamic linking and rootfs | **bash runs** — Debian trixie `bash` executes external commands, pipelines, command substitution, loops and redirections under a real `ld-linux-aarch64.so.1` + glibc. Needed file-backed mmap by copy, a 16KiB guest-page model, the caches on (§3.5.5) and `VREG_PC` via `ELR_EL1` (§3.5.7). Rootfs built offline from the netinst ISO |
 | 6 | test port — not started |
 
 `make ARCH=arm64` produces a signed arm64 binary that **runs real static aarch64
-Linux ELFs** - proven by `make check-smoke`. Bounds today: a **single-threaded,
-statically-linked** guest works, signals and `fork` included. A multi-threaded
-`clone` (a second live vCPU) still hits a Phase 4 guard. `munmap` of a whole
+Linux ELFs** - proven by `make check-smoke`. Bounds today: a **single-threaded**
+guest works, static or dynamically linked, signals included; `fork` works but
+fails about one time in eight (§3.5.8). A multi-threaded `clone` (a second live
+vCPU) still hits a Phase 4 guard. `munmap` of a whole
 region now works (§3.5.3); a sub-16KiB-block partial split still panics. Three real host-side bugs stood between "links"
 and "runs", all found by the first smoke test and fixed: a W^X-incompatible RWX
 mmap of the malloc arena, an unreachable `RLIMIT_NOFILE`-derived kernel fd range
@@ -523,6 +526,34 @@ This is the third instance of the same trap (see §3.4 for the signal-frame one)
 on aarch64, *any* host code that touches the guest's PC or PSTATE must ask which
 exception level the vCPU is parked at first. The `exectest` smoke binary guards
 it.
+
+### 3.5.8 `fork` is unreliable, and it is the framework — **diagnosed, not fixed**
+
+Roughly one guest `fork` in eight produces a child that never runs. The cause is
+not in NABI: **once a vCPU has existed anywhere in a process, `hv_vcpu_create` in
+a forked child crashes** — a `SIGSEGV` inside Hypervisor.framework, not an error
+return, so there is nothing to test and nothing to handle. It reproduces in forty
+lines with no NABI code involved; see [spike/arm64-fork/](spike/arm64-fork/),
+which also shows it is the vCPU specifically (a parent that only created and
+destroyed a *VM* before forking never sees it).
+
+This surfaced only when the caches were enabled (§3.5.5) — not because caches
+cause it, but because before that the guest was slow and simple enough that the
+timing rarely lined up.
+
+Measured and rejected as fixes: forking from a thread that never touched a vCPU
+(the state is process-wide, not thread-local); serializing the two rebuilds;
+creating the vCPU before replaying the stage-2 mappings; backing guest pages with
+`mmap` rather than the C heap; and retrying the fork — within one NABI run the
+failure is deterministic, so every retry dies too, even though it varies between
+runs.
+
+The plausible fix is a **zygote**: fork a helper at startup, before any vCPU
+exists, and let it fork the children that need fresh vCPUs. Guest memory would
+then have to be handed over explicitly rather than inherited, which is a much
+larger change and is not attempted here. Until then `forktest` and `clonetid`
+make the smoke suite intermittently red, and that is honest: `fork` really is
+broken about one time in eight.
 
 ### 3.6 Segmentation, IDT, FPU, CPUID, TSC
 
