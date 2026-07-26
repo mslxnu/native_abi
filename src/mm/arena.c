@@ -13,11 +13,20 @@
  * survive `exec`, so guest memory reached through this fd survives with them,
  * while memory reached only through a pointer does not.
  *
- * The mapping the running guest uses is MAP_SHARED, so writes land in the arena
- * rather than in a private copy. A child then maps the same region MAP_PRIVATE,
- * which is exactly `fork` semantics for memory: it starts out seeing the
- * parent's bytes and diverges copy-on-write as soon as it writes, with no eager
- * copy of the guest's address space.
+ * The running guest's mappings are MAP_PRIVATE, and that is not an accident.
+ * MAP_SHARED would be the obvious choice - writes would land in the arena, so a
+ * handover would need no copy at all - but it also removes copy-on-write from
+ * an ordinary `fork`, and until the fork rework lands `fork` is still exactly
+ * that. Sharing the arena makes a forked child write straight into its parent's
+ * guest memory: measurably, guest pipelines stop working, because the two halves
+ * of `cmd | cmd` corrupt each other. Private mappings keep today's semantics
+ * correct and cost only that the handover has to write the live bytes into the
+ * arena at fork time rather than finding them already there.
+ *
+ * What the arena buys today is therefore the *naming*, not the sharing: every
+ * guest region has an offset, recorded alongside it, that means something in
+ * another process. Filling those offsets and mapping them on the far side is
+ * what the remaining fork work does.
  *
  * The backing file is created and immediately unlinked, so it has no name for
  * anyone else to find and disappears with the last descriptor.
@@ -121,7 +130,7 @@ arena_alloc(size_t size, off_t *off_out)
     arena_capacity = want;
   }
 
-  void *p = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_SHARED,
+  void *p = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE,
                  arena_backing_fd, off);
   if (p == MAP_FAILED)
     panic("could not map guest memory arena offset %lld: %s",
@@ -130,6 +139,36 @@ arena_alloc(size_t size, off_t *off_out)
   if (off_out)
     *off_out = off;
   return p;
+}
+
+/*
+ * Release an arena range.
+ *
+ * The storage goes back to the filesystem; the offset does not go back to the
+ * allocator. That asymmetry is deliberate. Reusing offsets would need a free
+ * list and would invite fragmentation, whereas offsets are a 64-bit namespace
+ * that a guest cannot plausibly exhaust - the arena's *apparent* size grows
+ * monotonically but it is sparse, and what actually costs anything is the
+ * storage, which punching the hole hands back straight away.
+ *
+ * Best-effort: a filesystem that cannot punch holes leaves the pages allocated,
+ * which wastes space but breaks nothing, so it is not worth failing a guest
+ * munmap over.
+ */
+void
+arena_free(off_t off, size_t size)
+{
+  if (arena_backing_fd < 0)
+    return;
+
+  size = roundup(size, ARENA_GRANULE);
+  struct fpunchhole hole = {
+    .fp_flags = 0,
+    .reserved = 0,
+    .fp_offset = off,
+    .fp_length = (off_t) size,
+  };
+  (void) fcntl(arena_backing_fd, F_PUNCHHOLE, &hole);
 }
 
 /*

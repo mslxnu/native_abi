@@ -95,6 +95,8 @@ do_munmap(gaddr_t gaddr, size_t size)
     RB_REMOVE(mm_region_tree, &proc.mm->mm_region_tree, overlapping);
     vmm_munmap(overlapping->gaddr, overlapping->size);
     munmap(overlapping->haddr, overlapping->size);
+    if (overlapping->arena_off >= 0)
+      arena_free(overlapping->arena_off, overlapping->size);
     free(overlapping);
     if (next == &proc.mm->mm_regions)
       break;
@@ -104,6 +106,7 @@ do_munmap(gaddr_t gaddr, size_t size)
   return 0;
 }
 
+#if !defined(__arm64__)
 static int
 linux_to_darwin_mflags(int l_flags)
 {
@@ -114,6 +117,7 @@ linux_to_darwin_mflags(int l_flags)
   if (l_flags & LINUX_MAP_HUGETLB) d_flags |= VM_FLAGS_SUPERPAGE_SIZE_ANY;
   return d_flags;
 }
+#endif
 
 gaddr_t
 do_mmap(gaddr_t addr, size_t len, int d_prot, int l_prot, int l_flags, int fd, off_t offset)
@@ -145,39 +149,41 @@ do_mmap(gaddr_t addr, size_t len, int d_prot, int l_prot, int l_flags, int fd, o
   }
 
   void *ptr;
+  off_t arena_off = -1;
 #if defined(__arm64__)
-  if (fd >= 0) {
-    /*
-     * File-backed mapping. Apple Silicon cannot map a file into the guest
-     * directly: it rejects PROT_EXEC file maps (EPERM - an arbitrary file may
-     * not be mapped executable under the hardened runtime) and requires
-     * 16KiB-aligned file offsets, while a 4KiB-page guest's ld.so maps library
-     * segments R-X at 4KiB-aligned offsets. So back the region with anonymous
-     * host memory and copy the file's bytes in. The guest's real R/W/X comes
-     * from stage-2 (vmm_mmap below), so the host copy only needs to be readable
-     * and writable by us, and MAP_PRIVATE is exactly these copy semantics. A
-     * short read at EOF leaves the tail zero, which is what a file mapping past
-     * end-of-file must read as. (MAP_SHARED write-back to the file is not
-     * preserved - no guest run so far needs it.)
-     */
-    ptr = mmap(0, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
-    if (ptr == MAP_FAILED)
-      return -darwin_to_linux_errno(errno);
-    if (pread(fd, ptr, len, offset) < 0) {
-      int e = errno;
-      munmap(ptr, len);
-      return -darwin_to_linux_errno(e);
-    }
-  } else
-#endif
+  /*
+   * Every guest region comes out of the arena, so that a descriptor names it and
+   * a child that has had to exec can still reach it (src/mm/arena.c). That
+   * subsumes what this path already had to do for files: Apple Silicon rejects
+   * PROT_EXEC file maps (EPERM - an arbitrary file may not be mapped executable
+   * under the hardened runtime) and wants 16KiB-aligned file offsets, while a
+   * 4KiB-page guest's ld.so maps library segments R-X at 4KiB-aligned offsets,
+   * so a file's bytes have to be copied into memory we own regardless. The
+   * guest's real R/W/X comes from stage-2 (vmm_mmap below).
+   *
+   * A short read at EOF leaves the tail zero, which is what a file mapping past
+   * end-of-file must read as. MAP_SHARED write-back to the file is not
+   * preserved - no guest run so far needs it.
+   */
+  ptr = arena_alloc(len, &arena_off);
+  if (fd >= 0 && pread(fd, ptr, len, offset) < 0) {
+    int e = errno;
+    munmap(ptr, len);
+    arena_free(arena_off, len);
+    return -darwin_to_linux_errno(e);
+  }
+#else
   {
     ptr = mmap(0, len, d_prot, linux_to_darwin_mflags(l_flags), fd, offset);
     if (ptr == MAP_FAILED)
       return -darwin_to_linux_errno(errno);
   }
+#endif
 
   do_munmap(addr, len);
-  record_region(proc.mm, ptr, addr, len, l_prot, l_flags, fd, offset);
+  struct mm_region *recorded =
+      record_region(proc.mm, ptr, addr, len, l_prot, l_flags, fd, offset);
+  recorded->arena_off = arena_off;
 
   vmm_mmap(addr, len, linux_mprot_to_hv_mflag(l_prot), ptr);
 
@@ -246,12 +252,28 @@ DEFINE_SYSCALL(mremap, gaddr_t, old_addr, size_t, old_size, size_t, new_size, in
   if (new_size <= old_size) {
     munmap(region->haddr + new_size, region->size - new_size);
     vmm_munmap(region->gaddr + new_size, region->size - new_size);
+    if (region->arena_off >= 0)
+      arena_free(region->arena_off + new_size, region->size - new_size);
     region->size = new_size;
     goto out;
   }
 
   /* new_size > old_size */
-  void *moved_to = mmap(0, new_size, PROT_NONE, linux_to_darwin_mflags(region->mm_flags), region->mm_fd, region->pgoff);
+  off_t moved_off = -1;
+  void *moved_to;
+#if defined(__arm64__)
+  /* From the arena, like every other guest region - a region that lived outside
+   * it would be unreachable to a child that has had to exec. The old contents
+   * are copied across whatever the region was backed by, since the arena hands
+   * back plain readable/writable memory either way. */
+  moved_to = arena_alloc(new_size, &moved_off);
+  if (region->mm_flags & LINUX_MAP_ANONYMOUS) {
+    memcpy(moved_to, region->haddr, old_size);
+  } else if (pread(region->mm_fd, moved_to, new_size, region->pgoff) < 0) {
+    memcpy(moved_to, region->haddr, old_size);
+  }
+#else
+  moved_to = mmap(0, new_size, PROT_NONE, linux_to_darwin_mflags(region->mm_flags), region->mm_fd, region->pgoff);
   if (moved_to == MAP_FAILED) {
     panic("mremap failed. old_addr :0x%llx, old_size: 0x%lux, new_size: 0x%lux, flags:0x%ux, new_addr: 0x%llx, mm_flags: 0x%ux, mm_fd: %d", old_addr, old_size, new_size, flags, new_addr, region->mm_flags, region->mm_fd);
   }
@@ -266,6 +288,7 @@ DEFINE_SYSCALL(mremap, gaddr_t, old_addr, size_t, old_size, size_t, new_size, in
     mprotect(moved_to, new_size, PROT_READ | PROT_WRITE);
     memcpy(moved_to, region->haddr, old_size);
   }
+#endif
 
   /* Unmap the old page */
   if (old_size < region->size) {
@@ -275,10 +298,13 @@ DEFINE_SYSCALL(mremap, gaddr_t, old_addr, size_t, old_size, size_t, new_size, in
   RB_REMOVE(mm_region_tree, &proc.mm->mm_region_tree, region);
   munmap(region->haddr, region->size);
   vmm_munmap(region->gaddr, region->size);
+  if (region->arena_off >= 0)
+    arena_free(region->arena_off, region->size);
 
   /* Map new one */
   ret = alloc_region(new_size);
   struct mm_region *new = record_region(proc.mm, moved_to, ret, new_size, region->prot, region->mm_flags, region->mm_fd, region->pgoff);
+  new->arena_off = moved_off;
   vmm_mmap(new->gaddr, new->size, new->prot, new->haddr);
 
   free(region);

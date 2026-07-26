@@ -88,29 +88,41 @@ main(void)
   CHECK((off_c % EXPECTED_GRANULE) == 0,
         "a small allocation left offset %lld unaligned", (long long) off_c);
 
-  /* The bytes are reachable through the descriptor, by anyone holding it. */
+  /*
+   * The allocator's mapping is private, so a guest's writes stay in this
+   * process - that is what keeps an ordinary fork's copy-on-write intact. They
+   * are therefore NOT in the arena, which is exactly why the handover has to
+   * write them there.
+   */
   memset(a, 0xA5, EXPECTED_GRANULE);
-  unsigned char *shared = mmap(NULL, EXPECTED_GRANULE, PROT_READ, MAP_SHARED,
-                               fd, off_a);
-  CHECK(shared != MAP_FAILED, "could not map the arena through its descriptor");
-  if (shared != MAP_FAILED) {
-    CHECK(shared[0] == 0xA5 && shared[EXPECTED_GRANULE - 1] == 0xA5,
-          "a shared mapping does not see the allocator's writes");
-    munmap(shared, EXPECTED_GRANULE);
+  unsigned char *seen = mmap(NULL, EXPECTED_GRANULE, PROT_READ, MAP_SHARED,
+                             fd, off_a);
+  CHECK(seen != MAP_FAILED, "could not map the arena through its descriptor");
+  if (seen != MAP_FAILED) {
+    CHECK(seen[0] == 0x00,
+          "a private mapping's write reached the arena - fork would lose "
+          "copy-on-write and a guest pipeline would corrupt itself");
+    munmap(seen, EXPECTED_GRANULE);
   }
 
   /*
-   * The handover property: a private mapping sees what was there at map time
-   * and then diverges. This is what makes a fork child's memory correct - it
-   * inherits the parent's guest state and its own writes stay its own.
+   * The handover property: bytes written into the arena at an offset are what a
+   * private mapping of that offset starts from, and the two then diverge. That
+   * is what will make a resumed child's memory correct - it starts from the
+   * parent's state and its own writes stay its own.
    */
-  unsigned char *priv = arena_map_private(off_a, EXPECTED_GRANULE);
-  CHECK(priv[0] == 0xA5, "a private mapping does not start from the arena's bytes");
+  unsigned char pattern[64];
+  memset(pattern, 0x5A, sizeof pattern);
+  CHECK(pwrite(fd, pattern, sizeof pattern, off_b) == (ssize_t) sizeof pattern,
+        "could not stage bytes into the arena");
 
-  priv[0] = 0x5A;                       /* child-side write */
-  CHECK(a[0] == 0xA5, "a private mapping's write leaked into the arena");
-  CHECK(priv[0] == 0x5A && a[0] == 0xA5,
-        "private and shared mappings still alias after a copy-on-write");
+  unsigned char *priv = arena_map_private(off_b, EXPECTED_GRANULE);
+  CHECK(priv[0] == 0x5A, "a private mapping does not start from the arena's bytes");
+
+  priv[0] = 0x11;
+  unsigned char back = 0;
+  CHECK(pread(fd, &back, 1, off_b) == 1 && back == 0x5A,
+        "a private mapping's write leaked back into the arena");
 
   munmap(priv, EXPECTED_GRANULE);
 

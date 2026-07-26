@@ -569,15 +569,28 @@ The shape is: guest memory into a shared-memory arena, process state (mm
 regions, fd table, credentials, sigactions, task, brk, vCPU snapshot) serialized,
 and `__do_clone_process` becomes fork + `exec` of `nabi --resume <fd>`.
 
-**Step 1 of that is done**: [src/mm/arena.c](src/mm/arena.c). Guest-physical
-memory now comes from a single unlinked, file-backed arena rather than the C
-heap, so a *descriptor* names it - and descriptors survive `exec` where pointers
-do not. The running guest maps it `MAP_SHARED`; a resuming child will map the
-same offsets `MAP_PRIVATE`, which is precisely fork's memory semantics: it starts
-from the parent's bytes and diverges copy-on-write, with no eager copy of the
-address space. `make check-arm64` covers the arena's contract, including that
-copy-on-write divergence, and it needs no VM to run. The rest - serializing
-process state and the `--resume` path - is still ahead. Until then `forktest` and `clonetid` make the smoke suite
+**The memory half of that is done**: [src/mm/arena.c](src/mm/arena.c). Every
+guest region - `mmap`, `mremap`, the ELF image, the stack, `brk`, and the stage-1
+page tables - now comes from a single unlinked, file-backed arena rather than the
+C heap or a private anonymous mapping, and each region records the arena offset
+that names it. Host addresses mean nothing to another process; offsets do, and
+descriptors survive `exec` where pointers do not.
+
+One correction worth recording, because the obvious design is wrong. The arena
+was first mapped `MAP_SHARED`, which would have made a handover free: the child
+maps the same offsets and the bytes are already there. But `MAP_SHARED` also
+removes copy-on-write from an ordinary `fork`, and `fork` is still ordinary until
+the rework lands - a forked child wrote straight into its parent's guest memory,
+and guest pipelines stopped working, because the two halves of `cmd | cmd`
+corrupted each other. The mappings are private, and the handover pays for that by
+having to write the live bytes into the arena at fork time instead of finding
+them already there.
+
+Two allocations deliberately stay outside the arena: SysV `shmat`, which must
+alias a segment genuinely shared with other processes, and the vkernel's own
+`kmap`'d bookkeeping. `make check-arm64` covers the arena's contract - including
+that a guest write must *not* reach the arena - and needs no VM. Still ahead:
+serializing process state, and the `--resume` path. Until then `forktest` and `clonetid` make the smoke suite
 intermittently red, and that is honest: `fork` really is broken about one time in
 eight.
 

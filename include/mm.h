@@ -26,6 +26,13 @@ RB_HEAD(mm_region_tree, mm_region);
 struct mm_region {
   RB_ENTRY(mm_region) tree;
   void *haddr;
+  /*
+   * Where this region's memory lives in the guest arena, or -1 if it is not
+   * arena-backed (x86, and file mappings that must stay real file mappings).
+   * The host address means nothing to another process; the offset is what a
+   * resuming child can act on. See src/mm/arena.c.
+   */
+  off_t arena_off;
   gaddr_t gaddr;
   size_t size;
   int prot;            /* Access permission that consists of LINUX_PROT_* */
@@ -79,6 +86,7 @@ hv_memory_flags_t linux_mprot_to_hv_mflag(int mprot);
  */
 void  arena_init(void);
 void *arena_alloc(size_t size, off_t *off_out);
+void  arena_free(off_t off, size_t size);
 void *arena_map_private(off_t off, size_t size);
 void  arena_adopt(int fd);
 int   arena_fd(void);

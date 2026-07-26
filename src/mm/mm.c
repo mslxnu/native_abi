@@ -113,6 +113,9 @@ split_region(struct mm *mm, struct mm_region *region, gaddr_t gaddr)
   struct mm_region *tail = malloc(sizeof(struct mm_region));
   int offset = gaddr - region->gaddr;
   tail->haddr = region->haddr + offset;
+  /* The tail's arena range is the parent's, advanced by the same amount as its
+   * host address - the two are one allocation. */
+  tail->arena_off = region->arena_off < 0 ? -1 : region->arena_off + offset;
   tail->gaddr = gaddr;
   tail->size = region->size - offset;
   tail->prot = region->prot;
@@ -133,6 +136,7 @@ record_region(struct mm *mm, void *haddr, gaddr_t gaddr, size_t size, int prot, 
   struct mm_region *region = malloc(sizeof *region);
   *region = (struct mm_region) {
     .haddr = haddr,
+    .arena_off = -1,      /* callers that allocate from the arena set this */
     .gaddr = gaddr,
     .size = size,
     .prot = prot,
@@ -168,6 +172,8 @@ destroy_mm(struct mm *mm)
     struct mm_region *r = list_entry(list, struct mm_region, list);
     munmap(r->haddr, r->size);
     vmm_munmap(r->gaddr, r->size);
+    if (r->arena_off >= 0)
+      arena_free(r->arena_off, r->size);
     free(r);
   }
   RB_INIT(&mm->mm_region_tree);
