@@ -23,6 +23,7 @@
 #include <sys/types.h>
 
 #include "vmm.h"
+#include "linux/signal.h"
 
 #define CHECKPOINT_MAGIC   0x4E414249434B5031ULL  /* "NABICKP1" */
 #define CHECKPOINT_VERSION 1
@@ -58,6 +59,23 @@ struct checkpoint_pt_chunk {
   uint32_t _pad;
 };
 
+/*
+ * One open guest file descriptor.
+ *
+ * Only the *table* travels. The host descriptors themselves survive fork and
+ * exec on their own - that is the whole reason the handover is fork+exec rather
+ * than a zygote (spike/arm64-fork/) - so what has to be written down is which
+ * guest number refers to which host descriptor, and whether it is close-on-exec.
+ * struct file holds nothing else worth saving: its ops pointer is the one static
+ * table every file shares, and a pointer could not cross an exec anyway.
+ */
+struct checkpoint_fd {
+  int32_t table;        /* 0 = the guest's fds, 1 = the vkernel's */
+  int32_t index;        /* the guest-visible descriptor number */
+  int32_t host_fd;
+  int32_t cloexec;
+};
+
 struct checkpoint_header {
   uint64_t magic;
   uint32_t version;
@@ -72,9 +90,29 @@ struct checkpoint_header {
   uint64_t ipa_brk;
   uint64_t l1_ipa;
 
+  /* credentials, kept apart from the host's - see struct cred */
+  uint32_t uid, euid, suid;
+  uint32_t _pad3;
+
+  /* the task: what a resumed thread has to believe about itself */
+  uint64_t tid;
+  uint64_t set_child_tid, clear_child_tid;
+  uint64_t robust_list;
+  uint64_t sigmask;         /* l_sigset_t is one mask word */
+  uint64_t sigpending;
+  uint64_t sas_sp, sas_size;
+  int32_t  sas_flags;
+
+  /* the descriptor tables' shapes; the entries follow as checkpoint_fd[] */
+  int32_t  rootfd;
+  int32_t  user_start, user_size;
+  int32_t  vkern_start, vkern_size;
+
   uint32_t nr_regions;
   uint32_t nr_s2;
   uint32_t nr_pt_chunks;
+  uint32_t nr_fds;
+  uint32_t nr_sigactions;
   uint32_t _pad2;
 };
 
@@ -87,6 +125,8 @@ int checkpoint_write(int fd);
 int checkpoint_read(int fd, struct checkpoint_header *hdr,
                     struct checkpoint_region **regions,
                     struct checkpoint_s2 **s2,
-                    struct checkpoint_pt_chunk **chunks);
+                    struct checkpoint_pt_chunk **chunks,
+                    struct checkpoint_fd **fds,
+                    l_sigaction_t **sigactions);
 
 #endif

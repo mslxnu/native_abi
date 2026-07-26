@@ -92,6 +92,28 @@ pt_snapshot(uint64_t *ipa_brk_out, uint64_t *l1_ipa_out,
   return FAKE_CHUNKS;
 }
 
+#define FAKE_FDS 3
+
+size_t
+fdtable_snapshot(struct checkpoint_fd *out, size_t max,
+                 struct checkpoint_header *hdr)
+{
+  if (hdr) {
+    hdr->rootfd = 61000;
+    hdr->user_start = 0;  hdr->user_size = 64;
+    hdr->vkern_start = 61376; hdr->vkern_size = 64;
+  }
+  /* fd 0 plain, fd 5 close-on-exec, and one vkernel descriptor. */
+  struct checkpoint_fd want[FAKE_FDS] = {
+    { .table = 0, .index = 0, .host_fd = 0,     .cloexec = 0 },
+    { .table = 0, .index = 5, .host_fd = 9,     .cloexec = 1 },
+    { .table = 1, .index = 61376, .host_fd = 61000, .cloexec = 0 },
+  };
+  for (size_t i = 0; i < FAKE_FDS && i < max; i++)
+    out[i] = want[i];
+  return FAKE_FDS;
+}
+
 /* mm.c pieces the writer walks. */
 int mm_region_cmp(struct mm_region *a, struct mm_region *b)
 { return a->gaddr < b->gaddr ? -1 : a->gaddr > b->gaddr ? 1 : 0; }
@@ -109,6 +131,17 @@ main(void)
   mm.start_brk = 0x500000;
   mm.current_brk = 0x510000;
   mm.current_mmap_top = 0xc0400000;
+
+  proc.cred.uid = 501; proc.cred.euid = 0; proc.cred.suid = 0;
+  task.tid = 4242;
+  task.set_child_tid = 0xc0ffee; task.clear_child_tid = 0xdeadbe;
+  task.robust_list = 0xb0b; task.sigmask.__mask = 0x8000000000000042ULL;
+  task.sas.ss_sp = 0x7fb0000000; task.sas.ss_size = 0x4000; task.sas.ss_flags = 1;
+  /* A handler for SIGUSR1, default elsewhere - the distinction a resumed guest
+   * must keep, or a signal is delivered to the wrong place. */
+  proc.sigaction[9].lsa_handler = 0x401234;
+  proc.sigaction[9].lsa_flags = 0x4;
+  proc.sigaction[9].lsa_mask.__mask = 0x11;
 
   static struct mm_region r[2];
   r[0] = (struct mm_region){ .gaddr = 0x400000, .size = 0x8000,
@@ -132,7 +165,9 @@ main(void)
   struct checkpoint_region *regions = NULL;
   struct checkpoint_s2 *s2 = NULL;
   struct checkpoint_pt_chunk *chunks = NULL;
-  CHECK(checkpoint_read(fd, &hdr, &regions, &s2, &chunks) == 0,
+  struct checkpoint_fd *fds = NULL;
+  l_sigaction_t *sigactions = NULL;
+  CHECK(checkpoint_read(fd, &hdr, &regions, &s2, &chunks, &fds, &sigactions) == 0,
         "checkpoint_read failed: %s", strerror(errno));
 
   CHECK(hdr.magic == CHECKPOINT_MAGIC && hdr.version == CHECKPOINT_VERSION,
@@ -181,13 +216,42 @@ main(void)
   CHECK(hdr.nr_pt_chunks == FAKE_CHUNKS && chunks[1].used == 2,
         "page-table chunks did not survive");
 
-  free(regions); free(s2); free(chunks);
+  /* Credentials and task identity. */
+  CHECK(hdr.uid == 501 && hdr.euid == 0 && hdr.suid == 0,
+        "credentials did not survive");
+  CHECK(hdr.tid == 4242 && hdr.set_child_tid == 0xc0ffee &&
+        hdr.clear_child_tid == 0xdeadbe, "task identity did not survive");
+  CHECK(hdr.sigmask == 0x8000000000000042ULL, "the signal mask did not survive");
+  CHECK(hdr.sas_sp == 0x7fb0000000 && hdr.sas_size == 0x4000 &&
+        hdr.sas_flags == 1, "the alternate signal stack did not survive");
+
+  /* Signal dispositions: a handler must stay a handler, and the rest default. */
+  CHECK(hdr.nr_sigactions == LINUX_NSIG, "wrote %u sigactions, want %d",
+        hdr.nr_sigactions, LINUX_NSIG);
+  CHECK(sigactions[9].lsa_handler == 0x401234 && sigactions[9].lsa_flags == 0x4 &&
+        sigactions[9].lsa_mask.__mask == 0x11,
+        "an installed signal handler did not survive");
+  CHECK(sigactions[10].lsa_handler == 0,
+        "a default disposition came back as a handler");
+
+  /* The descriptor table: guest number -> host descriptor, and cloexec. */
+  CHECK(hdr.nr_fds == FAKE_FDS, "wrote %u fds, want %d", hdr.nr_fds, FAKE_FDS);
+  CHECK(hdr.rootfd == 61000, "the root descriptor did not survive");
+  if (hdr.nr_fds == FAKE_FDS) {
+    CHECK(fds[1].table == 0 && fds[1].index == 5 && fds[1].host_fd == 9 &&
+          fds[1].cloexec == 1,
+          "a close-on-exec guest descriptor did not survive intact");
+    CHECK(fds[2].table == 1 && fds[2].host_fd == 61000,
+          "a vkernel descriptor did not survive intact");
+  }
+
+  free(regions); free(s2); free(chunks); free(fds); free(sigactions);
 
   /* A truncated checkpoint must be refused, not half-read. */
   lseek(fd, 0, SEEK_SET);
   ftruncate(fd, (off_t) sizeof hdr - 8);
   lseek(fd, 0, SEEK_SET);
-  CHECK(checkpoint_read(fd, &hdr, &regions, &s2, &chunks) < 0,
+  CHECK(checkpoint_read(fd, &hdr, &regions, &s2, &chunks, &fds, &sigactions) < 0,
         "a truncated checkpoint was accepted");
 
   /* So must one whose version we do not speak. */
@@ -199,7 +263,7 @@ main(void)
   ftruncate(fd, 0);
   (void) !write(fd, &bad, sizeof bad);
   lseek(fd, 0, SEEK_SET);
-  CHECK(checkpoint_read(fd, &hdr, &regions, &s2, &chunks) < 0,
+  CHECK(checkpoint_read(fd, &hdr, &regions, &s2, &chunks, &fds, &sigactions) < 0,
         "a checkpoint from another version was accepted");
 
   close(fd);

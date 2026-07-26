@@ -29,6 +29,7 @@
 
 #include "common.h"
 #include "noah.h"
+#include "checkpoint.h"
 
 #include "linux/common.h"
 #include "linux/time.h"
@@ -2271,4 +2272,55 @@ DEFINE_SYSCALL(sync)
 {
   sync();
   return 0;
+}
+
+/*
+ * The descriptor tables, for a handover.
+ *
+ * Walks both tables' open bits and records which guest number maps to which
+ * host descriptor. The host descriptors need no saving of their own - they
+ * survive fork and exec, offsets and all - so this table is the entire mapping
+ * a resumed process needs to keep the guest's I/O pointing where it was.
+ *
+ * Returns the number of open descriptors, which may exceed `max`.
+ */
+static size_t
+fdtable_snapshot_one(struct fdtable *t, int32_t which,
+                     struct checkpoint_fd *out, size_t max, size_t n)
+{
+  for (int fd = t->start; fd < t->start + t->size; fd++) {
+    int i = (fd - t->start) / 64, b = (fd - t->start) - i * 64;
+    if (!(t->open_fds[i] & (1ULL << b)))
+      continue;
+    if (n < max) {
+      int off = fd - t->start;
+      struct file *f = &t->files[off / fdtable_alloc_unit][off % fdtable_alloc_unit];
+      out[n] = (struct checkpoint_fd){
+        .table = which,
+        .index = fd,
+        .host_fd = f->fd,
+        .cloexec = (t->cloexec_fds[i] & (1ULL << b)) ? 1 : 0,
+      };
+    }
+    n++;
+  }
+  return n;
+}
+
+size_t
+fdtable_snapshot(struct checkpoint_fd *out, size_t max, struct checkpoint_header *hdr)
+{
+  struct fileinfo *fi = &proc.fileinfo;
+
+  if (hdr) {
+    hdr->rootfd      = fi->rootfd;
+    hdr->user_start  = fi->fdtable.start;
+    hdr->user_size   = fi->fdtable.size;
+    hdr->vkern_start = fi->vkern_fdtable.start;
+    hdr->vkern_size  = fi->vkern_fdtable.size;
+  }
+
+  size_t n = fdtable_snapshot_one(&fi->fdtable, 0, out, max, 0);
+  n = fdtable_snapshot_one(&fi->vkern_fdtable, 1, out, max, n);
+  return n;
 }

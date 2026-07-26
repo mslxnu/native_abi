@@ -589,8 +589,29 @@ them already there.
 Two allocations deliberately stay outside the arena: SysV `shmat`, which must
 alias a segment genuinely shared with other processes, and the vkernel's own
 `kmap`'d bookkeeping. `make check-arm64` covers the arena's contract - including
-that a guest write must *not* reach the arena - and needs no VM. Still ahead:
-serializing process state, and the `--resume` path. Until then `forktest` and `clonetid` make the smoke suite
+that a guest write must *not* reach the arena - and needs no VM.
+
+**The state half is done too**: [include/checkpoint.h](include/checkpoint.h) and
+[src/proc/checkpoint.c](src/proc/checkpoint.c) write everything about a guest
+that is not bytes of its memory - the vCPU, the region list and the mm scalars it
+does not imply, the stage-2 registry, the stage-1 allocator's cursors and chunks,
+the credentials, the task's identity/mask/alternate stack, the signal
+dispositions, and the descriptor tables. Nothing in the format holds a host
+pointer, because a pointer is the one thing the far side cannot use; memory is
+named by arena offset throughout.
+
+The descriptor tables are the part that fork+exec makes easy and a zygote would
+have made hard: the host descriptors survive `fork` and `exec` by themselves, so
+only the *mapping* - which guest number refers to which host descriptor, and
+whether it is close-on-exec - has to be written down. `struct file` holds nothing
+else worth saving, since its ops pointer is the one static table every file
+shares.
+
+The format is versioned and refuses a truncated or unknown-version checkpoint
+rather than resuming a guest from state it may be misreading; `test_checkpoint`
+drives a real descriptor and checks both refusals along with every field.
+
+Still ahead: the `--resume` path that consumes one of these. Until then `forktest` and `clonetid` make the smoke suite
 intermittently red, and that is honest: `fork` really is broken about one time in
 eight.
 
