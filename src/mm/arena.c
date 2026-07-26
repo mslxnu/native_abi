@@ -297,36 +297,61 @@ arena_free(off_t off, size_t size)
 }
 
 /*
- * Push every live span's current contents into the arena.
+ * Copy the guest, as it is now, into a fresh arena and return its descriptor.
  *
- * The running guest's mappings are private, so its writes are in this process
- * and not in the file (see the note at the top of this file). A handover has to
- * put them there: this is the one eager copy the design costs, and it buys back
- * ordinary copy-on-write fork semantics for the guest while it runs.
+ * The running guest's mappings are private, so its writes live in this process
+ * and not in any file; a handover has to put them somewhere the child can map.
+ * This is the one eager copy the design costs, and it buys back ordinary
+ * copy-on-write fork semantics for the guest while it runs.
  *
- * After this the arena is a snapshot of the guest as of now. The caller's own
- * mappings are untouched - they were already copy-on-write away from the file -
- * so the parent carries on undisturbed and a later handover simply overwrites
- * the snapshot.
+ * Each handover gets its *own* file, which is the part that is not optional.
+ * Writing into the arena the parent is already using looks like it would work -
+ * the parent's mappings are copy-on-write away from it, so the parent is
+ * undisturbed - but a child that has already been handed that arena maps it
+ * privately and reads any page it has not yet written straight out of the file.
+ * Overwriting it therefore reaches into a live child and changes guest memory
+ * underneath it. It is not even a rare race: a shell pipeline forks twice in
+ * succession, and the second flush would rewrite the first child's memory to the
+ * parent's later state, so both halves of `cmd | cmd` came up believing they
+ * were the same half. A file nothing writes to again cannot do that.
+ *
+ * Offsets are preserved exactly, so the checkpoint's offsets mean the same thing
+ * on both sides.
  */
 int
-arena_flush(void)
+arena_snapshot(void)
 {
+  const char *tmp = getenv("TMPDIR");
+  char path[1024];
+  snprintf(path, sizeof path, "%s/nabi-snap-XXXXXX", tmp && *tmp ? tmp : "/tmp");
+
+  int fd = mkstemp(path);
+  if (fd < 0)
+    return -1;
+  unlink(path);
+  fcntl(fd, F_SETFD, 0);                /* must survive the child's exec */
+
+  if (ftruncate(fd, arena_capacity) < 0) {
+    close(fd);
+    return -1;
+  }
+
   for (size_t i = 0; i < nr_arena_spans; i++) {
     const char *p = arena_spans[i].addr;
     size_t left = arena_spans[i].size;
     off_t off = arena_spans[i].off;
     while (left > 0) {
-      ssize_t n = pwrite(arena_backing_fd, p, left, off);
+      ssize_t n = pwrite(fd, p, left, off);
       if (n < 0) {
         if (errno == EINTR)
           continue;
+        close(fd);
         return -1;
       }
       p += n; off += n; left -= (size_t) n;
     }
   }
-  return 0;
+  return fd;
 }
 
 /*

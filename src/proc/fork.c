@@ -106,11 +106,14 @@ clone_process_by_exec(unsigned long clone_flags, gaddr_t parent_tid,
    */
   vmm_set_reg(VREG_RET, 0);
 
-  /* The guest's live bytes are in private mappings; put them where the child
-   * can reach them. */
-  if (arena_flush() < 0 || checkpoint_write(ckpt_fd) < 0) {
+  /* The guest's live bytes are in private mappings; copy them into an arena of
+   * this handover's own, which nothing will write to again. */
+  int snap_fd = arena_snapshot();
+  if (snap_fd < 0 || checkpoint_write(ckpt_fd) < 0) {
     int e = errno;
     close(ckpt_fd);
+    if (snap_fd >= 0)
+      close(snap_fd);
     return -darwin_to_linux_errno(e);
   }
   lseek(ckpt_fd, 0, SEEK_SET);
@@ -131,7 +134,7 @@ clone_process_by_exec(unsigned long clone_flags, gaddr_t parent_tid,
      */
     char ckpt_arg[16], arena_arg[16], flags_arg[24], ctid_arg[24], tls_arg[24];
     snprintf(ckpt_arg, sizeof ckpt_arg, "%d", ckpt_fd);
-    snprintf(arena_arg, sizeof arena_arg, "%d", arena_fd());
+    snprintf(arena_arg, sizeof arena_arg, "%d", snap_fd);
     snprintf(flags_arg, sizeof flags_arg, "%lu", clone_flags);
     snprintf(ctid_arg, sizeof ctid_arg, "%llu", (unsigned long long) child_tid);
     snprintf(tls_arg, sizeof tls_arg, "%llu", (unsigned long long) tls);
@@ -144,6 +147,7 @@ clone_process_by_exec(unsigned long clone_flags, gaddr_t parent_tid,
   }
 
   close(ckpt_fd);
+  close(snap_fd);
 
   if (clone_flags & LINUX_CLONE_PARENT_SETTID) {
     if (copy_to_user(parent_tid, &ret, sizeof ret))

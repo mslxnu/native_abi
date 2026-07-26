@@ -132,10 +132,17 @@ main(void)
    * this a resumed child would come up on whatever the arena last held.
    */
   memset(a, 0x77, EXPECTED_GRANULE);
-  CHECK(arena_flush() == 0, "arena_flush failed: %s", strerror(errno));
+  int snap = arena_snapshot();
+  CHECK(snap >= 0, "arena_snapshot failed: %s", strerror(errno));
   unsigned char after = 0;
-  CHECK(pread(fd, &after, 1, off_a) == 1 && after == 0x77,
-        "a flush did not put the live bytes into the arena");
+  CHECK(pread(snap, &after, 1, off_a) == 1 && after == 0x77,
+        "the snapshot does not hold the live bytes");
+  /* A snapshot is a separate file: writing the arena afterwards must not reach
+   * a child already mapping the snapshot. */
+  memset(a, 0x33, EXPECTED_GRANULE);
+  CHECK(pread(snap, &after, 1, off_a) == 1 && after == 0x77,
+        "a later write reached an already-taken snapshot");
+  close(snap);
   CHECK(arena_offset_of(a) == off_a,
         "arena_offset_of did not map a live address back to its offset");
   CHECK(arena_offset_of((char *) a + 32) == off_a + 32,

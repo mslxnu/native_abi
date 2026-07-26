@@ -654,11 +654,23 @@ RELRO - therefore made NABI unable to touch the guest's own memory. It is a
 no-op on arm64 now; the permissions the guest is subject to are the stage-1
 descriptors, not that mapping's bits.
 
-**Not yet default, because pipelines do not work on it.** `cmd | cmd` produces
-nothing - silently, with no error from bash and nothing in the logs - while
-builtins, single external commands and sequential ones all work. The default
-path still runs them correctly, so the env var is the honest place for this
-until that is understood. Until then `forktest` and `clonetid` make the smoke suite
+Pipelines work now too, and the cause was the one hazard flagged when the arena
+was first made `MAP_PRIVATE`. A child maps the arena privately and reads any page
+it has not yet written straight out of the file, so when the parent copied its
+guest into that same arena for a *second* fork, it reached into the still-running
+first child and changed its memory to the parent's later state. Both halves of
+`cmd | cmd` then came up believing they were the same half - the trace showed the
+two children issuing identical `dup3` and `execve` calls. Sequential commands hid
+it, because the first child had already exited.
+
+Each handover now copies the guest into an arena **of its own**, which nothing
+writes to again. `cmd | cmd`, three-stage pipelines, command substitution and
+loops feeding a pipeline all work.
+
+On the same machine and the same forty runs: `forktest` **3/40 -> 0/40** and
+`clonetid` **7/40 -> 0/40**, with four consecutive clean smoke runs. The env var
+is still what selects it, so the default is unchanged; on this evidence the
+remaining step is simply to flip it. Until then `forktest` and `clonetid` make the smoke suite
 intermittently red, and that is honest: `fork` really is broken about one time in
 eight.
 
