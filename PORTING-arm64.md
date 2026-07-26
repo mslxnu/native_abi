@@ -548,12 +548,29 @@ creating the vCPU before replaying the stage-2 mappings; backing guest pages wit
 failure is deterministic, so every retry dies too, even though it varies between
 runs.
 
-The plausible fix is a **zygote**: fork a helper at startup, before any vCPU
-exists, and let it fork the children that need fresh vCPUs. Guest memory would
-then have to be handed over explicitly rather than inherited, which is a much
-larger change and is not attempted here. Until then `forktest` and `clonetid`
-make the smoke suite intermittently red, and that is honest: `fork` really is
-broken about one time in eight.
+Two escapes are measured in the spike, both perfect over the runs tried: a
+**zygote** (a process that never touched HVF forks the children — 0/100, with the
+runner holding a live VM throughout) and **fork + exec** (the child replaces its
+image before creating a vCPU — 0/75).
+
+**fork + exec is the one to build**, even though the zygote is the more obvious
+fix. Both need the same hard thing — the new process no longer inherits the
+guest's address space, so guest memory and NABI's bookkeeping must be handed over
+explicitly instead of arriving by copy-on-write, which is checkpoint/restore and
+is the bulk of the work. The difference is everything else a process carries: a
+fork+exec child is still a `fork` child and **inherits the open file
+descriptors**, so the guest fd table keeps pointing at the right host files and
+only the table needs serializing. A zygote child shares no ancestry with the
+running guest, so every open file would have to be re-opened and re-positioned
+from serialized state — more code, and not reliably possible for pipes, sockets
+and unlinked files.
+
+The shape would be: guest memory into a shared-memory arena, process state (mm
+regions, fd table, credentials, sigactions, task, brk, vCPU snapshot) serialized,
+and `__do_clone_process` becomes fork + `exec` of `nabi --resume <fd>`. Not
+attempted here. Until then `forktest` and `clonetid` make the smoke suite
+intermittently red, and that is honest: `fork` really is broken about one time in
+eight.
 
 ### 3.6 Segmentation, IDT, FPU, CPUID, TSC
 

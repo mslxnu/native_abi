@@ -46,10 +46,43 @@ All measured, all still failing at about the same rate:
   repro does not degrade over repeated cycles, so something about the guest's
   memory layout decides it for the run.
 
-## The plausible fix
+## Two ways out, both measured
 
-A **zygote**: fork a helper process at startup, before any vCPU is created (mode
-0/1 above, which never fail), and have *it* fork the children that need fresh
-vCPUs. The cost is that guest memory can no longer simply be inherited across
-the fork — it has to be handed over explicitly — which is a substantially larger
-change than anything above.
+`make check` runs all three programs.
+
+| approach | children that failed |
+|---|---|
+| direct fork (today) | ~3/20 |
+| **zygote** — a process that never touched HVF forks the children | **0/100** |
+| **fork + exec** — the child `exec`s before creating a vCPU | **0/75** |
+
+`hv_zygote.c` is the stronger test of the two: the "runner" holds a **live** VM
+and vCPU the whole time, exactly as a process running a guest would, and the
+zygote's children still come up clean every time.
+
+`hv_fork_exec.c` shows `exec` clears the poisoning as well — the child is forked
+from the poisoned process and only becomes clean by replacing its image.
+
+## Which one NABI should use
+
+**fork + exec**, not the zygote, despite the zygote being the more obvious fix.
+
+Both require the same hard thing: the new process does not inherit the guest's
+address space, so guest memory and NABI's own bookkeeping have to be handed over
+explicitly rather than arriving by copy-on-write. That is checkpoint/restore, and
+it is the bulk of the work either way.
+
+What separates them is everything *else* a process holds. A fork+exec child is
+still a `fork` child: it inherits the open file descriptors, so NABI's guest fd
+table keeps pointing at the right host files and only the table itself needs
+serializing. A zygote child inherits nothing — it never shared an ancestor with
+the running guest — so every open file would have to be re-opened and re-seeked
+from serialized state, which is both more code and impossible to get exactly
+right for pipes, sockets and unlinked files.
+
+So the shape is: guest memory moves into a shared-memory arena, NABI's process
+state (mm regions, fd table, credentials, sigactions, task, brk, vCPU snapshot)
+gets serialized, and `__do_clone_process` becomes fork + `exec` of `nabi
+--resume <fd>`, which maps the arena and rebuilds. The measurements above say
+the resulting child will create its vCPU reliably; they do not make the
+checkpoint/restore any smaller.
