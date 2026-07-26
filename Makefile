@@ -58,12 +58,9 @@ NEEDS_BUILD  := $(filter-out $(NONBUILD),$(GOALS))
 
 ifneq ($(NEEDS_BUILD),)
 ifeq ($(ARCH),arm64)
-    # A whole nabi links now. Guest signal delivery and fork/clone are still
-    # stubbed (they panic loudly) - see signal_arm64.c and the snapshot stubs in
-    # vmm_arm64.c - so a single-threaded, signal-free binary can run but much
-    # cannot yet. See PORTING-arm64.md.
-    $(warning arm64: building. Signal delivery and fork/clone are stubbed \
-      (Phase 4); a single-threaded signal-free guest runs, more does not yet.)
+    # Signals, fork and dynamic linking all work now - a Debian bash runs
+    # external commands and pipelines. What is left is threads: a second live
+    # vCPU is still guarded off. See PORTING-arm64.md.
 else ifneq ($(ARCH),x86_64)
     $(error Unknown ARCH=$(ARCH). Use arm64 or x86_64)
 endif

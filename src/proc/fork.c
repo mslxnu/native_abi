@@ -72,8 +72,7 @@ init_task(unsigned long clone_flags, gaddr_t child_tid, gaddr_t tls)
  * was the *child's* rebuild that crashed. With the child exec'ing there is no
  * rebuild to crash, and the parent carries on with the machine it already had.
  *
- * Selected by NABI_FORK_EXEC while it is proven out; the plain path is still
- * the default.
+ * This is the default on arm64; NABI_FORK_EXEC=0 falls back to the old path.
  */
 static int
 clone_process_by_exec(unsigned long clone_flags, gaddr_t parent_tid,
@@ -188,9 +187,19 @@ int
 __do_clone_process(unsigned long clone_flags, unsigned long newsp, gaddr_t parent_tid, gaddr_t child_tid, gaddr_t tls)
 {
 #if defined(__arm64__)
+  /*
+   * fork+exec is how fork works here. The path below - destroy the VM, fork,
+   * rebuild it on both sides - is what x86 does and what arm64 used to do, and
+   * on Apple Silicon it loses about one child in eight to a crash inside the
+   * framework (spike/arm64-fork/). Measured on the same forty runs: forktest
+   * 3/40 failures against 0/40, clonetid 7/40 against 0/40.
+   *
+   * NABI_FORK_EXEC=0 selects the old path anyway. It is kept for bisecting a
+   * suspected handover bug, not because it is a supported way to run.
+   */
   {
     const char *v = getenv("NABI_FORK_EXEC");
-    if (v && *v == '1')
+    if (!(v && *v == '0'))
       return clone_process_by_exec(clone_flags, parent_tid, child_tid, tls);
   }
 #endif
