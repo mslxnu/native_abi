@@ -32,6 +32,10 @@ guest-code cache sync.
   PC being set through `ELR_EL1` rather than the EL1 trampoline's `HV_REG_PC`,
   without which `execve` returns to the old image and the guest wanders off
   silently. Runs `hello`, so the two are paired.
+- `threadtest` — a guest thread (a second live vCPU in the same VM), `CLONE_SETTLS`
+  reaching `TPIDR_EL0`, thread exit with `CHILD_CLEARTID`, futex `WAIT`/`WAKE`,
+  and `fork` from a process that has had threads: the primitives a threading libc
+  is built out of.
 
 The ELF binaries are committed prebuilt (as the x86 guest tests under
 `test/*/build/` are), so the check needs no cross-toolchain. The `.s` sources

@@ -12,9 +12,15 @@ loops, conditionals and redirections.
 working around a Hypervisor.framework limitation that is not a NABI bug (§3.5.8,
 reproduced standalone in [spike/arm64-fork/](spike/arm64-fork/)).
 
-Known rough edges: threads - a second live vCPU - are still guarded off;
-`mprotect` is an over-permissive no-op (§3.5.6); and `-m <root>` does not confine
-a guest whose rootfs contains absolute symlinks.
+Threads work too: a guest thread is a second live vCPU in the same VM, which is
+the ordinary Hypervisor.framework model and has nothing to do with the fork
+problem. `CLONE_SETTLS` reaches `TPIDR_EL0`, thread exit and `CHILD_CLEARTID`
+behave, futex `WAIT`/`WAKE` block and wake, and `fork` from a threaded process
+gives a single-threaded child (`threadtest`).
+
+Known rough edges: `execve` from a multi-threaded process is refused; `mprotect`
+is an over-permissive no-op (§3.5.6); and `-m <root>` does not confine a guest
+whose rootfs contains absolute symlinks.
 
 | Phase | State |
 |---|---|
@@ -22,16 +28,15 @@ a guest whose rootfs contains absolute symlinks.
 | 1 — arch abstraction | **done**, [include/arch.h](include/arch.h) |
 | 2 — arm64 VMM backend | **done** — backend, stage-1 translation, two-stage `vmm_mmap`, guest boot to EL0, all hardware-verified (`make check-arm64`) |
 | 3 — syscall table + ABI | **done for the static case** — generated aarch64 table (§3.2), exec.c ported, code-cache sync wired in, TLS via `TPIDR_EL0`, `struct stat` corrected to the aarch64 layout (§3.5.4), `statx`/`prlimit64` wired. A static ELF loads, runs, stats, syscalls and exits (`make check-smoke`). `ppoll`/`epoll_*` and the dynamic linker still to come |
-| 4 — signals, fork, threads | **signals and fork done** — a guest takes a signal, runs the handler at EL0 and resumes; and `fork` works reliably, implemented as fork + `exec` of a resumed process because the framework will not give a forked child a vCPU (§3.5.8). Multi-threaded `clone` (a second live vCPU) is still guarded off |
+| 4 — signals, fork, threads | **signals and fork done** — a guest takes a signal, runs the handler at EL0 and resumes; and `fork` works reliably, implemented as fork + `exec` of a resumed process because the framework will not give a forked child a vCPU (§3.5.8). Threads work as well - `CLONE_SETTLS` into `TPIDR_EL0`, thread exit with `CHILD_CLEARTID`, futex `WAIT`/`WAKE`, and `fork` from a threaded process - covered by `threadtest`. `execve` from a multi-threaded process is still refused |
 | 5 — dynamic linking and rootfs | **bash runs** — Debian trixie `bash` executes external commands, pipelines, command substitution, loops and redirections under a real `ld-linux-aarch64.so.1` + glibc. Needed file-backed mmap by copy, a 16KiB guest-page model, the caches on (§3.5.5) and `VREG_PC` via `ELR_EL1` (§3.5.7). Rootfs built offline from the netinst ISO |
 | 6 | test port — not started |
 
 `make ARCH=arm64` produces a signed arm64 binary that **runs real static aarch64
-Linux ELFs** - proven by `make check-smoke`. Bounds today: a **single-threaded**
-guest works, static or dynamically linked, signals included; `fork` works but
-fails about one time in eight (§3.5.8). A multi-threaded `clone` (a second live
-vCPU) still hits a Phase 4 guard. `munmap` of a whole
-region now works (§3.5.3); a sub-16KiB-block partial split still panics. Three real host-side bugs stood between "links"
+Linux ELFs** - proven by `make check-smoke`. Bounds today: static and
+dynamically-linked guests work, with signals, `fork` and threads; what is refused
+is `execve` from a multi-threaded process. `munmap` of a whole region works
+(§3.5.3); a sub-16KiB-block partial split still panics. Three real host-side bugs stood between "links"
 and "runs", all found by the first smoke test and fixed: a W^X-incompatible RWX
 mmap of the malloc arena, an unreachable `RLIMIT_NOFILE`-derived kernel fd range
 on modern macOS, and an unchecked `PROT_EXEC` file mmap of the ELF.

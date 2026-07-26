@@ -138,6 +138,18 @@ else
     fail=1
 fi
 
+# threadtest: a guest thread (a second live vCPU), CLONE_SETTLS reaching
+# TPIDR_EL0, thread exit with CHILD_CLEARTID, futex WAIT/WAKE, and fork from a
+# process that has had threads - the primitives a threading libc is built from.
+cp "$here/threadtest" "$root/"; chmod +x "$root/threadtest"
+out=$("$NABI" -m "$root" /threadtest); rc=$?
+if [ "$rc" -eq 0 ] && [ "$out" = "threads ok" ]; then
+    echo "  ok  threadtest -> \"$out\", exit 0"
+else
+    echo "  FAIL threadtest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 if [ "$fail" -eq 0 ]; then
     echo "smoke: PASS"
 else
