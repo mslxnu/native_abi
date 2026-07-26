@@ -260,14 +260,25 @@ check_platform_version(void)
  * NOT YET REACHED: nothing invokes this, because __do_clone_process still uses
  * the plain fork path. It is here so the switch is a change to fork alone.
  */
+void resume_apply_clone(unsigned long clone_flags, gaddr_t child_tid, gaddr_t tls);
+
 static noreturn void
-resume_main(int ckpt_fd, int arena_fd)
+resume_main(int ckpt_fd, int arena_fd, unsigned long clone_flags,
+            gaddr_t child_tid, gaddr_t tls)
 {
   init_mm(&vkern_mm);
   init_shm_malloc();
-  init_signal();
 
+  /*
+   * Deliberately no init_signal(): it *imports* the host's dispositions and
+   * mask into proc/task, which is right at first boot and wrong here - the
+   * checkpoint already carries the guest's own. What does have to happen is the
+   * other direction, once those are restored: exec reset every host disposition,
+   * so the handlers that route a signal into the guest are re-installed below.
+   */
   checkpoint_restore(ckpt_fd, arena_fd);
+  reinstall_host_sigactions();
+  resume_apply_clone(clone_flags, child_tid, tls);
 
   main_loop(0);
   vmm_destroy();
@@ -285,8 +296,9 @@ main(int argc, char *argv[], char **envp)
 #if defined(__arm64__)
   /* Handed over by another NABI: everything arrives through inherited
    * descriptors. x86 forks normally and has no such path. */
-  if (argc >= 4 && strcmp(argv[1], "--resume") == 0)
-    resume_main(atoi(argv[2]), atoi(argv[3]));
+  if (argc >= 7 && strcmp(argv[1], "--resume") == 0)
+    resume_main(atoi(argv[2]), atoi(argv[3]), strtoul(argv[4], NULL, 10),
+                strtoull(argv[5], NULL, 10), strtoull(argv[6], NULL, 10));
 #endif
 
   char root[PATH_MAX] = {};

@@ -42,9 +42,22 @@
  * is strictly safer than the corrupting call it replaces.
  */
 #define NABI_VM_PROTECT(region) ((void)0)
+/*
+ * ...and the host-side mprotect is skipped too.
+ *
+ * The host mapping is how NABI itself reaches guest memory - copy_to_user,
+ * copy_from_user, and the arena flush that hands a guest to its forked child all
+ * read and write through it. Mirroring a guest PROT_NONE onto it (ld.so does
+ * exactly that for guard pages and RELRO) makes NABI unable to touch the guest's
+ * own memory: the flush fails with EFAULT and the guest's fork reports "Bad
+ * address". It buys nothing in exchange, because the permissions the guest is
+ * actually subject to are the stage-1 descriptors, not this mapping's bits.
+ */
+#define NABI_HOST_PROTECT(region, prot) ((void)0)
 #else
 #define GUEST_MMAP_GRANULE PAGE_SIZEOF(PAGE_4KB)
 #define NABI_VM_PROTECT(region) hv_vm_protect((region)->gaddr, (region)->size, hvprot)
+#define NABI_HOST_PROTECT(region, prot) mprotect((region)->haddr, (region)->size, prot)
 #endif
 
 void
@@ -344,12 +357,12 @@ DEFINE_SYSCALL(mprotect, gaddr_t, addr, size_t, len, int, prot)
     region = list_entry(region->list.next, struct mm_region, list);
 
     NABI_VM_PROTECT(region);
-    mprotect(region->haddr, region->size, prot);
+    NABI_HOST_PROTECT(region, prot);
     region->prot = hvprot;
   }
   while (region->gaddr + region->size <= end) {
     NABI_VM_PROTECT(region);
-    mprotect(region->haddr, region->size, prot);
+    NABI_HOST_PROTECT(region, prot);
     region->prot = hvprot;
 
     if (region->list.next == &proc.mm->mm_regions) {
@@ -366,7 +379,7 @@ DEFINE_SYSCALL(mprotect, gaddr_t, addr, size_t, len, int, prot)
   if (region->gaddr < end) {
     split_region(proc.mm, region, end);
     NABI_VM_PROTECT(region);
-    mprotect(region->haddr, region->size, prot);
+    NABI_HOST_PROTECT(region, prot);
     region->prot = hvprot;
   }
 

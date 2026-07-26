@@ -627,8 +627,38 @@ so arm64 has no such state. And the wire format lives in
 [checkpoint.c](src/proc/checkpoint.c) apart from the machinery here, so the
 format stays testable without linking half the system.
 
-Still ahead: pointing `__do_clone_process` at fork + `exec` of `--resume`, and
-the end-to-end debugging that will come with it. Until then `forktest` and `clonetid` make the smoke suite
+**`__do_clone_process` can now take that path, behind `NABI_FORK_EXEC=1`.** It
+eliminates the failure this was all for: `forktest` goes from **6/40 to 0/40** on
+the same machine and the same forty runs, and the smoke suite passes cleanly
+three times over where the default path fails intermittently. The parent no
+longer touches its VM at all - the old path destroyed and rebuilt it on both
+sides, and it was the *child's* rebuild that crashed, so with the child exec'ing
+there is nothing left to crash.
+
+Two things the guest turned out to need that a checkpoint alone does not carry:
+
+- **The clone parameters.** They describe what this *call* asks of the child -
+  write your tid here, take this TLS - and are not part of the parent's state,
+  so they travel as arguments and are applied after the restore. Without them
+  `clonetid` failed every single time.
+- **Its close-on-exec descriptors.** The guest asked to *fork*, and fork does not
+  close them; only exec does. Since this fork is implemented as fork+exec, the
+  kernel would apply semantics the guest never asked for. They are cleared on
+  the host before the exec and restored from the checkpoint afterwards, so a
+  later guest `execve` still closes the right ones.
+
+Fixing the first of those also uncovered a bug that predates all of this: NABI
+mirrored a guest `mprotect` onto the *host* mapping, which is how NABI itself
+reaches guest memory. A guest `PROT_NONE` - which ld.so uses for guard pages and
+RELRO - therefore made NABI unable to touch the guest's own memory. It is a
+no-op on arm64 now; the permissions the guest is subject to are the stage-1
+descriptors, not that mapping's bits.
+
+**Not yet default, because pipelines do not work on it.** `cmd | cmd` produces
+nothing - silently, with no error from bash and nothing in the logs - while
+builtins, single external commands and sequential ones all work. The default
+path still runs them correctly, so the env var is the honest place for this
+until that is understood. Until then `forktest` and `clonetid` make the smoke suite
 intermittently red, and that is honest: `fork` really is broken about one time in
 eight.
 

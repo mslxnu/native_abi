@@ -47,6 +47,7 @@ int vkern_openat(int fd, const char *path, int flags, int mode);
 int user_close(int fd);
 int vkern_close(int fd);
 void close_cloexec();
+void fdtable_clear_host_cloexec(void);
 int register_fd(int fd, bool is_cloexec);
 int vkern_dup_fd(int fd, bool is_cloexec);
 gaddr_t alloc_region(size_t len);
@@ -154,6 +155,7 @@ extern struct proc proc;
 _Thread_local extern struct task task;
 
 void init_signal(void);
+void reinstall_host_sigactions(void);
 void reset_signal_state(void);
 void init_fileinfo(int rootfd);
 

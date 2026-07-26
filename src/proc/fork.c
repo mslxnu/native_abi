@@ -12,6 +12,14 @@
 #include "linux/common.h"
 #include "linux/misc.h"
 #include "linux/signal.h"
+#include <fcntl.h>
+#include <limits.h>
+#include <sys/syslimits.h>
+#include <mach-o/dyld.h>
+
+#include "mm.h"
+#include "checkpoint.h"
+
 
 static void
 init_task(unsigned long clone_flags, gaddr_t child_tid, gaddr_t tls)
@@ -49,9 +57,140 @@ init_task(unsigned long clone_flags, gaddr_t child_tid, gaddr_t tls)
   }
 }
 
+#if defined(__arm64__)
+/*
+ * fork by handing the guest to a fresh process.
+ *
+ * The child cannot create a vCPU in the process fork gives it - the framework
+ * crashes about one time in eight once a vCPU has existed anywhere in the
+ * process (spike/arm64-fork/) - so it `exec`s first, and everything it needs
+ * arrives through two inherited descriptors: the arena holding the guest's
+ * memory, and a checkpoint describing everything else.
+ *
+ * The parent never touches its VM. That is the real prize here, and not just an
+ * economy: the old path destroyed the VM and rebuilt it on both sides, and it
+ * was the *child's* rebuild that crashed. With the child exec'ing there is no
+ * rebuild to crash, and the parent carries on with the machine it already had.
+ *
+ * Selected by NABI_FORK_EXEC while it is proven out; the plain path is still
+ * the default.
+ */
+static int
+clone_process_by_exec(unsigned long clone_flags, gaddr_t parent_tid,
+                      gaddr_t child_tid, gaddr_t tls)
+{
+  char self[PATH_MAX];
+  uint32_t selfsz = sizeof self;
+  if (_NSGetExecutablePath(self, &selfsz) != 0)
+    return -LINUX_ENOEXEC;
+
+  /*
+   * The checkpoint goes to a file rather than a pipe: the child does not read it
+   * until after it has exec'd, so a pipe would deadlock the moment the
+   * checkpoint outgrew the pipe buffer.
+   */
+  char path[PATH_MAX];
+  const char *tmp = getenv("TMPDIR");
+  snprintf(path, sizeof path, "%s/nabi-handover-XXXXXX",
+           tmp && *tmp ? tmp : "/tmp");
+  int ckpt_fd = mkstemp(path);
+  if (ckpt_fd < 0)
+    return -darwin_to_linux_errno(errno);
+  unlink(path);
+  fcntl(ckpt_fd, F_SETFD, 0);           /* must survive the exec */
+
+  /*
+   * The child returns 0 from clone. Set that before the snapshot is taken - the
+   * parent's own return value is written by the syscall path afterwards, so x0
+   * is free to borrow here.
+   */
+  vmm_set_reg(VREG_RET, 0);
+
+  /* The guest's live bytes are in private mappings; put them where the child
+   * can reach them. */
+  if (arena_flush() < 0 || checkpoint_write(ckpt_fd) < 0) {
+    int e = errno;
+    close(ckpt_fd);
+    return -darwin_to_linux_errno(e);
+  }
+  lseek(ckpt_fd, 0, SEEK_SET);
+
+  int ret = syswrap(fork());
+  if (ret < 0) {
+    close(ckpt_fd);
+    return ret;
+  }
+
+  if (ret == 0) {
+    /* The guest forked; only our implementation execs. Keep its descriptors. */
+    fdtable_clear_host_cloexec();
+    /*
+     * The clone parameters travel too. They describe what this *call* asks of
+     * the child - write your tid here, clear it there, take this TLS - and are
+     * not part of the parent's state, so the checkpoint does not carry them.
+     */
+    char ckpt_arg[16], arena_arg[16], flags_arg[24], ctid_arg[24], tls_arg[24];
+    snprintf(ckpt_arg, sizeof ckpt_arg, "%d", ckpt_fd);
+    snprintf(arena_arg, sizeof arena_arg, "%d", arena_fd());
+    snprintf(flags_arg, sizeof flags_arg, "%lu", clone_flags);
+    snprintf(ctid_arg, sizeof ctid_arg, "%llu", (unsigned long long) child_tid);
+    snprintf(tls_arg, sizeof tls_arg, "%llu", (unsigned long long) tls);
+    char *argv[] = { self, (char *) "--resume", ckpt_arg, arena_arg,
+                     flags_arg, ctid_arg, tls_arg, NULL };
+    execv(self, argv);
+    /* Only here if exec failed; the guest state is intact in the parent, so the
+     * only honest thing this child can do is disappear. */
+    _exit(127);
+  }
+
+  close(ckpt_fd);
+
+  if (clone_flags & LINUX_CLONE_PARENT_SETTID) {
+    if (copy_to_user(parent_tid, &ret, sizeof ret))
+      return -LINUX_EFAULT;
+  }
+  return ret;
+}
+/*
+ * Apply the clone semantics in a resumed child.
+ *
+ * The equivalent of what init_task does for a plain fork's child, minus the
+ * signal mask: init_task empties it, but a resumed child has the parent's mask
+ * restored from the checkpoint, which is what fork actually owes it.
+ */
+void
+resume_apply_clone(unsigned long clone_flags, gaddr_t child_tid, gaddr_t tls)
+{
+  task.tid = getpid();
+
+  task.set_child_tid = task.clear_child_tid = 0;
+  if (clone_flags & LINUX_CLONE_CHILD_SETTID)
+    task.set_child_tid = child_tid;
+  if (clone_flags & LINUX_CLONE_CHILD_CLEARTID)
+    task.clear_child_tid = child_tid;
+
+  if (task.set_child_tid != 0) {
+    int tid = do_gettid();
+    if (copy_to_user(task.set_child_tid, &tid, sizeof tid))
+      warnk("resume: could not write the child tid\n");
+  }
+
+  if (clone_flags & LINUX_CLONE_SETTLS)
+    vmm_set_tls(tls);
+}
+#endif /* __arm64__ */
+
 int
 __do_clone_process(unsigned long clone_flags, unsigned long newsp, gaddr_t parent_tid, gaddr_t child_tid, gaddr_t tls)
 {
+#if defined(__arm64__)
+  {
+    const char *v = getenv("NABI_FORK_EXEC");
+    if (v && *v == '1')
+      return clone_process_by_exec(clone_flags, parent_tid, child_tid, tls);
+  }
+#endif
+
   // Because Apple Hypervisor Framwork won't let us use multiple VMs,
   // we destroy the current vm and restore it later
   struct vmm_snapshot snapshot;

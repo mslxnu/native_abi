@@ -2359,3 +2359,38 @@ fdtable_restore(const struct checkpoint_fd *fds, size_t n,
       set_fdbit(t, t->cloexec_fds, fds[i].index);
   }
 }
+
+/*
+ * Clear FD_CLOEXEC on every descriptor the guest has open.
+ *
+ * For the child of a guest fork, between the host fork and the host exec.
+ *
+ * The guest asked to fork, and fork does not close close-on-exec descriptors -
+ * only exec does. But this fork is implemented as fork+exec (the framework
+ * cannot give a forked child a vCPU, see spike/arm64-fork/), so the kernel would
+ * apply exec semantics the guest never asked for and close them: a shell
+ * pipeline, whose pipe ends are exactly such descriptors, would come up with
+ * nothing connected.
+ *
+ * The flags are not lost, only moved: the checkpoint carries each descriptor's
+ * close-on-exec bit, so the resumed process restores the table exactly, and a
+ * later *guest* execve still closes the right ones through close_cloexec().
+ */
+void
+fdtable_clear_host_cloexec(void)
+{
+  struct fileinfo *fi = &proc.fileinfo;
+  struct fdtable *tables[] = { &fi->fdtable, &fi->vkern_fdtable };
+
+  for (int t = 0; t < 2; t++) {
+    struct fdtable *tab = tables[t];
+    for (int fd = tab->start; fd < tab->start + tab->size; fd++) {
+      int i = (fd - tab->start) / 64, b = (fd - tab->start) - i * 64;
+      if (!(tab->open_fds[i] & (1ULL << b)))
+        continue;
+      int flags = fcntl(fd, F_GETFD);
+      if (flags >= 0 && (flags & FD_CLOEXEC))
+        fcntl(fd, F_SETFD, flags & ~FD_CLOEXEC);
+    }
+  }
+}

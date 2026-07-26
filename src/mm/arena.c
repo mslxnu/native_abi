@@ -78,6 +78,7 @@ static off_t  arena_capacity;   /* how far the file has been grown */
  * checkpoint is taken, never on a fault path.
  */
 struct arena_span { void *addr; size_t size; off_t off; };
+off_t arena_offset_of(void *addr);
 #define ARENA_MAX_SPANS 16384
 static struct arena_span arena_spans[ARENA_MAX_SPANS];
 static size_t nr_arena_spans;
@@ -90,26 +91,55 @@ arena_span_record(void *addr, size_t size, off_t off)
   arena_spans[nr_arena_spans++] = (struct arena_span){ addr, size, off };
 }
 
+/*
+ * Remove [off, off+size) from whatever span covers it.
+ *
+ * Not simply "forget the span with this offset". A region can be split - the mm
+ * layer does it whenever a guest unmaps part of one - and the halves are then
+ * freed separately, so a release may take a prefix, a suffix or a hole out of
+ * the middle of a span. Getting this wrong leaves a span describing memory the
+ * caller has already unmapped, and the next flush reads from it: the guest's
+ * fork then fails with EFAULT, or worse, silently hands its child stale bytes.
+ */
 static void
-arena_span_forget(off_t off)
+arena_span_forget(off_t off, size_t size)
 {
+  off_t lo = off, hi = off + (off_t) size;
+
   for (size_t i = 0; i < nr_arena_spans; i++) {
-    if (arena_spans[i].off == off) {
+    off_t slo = arena_spans[i].off;
+    off_t shi = slo + (off_t) arena_spans[i].size;
+    if (hi <= slo || lo >= shi)
+      continue;                                   /* no overlap */
+
+    if (lo <= slo && hi >= shi) {                 /* whole span */
       arena_spans[i] = arena_spans[--nr_arena_spans];
-      return;
+      i--;
+    } else if (lo <= slo) {                       /* prefix */
+      size_t cut = (size_t)(hi - slo);
+      arena_spans[i].addr = (char *) arena_spans[i].addr + cut;
+      arena_spans[i].off += (off_t) cut;
+      arena_spans[i].size -= cut;
+    } else if (hi >= shi) {                       /* suffix */
+      arena_spans[i].size = (size_t)(lo - slo);
+    } else {                                      /* hole: keep both sides */
+      struct arena_span tail = {
+        .addr = (char *) arena_spans[i].addr + (hi - slo),
+        .size = (size_t)(shi - hi),
+        .off  = hi,
+      };
+      arena_spans[i].size = (size_t)(lo - slo);
+      arena_span_record(tail.addr, tail.size, tail.off);
     }
   }
 }
 
 static void
-arena_span_forget_addr(const void *addr)
+arena_span_forget_addr(const void *addr, size_t size)
 {
-  for (size_t i = 0; i < nr_arena_spans; i++) {
-    if (arena_spans[i].addr == addr) {
-      arena_spans[i] = arena_spans[--nr_arena_spans];
-      return;
-    }
-  }
+  off_t off = arena_offset_of((void *) addr);
+  if (off >= 0)
+    arena_span_forget(off, size);
 }
 
 /*
@@ -122,8 +152,9 @@ arena_span_forget_addr(const void *addr)
 void
 arena_unmap(void *addr, size_t size)
 {
-  arena_span_forget_addr(addr);
-  munmap(addr, roundup(size, ARENA_GRANULE));
+  size = roundup(size, ARENA_GRANULE);
+  arena_span_forget_addr(addr, size);
+  munmap(addr, size);
 }
 
 /*
@@ -255,7 +286,7 @@ arena_free(off_t off, size_t size)
     return;
 
   size = roundup(size, ARENA_GRANULE);
-  arena_span_forget(off);
+  arena_span_forget(off, size);
   struct fpunchhole hole = {
     .fp_flags = 0,
     .reserved = 0,

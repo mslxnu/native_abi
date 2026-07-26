@@ -375,3 +375,25 @@ DEFINE_SYSCALL(kill, l_pid_t, pid, int, sig)
 {
   return send_signal(pid, sig);
 }
+
+/*
+ * Re-install the host's signal handlers to match the guest's dispositions.
+ *
+ * For a resumed process only. NABI routes a host signal into the guest through
+ * __host_signal_handler, and `exec` resets every host disposition to the
+ * default - so a guest restored from a checkpoint would have its handlers
+ * recorded but nothing on the host arranged to reach them, and the first signal
+ * would kill it instead of being delivered.
+ */
+void
+reinstall_host_sigactions(void)
+{
+  for (int i = 0; i < LINUX_NSIG; i++) {
+    l_sigaction_t *lact = &proc.sigaction[i];
+    if (lact->lsa_handler == LINUX_SIG_DFL || lact->lsa_handler == LINUX_SIG_IGN)
+      continue;
+    struct sigaction dact;
+    linux_to_darwin_sigaction(lact, &dact, __host_signal_handler);
+    sigaction(linux_to_darwin_signal(i + 1), &dact, NULL);
+  }
+}
