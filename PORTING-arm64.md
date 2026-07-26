@@ -611,7 +611,24 @@ The format is versioned and refuses a truncated or unknown-version checkpoint
 rather than resuming a guest from state it may be misreading; `test_checkpoint`
 drives a real descriptor and checks both refusals along with every field.
 
-Still ahead: the `--resume` path that consumes one of these. Until then `forktest` and `clonetid` make the smoke suite
+**The `--resume` path is built but not yet switched on.**
+[src/proc/resume.c](src/proc/resume.c) adopts the arena, maps every region and
+page-table chunk privately from it, creates the VM, replays stage 2, rebuilds the
+stage-1 allocator's bookkeeping, restores the mm regions, credentials, task,
+signal dispositions and descriptor tables, and finally restores the vCPU - last,
+because that is what turns translation back on. `nabi --resume <ckpt> <arena>`
+in [src/main.c](src/main.c) is the entry point.
+
+Nothing calls it yet: `__do_clone_process` still uses the plain fork path, so the
+switch is a change to fork alone and today's behaviour is untouched. Two things
+made that split cheap. `kmap` - vkernel memory published into the guest's address
+space, which a resumed process could not reconstruct - turns out to be x86-only,
+so arm64 has no such state. And the wire format lives in
+[checkpoint.c](src/proc/checkpoint.c) apart from the machinery here, so the
+format stays testable without linking half the system.
+
+Still ahead: pointing `__do_clone_process` at fork + `exec` of `--resume`, and
+the end-to-end debugging that will come with it. Until then `forktest` and `clonetid` make the smoke suite
 intermittently red, and that is honest: `fork` really is broken about one time in
 eight.
 

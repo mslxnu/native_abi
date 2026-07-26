@@ -122,6 +122,7 @@ struct checkpoint_header {
  * without adopting it. Both return 0, or -1 with errno set.
  */
 int checkpoint_write(int fd);
+void checkpoint_restore(int ckpt_fd, int arena_fd);
 int checkpoint_read(int fd, struct checkpoint_header *hdr,
                     struct checkpoint_region **regions,
                     struct checkpoint_s2 **s2,

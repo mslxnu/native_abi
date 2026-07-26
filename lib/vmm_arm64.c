@@ -146,6 +146,26 @@ vmm_arm64_s2_snapshot(struct checkpoint_s2 *out, size_t max)
   return n;
 }
 
+/*
+ * Rebuild the stage-2 registry, and the mappings, from a checkpoint.
+ *
+ * Each entry names its memory by arena offset; the caller has already mapped the
+ * arena, so the offset is resolved to this process's address and handed to
+ * hv_vm_map. After this the guest's physical memory is where the guest believes
+ * it is, and the registry is able to describe it again for the next handover.
+ */
+void
+vmm_arm64_s2_restore(const struct checkpoint_s2 *saved, size_t n)
+{
+  for (size_t i = 0; i < n; i++) {
+    void *hva = arena_hva_of(saved[i].arena_off);
+    if (hva == NULL)
+      panic("restoring stage-2: arena offset %lld for IPA 0x%llx is not mapped",
+            (long long) saved[i].arena_off, (unsigned long long) saved[i].ipa);
+    vmm_arm64_map_stage2(saved[i].ipa, STAGE2_GRANULE, saved[i].prot, hva);
+  }
+}
+
 /* Replay the whole registry into the current (freshly created) VM. Used by
  * vmm_reentry after fork to restore every stage-2 mapping. */
 void

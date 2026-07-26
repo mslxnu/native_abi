@@ -124,7 +124,24 @@ main(void)
   CHECK(pread(fd, &back, 1, off_b) == 1 && back == 0x5A,
         "a private mapping's write leaked back into the arena");
 
-  munmap(priv, EXPECTED_GRANULE);
+  arena_unmap(priv, EXPECTED_GRANULE);
+
+  /*
+   * The handover's one eager copy: after a flush the arena holds what the guest
+   * currently has, so a private mapping taken afterwards starts from it. Without
+   * this a resumed child would come up on whatever the arena last held.
+   */
+  memset(a, 0x77, EXPECTED_GRANULE);
+  CHECK(arena_flush() == 0, "arena_flush failed: %s", strerror(errno));
+  unsigned char after = 0;
+  CHECK(pread(fd, &after, 1, off_a) == 1 && after == 0x77,
+        "a flush did not put the live bytes into the arena");
+  CHECK(arena_offset_of(a) == off_a,
+        "arena_offset_of did not map a live address back to its offset");
+  CHECK(arena_offset_of((char *) a + 32) == off_a + 32,
+        "arena_offset_of mishandled an interior address");
+  CHECK(arena_offset_of((void *) &checks) == -1,
+        "arena_offset_of claimed a non-arena address");
 
   printf("\n%d checks, %d failures\n%s\n", checks, failures,
          failures == 0 ? "PASS" : "FAIL");

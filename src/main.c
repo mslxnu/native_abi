@@ -14,6 +14,9 @@
 #include "mm.h"
 #include "noah.h"
 #include "syscall.h"
+#if defined(__arm64__)
+#include "checkpoint.h"
+#endif
 #include "linux/errno.h"
 #include <sys/sysctl.h>
 #include <sys/resource.h>
@@ -245,12 +248,46 @@ check_platform_version(void)
   }
 }
 
+#if defined(__arm64__)
+/*
+ * Come up as an already-running guest, handed over by another process.
+ *
+ * This is the far side of fork on Apple Silicon: the child could not create a
+ * vCPU in the process fork gave it (spike/arm64-fork/), so it exec'd, and
+ * everything it needs arrives through the two inherited descriptors - the arena
+ * holding the guest's memory and a checkpoint describing everything else.
+ *
+ * NOT YET REACHED: nothing invokes this, because __do_clone_process still uses
+ * the plain fork path. It is here so the switch is a change to fork alone.
+ */
+static noreturn void
+resume_main(int ckpt_fd, int arena_fd)
+{
+  init_mm(&vkern_mm);
+  init_shm_malloc();
+  init_signal();
+
+  checkpoint_restore(ckpt_fd, arena_fd);
+
+  main_loop(0);
+  vmm_destroy();
+  exit(0);
+}
+#endif /* __arm64__ */
+
 int
 main(int argc, char *argv[], char **envp)
 {
   drop_privilege();
 
   check_platform_version();
+
+#if defined(__arm64__)
+  /* Handed over by another NABI: everything arrives through inherited
+   * descriptors. x86 forks normally and has no such path. */
+  if (argc >= 4 && strcmp(argv[1], "--resume") == 0)
+    resume_main(atoi(argv[2]), atoi(argv[3]));
+#endif
 
   char root[PATH_MAX] = {};
 

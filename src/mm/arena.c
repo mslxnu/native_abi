@@ -101,12 +101,53 @@ arena_span_forget(off_t off)
   }
 }
 
+static void
+arena_span_forget_addr(const void *addr)
+{
+  for (size_t i = 0; i < nr_arena_spans; i++) {
+    if (arena_spans[i].addr == addr) {
+      arena_spans[i] = arena_spans[--nr_arena_spans];
+      return;
+    }
+  }
+}
+
+/*
+ * Drop a mapping and the span that described it.
+ *
+ * Unmapping behind the arena's back would leave a span pointing at nothing, and
+ * the next flush would read from it - so anything mapped through the arena has
+ * to be released through the arena.
+ */
+void
+arena_unmap(void *addr, size_t size)
+{
+  arena_span_forget_addr(addr);
+  munmap(addr, roundup(size, ARENA_GRANULE));
+}
+
 /*
  * The arena offset backing a host address, or -1 if it is not arena memory
  * (SysV shared segments and the vkernel's own bookkeeping are not). Interior
  * addresses resolve to their span's offset plus the distance in, so a caller
  * holding a pointer into the middle of a region gets a usable answer.
  */
+/*
+ * The other direction: where a resumed process mapped a given arena offset.
+ * Restoring works from offsets - they are all a checkpoint can carry - and has
+ * to turn them back into addresses for hv_vm_map and the region list.
+ */
+void *
+arena_hva_of(off_t off)
+{
+  for (size_t i = 0; i < nr_arena_spans; i++) {
+    if (off >= arena_spans[i].off &&
+        off < arena_spans[i].off + (off_t) arena_spans[i].size)
+      return (char *) arena_spans[i].addr + (off - arena_spans[i].off);
+  }
+  return NULL;
+}
+
 off_t
 arena_offset_of(void *addr)
 {
@@ -225,6 +266,39 @@ arena_free(off_t off, size_t size)
 }
 
 /*
+ * Push every live span's current contents into the arena.
+ *
+ * The running guest's mappings are private, so its writes are in this process
+ * and not in the file (see the note at the top of this file). A handover has to
+ * put them there: this is the one eager copy the design costs, and it buys back
+ * ordinary copy-on-write fork semantics for the guest while it runs.
+ *
+ * After this the arena is a snapshot of the guest as of now. The caller's own
+ * mappings are untouched - they were already copy-on-write away from the file -
+ * so the parent carries on undisturbed and a later handover simply overwrites
+ * the snapshot.
+ */
+int
+arena_flush(void)
+{
+  for (size_t i = 0; i < nr_arena_spans; i++) {
+    const char *p = arena_spans[i].addr;
+    size_t left = arena_spans[i].size;
+    off_t off = arena_spans[i].off;
+    while (left > 0) {
+      ssize_t n = pwrite(arena_backing_fd, p, left, off);
+      if (n < 0) {
+        if (errno == EINTR)
+          continue;
+        return -1;
+      }
+      p += n; off += n; left -= (size_t) n;
+    }
+  }
+  return 0;
+}
+
+/*
  * Map an existing arena range privately.
  *
  * For the resuming side of a fork: the child starts out seeing exactly the
@@ -243,6 +317,9 @@ arena_map_private(off_t off, size_t size)
   if (p == MAP_FAILED)
     panic("could not privately map arena offset %lld: %s",
           (long long) off, strerror(errno));
+  /* Registered like any other span, so the restore can look the mapping up by
+   * offset and so a later handover from this process flushes it. */
+  arena_span_record(p, size, off);
   return p;
 }
 

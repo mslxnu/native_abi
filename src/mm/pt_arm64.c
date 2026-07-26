@@ -515,3 +515,51 @@ pt_snapshot(uint64_t *ipa_brk_out, uint64_t *l1_ipa_out,
   }
   return nr_chunks;
 }
+
+/*
+ * Rebuild the stage-1 allocator from a checkpoint.
+ *
+ * The tables themselves are guest pages and came across in the arena, so their
+ * contents - every descriptor, every IPA they point at - are already correct.
+ * What has to be reconstructed is this file's own bookkeeping: which host
+ * address each chunk landed at in *this* process, so ipa_to_host can follow a
+ * descriptor from one level to the next, and where the allocator had got to.
+ *
+ * The caller has already mapped the arena, so each chunk is looked up rather
+ * than mapped again - mapping it twice would give the guest two views of one
+ * page and let a stale one win.
+ */
+void
+pt_restore(uint64_t saved_ipa_brk, uint64_t l1_ipa,
+           const struct checkpoint_pt_chunk *saved, size_t n)
+{
+  nr_chunks = 0;
+  memset(&cur_chunk, 0, sizeof cur_chunk);
+
+  for (size_t i = 0; i < n; i++) {
+    void *hva = arena_hva_of(saved[i].arena_off);
+    if (hva == NULL)
+      panic("restoring stage-1: arena offset %lld for IPA 0x%llx is not mapped",
+            (long long) saved[i].arena_off, (unsigned long long) saved[i].ipa);
+    if (nr_chunks == MAX_CHUNKS)
+      panic("restoring stage-1: too many chunks");
+    chunks[nr_chunks++] = (struct s2_chunk){
+      .hva = hva,
+      .off = saved[i].arena_off,
+      .ipa = saved[i].ipa,
+      .used = saved[i].used,
+    };
+  }
+
+  ipa_brk = saved_ipa_brk;
+
+  /* The level-1 table is found the same way any other table is - through the
+   * chunk list that was just rebuilt. */
+  l1_table.ipa = l1_ipa;
+  l1_table.entries = ipa_to_host(l1_ipa);
+
+  /* Point the machine at it. The rest of the control state comes from the vCPU
+   * snapshot, which carries TTBR0 as well; setting it here keeps the tables and
+   * the register consistent even before that restore runs. */
+  vmm_arm64_write_sysreg(HV_SYS_REG_TTBR0_EL1, l1_ipa);
+}

@@ -2324,3 +2324,38 @@ fdtable_snapshot(struct checkpoint_fd *out, size_t max, struct checkpoint_header
   n = fdtable_snapshot_one(&fi->vkern_fdtable, 1, out, max, n);
   return n;
 }
+
+/*
+ * Rebuild both descriptor tables from a checkpoint.
+ *
+ * The host descriptors are already open - they came through fork and exec
+ * untouched, with their offsets and flags - so nothing here opens anything. It
+ * rebuilds the tables that say which of them the guest can see and under which
+ * number, and re-attaches the one static ops table every file shares.
+ */
+void
+fdtable_restore(const struct checkpoint_fd *fds, size_t n,
+                const struct checkpoint_header *hdr)
+{
+  struct fileinfo *fi = &proc.fileinfo;
+
+  pthread_rwlock_init(&fi->fdtable_lock, NULL);
+
+  fi->vkern_fdtable = (struct fdtable) { 0, 0, NULL, NULL, NULL };
+  fi->vkern_fdtable.start = hdr->vkern_start;
+  alloc_fdtable(&fi->vkern_fdtable, hdr->vkern_size);
+
+  fi->fdtable = (struct fdtable) { 0, 0, NULL, NULL, NULL };
+  fi->fdtable.start = hdr->user_start;
+  alloc_fdtable(&fi->fdtable, hdr->user_size);
+
+  fi->rootfd = hdr->rootfd;
+
+  for (size_t i = 0; i < n; i++) {
+    struct fdtable *t = fds[i].table ? &fi->vkern_fdtable : &fi->fdtable;
+    alloc_file(t, fds[i].index);
+    set_fdbit(t, t->open_fds, fds[i].index);
+    if (fds[i].cloexec)
+      set_fdbit(t, t->cloexec_fds, fds[i].index);
+  }
+}
