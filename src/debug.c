@@ -26,8 +26,19 @@ init_sink(const char *fn, FILE **sinkp, const char *name)
     fn = "/dev/null";
   }
   int fd = open(fn, O_RDWR | O_CREAT, 0644);
+  if (fd < 0) {
+    fprintf(stderr, "could not open %s log %s: %s\n", name, fn, strerror(errno));
+    return;
+  }
   *sinkp = fdopen(vkern_dup_fd(fd, false), "w");
   close(fd);
+
+  /* Everything that writes to a sink already treats NULL as "not enabled", so
+   * losing the log is survivable; writing the banner to a NULL FILE is not. */
+  if (*sinkp == NULL) {
+    fprintf(stderr, "could not open %s log %s: %s\n", name, fn, strerror(errno));
+    return;
+  }
 
   char buf[1000];
   time_t now = time(0);

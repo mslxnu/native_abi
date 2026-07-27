@@ -725,6 +725,54 @@ Silicon it is simply broken. Until then `forktest` and `clonetid` make the smoke
 intermittently red, and that is honest: `fork` really is broken about one time in
 eight.
 
+### 3.5.9 A guest `svc` can be lost after a partial `munmap` — **open**
+
+`apt` does not load. It fails at `libcrypto.so.3` with *"cannot change memory
+protections"*, and the reason is not the mprotect: it is that **two consecutive
+`svc` instructions execute without ever trapping to the host.**
+
+The sequence is glibc's over-align-then-trim load (§3.5.6, and `bigmaptest`).
+After the *head* trim - `munmap(0xc0b58000, 0x8000)`, which unmaps two stage-2
+blocks - the loader's next two syscalls, the tail `munmap` and the hole
+`mprotect`, never reach `handle_syscall`. Then syscalls resume and the guest runs
+on normally; the `close` and the `writev` that print the error are dispatched as
+usual.
+
+What is established, each from direct instrumentation rather than inference:
+
+- The guest really executes them. A `brk` planted at the `bl mprotect`
+  (`ld.so+0x6bb0`) traps; one planted at the `svc` inside the stub traps; one
+  planted at the instruction *after* the `svc` also traps - with no syscall exit
+  logged in between. The link register at each confirms the call site.
+- Every VM exit is accounted for. Logging at the top of `main_loop` - every
+  `exit.kind`, not just syscalls - shows exactly one exit between the head trim
+  and the `brk`, and it is the `brk`.
+- The guest's memory is intact. `ld.so`'s text at the call site and at the
+  syscall stub both byte-match the file, the `loadcmds` array is correct
+  (`mapstart 0 / mapend 0x580000 / next mapstart 0x584000`, so the 0x4000 hole is
+  right), and `l_addr` is the correct `0xc0b60000`.
+- The trampoline works. The planted `brk` reaches the host through it, out of the
+  same `VBAR_EL1+0x400` vector slot that the lost `svc`s go to.
+- The syscall leaves garbage behind. Bit 31 of the "return value" ends up set,
+  and glibc's `tbnz w0, #31` reads that as failure. That is the whole of the
+  reported mprotect error.
+
+Ruled out by experiment: the stage-2 unmap itself (forcing `finish_unmapped_block`
+to reflush instead of unmap changes nothing); the trampoline's own stage-2 block
+going stale (reflushing it after every unmap changes nothing); guest layout
+(padding the environment does not move it); and the library (`openssl` loads the
+same `libcrypto.so.3` and works - its reservation happens to land aligned, so it
+never takes the head-trim path).
+
+The standalone reproducer does *not* reproduce it: `bigmaptest` performs the same
+reserve / file-map / head-trim / tail-trim / hole-mprotect at libcrypto's exact
+sizes and passes. So it needs accumulated address-space state that only a real
+load chain builds up - `apt` reaches `libcrypto` about nine libraries in.
+
+This is the third distinct way HVF's translation caching has bitten this port
+(§3.5.3, §3.5.8). Losing an *exception* rather than a translation is a new shape,
+though, and nothing tried so far explains it.
+
 ### 3.6 Segmentation, IDT, FPU, CPUID, TSC
 
 - `init_segment` ([src/mm/mm.c:74](src/mm/mm.c#L74)) — **delete**. ARM has no
@@ -746,6 +794,19 @@ eight.
 tree. Needs an arm64 tree. `noahstrap` lives outside this repo (Homebrew formula) —
 either patch it for an `--arch` flag or point `bin/noah.in` at a
 `debootstrap --arch=arm64` tarball.
+
+In the meantime [util/mkrootfs-debian.sh](util/mkrootfs-debian.sh) builds one
+from a Debian netinst ISO with nothing but the tools macOS ships — no
+`debootstrap`, no network, no mounting (macOS cannot mount the hybrid ISO at
+all). It unpacks the 427 `.deb`s in the ISO's `pool/` and synthesises
+`/var/lib/dpkg/status` from their control stanzas, which is what makes `dpkg`
+and `apt` see an installed system rather than an empty one. The maintainer
+scripts cannot run — they are aarch64 shell scripts, and running them needs the
+guest that is being built — so what they would have generated is missing:
+`/etc/shadow`, the `ldconfig` cache, and `update-alternatives` symlinks.
+
+`dpkg`, `dpkg-query`, `bash`, `openssl`, `gpgv` and `wget` all run against it.
+`apt` does not, for the reason in §3.5.9.
 
 ---
 

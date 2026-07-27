@@ -55,6 +55,14 @@ guest-code cache sync.
   the stage-2 block being re-established so the translation notices.
 - `mtexectest` — `execve` from a multi-threaded process, with the spare thread in
   a syscall-free loop so it must be kicked out of `hv_vcpu_run` to be stopped.
+- `bigmaptest` — the dynamic linker's over-align-then-trim load, at library size:
+  reserve `maplength+p_align` anonymously, map the file at the aligned address
+  inside it, munmap the slack at each end, `PROT_NONE` the inter-segment hole,
+  then read what survives. The byte immediately after the hole is the point:
+  `mprotect` used to apply the new permission to the whole remainder of the
+  region rather than the requested range, which made a library load and then
+  fault on its own data. Needs `/bigmapfile`, which `run.sh` creates shorter than
+  the mapping so the tail also checks that past-EOF pages read as zero.
 
 The ELF binaries are committed prebuilt (as the x86 guest tests under
 `test/*/build/` are), so the check needs no cross-toolchain. The `.s` sources

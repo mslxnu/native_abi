@@ -173,6 +173,22 @@ else
     fail=1
 fi
 
+# bigmaptest: the dynamic linker's over-align-then-trim sequence at library
+# size - reserve, map the file inside it, trim both ends, PROT_NONE the
+# inter-segment hole - and then read what survives. Catches an mprotect that
+# applies the new permission to the whole remainder of a region instead of only
+# the requested range: the bytes just past the hole must still be readable.
+cp "$here/bigmaptest" "$root/"; chmod +x "$root/bigmaptest"
+# shorter than the mapping on purpose, so the tail reads as zero
+dd if=/dev/zero of="$root/bigmapfile" bs=1024 count=6100 2>/dev/null
+out=$("$NABI" -m "$root" /bigmaptest); rc=$?
+if [ "$rc" -eq 0 ] && [ "$out" = "OK" ]; then
+    echo "  ok  bigmaptest -> library-sized reserve/trim/protect, exit 0"
+else
+    echo "  FAIL bigmaptest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 # pathtest: a guest path starting with a host-passthrough name (/tmpmark) must
 # resolve in the rootfs, not on the host. Needs the marker file to exist here.
 cp "$here/pathtest" "$root/"; chmod +x "$root/pathtest"; echo marker > "$root/tmpmark"

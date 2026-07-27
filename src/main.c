@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <assert.h>
 #include <getopt.h>
+#include <limits.h>
 #include <string.h>
 #include <sys/syslimits.h>
 #include <libgen.h>
@@ -158,16 +159,27 @@ init_first_proc(const char *root)
    * invalid and every path lookup returns EBADF before the guest even loads.
    * (Older macOS, where this last ran on Intel, defaulted the soft limit to
    * ~256, so the reservation happened to fit.)
+   *
+   * SHRT_MAX+1 is the second ceiling, and the tighter one. A macOS FILE keeps
+   * its descriptor in a short, so fdopen refuses anything above SHRT_MAX with
+   * EMFILE - which is what the -o/-w/-s debug sinks do to a kernel descriptor.
+   * Reserving [32704, 32768) puts the whole kernel range inside what stdio can
+   * represent while still leaving the guest ~32k descriptors.
    */
   {
     struct rlimit rl;
     int maxfiles = 0;
     size_t sz = sizeof maxfiles;
-    if (getrlimit(RLIMIT_NOFILE, &rl) == 0 &&
-        sysctlbyname("kern.maxfilesperproc", &maxfiles, &sz, NULL, 0) == 0 &&
-        maxfiles > 0 && rl.rlim_cur > (rlim_t) maxfiles) {
-      rl.rlim_cur = maxfiles;
-      setrlimit(RLIMIT_NOFILE, &rl);
+    if (getrlimit(RLIMIT_NOFILE, &rl) == 0) {
+      rlim_t ceiling = (rlim_t) SHRT_MAX + 1;
+      if (sysctlbyname("kern.maxfilesperproc", &maxfiles, &sz, NULL, 0) == 0 &&
+          maxfiles > 0 && (rlim_t) maxfiles < ceiling) {
+        ceiling = maxfiles;
+      }
+      if (rl.rlim_cur > ceiling) {
+        rl.rlim_cur = ceiling;
+        setrlimit(RLIMIT_NOFILE, &rl);
+      }
     }
   }
 

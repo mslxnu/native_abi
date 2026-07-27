@@ -370,13 +370,25 @@ DEFINE_SYSCALL(mprotect, gaddr_t, addr, size_t, len, int, prot)
     ret = -LINUX_ENOMEM;
     goto out;
   }
+  /*
+   * Trim what lies before addr off the first region, so that everything from
+   * here on starts exactly at the requested range. Only the split happens here:
+   * the upper half may still run past `end`, and protecting it now - as this
+   * did - applies the new permission to the whole remainder of the mapping.
+   * The tail is split off correctly a few lines below and its bookkeeping says
+   * the old permission, but the descriptors have already been rewritten and
+   * nothing puts them back.
+   *
+   * That is invisible for most of what a dynamic linker does, because the
+   * over-protected tail is normally the next segment, which is immediately
+   * re-mapped MAP_FIXED and so re-permissioned. It shows up when the tail is
+   * left as it is - and then the bytes just past a PROT_NONE inter-segment hole
+   * are unreadable, which is a library that loads and then faults on its own
+   * data.
+   */
   if (addr > region->gaddr) {
     split_region(proc.mm, region, addr);
     region = list_entry(region->list.next, struct mm_region, list);
-
-    NABI_VM_PROTECT(region);
-    NABI_HOST_PROTECT(region, prot);
-    region->prot = hvprot;
   }
   while (region->gaddr + region->size <= end) {
     NABI_VM_PROTECT(region);
