@@ -427,31 +427,36 @@ walk_existing(gaddr_t va)
 }
 
 /*
- * Is any stage-1 page still mapped into the 16KiB stage-2 block that backs
- * guest-physical `ipa`, other than within [va_lo, va_hi)?
+ * Finish one 16KiB stage-2 block whose pages have just been cleared from the
+ * stage-1 tables.
  *
- * The block's four 4KiB slots correspond to four contiguous guest VAs, and VA
- * and IPA are congruent modulo 16KiB within a region (see PORTING-arm64.md
- * 3.5.2), so the block's VAs are derivable from one page's (va, ipa) without
- * any reverse map: va_block_base = va - (ipa mod 16KiB).
+ * A block that no longer backs anything is unmapped outright, which releases it
+ * and drops its registry entry. A block that still backs a live page - a guest
+ * unmapping part of a region, which it may do at 4KiB granularity - must keep
+ * its mapping, so instead it is re-established: unmap followed by map, which is
+ * the only thing measured to drop HVF's combined stage-1+2 TLB entries
+ * (PORTING-arm64.md 3.5.3). The survivor keeps working because its stage-1
+ * descriptor is untouched, and the cleared pages now fault because theirs are
+ * gone and the stale translations went with the flush.
+ *
+ * This is what the code used to panic over as needing "evacuation" - moving the
+ * survivor to a fresh block. Nothing has to move: what was actually needed was a
+ * way to invalidate a block without leaving it unmapped, which is the same
+ * unmap-and-remap that makes mprotect take effect.
  */
-static bool
-block_has_survivor(gaddr_t va, gaddr_t ipa, gaddr_t va_lo, gaddr_t va_hi)
+static void
+finish_unmapped_block(gaddr_t base_ipa, gaddr_t base_va)
 {
-  gaddr_t block_base_ipa = ipa & ~(STAGE2_GRANULE - 1);
-  gaddr_t va_block_base = va - (ipa & (STAGE2_GRANULE - 1));
-
-  for (int j = 0; j < (int)(STAGE2_GRANULE / PAGE_SIZEOF(PAGE_4KB)); j++) {
-    gaddr_t cand = va_block_base + (gaddr_t) j * PAGE_SIZEOF(PAGE_4KB);
-    if (cand >= va_lo && cand < va_hi)
-      continue;                        /* being unmapped, not a survivor */
-    uint64_t *pte = walk_existing(cand);
+  for (int i = 0; i < (int)(STAGE2_GRANULE / PAGE_SIZEOF(PAGE_4KB)); i++) {
+    uint64_t *pte = walk_existing(base_va + (gaddr_t) i * PAGE_SIZEOF(PAGE_4KB));
     if (pte && (*pte & PTE_VALID) &&
-        (*pte & PTE_ADDR_MASK) >= block_base_ipa &&
-        (*pte & PTE_ADDR_MASK) <  block_base_ipa + STAGE2_GRANULE)
-      return true;
+        (*pte & PTE_ADDR_MASK) >= base_ipa &&
+        (*pte & PTE_ADDR_MASK) <  base_ipa + STAGE2_GRANULE) {
+      vmm_arm64_s2_reflush(base_ipa);      /* a survivor: keep it, flush it */
+      return;
+    }
   }
-  return false;
+  vmm_arm64_unmap_stage2(base_ipa, STAGE2_GRANULE);
 }
 
 /*
@@ -479,25 +484,39 @@ vmm_munmap(gaddr_t gaddr, size_t size)
   gaddr_t va_hi = gaddr + size;
   gaddr_t pagesz = PAGE_SIZEOF(PAGE_4KB);
 
+  /* Blocks touched, and where each one's four guest pages begin. */
+  gaddr_t block_ipa[64], block_va[64];
+  size_t nr_blocks = 0;
+
   for (gaddr_t va = va_lo; va < va_hi; va += pagesz) {
     uint64_t *pte = walk_existing(va);
     if (!pte || !(*pte & PTE_VALID))
       continue;
 
     gaddr_t ipa = *pte & PTE_ADDR_MASK;
+    gaddr_t base_ipa = ipa & ~(STAGE2_GRANULE - 1);
+    gaddr_t base_va  = va - (ipa & (STAGE2_GRANULE - 1));
 
-    if (block_has_survivor(va, ipa, va_lo, va_hi)) {
-      panic("vmm_munmap: partial unmap splits a 16KiB stage-2 block at "
-            "va 0x%llx - evacuation not implemented (see PORTING-arm64.md "
-            "3.5.2 / 3.5.3).", (unsigned long long) va);
-    }
-
-    /* Clear the stage-1 descriptor and unmap the whole 16KiB stage-2 block.
-     * Other slots of the block are either in this range (cleared as we reach
-     * them) or unmapped tail, so unmapping the block harms nothing. */
     *pte = 0;
-    vmm_arm64_unmap_stage2(ipa & ~(STAGE2_GRANULE - 1), STAGE2_GRANULE);
+
+    bool seen = false;
+    for (size_t i = 0; i < nr_blocks; i++)
+      if (block_ipa[i] == base_ipa) { seen = true; break; }
+    if (!seen) {
+      if (nr_blocks == sizeof block_ipa / sizeof block_ipa[0]) {
+        /* Flush what we have rather than lose a block, and start again. */
+        for (size_t i = 0; i < nr_blocks; i++)
+          finish_unmapped_block(block_ipa[i], block_va[i]);
+        nr_blocks = 0;
+      }
+      block_ipa[nr_blocks] = base_ipa;
+      block_va[nr_blocks] = base_va;
+      nr_blocks++;
+    }
   }
+
+  for (size_t i = 0; i < nr_blocks; i++)
+    finish_unmapped_block(block_ipa[i], block_va[i]);
 }
 
 /*

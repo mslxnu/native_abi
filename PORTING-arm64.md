@@ -35,8 +35,8 @@ is how a guest sees the Mac's files. Everything else resolves inside the rootfs.
 `make ARCH=arm64` produces a signed arm64 binary that **runs real static aarch64
 Linux ELFs** - proven by `make check-smoke`. Bounds today: static and
 dynamically-linked guests work, with signals, `fork`, threads and `mprotect`.
-`munmap` of a whole region works (§3.5.3); a sub-16KiB-block partial split still
-panics, and `MAP_SHARED` file write-back is not preserved. Three real host-side bugs stood between "links"
+`munmap` works, including a range that leaves live pages inside the 16KiB blocks
+it partly empties (§3.5.3). `MAP_SHARED` file write-back is not preserved. Three real host-side bugs stood between "links"
 and "runs", all found by the first smoke test and fixed: a W^X-incompatible RWX
 mmap of the malloc arena, an unreachable `RLIMIT_NOFILE`-derived kernel fd range
 on modern macOS, and an unchecked `PROT_EXEC` file mmap of the ELF.
@@ -398,21 +398,32 @@ adjacent region is untouched. This covers **whole-region munmap** — the common
 case, and everything `mprotect`-free code and the dynamic linker's whole-mapping
 teardown need.
 
-**Not done: the sub-block partial split.** A `munmap` that unmaps one 4KiB page
-of a 16KiB block while a sibling page stays live cannot use the block-unmap
-primitive (it would fault the survivor too), and the guest `TLBI` that would let
-us clear just the one stage-1 entry does not work. The fix is *evacuation* —
-re-home the survivor to a fresh block so the old block can be unmapped whole —
-but a hardware spike showed that is not merely a page-table operation: because
-the no-copy backing shares one host page across the block, the survivor and the
-victim resolve to the same host page, and HVF keeps the victim's TLB entry alive
-as long as that host page is mapped anywhere. Evacuating with a *copy* to a
-fresh host page works for the TLB, but then desynchronises the survivor's
-`mm_region.haddr` (the host still reads the old buffer via `guest_to_host`).
-Doing it correctly means moving the region's backing with the page — a change to
-the mmap ownership model, not the page tables. Until then such a split panics
-loudly rather than silently leaving the unmapped page reachable. It is rare:
-whole-region munmap never hits it.
+**Done: the sub-block partial split.** A `munmap` that clears one 4KiB page of a
+16KiB block while a sibling stays live cannot use the block-unmap primitive - it
+would fault the survivor too - and clearing the stage-1 entry alone does not work
+either, since the guest `TLBI` does not invalidate HVF's combined entries.
+
+This was written up here as needing *evacuation*: re-home the survivor to a fresh
+block so the old one could be unmapped whole. A hardware spike had shown that was
+not merely a page-table operation - the no-copy backing shares one host page
+across the block, so survivor and victim resolve to the same host page, and
+copying the survivor elsewhere desynchronises its `mm_region.haddr`, which is
+what `guest_to_host` reads. The conclusion was that it needed a change to the
+mmap ownership model.
+
+That conclusion was wrong, or rather it answered the wrong question. Nothing has
+to move. What was actually missing was a way to invalidate a block *without*
+leaving it unmapped - and `hv_vm_unmap` followed immediately by `hv_vm_map` of
+the same block is exactly that, the same operation that makes `mprotect` take
+effect (§3.5.6). So the partial case clears the stage-1 descriptors it is asked
+to and re-establishes the block: the survivor keeps working because its
+descriptor was never touched, and the cleared pages fault because theirs are gone
+and the stale translations went with the flush. A block left backing nothing is
+still unmapped outright, which releases it.
+
+`splitmunmaptest` covers it - live pages either side of an unmapped middle keep
+their contents, and touching the middle faults. The previous revision panics on
+that binary.
 
 ### 3.5.1 Cache coherency — net-new work with no x86 counterpart
 

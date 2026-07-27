@@ -36,6 +36,9 @@ guest-code cache sync.
   reaching `TPIDR_EL0`, thread exit with `CHILD_CLEARTID`, futex `WAIT`/`WAKE`,
   and `fork` from a process that has had threads: the primitives a threading libc
   is built out of.
+- `splitmunmaptest` — unmap part of a mapping so live pages remain inside the
+  16KiB stage-2 blocks it partly emptied; survivors keep their contents and the
+  unmapped pages fault. This case used to panic as needing "evacuation".
 - `epolltest` — `epoll` over a self-pipe (translated to kqueue): the timeout
   path, a readable descriptor, the guest's opaque 64-bit data returned verbatim,
   and that `EPOLL_CTL_DEL` really unregisters.

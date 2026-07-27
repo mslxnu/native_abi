@@ -195,6 +195,18 @@ else
     fail=1
 fi
 
+# splitmunmaptest: unmap part of a mapping so live pages remain inside the
+# 16KiB stage-2 blocks it partly emptied. Survivors must keep their contents and
+# the unmapped pages must fault - this used to panic as needing "evacuation".
+cp "$here/splitmunmaptest" "$root/"; chmod +x "$root/splitmunmaptest"
+out=$("$NABI" -m "$root" /splitmunmaptest); rc=$?
+if [ "$rc" -eq 0 ] && [ "$out" = "split munmap ok" ]; then
+    echo "  ok  splitmunmaptest -> \"$out\", exit 0"
+else
+    echo "  FAIL splitmunmaptest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 if [ "$fail" -eq 0 ]; then
     echo "smoke: PASS"
 else
