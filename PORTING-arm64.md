@@ -807,9 +807,39 @@ guest that is being built — so what they would have generated is missing:
 `/etc/shadow`, the `ldconfig` cache, and `update-alternatives` symlinks.
 
 `dpkg`, `dpkg-query`, `apt`, `bash`, `openssl`, `gpgv` and `wget` all run
-against it — `apt list --installed` and `dpkg -l` enumerate the 427 packages.
-Anything needing the network is a separate matter: the tree is built offline and
-`sources.list` is commented out by default.
+against it — `apt list --installed` and `dpkg -l` enumerate the 427 packages,
+and `apt update` completes its dependency resolution. Anything needing the
+network is a separate matter: the tree is built offline and `sources.list` is
+commented out by default.
+
+Alongside `status`, the builder writes a `/var/lib/dpkg/info/<pkg>.list` per
+package from the `data.tar` member names — keyed `<pkg>:<arch>` for `Multi-Arch:
+same`, as dpkg names them. Without those, `dpkg -S` and `dpkg -L` answer nothing
+and every query warns that the package has no files installed.
+
+### 3.7.1 An interactive shell
+
+`util/nabi-shell.sh <rootfs>` drops into a login shell in the guest. The work is
+entirely environment, and all of it matters:
+
+- **PATH.** The host's would be inherited, and nothing in it resolves `apt`.
+- **HOME.** The account's real home is on the host, and `/Users` is a NABI
+  passthrough prefix — so a guest `HOME` pointing there makes bash read the
+  *host's* dotfiles, and the Debian shell arrives wearing the host's prompt and
+  aliases. The rootfs gets its own `/home/<user>`, seeded from `/etc/skel` the
+  way `adduser` would, and `passwd` names that. The host home stays reachable at
+  its own path; it is just not `$HOME`.
+- **The working directory.** NABI hands the guest the host's cwd, and there is
+  no way to set the guest's initial directory, so the login shell `cd`s to
+  `$HOME` before exec'ing the interactive one. That exec is also what gets the
+  ordinary login sequence right: `/etc/profile` and `~/.profile` for exports,
+  `~/.bashrc` for interactive settings.
+
+`/etc/profile` is one more file base-files ships as a master for a postinst to
+install, so the builder places it directly, like `passwd` and `group`.
+
+Job control, pipelines, prompt rewriting on `cd`, and `apt`/`dpkg` queries all
+work from that shell.
 
 ---
 

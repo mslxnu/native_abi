@@ -50,6 +50,8 @@ echo "    $(echo "$debs" | wc -l | tr -d ' ') packages"
 status="$work/status"
 : > "$status"
 
+mkdir -p "$ROOT/var/lib/dpkg/info"
+
 echo "==> unpacking"
 n=0
 for deb in $debs; do
@@ -71,6 +73,23 @@ for deb in $debs; do
         if [ -f "$d/control" ]; then
             pkg=$(awk '/^Package:/ {print $2; exit}' "$d/control")
             if [ -n "$pkg" ]; then
+                # The file list. dpkg keeps one per package and without it
+                # `dpkg -S` and `dpkg -L` answer nothing and every query warns
+                # that the package "has no files currently installed". The
+                # data.tar member names are exactly that list, once ./ is turned
+                # into / and the trailing slash on directories is dropped.
+                # Multi-Arch: same packages are keyed by name:arch, everything
+                # else by name alone - that is how dpkg names both the status
+                # entry and this file.
+                if [ -n "$data" ]; then
+                    ma=$(awk '/^Multi-Arch:/ {print $2; exit}' "$d/control")
+                    arch=$(awk '/^Architecture:/ {print $2; exit}' "$d/control")
+                    lname=$pkg
+                    [ "$ma" = "same" ] && lname="$pkg:$arch"
+                    tar -tf "$data" 2>/dev/null |
+                        sed -e 's|^\./$|/.|' -e 's|^\./|/|' -e 's|\(.\)/$|\1|' \
+                        > "$ROOT/var/lib/dpkg/info/$lname.list"
+                fi
                 echo "Package: $pkg"                >> "$status"
                 echo "Status: install ok installed" >> "$status"
                 # Everything except Package, and stop at the first blank line so
@@ -97,18 +116,37 @@ cp "$status" "$ROOT/var/lib/dpkg/status"
 : > "$ROOT/var/lib/dpkg/available"
 echo 1 > "$ROOT/var/lib/dpkg/info/format" 2>/dev/null || true
 
-# base-passwd ships its tables as masters; the postinst that would install them
-# cannot run here, so they are put in place directly. The user NABI runs the
-# guest as needs an entry too, or getpwuid finds nothing and the shell prompt
+# base-passwd and base-files both ship their /etc content as masters that a
+# postinst is supposed to install; the postinst cannot run here, so they are put
+# in place directly. Without passwd, getpwuid finds nothing and the shell prompt
 # reads "I have no name!" - NABI takes the guest's credentials from the host.
 if [ -f "$ROOT/usr/share/base-passwd/passwd.master" ]; then
     cp "$ROOT/usr/share/base-passwd/passwd.master" "$ROOT/etc/passwd"
     cp "$ROOT/usr/share/base-passwd/group.master"  "$ROOT/etc/group"
-    u=$(id -un); uid=$(id -u); gid=$(id -g)
-    if ! grep -q "^$u:" "$ROOT/etc/passwd"; then
-        printf '%s:*:%s:%s:%s:%s:/bin/bash\n' "$u" "$uid" "$gid" "$u" "$HOME" \
-            >> "$ROOT/etc/passwd"
-    fi
+fi
+[ -f "$ROOT/usr/share/base-files/profile" ] &&
+    cp "$ROOT/usr/share/base-files/profile" "$ROOT/etc/profile"
+
+# A home inside the rootfs, seeded from /etc/skel like adduser would.
+#
+# Not the host's home directory, even though that is where the account really
+# lives: /Users is one of NABI's passthrough prefixes, so pointing the guest
+# there makes bash read the *host's* dotfiles and the Debian shell arrives
+# wearing the host's prompt, PATH and aliases. The host home stays reachable at
+# its own path for anyone who wants it; it is just not $HOME.
+u=$(id -un); uid=$(id -u); gid=$(id -g)
+ghome="/home/$u"
+mkdir -p "$ROOT$ghome" "$ROOT/root"
+for skel in "$ROOT/etc/skel/".*; do
+    b=$(basename "$skel")
+    [ "$b" = "." ] || [ "$b" = ".." ] && continue
+    [ -f "$skel" ] || continue
+    [ -e "$ROOT$ghome/$b" ] || cp "$skel" "$ROOT$ghome/$b"
+    [ -e "$ROOT/root/$b" ]  || cp "$skel" "$ROOT/root/$b"
+done
+if ! grep -q "^$u:" "$ROOT/etc/passwd"; then
+    printf '%s:*:%s:%s:%s:%s:/bin/bash\n' "$u" "$uid" "$gid" "$u" "$ghome" \
+        >> "$ROOT/etc/passwd"
 fi
 
 # usrmerge: the compatibility symlinks base-files would normally provide.
