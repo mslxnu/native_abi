@@ -166,6 +166,25 @@ vmm_arm64_s2_restore(const struct checkpoint_s2 *saved, size_t n)
   }
 }
 
+/*
+ * Re-establish one stage-2 block, to make a stage-1 permission change visible.
+ *
+ * hv_vm_unmap followed by hv_vm_map is the only thing measured to reliably drop
+ * HVF's combined stage-1+2 TLB entries for a block - a guest TLBI does not
+ * (PORTING-arm64.md 3.5.3). The mapping itself is unchanged; the registry
+ * already knows what backs this block, so this is a flush, not a remap.
+ */
+void
+vmm_arm64_s2_reflush(gaddr_t ipa)
+{
+  khiter_t k = kh_get(s2, s2_map, ipa & ~(STAGE2_GRANULE - 1));
+  if (k == kh_end(s2_map))
+    return;                    /* nothing mapped there; nothing to flush */
+  struct s2_ent ent = kh_value(s2_map, k);
+  vmm_arm64_map_stage2(ipa & ~(STAGE2_GRANULE - 1), STAGE2_GRANULE,
+                       ent.prot, ent.haddr);
+}
+
 /* Replay the whole registry into the current (freshly created) VM. Used by
  * vmm_reentry after fork to restore every stage-2 mapping. */
 void

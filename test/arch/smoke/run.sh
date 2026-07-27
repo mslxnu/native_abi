@@ -161,6 +161,18 @@ else
     fail=1
 fi
 
+# protecttest: mprotect a page read-only and write to it. The write must trap,
+# which needs both the stage-1 descriptors rewritten and the stage-2 block
+# re-established so the translation notices.
+cp "$here/protecttest" "$root/"; chmod +x "$root/protecttest"
+out=$("$NABI" -m "$root" /protecttest); rc=$?
+if [ "$rc" -eq 0 ] && [ "$out" = "mprotect ok" ]; then
+    echo "  ok  protecttest -> \"$out\", exit 0"
+else
+    echo "  FAIL protecttest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 if [ "$fail" -eq 0 ]; then
     echo "smoke: PASS"
 else

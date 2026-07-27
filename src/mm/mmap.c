@@ -29,19 +29,15 @@
  */
 #if defined(__arm64__)
 #include "arm64/vm.h"
+void pt_protect(gaddr_t va, size_t size, int prot);
 #define GUEST_MMAP_GRANULE STAGE2_GRANULE
 /*
- * TODO(arm64 mprotect): the x86 path calls hv_vm_protect(region->gaddr, ...),
- * but region->gaddr is a guest VIRTUAL address and hv_vm_protect wants an IPA
- * (stage-2) - on arm64 that reinterprets a VA as an IPA and corrupts an
- * unrelated region, and it never updates the stage-1 descriptors that actually
- * enforce EL0 permissions. A correct implementation walks the stage-1 tables to
- * repermission the VA range (and, if stage-2 is ever tightened below RWX, the
- * matching IPA). Until then this is an over-permissive no-op - the host-side
- * mprotect below still runs, and the region's recorded prot is updated - which
- * is strictly safer than the corrupting call it replaces.
+ * Guest permissions live in the stage-1 descriptors, so that is what mprotect
+ * rewrites (pt_protect). Not hv_vm_protect, which the x86 path uses: it takes an
+ * IPA, and region->gaddr is a guest *virtual* address - handing one to the other
+ * reinterprets it and repermissions an unrelated region.
  */
-#define NABI_VM_PROTECT(region) ((void)0)
+#define NABI_VM_PROTECT(region) pt_protect((region)->gaddr, (region)->size, prot)
 /*
  * ...and the host-side mprotect is skipped too.
  *
@@ -364,6 +360,15 @@ DEFINE_SYSCALL(mprotect, gaddr_t, addr, size_t, len, int, prot)
     NABI_VM_PROTECT(region);
     NABI_HOST_PROTECT(region, prot);
     region->prot = hvprot;
+
+    /*
+     * Done: this region ends where the request does, so the whole range is
+     * covered. Without this the loop goes looking for a region after the last
+     * one and reports ENOMEM for an mprotect that in fact succeeded - which is
+     * every mprotect of the highest mapping, and any whose range ends at a gap.
+     */
+    if (region->gaddr + region->size == end)
+      goto out;
 
     if (region->list.next == &proc.mm->mm_regions) {
       ret = -LINUX_ENOMEM;

@@ -87,6 +87,7 @@ void vmm_arm64_sync_guest_code(void *hva, size_t len);
 void vmm_arm64_map_stage2(gaddr_t ipa, size_t size, int prot, void *haddr);
 void vmm_arm64_unmap_stage2(gaddr_t ipa, size_t size);
 void vmm_arm64_replay_stage2(void);
+void vmm_arm64_s2_reflush(gaddr_t ipa);
 void vmm_arm64_install_trampoline(void *hva, gaddr_t ipa);
 void vmm_arm64_init_vcpu(void);
 void vmm_arm64_enter_el0(gaddr_t pc, gaddr_t sp, gaddr_t el1_eret_stub);

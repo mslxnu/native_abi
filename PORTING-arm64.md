@@ -18,9 +18,8 @@ problem. `CLONE_SETTLS` reaches `TPIDR_EL0`, thread exit and `CHILD_CLEARTID`
 behave, futex `WAIT`/`WAKE` block and wake, and `fork` from a threaded process
 gives a single-threaded child (`threadtest`).
 
-Known rough edges: `execve` from a multi-threaded process is refused; `mprotect`
-is an over-permissive no-op (§3.5.6); and `-m <root>` does not confine a guest
-whose rootfs contains absolute symlinks.
+Known rough edge: `-m <root>` does not confine a guest whose rootfs contains
+absolute symlinks.
 
 | Phase | State |
 |---|---|
@@ -503,10 +502,26 @@ Three things had to change before `ld-linux-aarch64.so.1` could load a library
   ld.so passes raw, unrounded segment lengths and relies on the kernel to extend
   them to a whole page.
 
-Still open on this path: `mprotect` is an over-permissive no-op on arm64 (the x86
-call passes a guest VA to `hv_vm_protect`, which wants an IPA, and never touches
-stage 1 — a correct version walks the stage-1 tables), and `MAP_SHARED` file
-write-back is not preserved by the copy.
+`mprotect` works now. It rewrites the stage-1 descriptors, which are what the
+guest is actually subject to - not `hv_vm_protect`, which the x86 path uses and
+which takes an IPA where `region->gaddr` is a virtual address - and then
+re-establishes the affected stage-2 blocks so the translation notices. That
+second step is not an optimization: a guest TLBI does not invalidate HVF's
+combined stage-1+2 entries (§3.5.3), so without it a *tightening* would silently
+do nothing, which is the direction that matters. `PROT_NONE` turns out to be the
+absence of AP[1] rather than a bit of its own, which is what makes a guard page
+fault at all.
+
+Fixing it exposed an older bug in the shared `mprotect` handler, so x86 had it
+too: once a region ended exactly where the request did, the loop still went
+looking for a contiguous region after it and reported ENOMEM for an mprotect
+that had in fact succeeded - every mprotect of the highest mapping, and any whose
+range ended at a gap.
+
+The `protecttest` smoke binary writes to a page it has just made read-only and
+requires the trap; it reports "NOT ENFORCED" if the stage-1 update is removed.
+Still open on this path: `MAP_SHARED` file write-back is not preserved by the
+copy.
 
 ### 3.5.7 `VREG_PC` and the trampoline — **fixed**
 

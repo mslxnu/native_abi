@@ -218,8 +218,17 @@ walk_to_l3(gaddr_t va)
 static uint64_t
 prot_to_pte(int prot)
 {
-  uint64_t pte = PTE_AF | PTE_SH_INNER | PTE_ATTR(MAIR_IDX_NORMAL) |
-                 PTE_AP_RW_EL0 | PTE_PXN;
+  uint64_t pte = PTE_AF | PTE_SH_INNER | PTE_ATTR(MAIR_IDX_NORMAL) | PTE_PXN;
+
+  /*
+   * PROT_NONE is the absence of AP[1], not a bit of its own: a descriptor that
+   * does not grant EL0 access faults on any EL0 touch while staying valid, which
+   * is what a guard page is. Anything the guest can reach at all gets AP[1] -
+   * execute-without-read is not representable here, and Linux does not offer it
+   * on this architecture either.
+   */
+  if (prot & (LINUX_PROT_READ | LINUX_PROT_WRITE | LINUX_PROT_EXEC))
+    pte |= PTE_AP_RW_EL0;
 
   if ((prot & LINUX_PROT_WRITE) == 0)
     pte |= PTE_AP_RO;
@@ -562,4 +571,52 @@ pt_restore(uint64_t saved_ipa_brk, uint64_t l1_ipa,
    * snapshot, which carries TTBR0 as well; setting it here keeps the tables and
    * the register consistent even before that restore runs. */
   vmm_arm64_write_sysreg(HV_SYS_REG_TTBR0_EL1, l1_ipa);
+}
+
+/*
+ * Change the permissions on a guest VA range.
+ *
+ * Two things have to happen and neither is optional. The stage-1 descriptors
+ * carry the permissions the guest is actually subject to, so they are rewritten;
+ * and the translation has to be made to notice, which on Apple Silicon means
+ * re-establishing the stage-2 block. A guest TLBI does not invalidate HVF's
+ * combined stage-1+2 entries (measured, PORTING-arm64.md 3.5.3), so without the
+ * second step the guest would keep running on the old permissions - which for a
+ * tightening, the direction that matters, means the change silently did nothing.
+ *
+ * Blocks are collected first and re-mapped once each, since a 16KiB block backs
+ * four guest pages and would otherwise be flushed four times.
+ */
+void
+pt_protect(gaddr_t va, size_t size, int prot)
+{
+  gaddr_t pagesz = PAGE_SIZEOF(PAGE_4KB);
+  gaddr_t blocks[64];
+  size_t nr_blocks = 0;
+
+  for (gaddr_t p = va; p < va + size; p += pagesz) {
+    uint64_t *pte = walk_existing(p);
+    if (!pte || !(*pte & PTE_VALID))
+      continue;
+
+    gaddr_t ipa = *pte & PTE_ADDR_MASK;
+    *pte = (ipa & PTE_ADDR_MASK) | prot_to_pte(prot) | PTE_PAGE | PTE_VALID;
+
+    gaddr_t block = ipa & ~(STAGE2_GRANULE - 1);
+    bool seen = false;
+    for (size_t i = 0; i < nr_blocks; i++)
+      if (blocks[i] == block) { seen = true; break; }
+    if (!seen) {
+      if (nr_blocks == sizeof blocks / sizeof blocks[0]) {
+        /* Rare: flush what we have and carry on rather than lose a block. */
+        for (size_t i = 0; i < nr_blocks; i++)
+          vmm_arm64_s2_reflush(blocks[i]);
+        nr_blocks = 0;
+      }
+      blocks[nr_blocks++] = block;
+    }
+  }
+
+  for (size_t i = 0; i < nr_blocks; i++)
+    vmm_arm64_s2_reflush(blocks[i]);
 }
