@@ -725,53 +725,69 @@ Silicon it is simply broken. Until then `forktest` and `clonetid` make the smoke
 intermittently red, and that is honest: `fork` really is broken about one time in
 eight.
 
-### 3.5.9 A guest `svc` can be lost after a partial `munmap` — **open**
+### 3.5.9 `x0` cannot hold a 16MiB band of values — **narrowed, not fixed**
 
 `apt` does not load. It fails at `libcrypto.so.3` with *"cannot change memory
-protections"*, and the reason is not the mprotect: it is that **two consecutive
-`svc` instructions execute without ever trapping to the host.**
+protections"*, and the mprotect really does fail — because the address the guest
+passes is `0xffffffff`.
 
-The sequence is glibc's over-align-then-trim load (§3.5.6, and `bigmaptest`).
-After the *head* trim - `munmap(0xc0b58000, 0x8000)`, which unmaps two stage-2
-blocks - the loader's next two syscalls, the tail `munmap` and the hole
-`mprotect`, never reach `handle_syscall`. Then syscalls resume and the guest runs
-on normally; the `close` and the `writev` that print the error are dispatched as
-usual.
+Where that comes from is the whole of the bug, and it is not what it first looks
+like. glibc computes the argument as `l->l_addr + c->mapend`, which here is
+`0xc0b60000 + 0x580000 = 0xc11695a7` once the page-size rounding is included.
+That value never survives:
 
-What is established, each from direct instrumentation rather than inference:
+**Writing any value in `[0xc1000000, 0xc2000000)` into `x0` reads back as
+`0xffffffff`.** The same value in `x2` or `x3` is kept perfectly. Values outside
+that 16MiB band — `0xc0b63fff`, `0xc2003fff`, `0xc3003fff`, `0xdead3fff`,
+`0x80003fff` — are kept perfectly in `x0`. It is not arithmetic: `movz x0,
+#0xc116, lsl #16`, with no operands and nothing else in the instruction, reads
+back `0xffffffff` just the same.
 
-- The guest really executes them. A `brk` planted at the `bl mprotect`
-  (`ld.so+0x6bb0`) traps; one planted at the `svc` inside the stub traps; one
-  planted at the instruction *after* the `svc` also traps - with no syscall exit
-  logged in between. The link register at each confirms the call site.
-- Every VM exit is accounted for. Logging at the top of `main_loop` - every
-  `exit.kind`, not just syscalls - shows exactly one exit between the head trim
-  and the `brk`, and it is the `brk`.
-- The guest's memory is intact. `ld.so`'s text at the call site and at the
-  syscall stub both byte-match the file, the `loadcmds` array is correct
-  (`mapstart 0 / mapend 0x580000 / next mapstart 0x584000`, so the 0x4000 hole is
-  right), and `l_addr` is the correct `0xc0b60000`.
-- The trampoline works. The planted `brk` reaches the host through it, out of the
-  same `VBAR_EL1+0x400` vector slot that the lost `svc`s go to.
-- The syscall leaves garbage behind. Bit 31 of the "return value" ends up set,
-  and glibc's `tbnz w0, #31` reads that as failure. That is the whole of the
-  reported mprotect error.
+Everything around it checks out, each verified rather than assumed:
 
-Ruled out by experiment: the stage-2 unmap itself (forcing `finish_unmapped_block`
-to reflush instead of unmap changes nothing); the trampoline's own stage-2 block
-going stale (reflushing it after every unmap changes nothing); guest layout
-(padding the environment does not move it); and the library (`openssl` loads the
-same `libcrypto.so.3` and works - its reservation happens to land aligned, so it
-never takes the head-trim path).
+- **The operands.** The guest is made to write its own registers out with a
+  planted `str`, so the values are the CPU's rather than the framework's report:
+  `x0 = 0x3fff` before the add, `x3 = 0xc11655a8`, both matching
+  `hv_vcpu_get_reg`. Slots are pre-filled with a sentinel, so a store that never
+  landed is distinguishable from one that stored something surprising.
+- **The instruction.** The word at the faulting PC is `8b030000` read through the
+  region mapping *and* through the guest's own path — stage-1 descriptor to IPA
+  to stage-2 backing — and the two never disagree at any step of the run.
+  Rewriting it with the identical word plus an icache invalidate changes nothing,
+  so it is not a stale fetch; re-encoding the same addition as `add x0, x3, x0`,
+  and replacing it with `orr` (same result for these operands), both fail
+  identically, so it is neither the encoding nor the operation.
+- **The destination.** `add x2, x0, x3` on the same operands at the same
+  instant yields the correct `0xc1163fff`. Only `x0` loses it.
+- **Memory and mappings.** The stack slots the loader spills through hold the
+  right values before and after the syscall, by both the region mapping and the
+  page-table walk; no stage-2 block is ever repointed at different host memory
+  (checked by instrumenting the registry for a changed backing).
 
-The standalone reproducer does *not* reproduce it: `bigmaptest` performs the same
-reserve / file-map / head-trim / tail-trim / hole-mprotect at libcrypto's exact
-sizes and passes. So it needs accumulated address-space state that only a real
-load chain builds up - `apt` reaches `libcrypto` about nine libraries in.
+Ruled out by experiment: the whole of `do_munmap` — with `vmm_munmap`, the host
+`munmap` and `arena_free` all disabled it fails identically, so the unmap is
+merely when the damage becomes visible, not its cause; the post-mapping
+`vmm_sync_guest_code`; re-syncing every executable region after every unmap; and
+forcing a register write-back (writing `x3` to a *different* value takes effect
+and the arithmetic then comes out right, but writing back the value it already
+holds does not, which is the asymmetry that first suggested a state divergence).
 
-This is the third distinct way HVF's translation caching has bitten this port
-(§3.5.3, §3.5.8). Losing an *exception* rather than a translation is a new shape,
-though, and nothing tried so far explains it.
+It needs accumulated address-space state. A freestanding guest that round-trips
+the same constants through `x0` and `x2` passes; `apt` reaches `libcrypto` about
+nine libraries in, and `openssl` loads the very same `libcrypto.so.3` without
+trouble — its reservation happens to land aligned, so it never takes the
+head-trim path that leads here.
+
+**Tooling note.** What cracked this open was ARM software single-step, and it is
+worth knowing it works: set `MDSCR_EL1.SS` and `SPSR_EL1.SS` (and clear
+`SPSR_EL1.D`) before entry, and the step exception arrives at the *same*
+`VBAR_EL1+0x400` slot the existing EL1 trampoline already handles, as `ESR_EL1`
+EC `0x32`. Re-arm `SPSR_EL1.SS` on every entry, since taking the exception
+clears it. Before that, the syscalls simply appeared to vanish — the guest ran
+straight past two `svc` instructions — which sent the investigation after a lost
+exception that was never lost at all. Stepping changes the shape of the failure
+(the syscalls reappear, with garbage arguments), which is itself the clue that
+this is state and not logic.
 
 ### 3.6 Segmentation, IDT, FPU, CPUID, TSC
 
