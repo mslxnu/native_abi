@@ -26,9 +26,9 @@
   SYSCALL(17, getcwd) \
   SYSCALL(18, unimplemented) \
   SYSCALL(19, unimplemented) \
-  SYSCALL(20, unimplemented) \
-  SYSCALL(21, unimplemented) \
-  SYSCALL(22, unimplemented) \
+  SYSCALL(20, epoll_create1) \
+  SYSCALL(21, epoll_ctl) \
+  SYSCALL(22, epoll_pwait) \
   SYSCALL(23, dup) \
   SYSCALL(24, dup3) \
   SYSCALL(25, fcntl) \

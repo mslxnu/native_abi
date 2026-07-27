@@ -236,7 +236,7 @@
   SYSCALL(230, unimplemented)                   \
   SYSCALL(231, exit_group)                      \
   SYSCALL(232, unimplemented)                   \
-  SYSCALL(233, unimplemented)                   \
+  SYSCALL(233, epoll_ctl)                   \
   SYSCALL(234, tgkill)                          \
   SYSCALL(235, utimes)                          \
   SYSCALL(236, vserver)                         \
@@ -284,7 +284,7 @@
   SYSCALL(278, unimplemented)                   \
   SYSCALL(279, unimplemented)                   \
   SYSCALL(280, utimensat)                       \
-  SYSCALL(281, unimplemented)                   \
+  SYSCALL(281, epoll_pwait)                   \
   SYSCALL(282, unimplemented)                   \
   SYSCALL(283, unimplemented)                   \
   SYSCALL(284, unimplemented)                   \
@@ -294,7 +294,7 @@
   SYSCALL(288, unimplemented)                   \
   SYSCALL(289, unimplemented)                   \
   SYSCALL(290, unimplemented)                   \
-  SYSCALL(291, unimplemented)                   \
+  SYSCALL(291, epoll_create1)                   \
   SYSCALL(292, dup3)                            \
   SYSCALL(293, pipe2)                           \
   SYSCALL(294, unimplemented)                   \

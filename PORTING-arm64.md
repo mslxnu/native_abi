@@ -222,9 +222,16 @@ smoke binary.
 it shares poll's marshalling body and adds the relative-timespec timeout and an
 optional signal mask (installed around the wait, not atomically inside it).
 
-Still missing and needed: `epoll_create1`, `epoll_pwait` (epoll wants a kqueue
-translation, a separate effort). `fstatat` is aarch64's `newfstatat` (nr 79) and
-already exists under that name.
+`epoll` is wired too - `epoll_create1` (20), `epoll_ctl` (21) and `epoll_pwait`
+(22) - implemented over kqueue in [src/fs/epoll.c](src/fs/epoll.c). The two
+models are close but not congruent: epoll describes a descriptor with one mask
+where kqueue uses a filter per direction, so a registration is up to two kevents
+and a wait has to fold them back into one event per descriptor; the guest's
+opaque 64-bit data is kept in a registration table rather than kqueue's `udata`,
+which is what makes `EPOLL_CTL_MOD`, `EPOLLONESHOT` and `EPOLLHUP` exact; and a
+regular file, which kqueue will not accept and epoll always calls ready, is
+answered without going to the kqueue at all. `fstatat` is aarch64's `newfstatat`
+(nr 79) and already exists under that name.
 
 ### 3.3 TLS
 

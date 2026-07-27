@@ -273,6 +273,41 @@ struct l_statx {
 #define LINUX_STATX_BLOCKS	0x00000400U
 #define LINUX_STATX_BASIC_STATS	0x000007ffU
 
+/*
+ * epoll. Implemented over kqueue (src/fs/epoll.c), so these are only the guest's
+ * side of the ABI.
+ *
+ * struct epoll_event is packed on x86-64 and NOT on other architectures - the
+ * kernel tags it __attribute__((packed)) only under __x86_64__, so aarch64 gets
+ * the natural layout with four bytes of padding after the events word. Getting
+ * that wrong shifts every data field by four bytes, and since the field is
+ * usually a pointer or an index the guest then acts on a plausible-looking wrong
+ * value rather than failing.
+ */
+struct l_epoll_event {
+  uint32_t events;
+  uint64_t data;
+}
+#ifdef __x86_64__
+__attribute__((packed))
+#endif
+;
+
+#define LINUX_EPOLL_CTL_ADD  1
+#define LINUX_EPOLL_CTL_DEL  2
+#define LINUX_EPOLL_CTL_MOD  3
+
+#define LINUX_EPOLLIN        0x0001
+#define LINUX_EPOLLPRI       0x0002
+#define LINUX_EPOLLOUT       0x0004
+#define LINUX_EPOLLERR       0x0008
+#define LINUX_EPOLLHUP       0x0010
+#define LINUX_EPOLLRDHUP     0x2000
+#define LINUX_EPOLLONESHOT   (1u << 30)
+#define LINUX_EPOLLET        (1u << 31)
+
+#define LINUX_EPOLL_CLOEXEC  0x80000   /* == O_CLOEXEC */
+
 typedef struct {
   l_int		val[2];
 } l_fsid_t;

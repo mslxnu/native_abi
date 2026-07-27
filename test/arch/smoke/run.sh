@@ -184,6 +184,17 @@ else
     fail=1
 fi
 
+# epolltest: epoll over a self-pipe, translated to kqueue - the timeout path, a
+# readable descriptor, the guest's opaque data returned verbatim, and DEL.
+cp "$here/epolltest" "$root/"; chmod +x "$root/epolltest"
+out=$("$NABI" -m "$root" /epolltest); rc=$?
+if [ "$rc" -eq 0 ] && [ "$out" = "epoll ok" ]; then
+    echo "  ok  epolltest -> \"$out\", exit 0"
+else
+    echo "  FAIL epolltest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 if [ "$fail" -eq 0 ]; then
     echo "smoke: PASS"
 else
