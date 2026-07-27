@@ -18,8 +18,9 @@ problem. `CLONE_SETTLS` reaches `TPIDR_EL0`, thread exit and `CHILD_CLEARTID`
 behave, futex `WAIT`/`WAKE` block and wake, and `fork` from a threaded process
 gives a single-threaded child (`threadtest`).
 
-Known rough edge: `-m <root>` does not confine a guest whose rootfs contains
-absolute symlinks.
+`-m <root>` is a filesystem root, not a sandbox: five absolute paths - `/Users`,
+`/Volumes`, `/dev`, `/tmp`, `/private` - deliberately resolve on the host, which
+is how a guest sees the Mac's files. Everything else resolves inside the rootfs.
 
 | Phase | State |
 |---|---|
@@ -27,15 +28,15 @@ absolute symlinks.
 | 1 — arch abstraction | **done**, [include/arch.h](include/arch.h) |
 | 2 — arm64 VMM backend | **done** — backend, stage-1 translation, two-stage `vmm_mmap`, guest boot to EL0, all hardware-verified (`make check-arm64`) |
 | 3 — syscall table + ABI | **done for the static case** — generated aarch64 table (§3.2), exec.c ported, code-cache sync wired in, TLS via `TPIDR_EL0`, `struct stat` corrected to the aarch64 layout (§3.5.4), `statx`/`prlimit64` wired. A static ELF loads, runs, stats, syscalls and exits (`make check-smoke`). `ppoll`/`epoll_*` and the dynamic linker still to come |
-| 4 — signals, fork, threads | **signals and fork done** — a guest takes a signal, runs the handler at EL0 and resumes; and `fork` works reliably, implemented as fork + `exec` of a resumed process because the framework will not give a forked child a vCPU (§3.5.8). Threads work as well - `CLONE_SETTLS` into `TPIDR_EL0`, thread exit with `CHILD_CLEARTID`, futex `WAIT`/`WAKE`, and `fork` from a threaded process - covered by `threadtest`. `execve` from a multi-threaded process is still refused |
+| 4 — signals, fork, threads | **signals and fork done** — a guest takes a signal, runs the handler at EL0 and resumes; and `fork` works reliably, implemented as fork + `exec` of a resumed process because the framework will not give a forked child a vCPU (§3.5.8). Threads work as well - `CLONE_SETTLS` into `TPIDR_EL0`, thread exit with `CHILD_CLEARTID`, futex `WAIT`/`WAKE`, and `fork` from a threaded process - covered by `threadtest`. `execve` from a multi-threaded process stops the others first (`mtexectest`) |
 | 5 — dynamic linking and rootfs | **bash runs** — Debian trixie `bash` executes external commands, pipelines, command substitution, loops and redirections under a real `ld-linux-aarch64.so.1` + glibc. Needed file-backed mmap by copy, a 16KiB guest-page model, the caches on (§3.5.5) and `VREG_PC` via `ELR_EL1` (§3.5.7). Rootfs built offline from the netinst ISO |
 | 6 | test port — not started |
 
 `make ARCH=arm64` produces a signed arm64 binary that **runs real static aarch64
 Linux ELFs** - proven by `make check-smoke`. Bounds today: static and
-dynamically-linked guests work, with signals, `fork` and threads; what is refused
-is `execve` from a multi-threaded process. `munmap` of a whole region works
-(§3.5.3); a sub-16KiB-block partial split still panics. Three real host-side bugs stood between "links"
+dynamically-linked guests work, with signals, `fork`, threads and `mprotect`.
+`munmap` of a whole region works (§3.5.3); a sub-16KiB-block partial split still
+panics, and `MAP_SHARED` file write-back is not preserved. Three real host-side bugs stood between "links"
 and "runs", all found by the first smoke test and fixed: a W^X-incompatible RWX
 mmap of the malloc arena, an unreachable `RLIMIT_NOFILE`-derived kernel fd range
 on modern macOS, and an unchecked `PROT_EXEC` file mmap of the ELF.

@@ -36,6 +36,8 @@ guest-code cache sync.
   reaching `TPIDR_EL0`, thread exit with `CHILD_CLEARTID`, futex `WAIT`/`WAKE`,
   and `fork` from a process that has had threads: the primitives a threading libc
   is built out of.
+- `pathtest` — a guest path merely starting with a host-passthrough name
+  (`/tmpmark` vs `/tmp`) must resolve in the rootfs, not on the host.
 - `protecttest` — `mprotect` a page read-only and write to it; the write must trap.
   Covers both halves: the stage-1 descriptors carrying the new permission, and
   the stage-2 block being re-established so the translation notices.

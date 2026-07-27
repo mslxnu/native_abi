@@ -1043,6 +1043,34 @@ darwinfs_fchmodat(struct fs *fs, struct dir *dir, const char *path, l_mode_t mod
 
 #define LOOP_MAX 20
 
+/*
+ * Absolute guest paths that are deliberately the *host's*, not the rootfs's.
+ *
+ * This is what lets a guest see the Mac's files - much of the point of the thing
+ * - and it means `-m <root>` is a filesystem root, not a sandbox. Anything not
+ * listed here resolves inside the rootfs.
+ *
+ * Matched a whole component at a time. A plain prefix test also catches
+ * `/tmpmark`, `/devices` or `/private-key`, which are ordinary guest paths that
+ * would then be looked up on the host instead: the guest's own file becomes
+ * invisible and a host file of that name is exposed in its place.
+ */
+static const char *const host_passthrough[] = {
+  "/Users", "/Volumes", "/dev", "/tmp", "/private",
+};
+
+static bool
+is_host_passthrough(const char *name)
+{
+  for (size_t i = 0; i < sizeof host_passthrough / sizeof host_passthrough[0]; i++) {
+    size_t n = strlen(host_passthrough[i]);
+    if (strncmp(name, host_passthrough[i], n) == 0 &&
+        (name[n] == '\0' || name[n] == '/'))
+      return true;
+  }
+  return false;
+}
+
 int
 resolve_path(const struct dir *parent, const char *name, int flags, struct path *path, int loop)
 {
@@ -1077,7 +1105,7 @@ resolve_path(const struct dir *parent, const char *name, int flags, struct path 
       strcpy(path->subpath, ".");
       goto out;
     }
-    if (strncmp(name, "/Users", sizeof "/Users" - 1) && strncmp(name, "/Volumes", sizeof "/Volumes" - 1) && strncmp(name, "/dev", sizeof "/dev" - 1) && strncmp(name, "/tmp", sizeof "/tmp" - 1) && strncmp(name, "/private", sizeof "/private" - 1)) {
+    if (!is_host_passthrough(name)) {
       dir.fd = proc.fileinfo.rootfd;
       name++;
     }

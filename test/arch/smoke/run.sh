@@ -173,6 +173,17 @@ else
     fail=1
 fi
 
+# pathtest: a guest path starting with a host-passthrough name (/tmpmark) must
+# resolve in the rootfs, not on the host. Needs the marker file to exist here.
+cp "$here/pathtest" "$root/"; chmod +x "$root/pathtest"; echo marker > "$root/tmpmark"
+out=$("$NABI" -m "$root" /pathtest); rc=$?
+if [ "$rc" -eq 0 ] && [ "$out" = "path ok" ]; then
+    echo "  ok  pathtest -> \"$out\", exit 0"
+else
+    echo "  FAIL pathtest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 if [ "$fail" -eq 0 ]; then
     echo "smoke: PASS"
 else
