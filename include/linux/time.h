@@ -55,6 +55,10 @@ struct l_itimerval {
   struct l_timeval it_value;
 };
 
+/* clock_nanosleep: sleep until an absolute time on the named clock rather than
+ * for a duration. Linux's value; Darwin's TIMER_ABSTIME is a different number. */
+#define LINUX_TIMER_ABSTIME              1
+
 #define LINUX_CLOCK_REALTIME             0
 #define LINUX_CLOCK_MONOTONIC            1
 #define LINUX_CLOCK_PROCESS_CPUTIME_ID   2

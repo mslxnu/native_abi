@@ -14,6 +14,7 @@ static long sys6(long n,long a,long b,long c,long d,long e,long f){
   register long x2 asm("x2")=c; register long x3 asm("x3")=d; register long x4 asm("x4")=e; register long x5 asm("x5")=f;
   asm volatile("svc #0":"+r"(x0):"r"(x8),"r"(x1),"r"(x2),"r"(x3),"r"(x4),"r"(x5):"memory"); return x0;
 }
+#define SYS_clock_nanosleep 115
 #define SYS_write 64
 #define SYS_exit  93
 #define SYS_fcntl 25
@@ -42,6 +43,31 @@ void _start(void){
   struct ts t;
   if (sys6(SYS_clock_gettime, 99, (long)&t, 0,0,0,0) >= 0) {
     put("bogus clock accepted\n"); ok = 0;
+  }
+
+  /* clock_nanosleep, both forms. coreutils' sleep uses the absolute one on
+   * CLOCK_REALTIME; when it was unimplemented the guest reported "cannot read
+   * realtime clock", naming the wrong syscall - the clock read was fine, it was
+   * the sleep that did not exist. A short relative sleep must advance
+   * MONOTONIC, and a deadline already in the past must return at once. */
+  {
+    struct ts before = {0,0}, after = {0,0};
+    struct ts nap = { 0, 40000000L };            /* 40ms */
+    sys6(SYS_clock_gettime, 1, (long)&before, 0,0,0,0);
+    if (sys6(SYS_clock_nanosleep, 1, 0, (long)&nap, 0, 0, 0) != 0) {
+      put("clock_nanosleep relative FAIL\n"); ok = 0;
+    }
+    sys6(SYS_clock_gettime, 1, (long)&after, 0,0,0,0);
+    long dns = (after.sec - before.sec) * 1000000000L + (after.nsec - before.nsec);
+    if (dns < 20000000L) { put("clock_nanosleep did not sleep\n"); ok = 0; }
+
+    struct ts past = { 1, 0 };                   /* long gone */
+    if (sys6(SYS_clock_nanosleep, 0, 1 /*TIMER_ABSTIME*/, (long)&past, 0, 0, 0) != 0) {
+      put("clock_nanosleep past-deadline FAIL\n"); ok = 0;
+    }
+    if (sys6(SYS_clock_nanosleep, 99, 0, (long)&nap, 0, 0, 0) >= 0) {
+      put("clock_nanosleep bogus clock accepted\n"); ok = 0;
+    }
   }
 
   /* F_GETFL on stdin must answer rather than assert */

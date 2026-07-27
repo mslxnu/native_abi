@@ -233,7 +233,7 @@
   SYSCALL(227, unimplemented)                   \
   SYSCALL(228, clock_gettime)                   \
   SYSCALL(229, clock_getres)                    \
-  SYSCALL(230, unimplemented)                   \
+  SYSCALL(230, clock_nanosleep)                 \
   SYSCALL(231, exit_group)                      \
   SYSCALL(232, unimplemented)                   \
   SYSCALL(233, epoll_ctl)                   \

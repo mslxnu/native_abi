@@ -121,7 +121,7 @@
   SYSCALL(112, unimplemented) \
   SYSCALL(113, clock_gettime) \
   SYSCALL(114, clock_getres) \
-  SYSCALL(115, unimplemented) \
+  SYSCALL(115, clock_nanosleep) \
   SYSCALL(116, unimplemented) \
   SYSCALL(117, ptrace) \
   SYSCALL(118, unimplemented) \

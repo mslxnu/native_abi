@@ -841,6 +841,14 @@ install, so the builder places it directly, like `passwd` and `group`.
 Job control, pipelines, prompt rewriting on `cd`, and `apt`/`dpkg` queries all
 work from that shell.
 
+`clock_nanosleep` had to be implemented to get there. Darwin has none, so it is
+`clock_gettime` plus `nanosleep`, and the absolute form is the one that matters:
+coreutils' `sleep` — and anything else on gnulib's `xnanosleep` — asks for
+`CLOCK_REALTIME` with `TIMER_ABSTIME`. Unimplemented, it reported *"sleep:
+cannot read realtime clock"*, which names the wrong syscall entirely: the clock
+read was fine, it was the sleep that did not exist. Worth remembering when a
+guest blames a syscall that demonstrably works.
+
 ---
 
 ## 4. Phased implementation

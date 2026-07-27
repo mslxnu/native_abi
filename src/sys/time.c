@@ -13,6 +13,7 @@
 #include <fcntl.h>
 #include <ctype.h>
 
+#include <errno.h>
 #include <utime.h>
 #include <sys/time.h>
 #include <sys/attr.h>
@@ -267,6 +268,72 @@ DEFINE_SYSCALL(clock_getres, l_clockid_t, id, gaddr_t, res_ptr)
   }
   if (res_ptr != 0 && copy_to_user(res_ptr, &ts, sizeof ts)) {
     return -LINUX_EFAULT;
+  }
+  return 0;
+}
+
+/*
+ * Sleep on a named clock.
+ *
+ * Darwin has no clock_nanosleep, so this is clock_gettime plus nanosleep. The
+ * absolute form is the one that matters in practice: coreutils' sleep - and
+ * anything else built on gnulib's xnanosleep - asks for CLOCK_REALTIME with
+ * TIMER_ABSTIME, and without this lands on the unimplemented handler. What the
+ * user sees is "sleep: cannot read realtime clock", which names the wrong
+ * syscall entirely: the clock read succeeded, it was the sleep that did not
+ * exist.
+ *
+ * Only the relative form reports a remainder. For an absolute deadline the
+ * caller already knows when it was, so Linux leaves rmtp untouched and expects
+ * to be called again with the same value after a signal.
+ */
+DEFINE_SYSCALL(clock_nanosleep, l_clockid_t, id, int, flags, gaddr_t, rqtp_ptr,
+               gaddr_t, rmtp_ptr)
+{
+  clockid_t cid = linux_to_darwin_clockid(id);
+  if (cid == (clockid_t) -1)
+    return -LINUX_EINVAL;
+  /* A thread cannot wait on its own CPU clock: it does not advance while the
+   * thread is not running, so the sleep could never end. */
+  if (id == LINUX_CLOCK_THREAD_CPUTIME_ID)
+    return -LINUX_EINVAL;
+  if (flags & ~LINUX_TIMER_ABSTIME)
+    return -LINUX_EINVAL;
+
+  struct l_timespec lreq;
+  if (copy_from_user(&lreq, rqtp_ptr, sizeof lreq))
+    return -LINUX_EFAULT;
+  if (lreq.tv_sec < 0 || lreq.tv_nsec < 0 || lreq.tv_nsec >= 1000000000L)
+    return -LINUX_EINVAL;
+
+  struct timespec rq, rm;
+  rq.tv_sec = lreq.tv_sec;
+  rq.tv_nsec = lreq.tv_nsec;
+
+  if (flags & LINUX_TIMER_ABSTIME) {
+    struct timespec now;
+    if (clock_gettime(cid, &now) < 0)
+      return -darwin_to_linux_errno(errno);
+    rq.tv_sec -= now.tv_sec;
+    rq.tv_nsec -= now.tv_nsec;
+    if (rq.tv_nsec < 0) {
+      rq.tv_nsec += 1000000000L;
+      rq.tv_sec -= 1;
+    }
+    if (rq.tv_sec < 0)
+      return 0;                 /* the deadline is already behind us */
+  }
+
+  int r = syswrap(nanosleep(&rq, &rm));
+  if (r < 0) {
+    if (r == -LINUX_EINTR && (flags & LINUX_TIMER_ABSTIME) == 0 && rmtp_ptr != 0) {
+      struct l_timespec lrem;
+      lrem.tv_sec = rm.tv_sec;
+      lrem.tv_nsec = rm.tv_nsec;
+      if (copy_to_user(rmtp_ptr, &lrem, sizeof lrem))
+        return -LINUX_EFAULT;
+    }
+    return r;
   }
   return 0;
 }
