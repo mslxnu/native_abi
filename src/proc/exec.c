@@ -421,9 +421,14 @@ do_exec(const char *elf_path, int argc, char *argv[], char **envp)
   if ((fd = vkern_open(elf_path, LINUX_O_RDONLY, 0)) < 0) {
     return fd;
   }
-  if (proc.nr_tasks > 1) {
-    warnk("Multi-thread execve is not implemented yet\n");
-    return -LINUX_EINVAL;
+  /*
+   * execve replaces the program, so every other thread has to be gone first -
+   * they are running code that is about to stop existing. Doing this before the
+   * image is touched means a failure here leaves the caller's program intact.
+   */
+  if (!stop_other_tasks()) {
+    warnk("execve: could not stop the other threads\n");
+    return -LINUX_EAGAIN;
   }
 
   /* Now do exec */

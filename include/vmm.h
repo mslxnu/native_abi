@@ -109,6 +109,10 @@ void vmm_snapshot_vcpu(struct vcpu_snapshot*);
 void vmm_restore_vcpu(struct vcpu_snapshot*);
 
 void vmm_create_vcpu(struct vcpu_snapshot *);
+
+/* Interrupt every other thread's vCPU so it leaves guest code; used when one
+ * thread must stop the others (execve). */
+void vmm_kick_other_vcpus(void);
 void vmm_destroy_vcpu(void);
 
 int vmm_enter(void);

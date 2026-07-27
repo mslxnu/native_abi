@@ -270,6 +270,34 @@ vmm_create_vcpu(struct vcpu_snapshot *snapshot)
   pthread_rwlock_unlock(&alloc_lock);
 }
 
+/*
+ * Force every other thread's vCPU out of hv_vcpu_run.
+ *
+ * A thread executing guest code is inside hv_vcpu_run and will not look at any
+ * flag we set until it comes back - and it need not come back at all, since a
+ * guest loop with no syscalls in it runs forever. hv_vcpus_exit is the framework's
+ * way to interrupt that; the interrupted run returns HV_EXIT_REASON_CANCELED,
+ * which the decoder already reports as EXIT_RESUME, so the thread simply comes
+ * round its loop and can be told to stop there.
+ */
+void
+vmm_kick_other_vcpus(void)
+{
+  hv_vcpu_t ids[64];
+  uint32_t n = 0;
+
+  pthread_rwlock_rdlock(&alloc_lock);
+  struct vcpu *v;
+  list_for_each_entry (v, &vcpus, list) {
+    if (v != vcpu && n < (uint32_t)(sizeof ids / sizeof ids[0]))
+      ids[n++] = v->vcpuid;
+  }
+  pthread_rwlock_unlock(&alloc_lock);
+
+  if (n > 0)
+    hv_vcpus_exit(ids, n);
+}
+
 void
 vmm_destroy_vcpu(void)
 {

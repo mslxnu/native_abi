@@ -157,6 +157,11 @@ _Thread_local extern struct task task;
 void init_signal(void);
 void reinstall_host_sigactions(void);
 void reset_signal_state(void);
+
+/* execve must be the only thread left; see src/proc/process.c. */
+bool stop_other_tasks(void);
+bool task_should_stop(void);
+noreturn void task_stop_self(void);
 void init_fileinfo(int rootfd);
 
 void init_fpu(void);

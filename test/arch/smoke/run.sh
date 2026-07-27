@@ -150,6 +150,17 @@ else
     fail=1
 fi
 
+# mtexectest: execve from a multi-threaded process, where the spare thread is in
+# a syscall-free loop and so must be kicked out of hv_vcpu_run to be stopped.
+cp "$here/mtexectest" "$root/"; chmod +x "$root/mtexectest"
+out=$("$NABI" -m "$root" /mtexectest); rc=$?
+if [ "$rc" -eq 0 ] && [ "$out" = "hello arm64!" ]; then
+    echo "  ok  mtexectest -> execve from a thread, exit 0"
+else
+    echo "  FAIL mtexectest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 if [ "$fail" -eq 0 ]; then
     echo "smoke: PASS"
 else

@@ -36,6 +36,8 @@ guest-code cache sync.
   reaching `TPIDR_EL0`, thread exit with `CHILD_CLEARTID`, futex `WAIT`/`WAKE`,
   and `fork` from a process that has had threads: the primitives a threading libc
   is built out of.
+- `mtexectest` — `execve` from a multi-threaded process, with the spare thread in
+  a syscall-free loop so it must be kicked out of `hv_vcpu_run` to be stopped.
 
 The ELF binaries are committed prebuilt (as the x86 guest tests under
 `test/*/build/` are), so the check needs no cross-toolchain. The `.s` sources

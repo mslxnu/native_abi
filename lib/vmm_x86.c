@@ -148,6 +148,23 @@ vmm_create_vcpu(struct vcpu_snapshot *snapshot)
   pthread_rwlock_unlock(&alloc_lock);
 }
 
+/*
+ * Force every other thread's vCPU out of its run, so a thread executing guest
+ * code notices it has been asked to stop (see stop_other_tasks). The x86
+ * framework interrupts a vCPU by identifier, one at a time.
+ */
+void
+vmm_kick_other_vcpus(void)
+{
+  pthread_rwlock_rdlock(&alloc_lock);
+  struct vcpu *v;
+  list_for_each_entry (v, &vcpus, list) {
+    if (v != vcpu)
+      hv_vcpu_interrupt(&v->vcpuid, 1);
+  }
+  pthread_rwlock_unlock(&alloc_lock);
+}
+
 void
 vmm_destroy_vcpu(void)
 {

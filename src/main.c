@@ -77,6 +77,15 @@ main_loop(int return_on_sigret)
     /* dump_instr(); */
     /* print_regs(); */
 
+    /*
+     * Another thread is calling execve and needs to be the only one left. This
+     * is the point at which a thread can stop safely: it is out of guest code
+     * and between syscalls. (vmm_kick_other_vcpus is what got it here; a guest
+     * loop with no syscalls in it would never arrive on its own.)
+     */
+    if (task_should_stop())
+      task_stop_self();
+
     switch (exit.kind) {
     case EXIT_SYSCALL: {
       int r = handle_syscall();

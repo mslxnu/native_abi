@@ -29,6 +29,73 @@
 struct proc proc;
 _Thread_local struct task task;
 
+/*
+ * Stopping every thread but this one, for execve.
+ *
+ * execve replaces the whole program, so POSIX requires the other threads to be
+ * gone before the new image starts - they are running code that is about to stop
+ * existing, on stacks that are about to be unmapped.
+ *
+ * A thread inside guest code is inside hv_vcpu_run and cannot see this flag, and
+ * a guest loop containing no syscalls never comes out on its own, so setting the
+ * flag is paired with kicking the vCPUs (vmm_kick_other_vcpus). Each thread then
+ * returns from its run, sees the flag at the top of its loop, and tears itself
+ * down. Only threads that reach that check observe it, and the caller is inside a
+ * syscall rather than in the loop, so it cannot stop itself by mistake.
+ */
+static atomic_int stop_others_requested;
+
+bool
+task_should_stop(void)
+{
+  return atomic_load(&stop_others_requested) != 0;
+}
+
+/* The dying side: give up the vCPU and leave the process's task list. */
+noreturn void
+task_stop_self(void)
+{
+  vmm_destroy_vcpu();
+  pthread_rwlock_wrlock(&proc.lock);
+  proc.nr_tasks--;
+  list_del(&task.head);
+  pthread_rwlock_unlock(&proc.lock);
+  pthread_exit(NULL);
+}
+
+bool
+stop_other_tasks(void)
+{
+  pthread_rwlock_rdlock(&proc.lock);
+  int others = proc.nr_tasks - 1;
+  pthread_rwlock_unlock(&proc.lock);
+  if (others <= 0)
+    return true;
+
+  atomic_store(&stop_others_requested, 1);
+  vmm_kick_other_vcpus();
+
+  /*
+   * Wait for them. Bounded rather than forever: a thread wedged somewhere that
+   * never reaches the check would otherwise hang the execve with no explanation,
+   * and reporting failure lets the guest see an error instead.
+   */
+  bool done = false;
+  for (int i = 0; i < 10000; i++) {
+    pthread_rwlock_rdlock(&proc.lock);
+    done = proc.nr_tasks <= 1;
+    pthread_rwlock_unlock(&proc.lock);
+    if (done)
+      break;
+    usleep(200);
+  }
+
+  atomic_store(&stop_others_requested, 0);
+  if (!done)
+    warnk("execve: %d thread(s) did not stop\n", proc.nr_tasks - 1);
+  return done;
+}
+
 DEFINE_SYSCALL(sched_yield)
 {
   sleep(0);
