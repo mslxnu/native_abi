@@ -36,6 +36,9 @@ guest-code cache sync.
   reaching `TPIDR_EL0`, thread exit with `CHILD_CLEARTID`, futex `WAIT`/`WAKE`,
   and `fork` from a process that has had threads: the primitives a threading libc
   is built out of.
+- `clocktest` — the clocks an interactive shell asks for (including
+  `CLOCK_REALTIME_COARSE`) and `fcntl(F_GETFL)`; both used to kill the guest
+  rather than answer it, and an unknown clock must give EINVAL, not die.
 - `sharedmaptest` — a `MAP_SHARED` write reaches the file and a `MAP_PRIVATE`
   one does not. Other file mappings are copied into guest memory, which cannot
   give `MAP_SHARED` its meaning.

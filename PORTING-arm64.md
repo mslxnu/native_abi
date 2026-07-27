@@ -2,11 +2,19 @@
 
 **Target:** run **aarch64** Linux binaries on arm64 macOS via Hypervisor.framework's ARM API.
 
-**Status** (M5, macOS 26): **a native arm64 `nabi` runs Debian's `bash`.** Static
-and dynamically-linked aarch64 binaries both work - `make check-smoke` covers the
-static ELFs, and under a real `ld-linux-aarch64.so.1` + glibc, `bash` runs
-external commands, pipelines (`echo x | tr a-z A-Z`), command substitution,
-loops, conditionals and redirections.
+**Status** (M5, macOS 26): **a native arm64 `nabi` runs Debian's `bash`
+interactively** - the README's milestone. On a tty it prints its prompt, takes
+commands, and runs builtins, external commands and pipelines with job control;
+`bash -c` covers the same ground plus command substitution, loops, conditionals
+and redirections. Static and dynamically-linked aarch64 binaries both work, under
+a real `ld-linux-aarch64.so.1` + glibc.
+
+Two things stood between a working `bash -c` and a working prompt, and both were
+NABI killing the guest over something ordinary: `clock_gettime` panicked on any
+clock outside a short list, and bash asks for `CLOCK_REALTIME_COARSE`; and the
+descriptor-flag conversion asserted that every Darwin flag has a Linux
+counterpart, which is a fact about the host rather than about the guest. Neither
+is a thing a guest should be able to die of.
 
 `fork` is reliable: it is implemented as fork + `exec` of a resumed process,
 working around a Hypervisor.framework limitation that is not a NABI bug (§3.5.8,

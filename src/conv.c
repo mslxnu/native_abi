@@ -131,7 +131,17 @@ darwin_to_linux_o_flags(int r)
   TEST(O_NOFOLLOW, LINUX_O_NOFOLLOW);
   TEST(O_DIRECTORY, LINUX_O_DIRECTORY);
   TEST(O_CLOEXEC, LINUX_O_CLOEXEC);
-  assert(r == 0);
+  TEST(O_DSYNC, LINUX_O_SYNC);
+  TEST(O_ASYNC, LINUX_FASYNC);
+  /*
+   * Anything left is a Darwin flag with no Linux counterpart - O_SHLOCK,
+   * O_EXLOCK, O_EVTONLY and friends. Drop it rather than assert: this value
+   * comes from the host kernel describing a descriptor the guest already has,
+   * so an unmodelled bit is not the guest's fault and killing it over one is
+   * both wrong and, in an interactive shell, immediate.
+   */
+  if (r != 0)
+    warnk("darwin_to_linux_o_flags: ignoring host-only flags 0x%x\n", r);
   return flags;
 }
 

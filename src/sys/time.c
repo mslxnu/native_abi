@@ -205,29 +205,47 @@ DEFINE_SYSCALL(utime, gaddr_t, path, gaddr_t, times)
   return do_utimensat(LINUX_AT_FDCWD, name, times == 0 ? NULL : l_time, 0);
 }
 
-clockid_t
+/*
+ * Returns -1 for a clock we cannot serve, so the caller can answer EINVAL.
+ *
+ * It used to panic instead, which handed any guest a way to kill the machine
+ * with one bad argument - and it did not even take a bad one: bash asks for
+ * CLOCK_REALTIME_COARSE, which is a perfectly ordinary clock that simply was not
+ * listed. The coarse clocks are the same clocks read more cheaply and less
+ * precisely, so they map onto the precise ones; nothing is lost but the saving.
+ */
+static clockid_t
 linux_to_darwin_clockid(l_clockid_t id)
 {
   switch (id) {
   case LINUX_CLOCK_REALTIME:
-  case LINUX_CLOCK_REALTIME_HR:
+  case LINUX_CLOCK_REALTIME_COARSE:
     return CLOCK_REALTIME;
   case LINUX_CLOCK_MONOTONIC:
   case LINUX_CLOCK_MONOTONIC_COARSE:
+    return CLOCK_MONOTONIC;
+  case LINUX_CLOCK_MONOTONIC_RAW:
+    return CLOCK_MONOTONIC_RAW;
+  case LINUX_CLOCK_BOOTTIME:
+    /* Time since boot including any suspend, which is what Darwin's
+     * CLOCK_MONOTONIC counts. */
     return CLOCK_MONOTONIC;
   case LINUX_CLOCK_PROCESS_CPUTIME_ID:
     return CLOCK_PROCESS_CPUTIME_ID;
   case LINUX_CLOCK_THREAD_CPUTIME_ID:
     return CLOCK_THREAD_CPUTIME_ID;
   default:
-    panic("linux_to_darwin_clockid: %d", id);
+    return (clockid_t) -1;
   }
 }
 
 DEFINE_SYSCALL(clock_gettime, l_clockid_t, id, gaddr_t, spec_ptr)
 {
   struct timespec ts;
-  int r = syswrap(clock_gettime(linux_to_darwin_clockid(id), &ts));
+  clockid_t cid = linux_to_darwin_clockid(id);
+  if (cid == (clockid_t) -1)
+    return -LINUX_EINVAL;
+  int r = syswrap(clock_gettime(cid, &ts));
   if (r < 0) {
     return r;
   }
@@ -240,7 +258,10 @@ DEFINE_SYSCALL(clock_gettime, l_clockid_t, id, gaddr_t, spec_ptr)
 DEFINE_SYSCALL(clock_getres, l_clockid_t, id, gaddr_t, res_ptr)
 {
   struct timespec ts;
-  int r = syswrap(clock_getres(linux_to_darwin_clockid(id), &ts));
+  clockid_t cid = linux_to_darwin_clockid(id);
+  if (cid == (clockid_t) -1)
+    return -LINUX_EINVAL;
+  int r = syswrap(clock_getres(cid, &ts));
   if (r < 0) {
     return r;
   }

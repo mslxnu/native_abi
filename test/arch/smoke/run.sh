@@ -219,6 +219,17 @@ else
     fail=1
 fi
 
+# clocktest: the clocks and descriptor flags an interactive shell asks for -
+# CLOCK_REALTIME_COARSE and fcntl(F_GETFL) both used to kill the guest.
+cp "$here/clocktest" "$root/"; chmod +x "$root/clocktest"
+out=$("$NABI" -m "$root" /clocktest); rc=$?
+if [ "$rc" -eq 0 ] && [ "$out" = "clocks ok" ]; then
+    echo "  ok  clocktest -> \"$out\", exit 0"
+else
+    echo "  FAIL clocktest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 if [ "$fail" -eq 0 ]; then
     echo "smoke: PASS"
 else

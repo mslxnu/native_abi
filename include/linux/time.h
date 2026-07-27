@@ -59,8 +59,10 @@ struct l_itimerval {
 #define LINUX_CLOCK_MONOTONIC            1
 #define LINUX_CLOCK_PROCESS_CPUTIME_ID   2
 #define LINUX_CLOCK_THREAD_CPUTIME_ID    3
-#define LINUX_CLOCK_REALTIME_HR          4
-#define LINUX_CLOCK_MONOTONIC_HR         5
+/* 4 and 5 were mislabelled here as _HR, a pair of names that never made it into
+ * Linux's UAPI. The real ones - which is what a guest actually sends - are: */
+#define LINUX_CLOCK_MONOTONIC_RAW        4
+#define LINUX_CLOCK_REALTIME_COARSE      5
 #define LINUX_CLOCK_MONOTONIC_COARSE     6
 #define LINUX_CLOCK_BOOTTIME             7
 #define LINUX_CLOCK_REALTIME_ALARM       8
