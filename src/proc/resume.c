@@ -16,6 +16,9 @@
 #include "noah.h"
 #include "vmm.h"
 #include "mm.h"
+#include <sys/mman.h>
+
+#include "arm64/vm.h"
 #include "checkpoint.h"
 
 void fdtable_restore(const struct checkpoint_fd *fds, size_t n,
@@ -23,6 +26,7 @@ void fdtable_restore(const struct checkpoint_fd *fds, size_t n,
 void pt_restore(uint64_t ipa_brk, uint64_t l1_ipa,
                 const struct checkpoint_pt_chunk *saved, size_t n);
 void vmm_arm64_s2_restore(const struct checkpoint_s2 *saved, size_t n);
+gaddr_t pt_ipa_of(gaddr_t va);
 
 /*
  * Adopt a checkpoint: become the guest it describes.
@@ -61,10 +65,25 @@ checkpoint_restore(int ckpt_fd, int arena_fd)
   void **region_hva = calloc(hdr.nr_regions ? hdr.nr_regions : 1,
                              sizeof *region_hva);
   for (uint32_t i = 0; i < hdr.nr_regions; i++) {
-    if (regions[i].arena_off < 0)
-      panic("region 0x%llx was never in the arena and cannot be resumed",
+    if (regions[i].arena_off >= 0) {
+      region_hva[i] = arena_map_private(regions[i].arena_off, regions[i].size);
+      continue;
+    }
+    /*
+     * Not in the arena: a shared file mapping, whose bytes belong to the file.
+     * Re-map it from the descriptor - which came through the exec with
+     * everything else - so the resumed guest goes on sharing the file with
+     * whoever else has it, which is what MAP_SHARED means and what fork owes a
+     * shared mapping.
+     */
+    if (regions[i].mm_fd < 0)
+      panic("region 0x%llx is neither arena-backed nor file-backed",
             (unsigned long long) regions[i].gaddr);
-    region_hva[i] = arena_map_private(regions[i].arena_off, regions[i].size);
+    region_hva[i] = mmap(NULL, regions[i].size, PROT_READ | PROT_WRITE,
+                         MAP_SHARED, regions[i].mm_fd, regions[i].pgoff);
+    if (region_hva[i] == MAP_FAILED)
+      panic("could not re-map shared file region 0x%llx: %s",
+            (unsigned long long) regions[i].gaddr, strerror(errno));
   }
   for (uint32_t i = 0; i < hdr.nr_pt_chunks; i++)
     (void) arena_map_private(pt_chunks[i].arena_off, 1);
@@ -73,6 +92,23 @@ checkpoint_restore(int ckpt_fd, int arena_fd)
 
   vmm_arm64_s2_restore(s2, hdr.nr_s2);
   pt_restore(hdr.ipa_brk, hdr.l1_ipa, pt_chunks, hdr.nr_pt_chunks);
+
+  /*
+   * Shared file mappings, now that stage 1 is back and can say which IPA each
+   * one was given. Their memory came from the file rather than the arena, so
+   * stage 2 could not be replayed for them along with the rest.
+   */
+  for (uint32_t i = 0; i < hdr.nr_regions; i++) {
+    if (regions[i].arena_off >= 0)
+      continue;
+    gaddr_t ipa = pt_ipa_of(regions[i].gaddr);
+    if (ipa == 0)
+      panic("resuming shared region 0x%llx: no stage-1 mapping",
+            (unsigned long long) regions[i].gaddr);
+    vmm_arm64_map_stage2(ipa, roundup(regions[i].size, STAGE2_GRANULE),
+                         linux_mprot_to_hv_mflag(regions[i].prot),
+                         region_hva[i]);
+  }
 
   /* The mm layer's own view of the same memory. */
   proc.mm = malloc(sizeof *proc.mm);

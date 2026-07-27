@@ -174,12 +174,34 @@ do_mmap(gaddr_t addr, size_t len, int d_prot, int l_prot, int l_flags, int fd, o
    * end-of-file must read as. MAP_SHARED write-back to the file is not
    * preserved - no guest run so far needs it.
    */
-  ptr = arena_alloc(len, &arena_off);
-  if (fd >= 0 && pread(fd, ptr, len, offset) < 0) {
-    int e = errno;
-    munmap(ptr, len);
-    arena_free(arena_off, len);
-    return -darwin_to_linux_errno(e);
+  /*
+   * A shared file mapping is mapped for real, so the guest's writes reach the
+   * file - which is the whole meaning of MAP_SHARED, and something a copy can
+   * never provide. The reasons the copy exists do not apply here: the host
+   * refuses a PROT_EXEC file map and wants a granule-aligned offset, and neither
+   * is true of this case, so it is checked for rather than assumed.
+   *
+   * Such a region is deliberately NOT in the arena. Its bytes belong to the
+   * file, so a handover re-establishes it from the file on the far side rather
+   * than copying it - which is also what fork owes a shared mapping, since the
+   * child must share it with the parent and not get a private snapshot.
+   */
+  bool shared_file = fd >= 0 && (l_flags & LINUX_MAP_SHARED) &&
+                     (offset & (GUEST_MMAP_GRANULE - 1)) == 0 &&
+                     !(l_prot & LINUX_PROT_EXEC);
+
+  if (shared_file) {
+    ptr = mmap(0, len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, offset);
+    if (ptr == MAP_FAILED)
+      return -darwin_to_linux_errno(errno);
+  } else {
+    ptr = arena_alloc(len, &arena_off);
+    if (fd >= 0 && pread(fd, ptr, len, offset) < 0) {
+      int e = errno;
+      arena_unmap(ptr, len);
+      arena_free(arena_off, len);
+      return -darwin_to_linux_errno(e);
+    }
   }
 #else
   {

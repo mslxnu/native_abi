@@ -207,6 +207,18 @@ else
     fail=1
 fi
 
+# sharedmaptest: a MAP_SHARED write must reach the file (and a MAP_PRIVATE one
+# must not). Everything else file-backed is copied into guest memory, which
+# cannot give MAP_SHARED its meaning.
+cp "$here/sharedmaptest" "$root/"; chmod +x "$root/sharedmaptest"
+out=$("$NABI" -m "$root" /sharedmaptest); rc=$?
+if [ "$rc" -eq 0 ] && [ "$out" = "shared map ok" ]; then
+    echo "  ok  sharedmaptest -> \"$out\", exit 0"
+else
+    echo "  FAIL sharedmaptest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 if [ "$fail" -eq 0 ]; then
     echo "smoke: PASS"
 else

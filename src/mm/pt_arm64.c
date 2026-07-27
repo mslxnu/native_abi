@@ -639,3 +639,21 @@ pt_protect(gaddr_t va, size_t size, int prot)
   for (size_t i = 0; i < nr_blocks; i++)
     vmm_arm64_s2_reflush(blocks[i]);
 }
+
+/*
+ * The guest-physical address a mapped VA resolves to, or 0 if it is unmapped.
+ *
+ * Used when resuming a shared file mapping: such a region is not in the arena -
+ * its bytes belong to the file - so the checkpoint cannot say where its memory
+ * is, but the stage-1 tables, which travel in the arena like any other guest
+ * page, still record which IPA it was given. That is enough to re-establish
+ * stage 2 over the freshly re-mapped file.
+ */
+gaddr_t
+pt_ipa_of(gaddr_t va)
+{
+  uint64_t *pte = walk_existing(va);
+  if (!pte || !(*pte & PTE_VALID))
+    return 0;
+  return *pte & PTE_ADDR_MASK;
+}

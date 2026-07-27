@@ -36,7 +36,8 @@ is how a guest sees the Mac's files. Everything else resolves inside the rootfs.
 Linux ELFs** - proven by `make check-smoke`. Bounds today: static and
 dynamically-linked guests work, with signals, `fork`, threads and `mprotect`.
 `munmap` works, including a range that leaves live pages inside the 16KiB blocks
-it partly empties (§3.5.3). `MAP_SHARED` file write-back is not preserved. Three real host-side bugs stood between "links"
+it partly empties (§3.5.3), and a `MAP_SHARED` file mapping is mapped for real so
+the guest's writes reach the file. Three real host-side bugs stood between "links"
 and "runs", all found by the first smoke test and fixed: a W^X-incompatible RWX
 mmap of the malloc arena, an unreachable `RLIMIT_NOFILE`-derived kernel fd range
 on modern macOS, and an unchecked `PROT_EXEC` file mmap of the ELF.

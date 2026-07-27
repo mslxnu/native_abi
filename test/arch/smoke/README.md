@@ -36,6 +36,9 @@ guest-code cache sync.
   reaching `TPIDR_EL0`, thread exit with `CHILD_CLEARTID`, futex `WAIT`/`WAKE`,
   and `fork` from a process that has had threads: the primitives a threading libc
   is built out of.
+- `sharedmaptest` — a `MAP_SHARED` write reaches the file and a `MAP_PRIVATE`
+  one does not. Other file mappings are copied into guest memory, which cannot
+  give `MAP_SHARED` its meaning.
 - `splitmunmaptest` — unmap part of a mapping so live pages remain inside the
   16KiB stage-2 blocks it partly emptied; survivors keep their contents and the
   unmapped pages fault. This case used to panic as needing "evacuation".

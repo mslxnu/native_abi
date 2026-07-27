@@ -158,6 +158,14 @@ void
 vmm_arm64_s2_restore(const struct checkpoint_s2 *saved, size_t n)
 {
   for (size_t i = 0; i < n; i++) {
+    /*
+     * A negative offset is a shared file mapping, whose memory is the file's
+     * and not the arena's. It is re-established from the descriptor once the
+     * stage-1 tables are back and can say which IPA it had - see
+     * checkpoint_restore - so it is skipped rather than guessed at here.
+     */
+    if (saved[i].arena_off < 0)
+      continue;
     void *hva = arena_hva_of(saved[i].arena_off);
     if (hva == NULL)
       panic("restoring stage-2: arena offset %lld for IPA 0x%llx is not mapped",
