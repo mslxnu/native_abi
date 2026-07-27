@@ -84,7 +84,23 @@
  * and keeping it inline avoids an assembler step and a linker script for a
  * blob that has to be copied into guest memory anyway.
  */
-#define INSN_HVC0  0xD4000002u  /* hvc #0  */
+/*
+ * The immediate is 1, not 0, and that is load-bearing.
+ *
+ * The trampoline clobbers no register - a real `svc` must preserve x0-x30 - so
+ * the guest's x0 is still live when this executes. x0 is also where SMCCC puts
+ * a function ID, and Apple's hypervisor answers part of that space itself: an
+ * `hvc #0` whose x0 looks like a call it owns is completed in firmware,
+ * returning SMCCC_RET_NOT_SUPPORTED in x0, and never becomes a VM exit. The
+ * guest's syscall then silently does not happen. Measured, that was every x0 in
+ * [0xc1000000, 0xc2000000) - fast call, SMC64, owning entity 1. A guest whose
+ * mappings land in that band loses mmap and mprotect, which is not a band we
+ * get to avoid: the first argument of any syscall is a guest address.
+ *
+ * A non-zero immediate is not treated as a firmware call, so the exit is ours
+ * whatever the guest left in x0. See test/arch/smoke/hvctest.c.
+ */
+#define INSN_HVC1  0xD4000022u  /* hvc #1  */
 #define INSN_ERET  0xD69F03E0u  /* eret    */
 #define INSN_BRK0  0xD4200000u  /* brk #0  */
 #define INSN_NOP   0xD503201Fu  /* nop     */

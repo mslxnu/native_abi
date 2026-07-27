@@ -189,6 +189,19 @@ else
     fail=1
 fi
 
+# hvctest: no value in x0 may stop a syscall from reaching the host. The EL1
+# trampoline preserves the guest's registers, so x0 is live when its `hvc`
+# runs, and Apple's hypervisor answers SMCCC-shaped function IDs itself unless
+# the immediate is non-zero. Sweeps the whole top byte.
+cp "$here/hvctest" "$root/"; chmod +x "$root/hvctest"
+out=$("$NABI" -m "$root" /hvctest); rc=$?
+if [ "$rc" -eq 0 ] && [ "$out" = "hvc ok" ]; then
+    echo "  ok  hvctest -> \"$out\", exit 0"
+else
+    echo "  FAIL hvctest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 # pathtest: a guest path starting with a host-passthrough name (/tmpmark) must
 # resolve in the rootfs, not on the host. Needs the marker file to exist here.
 cp "$here/pathtest" "$root/"; chmod +x "$root/pathtest"; echo marker > "$root/tmpmark"

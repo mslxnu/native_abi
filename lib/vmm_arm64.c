@@ -478,7 +478,7 @@ vmm_arm64_install_trampoline(void *hva, gaddr_t ipa)
     vec[i] = INSN_BRK0;
 
   uint32_t *sync = (uint32_t *)((char *) hva + VEC_LOWER64_SYNC);
-  sync[0] = INSN_HVC0;   /* -> host */
+  sync[0] = INSN_HVC1;   /* -> host */
   sync[1] = INSN_ERET;   /* <- host, back to EL0 via ELR_EL1/SPSR_EL1 */
 
   vmm_arm64_sync_guest_code(hva, VEC_TABLE_SIZE);

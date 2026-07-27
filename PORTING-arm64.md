@@ -725,69 +725,54 @@ Silicon it is simply broken. Until then `forktest` and `clonetid` make the smoke
 intermittently red, and that is honest: `fork` really is broken about one time in
 eight.
 
-### 3.5.9 `x0` cannot hold a 16MiB band of values — **narrowed, not fixed**
+### 3.5.9 SMCCC swallows the trampoline's `hvc` — **fixed**
 
-`apt` does not load. It fails at `libcrypto.so.3` with *"cannot change memory
-protections"*, and the mprotect really does fail — because the address the guest
-passes is `0xffffffff`.
+`apt` did not load. It failed at `libcrypto.so.3` with *"cannot change memory
+protections"*, and underneath that the loader's `mprotect` was never reaching
+NABI at all: the syscall produced no VM exit of any kind, and the guest carried
+on with `0xffffffff` in x0. The same was true of the `munmap` before it.
 
-Where that comes from is the whole of the bug, and it is not what it first looks
-like. glibc computes the argument as `l->l_addr + c->mapend`, which here is
-`0xc0b60000 + 0x580000 = 0xc11695a7` once the page-size rounding is included.
-That value never survives:
+The cause is the EL1 trampoline, and specifically the thing about it that is
+otherwise a virtue. It clobbers no register — a real `svc` must preserve x0-x30
+— so when its `hvc` executes, the guest's x0 is still whatever the syscall's
+first argument was. x0 is also where SMCCC puts a function ID, and Apple's
+hypervisor answers part of that space itself: an `hvc #0` whose x0 looks like a
+call it owns is completed in firmware, returns `SMCCC_RET_NOT_SUPPORTED` (-1) in
+x0, and never becomes a VM exit. The guest's syscall silently does not happen.
 
-**Writing any value in `[0xc1000000, 0xc2000000)` into `x0` reads back as
-`0xffffffff`.** The same value in `x2` or `x3` is kept perfectly. Values outside
-that 16MiB band — `0xc0b63fff`, `0xc2003fff`, `0xc3003fff`, `0xdead3fff`,
-`0x80003fff` — are kept perfectly in `x0`. It is not arithmetic: `movz x0,
-#0xc116, lsl #16`, with no operands and nothing else in the instruction, reads
-back `0xffffffff` just the same.
+Measured, the swallowed range is every x0 in `[0xc1000000, 0xc2000000)` — fast
+call, SMC64, owning entity 1, "CPU service calls". Neighbouring entities are
+forwarded: `0xc0`, `0xc2`, `0xc3`, `0xc4` and the rest of the top byte all reach
+the host, which is why this stayed hidden until a guest's mappings first grew
+past `0xc1000000`. It is not a band that can be avoided by construction — the
+first argument of *any* syscall is a guest address.
 
-Everything around it checks out, each verified rather than assumed:
+The fix is one instruction: the trampoline traps with `hvc #1`. A non-zero
+immediate is not treated as a firmware call, so the exit is ours whatever the
+guest left in x0. `test/arch/smoke/hvctest.c` sweeps the whole top byte through
+x0 and checks every syscall still arrives.
 
-- **The operands.** The guest is made to write its own registers out with a
-  planted `str`, so the values are the CPU's rather than the framework's report:
-  `x0 = 0x3fff` before the add, `x3 = 0xc11655a8`, both matching
-  `hv_vcpu_get_reg`. Slots are pre-filled with a sentinel, so a store that never
-  landed is distinguishable from one that stored something surprising.
-- **The instruction.** The word at the faulting PC is `8b030000` read through the
-  region mapping *and* through the guest's own path — stage-1 descriptor to IPA
-  to stage-2 backing — and the two never disagree at any step of the run.
-  Rewriting it with the identical word plus an icache invalidate changes nothing,
-  so it is not a stale fetch; re-encoding the same addition as `add x0, x3, x0`,
-  and replacing it with `orr` (same result for these operands), both fail
-  identically, so it is neither the encoding nor the operation.
-- **The destination.** `add x2, x0, x3` on the same operands at the same
-  instant yields the correct `0xc1163fff`. Only `x0` loses it.
-- **Memory and mappings.** The stack slots the loader spills through hold the
-  right values before and after the syscall, by both the region mapping and the
-  page-table walk; no stage-2 block is ever repointed at different host memory
-  (checked by instrumenting the registry for a changed backing).
+Two things about the investigation are worth keeping, because both cost time.
 
-Ruled out by experiment: the whole of `do_munmap` — with `vmm_munmap`, the host
-`munmap` and `arena_free` all disabled it fails identically, so the unmap is
-merely when the damage becomes visible, not its cause; the post-mapping
-`vmm_sync_guest_code`; re-syncing every executable region after every unmap; and
-forcing a register write-back (writing `x3` to a *different* value takes effect
-and the arithmetic then comes out right, but writing back the value it already
-holds does not, which is the asymmetry that first suggested a state divergence).
+**Any exception is affected, not just `svc`.** The trampoline is the single path
+out of EL1, so a data abort, a `brk`, or a software-step exception taken while x0
+holds a swallowed value is lost exactly the same way. That is what made the bug
+look like several different bugs: register values appearing to corrupt
+themselves, arithmetic appearing to produce impossible results. In every case
+the guest had simply run on past an exception the host never saw, with x0
+overwritten by the firmware's return value.
 
-It needs accumulated address-space state. A freestanding guest that round-trips
-the same constants through `x0` and `x2` passes; `apt` reaches `libcrypto` about
-nine libraries in, and `openssl` loads the very same `libcrypto.so.3` without
-trouble — its reservation happens to land aligned, so it never takes the
-head-trim path that leads here.
+**Software single-step works, and is worth knowing about.** Set `MDSCR_EL1.SS`
+and `SPSR_EL1.SS` (and clear `SPSR_EL1.D`) before entry; the step exception
+arrives at the *same* `VBAR_EL1+0x400` slot the trampoline already handles, as
+`ESR_EL1` EC `0x32`. Re-arm `SPSR_EL1.SS` on every entry, since taking the
+exception clears it. It was the tool that eventually localised this — though
+note that it is itself subject to the bug above, so a step whose x0 is in the
+swallowed range is not reported and the guest advances anyway.
 
-**Tooling note.** What cracked this open was ARM software single-step, and it is
-worth knowing it works: set `MDSCR_EL1.SS` and `SPSR_EL1.SS` (and clear
-`SPSR_EL1.D`) before entry, and the step exception arrives at the *same*
-`VBAR_EL1+0x400` slot the existing EL1 trampoline already handles, as `ESR_EL1`
-EC `0x32`. Re-arm `SPSR_EL1.SS` on every entry, since taking the exception
-clears it. Before that, the syscalls simply appeared to vanish — the guest ran
-straight past two `svc` instructions — which sent the investigation after a lost
-exception that was never lost at all. Stepping changes the shape of the failure
-(the syscalls reappear, with garbage arguments), which is itself the clue that
-this is state and not logic.
+The Phase 0 spike in `spike/arm64-trap/` still uses `hvc #0` and would show the
+same behaviour; it is kept as the record of that experiment rather than as
+working code.
 
 ### 3.6 Segmentation, IDT, FPU, CPUID, TSC
 
@@ -821,8 +806,10 @@ scripts cannot run — they are aarch64 shell scripts, and running them needs th
 guest that is being built — so what they would have generated is missing:
 `/etc/shadow`, the `ldconfig` cache, and `update-alternatives` symlinks.
 
-`dpkg`, `dpkg-query`, `bash`, `openssl`, `gpgv` and `wget` all run against it.
-`apt` does not, for the reason in §3.5.9.
+`dpkg`, `dpkg-query`, `apt`, `bash`, `openssl`, `gpgv` and `wget` all run
+against it — `apt list --installed` and `dpkg -l` enumerate the 427 packages.
+Anything needing the network is a separate matter: the tree is built offline and
+`sources.list` is commented out by default.
 
 ---
 

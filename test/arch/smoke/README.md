@@ -64,6 +64,15 @@ guest-code cache sync.
   fault on its own data. Needs `/bigmapfile`, which `run.sh` creates shorter than
   the mapping so the tail also checks that past-EOF pages read as zero.
 
+- `hvctest` — sweeps every top byte through x0 and checks each syscall still
+  reaches the host. The EL1 trampoline clobbers no register, so the guest's x0
+  is live at its `hvc`, and an `hvc #0` whose x0 looks like an SMCCC function ID
+  the hypervisor owns is answered in firmware instead of exiting to us.
+- `bigmaptest` — the dynamic linker's over-align-then-trim sequence at
+  libcrypto's size: reserve, map the file at an aligned address inside it, trim
+  both ends, and `PROT_NONE` the inter-segment hole. Needs `bigmapfile` in the
+  root.
+
 The ELF binaries are committed prebuilt (as the x86 guest tests under
 `test/*/build/` are), so the check needs no cross-toolchain. The `.s` sources
 are here for reference; rebuild with an aarch64-linux clang + ld.lld:
