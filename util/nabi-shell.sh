@@ -23,7 +23,10 @@
 # has no way to set the guest's initial directory.
 set -eu
 
-ROOT=${1:?usage: nabi-shell.sh <rootfs> [command ...]}
+# Named for whatever it was invoked as: it ships as nabi-shell.sh and installs
+# as msl, so a hardcoded name would be wrong in one place or the other.
+me=$(basename "$0")
+ROOT=${1:?usage: ${0##*/} <rootfs> [command ...]}
 shift
 
 [ -d "$ROOT" ] || { echo "no such rootfs: $ROOT" >&2; exit 1; }
@@ -48,7 +51,7 @@ for cand in ${NABI:-} "$here/out/nabi" "$here/libexec/nabi" \
     # calling it and getting an option error from a layer down.
     if [ "$(head -c 2 "$cand" 2>/dev/null)" = "#!" ]; then
         [ -n "${NABI:-}" ] && [ "$cand" = "$NABI" ] && {
-            echo "$0: NABI=$cand is the wrapper script, not the executable." >&2
+            echo "$me: NABI=$cand is the wrapper script, not the executable." >&2
             echo "  point it at libexec/nabi instead." >&2
             exit 1
         }
@@ -58,7 +61,7 @@ for cand in ${NABI:-} "$here/out/nabi" "$here/libexec/nabi" \
     break
 done
 [ -n "${NABI:-}" ] && [ -x "$NABI" ] || {
-    echo "$0: no nabi executable found." >&2
+    echo "$me: no nabi executable found." >&2
     echo "  build one with 'make ARCH=arm64', install with 'sudo make install'," >&2
     echo "  or set NABI to the path of libexec/nabi." >&2
     exit 1

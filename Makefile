@@ -132,6 +132,9 @@ HEADERS := $(wildcard include/*.h include/*/*.h)
 
 NABI    := $(OUT)/nabi
 WRAPPER := $(OUT)/nabi.pl
+# The interactive-shell front end, installed under the family name. It is a
+# plain script with nothing to build, so it is taken from the source tree.
+SHELLCMD := util/nabi-shell.sh
 
 # ---------------------------------------------------------------------------
 # Build
@@ -313,10 +316,13 @@ check-guest: build
 
 install: require-root require-built migrate
 	install -d -m 755 -o root -g wheel $(PREFIX)/bin $(PREFIX)/libexec $(PREFIX)/man/man1
-	install -m 755 -o root -g wheel $(WRAPPER) $(PREFIX)/bin/nabi
-	install -m 755 -o root -g wheel $(NABI)    $(PREFIX)/libexec/nabi
-	install -m 644 -o root -g wheel man/nabi.1 $(PREFIX)/man/man1/nabi.1
-	@echo "nabi: installed to $(PREFIX). Run 'nabi' to provision a rootfs and start."
+	install -m 755 -o root -g wheel $(WRAPPER)  $(PREFIX)/bin/nabi
+	install -m 755 -o root -g wheel $(SHELLCMD) $(PREFIX)/bin/msl
+	install -m 755 -o root -g wheel $(NABI)     $(PREFIX)/libexec/nabi
+	install -m 644 -o root -g wheel man/nabi.1  $(PREFIX)/man/man1/nabi.1
+	@echo "nabi: installed to $(PREFIX)."
+	@echo "      'nabi' provisions a rootfs in ~/.nabi/tree and starts it."
+	@echo "      'msl <rootfs>' opens a shell in a rootfs you already have."
 
 # ---------------------------------------------------------------------------
 # Migration from the pre-rename install (the command was called noah).
@@ -341,7 +347,8 @@ migrate: require-root
 	done
 
 uninstall: require-root
-	rm -f $(PREFIX)/bin/nabi $(PREFIX)/libexec/nabi $(PREFIX)/man/man1/nabi.1
+	rm -f $(PREFIX)/bin/nabi $(PREFIX)/bin/msl $(PREFIX)/libexec/nabi \
+	      $(PREFIX)/man/man1/nabi.1
 	@echo "nabi: uninstalled. ~/.nabi/tree is left alone - remove it by hand if"
 	@echo "      you want the rootfs gone; it may be several gigabytes."
 

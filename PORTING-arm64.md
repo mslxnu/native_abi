@@ -819,8 +819,9 @@ and every query warns that the package has no files installed.
 
 ### 3.7.1 An interactive shell
 
-`util/nabi-shell.sh <rootfs>` drops into a login shell in the guest. The work is
-entirely environment, and all of it matters:
+`util/nabi-shell.sh <rootfs>` drops into a login shell in the guest — `make
+install` puts it on `PATH` as `msl`, and it names itself after however it was
+invoked. The work is entirely environment, and all of it matters:
 
 - **PATH.** The host's would be inherited, and nothing in it resolves `apt`.
 - **HOME.** The account's real home is on the host, and `/Users` is a NABI
