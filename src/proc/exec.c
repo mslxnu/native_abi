@@ -457,6 +457,14 @@ do_exec(const char *elf_path, int argc, char *argv[], char **envp)
   if (4 <= st.st_size && memcmp(data, ELFMAG, 4) == 0) {
     if ((err = load_elf((Elf64_Ehdr *) data, argc, argv, envp)) < 0)
       return err;
+    /*
+     * Recorded here rather than where do_exec returns, because a `#!` script
+     * comes back through this function: load_script re-enters do_exec with the
+     * interpreter, and the outer call would then overwrite the interpreter's
+     * identity with the script's. Linux reports the interpreter as exe and its
+     * rewritten argv as cmdline, which is exactly the inner call.
+     */
+    proc_set_ident(elf_path, argc, argv);
     if (st.st_mode & 04000) {
       elevate_privilege();
     }

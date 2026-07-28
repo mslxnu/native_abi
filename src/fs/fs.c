@@ -1728,6 +1728,20 @@ DEFINE_SYSCALL(readlinkat, int, dirfd, gstr_t, path_ptr, gaddr_t, buf_ptr, int, 
   char name[LINUX_PATH_MAX];
   strncpy_from_user(name, path_ptr, sizeof name);
 
+  /* /proc/<pid>/exe names the guest's binary, which only NABI knows - from the
+   * host's side this process's executable is the emulator. */
+  {
+    char own[LINUX_PATH_MAX];
+    int n = procfs_readlink(name, own, sizeof own);
+    if (n >= 0) {
+      if (n > bufsize)
+        n = bufsize;
+      if (copy_to_user(buf_ptr, own, n))
+        return -LINUX_EFAULT;
+      return n;
+    }
+  }
+
   int r;
   struct path path;
   if ((r = vfs_grab_dir(dirfd, name, LOOKUP_NOFOLLOW, &path)) < 0) {

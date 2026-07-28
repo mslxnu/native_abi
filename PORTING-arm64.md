@@ -887,7 +887,23 @@ than a pipe keeps the descriptor an ordinary one — seekable, `stat`-able,
 readable more than once — and the snapshot-at-open behaviour is what procfs does
 with these files anyway.
 
-Two things are deliberately left out, both for the same reason.
+`cmdline`, `comm` and `exe` are overlaid the same way, and needed the guest's
+argv and binary path to survive a fork that is fork + `exec` — so they are
+recorded at exec and carried in the checkpoint, which went to version 2. They
+are trailing blobs after the existing arrays, lengths in the header, following
+the shape already there. Old checkpoints are not a compatibility concern: one is
+written per handover and read once by the child it was written for, so none
+outlives the pair of processes that share it.
+
+Recording happens where the ELF is loaded rather than where `do_exec` returns,
+because a `#!` script comes back through that function — `load_script` re-enters
+`do_exec` with the interpreter, and the outer call would overwrite the
+interpreter's identity with the script's. Linux reports the interpreter as `exe`
+and its rewritten argv as `cmdline`, which is exactly what the inner call has.
+`exe` is a symlink rather than a file, so it arrives through `readlink` and is
+answered there instead.
+
+One thing is still deliberately left out.
 
 **Paths in `maps`.** `mm_region` records the guest fd a mapping was made from,
 but the guest closes that descriptor as soon as `ld.so` has mapped a segment and
@@ -897,10 +913,6 @@ out as `/dev/urandom`. A wrong path is worse than an absent one: a reader can
 see that nothing is claimed, but not that something claimed is a lie. Naming
 them means the region remembering its own file at mmap time, which is a new
 field in `mm_region` and so a change to the checkpoint wire format.
-
-**`cmdline`, `exe`, `comm`.** Same obstacle — they need the guest's argv and
-binary path kept across a fork that is fork + `exec`. Until then they are the
-emulator's, and `cmdline` leaks `--resume 5 6 …`.
 
 Beyond that is the other half of the problem, which is not NABI's to solve
 alone: **host** tools still see a `nabi`. Making `ps` on macOS show the guest

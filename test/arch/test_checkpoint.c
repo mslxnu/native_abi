@@ -153,6 +153,16 @@ main(void)
   list_add(&r[0].list, &mm.mm_regions);
   list_add(&r[1].list, &r[0].list);
 
+  /* The guest's identity. Only NABI knows it - from the outside this process
+   * is a nabi - so if it does not travel here, a forked child cannot report it
+   * at all. Set directly rather than through proc_set_ident to keep this test
+   * to the wire format. */
+  static char ident_exe[] = "/bin/guest";
+  static char ident_cmd[] = "/bin/guest\0-x\0arg";   /* NUL-separated argv */
+  proc.ident.exe = ident_exe;
+  proc.ident.cmdline = ident_cmd;
+  proc.ident.cmdline_len = sizeof ident_cmd - 1;
+
   char path[] = "/tmp/nabi-ckpt-XXXXXX";
   int fd = mkstemp(path);
   unlink(path);
@@ -167,11 +177,21 @@ main(void)
   struct checkpoint_pt_chunk *chunks = NULL;
   struct checkpoint_fd *fds = NULL;
   l_sigaction_t *sigactions = NULL;
-  CHECK(checkpoint_read(fd, &hdr, &regions, &s2, &chunks, &fds, &sigactions) == 0,
+  char *exe = NULL, *cmdline = NULL;
+  CHECK(checkpoint_read(fd, &hdr, &regions, &s2, &chunks, &fds, &sigactions,
+                        &exe, &cmdline) == 0,
         "checkpoint_read failed: %s", strerror(errno));
 
   CHECK(hdr.magic == CHECKPOINT_MAGIC && hdr.version == CHECKPOINT_VERSION,
         "header magic/version did not survive");
+
+  /* The identity, which is the whole reason a child can answer /proc for
+   * itself. cmdline is compared with memcmp: it has NULs inside it. */
+  CHECK(hdr.exe_len == sizeof ident_exe && exe && strcmp(exe, ident_exe) == 0,
+        "the executable path did not survive");
+  CHECK(hdr.cmdline_len == sizeof ident_cmd - 1 && cmdline &&
+        memcmp(cmdline, ident_cmd, sizeof ident_cmd - 1) == 0,
+        "the command line did not survive");
 
   /* The vCPU: the registers a guest resumes on. */
   CHECK(hdr.vcpu.x[0] == 0x1000 && hdr.vcpu.x[30] == 0x1000 + 30,
@@ -251,7 +271,8 @@ main(void)
   lseek(fd, 0, SEEK_SET);
   ftruncate(fd, (off_t) sizeof hdr - 8);
   lseek(fd, 0, SEEK_SET);
-  CHECK(checkpoint_read(fd, &hdr, &regions, &s2, &chunks, &fds, &sigactions) < 0,
+  CHECK(checkpoint_read(fd, &hdr, &regions, &s2, &chunks, &fds, &sigactions,
+                        &exe, &cmdline) < 0,
         "a truncated checkpoint was accepted");
 
   /* So must one whose version we do not speak. */
@@ -263,7 +284,8 @@ main(void)
   ftruncate(fd, 0);
   (void) !write(fd, &bad, sizeof bad);
   lseek(fd, 0, SEEK_SET);
-  CHECK(checkpoint_read(fd, &hdr, &regions, &s2, &chunks, &fds, &sigactions) < 0,
+  CHECK(checkpoint_read(fd, &hdr, &regions, &s2, &chunks, &fds, &sigactions,
+                        &exe, &cmdline) < 0,
         "a checkpoint from another version was accepted");
 
   close(fd);

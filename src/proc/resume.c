@@ -56,8 +56,9 @@ checkpoint_restore(int ckpt_fd, int arena_fd)
 
   arena_adopt(arena_fd);
 
+  char *exe = NULL, *cmdline = NULL;
   if (checkpoint_read(ckpt_fd, &hdr, &regions, &s2, &pt_chunks, &fds,
-                      &sigactions) < 0)
+                      &sigactions, &exe, &cmdline) < 0)
     panic("could not read the checkpoint: %s", strerror(errno));
   close(ckpt_fd);
 
@@ -148,6 +149,12 @@ checkpoint_restore(int ckpt_fd, int arena_fd)
   INIT_SIGBIT(&task.sigpending);
 
   fdtable_restore(fds, hdr.nr_fds, &hdr);
+
+  /* The guest's identity, which only this checkpoint could carry: from outside
+   * this is a fresh `nabi --resume`, and its own argv says exactly that. */
+  proc.ident.exe         = exe;
+  proc.ident.cmdline     = cmdline;
+  proc.ident.cmdline_len = hdr.cmdline_len;
   /* Host-derived, so it is probed here rather than carried in the checkpoint -
    * but it must be probed, because this process never ran init_fileinfo. */
   init_host_passthrough();

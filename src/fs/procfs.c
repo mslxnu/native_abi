@@ -46,6 +46,42 @@
 #include "linux/mman.h"
 
 /*
+ * Record what this process is running, at exec.
+ *
+ * argv is flattened here rather than kept as a vector because that is the shape
+ * /proc/<pid>/cmdline has - one NUL-terminated string per argument, run
+ * together - and the shape the checkpoint carries. Doing it once at exec means
+ * neither the reader nor the handover has to walk a pointer array that belongs
+ * to a guest address space.
+ */
+void
+proc_set_ident(const char *exe, int argc, char *argv[])
+{
+  free(proc.ident.exe);
+  free(proc.ident.cmdline);
+  proc.ident.exe = exe ? strdup(exe) : NULL;
+
+  size_t len = 0;
+  for (int i = 0; i < argc; i++)
+    len += strlen(argv[i]) + 1;
+
+  char *flat = malloc(len ? len : 1);
+  if (!flat) {
+    proc.ident.cmdline = NULL;
+    proc.ident.cmdline_len = 0;
+    return;
+  }
+  size_t off = 0;
+  for (int i = 0; i < argc; i++) {
+    size_t n = strlen(argv[i]) + 1;
+    memcpy(flat + off, argv[i], n);
+    off += n;
+  }
+  proc.ident.cmdline = flat;
+  proc.ident.cmdline_len = len;
+}
+
+/*
  * The guest's address space in Linux's /proc/<pid>/maps format:
  *
  *   start-end perms offset dev inode path
@@ -105,32 +141,63 @@ build_maps(size_t *len_out)
 }
 
 /*
- * Is this one of the paths naming *this* process's maps?
+ * Which of this process's own /proc files is being asked for, if any.
  *
  * /proc/self and /proc/thread-self are the guest asking about itself, and so is
  * its own pid spelled out - a guest pid is the host pid, so the number a guest
- * reads from getpid() is the one procfs knows it by.
+ * reads from getpid() is the one procfs knows it by. Another process's pid is
+ * not ours to answer for: it may be an ordinary macOS process, and even if it
+ * is another guest, its state lives in a different nabi.
  */
-static bool
-is_own_maps(const char *path)
+enum procfs_file { PROCFS_NONE, PROCFS_MAPS, PROCFS_CMDLINE, PROCFS_COMM,
+                   PROCFS_EXE };
+
+static enum procfs_file
+own_procfs_file(const char *path)
 {
   if (strncmp(path, "/proc/", 6) != 0)
-    return false;
+    return PROCFS_NONE;
   const char *rest = path + 6;
 
   const char *slash = strchr(rest, '/');
-  if (!slash || strcmp(slash, "/maps") != 0)
-    return false;
+  if (!slash)
+    return PROCFS_NONE;
 
   size_t n = (size_t) (slash - rest);
-  if (n == 4 && strncmp(rest, "self", 4) == 0)
-    return true;
-  if (n == 11 && strncmp(rest, "thread-self", 11) == 0)
-    return true;
+  bool mine = (n == 4 && strncmp(rest, "self", 4) == 0) ||
+              (n == 11 && strncmp(rest, "thread-self", 11) == 0);
+  if (!mine) {
+    char pid[16];
+    int m = snprintf(pid, sizeof pid, "%d", getpid());
+    mine = m > 0 && (size_t) m == n && strncmp(rest, pid, n) == 0;
+  }
+  if (!mine)
+    return PROCFS_NONE;
 
-  char pid[16];
-  int m = snprintf(pid, sizeof pid, "%d", getpid());
-  return m > 0 && (size_t) m == n && strncmp(rest, pid, n) == 0;
+  if (strcmp(slash, "/maps") == 0)    return PROCFS_MAPS;
+  if (strcmp(slash, "/cmdline") == 0) return PROCFS_CMDLINE;
+  if (strcmp(slash, "/comm") == 0)    return PROCFS_COMM;
+  if (strcmp(slash, "/exe") == 0)     return PROCFS_EXE;
+  return PROCFS_NONE;
+}
+
+/* comm is the executable's basename and a newline - Linux truncates it to 15
+ * characters, and something reading it to compare against a process name will
+ * expect that truncation rather than the full one. */
+static char *
+build_comm(size_t *len_out)
+{
+  const char *exe = proc.ident.exe;
+  if (!exe)
+    return NULL;
+  const char *base = strrchr(exe, '/');
+  base = base ? base + 1 : exe;
+
+  char *out = malloc(18);
+  if (!out)
+    return NULL;
+  *len_out = (size_t) snprintf(out, 18, "%.15s\n", base);
+  return out;
 }
 
 /*
@@ -144,11 +211,28 @@ is_own_maps(const char *path)
 int
 procfs_open(const char *path, int *out_fd)
 {
-  if (!is_own_maps(path))
-    return -1;
-
   size_t len = 0;
-  char *content = build_maps(&len);
+  char *content = NULL;
+
+  switch (own_procfs_file(path)) {
+  case PROCFS_MAPS:
+    content = build_maps(&len);
+    break;
+  case PROCFS_CMDLINE:
+    /* Handed back as-is: it is already the NUL-separated form the file has. */
+    if (!proc.ident.cmdline)
+      return -1;
+    len = proc.ident.cmdline_len;
+    content = malloc(len ? len : 1);
+    if (content)
+      memcpy(content, proc.ident.cmdline, len);
+    break;
+  case PROCFS_COMM:
+    content = build_comm(&len);
+    break;
+  default:
+    return -1;      /* not ours; the caller does the ordinary lookup */
+  }
   if (!content)
     return -1;
 
@@ -171,4 +255,25 @@ procfs_open(const char *path, int *out_fd)
 
   *out_fd = fd;
   return 0;
+}
+
+/*
+ * /proc/<pid>/exe, which is a symlink rather than a file and so arrives through
+ * readlink instead of open.
+ *
+ * Returns the length written, or -1 for "not ours". Not NUL-terminated: readlink
+ * does not terminate, and a caller that adds one would overrun the guest's
+ * buffer by a byte.
+ */
+int
+procfs_readlink(const char *path, char *buf, size_t bufsize)
+{
+  if (own_procfs_file(path) != PROCFS_EXE || !proc.ident.exe)
+    return -1;
+
+  size_t n = strlen(proc.ident.exe);
+  if (n > bufsize)
+    n = bufsize;
+  memcpy(buf, proc.ident.exe, n);
+  return (int) n;
 }

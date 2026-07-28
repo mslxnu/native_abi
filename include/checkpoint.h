@@ -26,7 +26,7 @@
 #include "linux/signal.h"
 
 #define CHECKPOINT_MAGIC   0x4E414249434B5031ULL  /* "NABICKP1" */
-#define CHECKPOINT_VERSION 1
+#define CHECKPOINT_VERSION 2
 
 /* One guest memory region, as src/mm/mmap.c tracks it, with the host address
  * replaced by the arena offset that names the same bytes elsewhere. */
@@ -113,6 +113,16 @@ struct checkpoint_header {
   uint32_t nr_pt_chunks;
   uint32_t nr_fds;
   uint32_t nr_sigactions;
+
+  /*
+   * The guest's identity, as /proc must report it: the executable's guest path
+   * and the flattened argv, both as trailing blobs after the arrays above.
+   * Only NABI knows these - from outside, the process is a `nabi` - so they
+   * cannot be re-derived on the far side and have to travel. Lengths include
+   * the terminating NUL of each string.
+   */
+  uint32_t exe_len;
+  uint32_t cmdline_len;
   uint32_t _pad2;
 };
 
@@ -128,6 +138,7 @@ int checkpoint_read(int fd, struct checkpoint_header *hdr,
                     struct checkpoint_s2 **s2,
                     struct checkpoint_pt_chunk **chunks,
                     struct checkpoint_fd **fds,
-                    l_sigaction_t **sigactions);
+                    l_sigaction_t **sigactions,
+                    char **exe, char **cmdline);
 
 #endif

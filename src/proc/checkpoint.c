@@ -154,6 +154,8 @@ checkpoint_write(int fd)
   hdr.nr_pt_chunks  = (uint32_t) nr_chunks;
   hdr.nr_fds        = (uint32_t) nr_fds;
   hdr.nr_sigactions = LINUX_NSIG;
+  hdr.exe_len       = proc.ident.exe ? (uint32_t)(strlen(proc.ident.exe) + 1) : 0;
+  hdr.cmdline_len   = (uint32_t) proc.ident.cmdline_len;
 
   int rc = -1;
   if (write_all(fd, &hdr, sizeof hdr) == 0 &&
@@ -163,7 +165,9 @@ checkpoint_write(int fd)
       write_all(fd, fds, nr_fds * sizeof *fds) == 0 &&
       /* The dispositions are plain data - a handler address in the guest, flags
        * and a mask - so the whole table goes as it stands. */
-      write_all(fd, proc.sigaction, LINUX_NSIG * sizeof proc.sigaction[0]) == 0)
+      write_all(fd, proc.sigaction, LINUX_NSIG * sizeof proc.sigaction[0]) == 0 &&
+      write_all(fd, proc.ident.exe, hdr.exe_len) == 0 &&
+      write_all(fd, proc.ident.cmdline, hdr.cmdline_len) == 0)
     rc = 0;
 
   free(regions); free(s2); free(chunks); free(fds);
@@ -176,7 +180,8 @@ checkpoint_read(int fd, struct checkpoint_header *hdr,
                 struct checkpoint_s2 **s2_out,
                 struct checkpoint_pt_chunk **chunks_out,
                 struct checkpoint_fd **fds_out,
-                l_sigaction_t **sigactions_out)
+                l_sigaction_t **sigactions_out,
+                char **exe_out, char **cmdline_out)
 {
   if (read_all(fd, hdr, sizeof *hdr) < 0)
     return -1;
@@ -209,6 +214,21 @@ checkpoint_read(int fd, struct checkpoint_header *hdr,
     free(regions); free(s2); free(chunks); free(fds); free(sigactions);
     return -1;
   }
+
+  /* The identity blobs. Absent (length zero) is normal for a guest that has not
+   * exec'd anything yet, so it is not an error. */
+  char *exe = NULL, *cmdline = NULL;
+  if ((hdr->exe_len && !(exe = malloc(hdr->exe_len))) ||
+      (hdr->cmdline_len && !(cmdline = malloc(hdr->cmdline_len))) ||
+      read_all(fd, exe, hdr->exe_len) < 0 ||
+      read_all(fd, cmdline, hdr->cmdline_len) < 0) {
+    free(regions); free(s2); free(chunks); free(fds); free(sigactions);
+    free(exe); free(cmdline);
+    errno = errno ? errno : ENOMEM;
+    return -1;
+  }
+  *exe_out = exe;
+  *cmdline_out = cmdline;
 
   *regions_out = regions;
   *s2_out = s2;

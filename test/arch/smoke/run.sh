@@ -189,6 +189,17 @@ else
     fail=1
 fi
 
+# identtest: /proc/self/{cmdline,comm,exe} describe the guest, not the nabi -
+# before and after a fork, which is where the checkpoint has to carry them.
+cp "$here/identtest" "$root/"; chmod +x "$root/identtest"
+out=$("$NABI" -m "$root" /identtest); rc=$?
+if [ "$rc" -eq 0 ] && [ "$out" = "ident ok" ]; then
+    echo "  ok  identtest -> \"$out\""
+else
+    echo "  FAIL identtest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 # mapstest: /proc/self/maps describes the guest, not the nabi running it.
 # Looks for a mapping the test made itself, so it cannot pass against the
 # host's map by accident.

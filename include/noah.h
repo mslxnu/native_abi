@@ -149,6 +149,20 @@ struct proc {
     khash_t(pfutex) *pfutex; /* TODO: modify khash and make this field being non-pointer */
   };
   struct fileinfo fileinfo;
+
+  /*
+   * What the guest is running, as /proc has to report it.
+   *
+   * Kept rather than re-derived because only NABI knows it: from outside, this
+   * process is a `nabi`, and its own argv and executable are the emulator's.
+   * Travels in the checkpoint, since arm64's fork is fork + exec and a child is
+   * a fresh nabi that never saw the original execve. See src/fs/procfs.c.
+   */
+  struct {
+    char  *exe;          /* guest path of the running binary */
+    char  *cmdline;      /* argv flattened, each entry NUL-terminated */
+    size_t cmdline_len;
+  } ident;
 };
 
 extern struct proc proc;
@@ -165,6 +179,8 @@ noreturn void task_stop_self(void);
 void init_fileinfo(int rootfd);
 void init_host_passthrough(void);
 int procfs_open(const char *path, int *out_fd);
+int procfs_readlink(const char *path, char *buf, size_t bufsize);
+void proc_set_ident(const char *exe, int argc, char *argv[]);
 
 void init_fpu(void);
 
