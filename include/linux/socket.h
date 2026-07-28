@@ -43,6 +43,11 @@
  */
 
 #define	LINUX_SOL_SOCKET	1
+
+/* setsockopt levels that are protocol numbers rather than SOL_* names; Linux
+ * and Darwin agree on these, but the option names underneath them do not. */
+#define	LINUX_IPPROTO_IP	0
+#define	LINUX_IPPROTO_IPV6	41
 #define	LINUX_SOL_IP		0
 #define	LINUX_SOL_IPX		256
 #define	LINUX_SOL_AX25		257

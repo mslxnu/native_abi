@@ -155,10 +155,42 @@ for l in bin sbin lib lib64; do
 done
 [ -e "$ROOT/lib64" ] || ln -s usr/lib "$ROOT/lib64" 2>/dev/null || true
 
+# The three files that decide whether the guest can reach the network at all.
+# Each is normally written by a maintainer script or by the installer, so none
+# of them arrives with the packages, and without them apt has no repository to
+# install from, glibc has no resolver configuration, and NSS does not know to
+# consult DNS - which presents as "Temporary failure in name resolution" for
+# every hostname.
 cat > "$ROOT/etc/apt/sources.list" <<'EOS'
-# Offline by default: this rootfs was built from a netinst ISO, and nothing here
-# has been fetched from the network. Uncomment to point apt at a mirror.
-# deb http://deb.debian.org/debian trixie main
+deb http://deb.debian.org/debian trixie main
+deb http://deb.debian.org/debian trixie-updates main
+deb http://security.debian.org/debian-security trixie-security main
+EOS
+
+# Taken from the host, so the guest resolves the way the machine does rather
+# than against a hardcoded public resolver.
+if [ -s /etc/resolv.conf ]; then
+    grep -E '^(nameserver|search|domain|options)' /etc/resolv.conf \
+        > "$ROOT/etc/resolv.conf" 2>/dev/null || true
+fi
+[ -s "$ROOT/etc/resolv.conf" ] || printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' \
+    > "$ROOT/etc/resolv.conf"
+
+cat > "$ROOT/etc/nsswitch.conf" <<'EOS'
+passwd:         files
+group:          files
+shadow:         files
+gshadow:        files
+
+hosts:          files dns
+networks:       files
+
+protocols:      db files
+services:       db files
+ethers:         db files
+rpc:            db files
+
+netgroup:       nis
 EOS
 
 printf 'nabi\n' > "$ROOT/etc/hostname"

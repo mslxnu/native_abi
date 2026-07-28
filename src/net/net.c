@@ -200,6 +200,47 @@ to_host_sockopt_name(int name)
   }
 }
 
+/*
+ * Is an option NABI cannot translate safe to accept and ignore?
+ *
+ * The ones that matter here only ask to be *told* things, or tune queueing.
+ * IP_RECVERR asks for ICMP errors to be queued on a UDP socket; Darwin has no
+ * equivalent, and a caller without it falls back on timing out. Not having it
+ * is a worse experience, not a wrong one.
+ *
+ * Failing the call instead is what breaks. glibc's resolver sets IP_RECVERR on
+ * its UDP socket and, when that errors, closes the socket and gives up - so
+ * every lookup in the guest returns "Temporary failure in name resolution" and
+ * nothing that resolves a hostname works at all. That is one unimplemented
+ * option costing the guest all of DNS, and with it apt, wget and anything else
+ * that reaches the network by name.
+ *
+ * Reporting success for something not done is a lie worth telling only where
+ * the truth cannot be told and the difference is unobservable, so this is a
+ * list rather than a blanket default: an option that changes what the guest
+ * would *see* still has to fail honestly.
+ */
+static bool
+sockopt_is_advisory(int level, int name)
+{
+  switch (level) {
+  case LINUX_SOL_SOCKET:
+    switch (name) {
+    case 11:  /* SO_NO_CHECK - skip the UDP checksum */
+    case 12:  /* SO_PRIORITY - queueing hint         */
+    case 36:  /* SO_MARK     - firewall mark         */
+      return true;
+    }
+    return false;
+  case LINUX_IPPROTO_IP:
+    return name == 11;    /* IP_RECVERR   - queue ICMP errors  */
+  case LINUX_IPPROTO_IPV6:
+    return name == 25;    /* IPV6_RECVERR - the v6 counterpart */
+  default:
+    return false;
+  }
+}
+
 DEFINE_SYSCALL(setsockopt, int, fd, int, level, int, optname, gaddr_t, optval_ptr, uint, opt_len)
 {
   int r;
@@ -209,8 +250,13 @@ DEFINE_SYSCALL(setsockopt, int, fd, int, level, int, optname, gaddr_t, optval_pt
     r = -LINUX_EFAULT;
     goto out;
   }
+  int host_name = to_host_sockopt_name(optname);
+  if (host_name < 0 && sockopt_is_advisory(level, optname)) {
+    r = 0;              /* accepted and ignored - see sockopt_is_advisory */
+    goto out;
+  }
   // Darwin's optval is compatible with that of Linux
-  r = syswrap(setsockopt(fd, linux_to_darwin_sockopt_level(level), to_host_sockopt_name(optname), optval, opt_len));
+  r = syswrap(setsockopt(fd, linux_to_darwin_sockopt_level(level), host_name, optval, opt_len));
 out:
   free(optval);
   return r;
