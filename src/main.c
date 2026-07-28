@@ -73,6 +73,12 @@ main_loop(int return_on_sigret)
 
   struct vm_exit exit;
 
+  /* See the EXIT_MMU_FAULT case: a fault that keeps repeating at one address
+   * is resolving nothing, and spinning on it is worse than dying. */
+  gaddr_t last_fault_addr = ~(gaddr_t) 0;
+  int same_fault_count = 0;
+  enum { MAX_SAME_FAULTS = 16 };
+
   while (task_run(&exit) == 0) {
 
     /* dump_instr(); */
@@ -86,6 +92,9 @@ main_loop(int return_on_sigret)
      */
     if (task_should_stop())
       task_stop_self();
+
+    if (exit.kind != EXIT_MMU_FAULT)
+      same_fault_count = 0;      /* anything else happening is progress */
 
     switch (exit.kind) {
     case EXIT_SYSCALL: {
@@ -113,6 +122,45 @@ main_loop(int return_on_sigret)
           printk("page fault: caused by guest linear address 0x%llx\n",
                  exit.fault_addr);
           send_signal(getpid(), LINUX_SIGSEGV);
+          break;
+        }
+        /*
+         * addr_ok said the address is fine, so nothing was done about the
+         * fault - and re-entering the guest faults on the same instruction
+         * again. That is an infinite loop at full CPU with nothing printed:
+         * the worst failure mode there is, and how a dpkg install presented,
+         * as a parent blocked in wait4 on a child that would never exit.
+         *
+         * A repeat is not by itself wrong - a fault resolved elsewhere can be
+         * retried - so what is fatal is repeating at the *same* address with
+         * no other exit in between, which means nothing is being resolved.
+         */
+        if (exit.fault_addr == last_fault_addr) {
+          if (++same_fault_count >= MAX_SAME_FAULTS) {
+            printk("page fault: no progress at 0x%llx after %d attempts "
+                   "(access %d); killing the guest rather than spinning\n",
+                   exit.fault_addr, same_fault_count, exit.fault_access);
+            warnk("unresolvable page fault at 0x%llx\n", exit.fault_addr);
+            {
+              static const char *acc[] = { "?", "read", "write", "exec" };
+              struct mm_region *r = find_region(exit.fault_addr, proc.mm);
+              fprintf(stderr,
+                      "nabi: unresolvable page fault at 0x%llx on %s; "
+                      "region %s prot=%d flags=%#x base=0x%llx size=0x%llx "
+                      "esr=0x%llx\n",
+                      (unsigned long long) exit.fault_addr,
+                      acc[exit.fault_access <= 3 ? exit.fault_access : 0],
+                      r ? "found" : "MISSING", r ? r->prot : -1,
+                      r ? r->mm_flags : 0,
+                      (unsigned long long)(r ? r->gaddr : 0),
+                      (unsigned long long)(r ? r->size : 0),
+                      (unsigned long long) exit.raw_reason);
+            }
+            send_signal(getpid(), LINUX_SIGSEGV);
+          }
+        } else {
+          last_fault_addr = exit.fault_addr;
+          same_fault_count = 1;
         }
       }
       break;
