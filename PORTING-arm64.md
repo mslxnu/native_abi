@@ -841,6 +841,15 @@ install, so the builder places it directly, like `passwd` and `group`.
 Job control, pipelines, prompt rewriting on `cd`, and `apt`/`dpkg` queries all
 work from that shell.
 
+One trap when it is installed rather than run from the tree: `make install`
+lays down *two* files. `bin/nabi` is a perl wrapper for a different workflow —
+it provisions `~/.nabi/tree`, adopts a pre-rename one, and offers to make the
+executable setuid root — and its options are `--root`/`--strace`/`--output`. The
+executable that takes `-m` is `libexec/nabi`. Pointing a shell script at the
+wrapper gets `Unknown option: m` from `Getopt::Long`, one layer down from where
+it looks like it came. `nabi-shell.sh` searches both layouts and refuses a
+wrapper by name rather than calling it.
+
 `clock_nanosleep` had to be implemented to get there. Darwin has none, so it is
 `clock_gettime` plus `nanosleep`, and the absolute form is the one that matters:
 coreutils' `sleep` — and anything else on gnulib's `xnanosleep` — asks for
