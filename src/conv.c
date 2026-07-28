@@ -152,8 +152,11 @@ stat_darwin_to_linux(struct stat *stat, struct l_newstat *lstat)
   lstat->st_ino = stat->st_ino;
   lstat->st_mode = stat->st_mode;
   lstat->st_nlink = stat->st_nlink;
-  lstat->st_uid = stat->st_uid;
-  lstat->st_gid = stat->st_gid;
+  /* The account NABI runs as is the guest's root - see struct cred. Without
+   * this the guest is root but everything it owns reads back as uid 501, and
+   * anything that checks the two agree (sudo most loudly) refuses to run. */
+  lstat->st_uid = host_uid_to_guest(stat->st_uid);
+  lstat->st_gid = host_gid_to_guest(stat->st_gid);
   lstat->st_rdev = stat->st_rdev;
   lstat->st_size = stat->st_size;
   lstat->st_atim.tv_sec = stat->st_atimespec.tv_sec;

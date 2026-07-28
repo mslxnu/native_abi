@@ -118,88 +118,78 @@ DEFINE_SYSCALL(getuid)
   return ret;
 }
 
+uid_t nabi_host_uid;
+gid_t nabi_host_gid;
+
+/*
+ * The account NABI runs as is the guest's root; anything else keeps the id it
+ * really has. One mapping applied both ways, so a file the guest chowns to root
+ * lands on the account that can actually own it and reads back as root.
+ */
+l_uid_t host_uid_to_guest(uid_t u) { return u == nabi_host_uid ? 0 : (l_uid_t) u; }
+l_gid_t host_gid_to_guest(gid_t g) { return g == nabi_host_gid ? 0 : (l_gid_t) g; }
+uid_t   guest_uid_to_host(l_uid_t u) { return u == 0 ? nabi_host_uid : (uid_t) u; }
+gid_t   guest_gid_to_host(l_gid_t g) { return g == 0 ? nabi_host_gid : (gid_t) g; }
+
 DEFINE_SYSCALL(getgid)
 {
-  return syswrap(getgid());
+  pthread_rwlock_rdlock(&proc.cred.lock);
+  int ret = proc.cred.gid;
+  pthread_rwlock_unlock(&proc.cred.lock);
+  return ret;
 }
 
-static inline int
-darwin_getsuid()
+/*
+ * Changing the guest's credentials, in software.
+ *
+ * Linux lets an unprivileged caller set each of the three only to one it
+ * already holds; root may set any. That rule is enforced here and nowhere else,
+ * because the host process keeps the account it started with whatever the guest
+ * believes. A guest dropping to a service account and back is bookkeeping.
+ *
+ * Which is exactly what makes it work: apt drops to _apt to check a signature
+ * and then reads a file it wrote as root, and both happen as the one account
+ * that owns them. The old model tried to mirror each change onto the host with
+ * setruid/seteuid, which needs to be setuid root to work at all, and panicked
+ * outright on the transitions Darwin cannot express.
+ */
+static bool
+may_become(l_uid_t want)
 {
-  struct kinfo_proc kinfo;
-  size_t len = sizeof kinfo;
-  int name[] = {CTL_KERN, KERN_PROC, KERN_PROC_PID, getpid()};
-  int ret  = sysctl(name, 4, &kinfo, &len, NULL, 0);
-  if (ret < 0) {
-    return ret;
-  }
-  return kinfo.kp_eproc.e_pcred.p_svuid;
+  return want == (l_uid_t) -1 || proc.cred.euid == 0 ||
+         want == proc.cred.uid || want == proc.cred.euid ||
+         want == proc.cred.suid;
 }
 
-static inline bool
-can_setresxid(l_uid_t id)
+static bool
+may_become_gid(l_gid_t want)
 {
-  return proc.cred.euid == 0 || proc.cred.euid == id || proc.cred.uid == id || proc.cred.suid == id;
+  return want == (l_gid_t) -1 || proc.cred.euid == 0 ||
+         want == proc.cred.gid || want == proc.cred.egid ||
+         want == proc.cred.sgid;
 }
 
 int
 do_setresuid(l_uid_t ruid, l_uid_t euid, l_uid_t suid)
 {
-  if (ruid != (l_uid_t) -1) {
-    if (!can_setresxid(ruid)) {
-      return -LINUX_EPERM;
-    }
-    if (ruid != 0 && proc.cred.euid != 0) {
-      // The app is setting ruid to NON-root while euid is also NON-root.
-      // To keep saved set-user-ID as 0, we have to set euid to 0 once due to bahavior of Darwin's setruid and setreuid.
-      // To implement it, we need some kind of global lock for security. We haven't implemented that and just panic now.
-      panic("NABI cannot setruid to non-root while euid is non-root currently");
-
-      /* Implementation would be like this...
-       acquire_global_lock_to_stop_other_threads();
-       if (syswrap(seteuid(0)) < 0) {
-       goto cred_management_err;
-       }
-       ret = syswrap(setruid(new_ruid));
-       seteuid(previous_euid);
-       unlock_it();
-       */
-    }
-    proc.cred.uid = ruid;
-    if (syswrap(setruid(ruid)) < 0) {
-      goto cred_management_err;
-    }
-  }
-  if (euid != (l_uid_t) -1) {
-    if (!can_setresxid(euid)) {
-      return -LINUX_EPERM;
-    }
-    if (proc.cred.euid != 0 && euid != proc.cred.uid && proc.cred.suid != 0) {
-      assert(euid == proc.cred.suid);
-      // The app is getting back from NON-root euid to NON-root saved user ID.
-      // We have to get root privilege once for it.
-      // To implement it, we need some kind of global lock for security. We haven't implement that and just panic now.
-      panic("NABI cannot setuid from non-root euid to non-root saved set-user-ID currently");
-    }
-    proc.cred.euid = euid;
-    if (syswrap(seteuid(euid)) < 0) {
-      goto cred_management_err;
-    }
-  }
-  if (suid != (l_uid_t) -1) {
-    if (!can_setresxid(suid)) {
-      return -LINUX_EPERM;
-    }
-    proc.cred.suid = suid;
-  }
-  
+  if (!may_become(ruid) || !may_become(euid) || !may_become(suid))
+    return -LINUX_EPERM;
+  if (ruid != (l_uid_t) -1) proc.cred.uid  = ruid;
+  if (euid != (l_uid_t) -1) proc.cred.euid = euid;
+  if (suid != (l_uid_t) -1) proc.cred.suid = suid;
   return 0;
-  
-cred_management_err:
-  panic("Cannot setresuid [%d, %d, %d] -> [%d, %d, %d]. Credential management bug of NABI. Host cred is [%d, %d, %d]",
-          proc.cred.uid, proc.cred.euid, proc.cred.suid, ruid, euid, suid, getuid(), geteuid(), darwin_getsuid());
 }
 
+static int
+do_setresgid(l_gid_t rgid, l_gid_t egid, l_gid_t sgid)
+{
+  if (!may_become_gid(rgid) || !may_become_gid(egid) || !may_become_gid(sgid))
+    return -LINUX_EPERM;
+  if (rgid != (l_gid_t) -1) proc.cred.gid  = rgid;
+  if (egid != (l_gid_t) -1) proc.cred.egid = egid;
+  if (sgid != (l_gid_t) -1) proc.cred.sgid = sgid;
+  return 0;
+}
 
 DEFINE_SYSCALL(setresuid, l_uid_t, ruid, l_uid_t, euid, l_uid_t, suid)
 {
@@ -256,7 +246,11 @@ out:
 
 DEFINE_SYSCALL(setgid, l_gid_t, gid)
 {
-  return syswrap(setgid(gid));
+  pthread_rwlock_wrlock(&proc.cred.lock);
+  int ret = proc.cred.euid == 0 ? do_setresgid(gid, gid, gid)
+                                : do_setresgid(-1, gid, -1);
+  pthread_rwlock_unlock(&proc.cred.lock);
+  return ret;
 }
 
 DEFINE_SYSCALL(geteuid)
@@ -269,29 +263,40 @@ DEFINE_SYSCALL(geteuid)
 
 DEFINE_SYSCALL(getegid)
 {
-  return syswrap(getegid());
+  pthread_rwlock_rdlock(&proc.cred.lock);
+  int ret = proc.cred.egid;
+  pthread_rwlock_unlock(&proc.cred.lock);
+  return ret;
 }
 
 DEFINE_SYSCALL(setresgid, l_gid_t, rgid, l_gid_t, egid, l_gid_t, sgid)
 {
-  return syswrap(setregid(rgid, egid));
+  pthread_rwlock_wrlock(&proc.cred.lock);
+  int ret = do_setresgid(rgid, egid, sgid);
+  pthread_rwlock_unlock(&proc.cred.lock);
+  return ret;
 }
 
 DEFINE_SYSCALL(getresgid, gaddr_t, rgid, gaddr_t, egid, gaddr_t, sgid)
 {
   int n;
-  n = getgid();
+  pthread_rwlock_rdlock(&proc.cred.lock);
+  n = proc.cred.gid;
   if (copy_to_user(rgid, &n, sizeof n)) {
+    pthread_rwlock_unlock(&proc.cred.lock);
     return -LINUX_EFAULT;
   }
-  n = getegid();
+  n = proc.cred.egid;
   if (copy_to_user(egid, &n, sizeof n)) {
+    pthread_rwlock_unlock(&proc.cred.lock);
     return -LINUX_EFAULT;
   }
-  n = getgid();
+  n = proc.cred.sgid;
   if (copy_to_user(sgid, &n, sizeof n)) {
+    pthread_rwlock_unlock(&proc.cred.lock);
     return -LINUX_EFAULT;
   }
+  pthread_rwlock_unlock(&proc.cred.lock);
   return 0;
 }
 
@@ -325,32 +330,56 @@ DEFINE_SYSCALL(getsid, l_pid_t, pid)
   return syswrap(getsid(pid));
 }
 
+/*
+ * The supplementary groups, like the rest of the guest's credentials, are the
+ * guest's own rather than the host's.
+ *
+ * The host list is the account NABI runs as and says nothing about the guest -
+ * it was leaking macOS's staff/admin/_lpoperator into a Debian process's id
+ * output. And setgroups is a privileged call on Darwin, so passing it on failed
+ * with EPERM: apt's sandbox drops its groups before fetching, took the error as
+ * fatal, and killed its own http method. The guest is root here, so the answer
+ * to "may I set my groups" is yes.
+ */
+static l_gid_t guest_groups[LINUX_NGROUPS_MAX];
+static int nr_guest_groups;
+
 DEFINE_SYSCALL(getgroups, int, gidsetsize, gaddr_t, grouplist_ptr)
 {
-  gid_t *gl = malloc(gidsetsize * sizeof(gid_t));
-  int r = syswrap(getgroups(gidsetsize, gidsetsize == 0 ? NULL : gl));
-  if (r < 0) {
-    goto out;
+  pthread_rwlock_rdlock(&proc.cred.lock);
+  int n = nr_guest_groups;
+  if (gidsetsize == 0) {
+    pthread_rwlock_unlock(&proc.cred.lock);
+    return n;                       /* asking how many, not for the list */
   }
-  if (copy_to_user(grouplist_ptr, gl, gidsetsize * sizeof(gid_t))) {
+  if (gidsetsize < n) {
+    pthread_rwlock_unlock(&proc.cred.lock);
+    return -LINUX_EINVAL;
+  }
+  int r = n;
+  if (n > 0 && copy_to_user(grouplist_ptr, guest_groups, n * sizeof guest_groups[0]))
     r = -LINUX_EFAULT;
-  }
-out:
-  free(gl);
+  pthread_rwlock_unlock(&proc.cred.lock);
   return r;
 }
 
 DEFINE_SYSCALL(setgroups, int, gidsetsize, gaddr_t, grouplist_ptr)
 {
-  int r;
-  gid_t *gl = malloc(gidsetsize * sizeof(gid_t));
-  if (copy_from_user(gl, grouplist_ptr, gidsetsize * sizeof(gid_t))) {
+  if (gidsetsize < 0 || gidsetsize > LINUX_NGROUPS_MAX)
+    return -LINUX_EINVAL;
+
+  pthread_rwlock_wrlock(&proc.cred.lock);
+  int r = 0;
+  if (proc.cred.euid != 0) {
+    r = -LINUX_EPERM;
+  } else if (gidsetsize > 0 &&
+             copy_from_user(guest_groups, grouplist_ptr,
+                            gidsetsize * sizeof guest_groups[0])) {
     r = -LINUX_EFAULT;
-    goto out;
+  } else {
+    nr_guest_groups = gidsetsize;
   }
-  r = syswrap(setgroups(gidsetsize, gl));
-out:
-  free(gl);
+  pthread_rwlock_unlock(&proc.cred.lock);
   return r;
 }
 

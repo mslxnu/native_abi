@@ -504,10 +504,34 @@ darwinfs_fstat(struct file *file, struct l_newstat *l_st)
   return ret;
 }
 
+/*
+ * Turn a chown the guest asked for into one the host can perform.
+ *
+ * Every file the guest can see is really owned by the one account NABI runs as,
+ * so there is no ownership to change: the guest's uids are names for a thing
+ * the host filesystem does not have. Accepting and doing nothing is the honest
+ * end of that - Darwin reserves chown for the superuser, so passing it on fails
+ * with EPERM, and both dpkg and apt treat that as a broken unpack rather than a
+ * missing capability. dpkg chowns nearly everything to root:root, apt chowns
+ * its partial downloads to _apt.
+ *
+ * What is lost is that ownership does not persist: chown to _apt then stat
+ * reads back root. Nothing in a single-account world could make it read back
+ * otherwise, and a guest that is root is entitled to be told its chown worked.
+ */
+static bool
+chown_is_noop(l_uid_t uid, l_gid_t gid)
+{
+  (void) uid; (void) gid;
+  return true;
+}
+
 int
 darwinfs_fchown(struct file *file, l_uid_t uid, l_gid_t gid)
 {
-  return syswrap(fchown(file->fd, uid, gid));
+  if (chown_is_noop(uid, gid))
+    return 0;
+  return syswrap(fchown(file->fd, guest_uid_to_host(uid), guest_gid_to_host(gid)));
 }
 
 int
@@ -1026,8 +1050,11 @@ darwinfs_statfs(struct fs *fs, struct dir *dir, const char *path, struct l_statf
 int
 darwinfs_fchownat(struct fs *fs, struct dir *dir, const char *path, l_uid_t uid, l_gid_t gid, int l_flags)
 {
+  if (chown_is_noop(uid, gid))
+    return 0;
   int flags = linux_to_darwin_at_flags(l_flags);
-  return syswrap(fchownat(dir->fd, path, uid, gid, flags));
+  return syswrap(fchownat(dir->fd, path, guest_uid_to_host(uid),
+                          guest_gid_to_host(gid), flags));
 }
 
 int
@@ -1532,8 +1559,8 @@ DEFINE_SYSCALL(statx, int, dirfd, gstr_t, path_ptr, int, flags, unsigned int, ma
   stx.stx_mask       = LINUX_STATX_BASIC_STATS;
   stx.stx_blksize    = st.st_blksize;
   stx.stx_nlink      = st.st_nlink;
-  stx.stx_uid        = st.st_uid;
-  stx.stx_gid        = st.st_gid;
+  stx.stx_uid        = host_uid_to_guest(st.st_uid);
+  stx.stx_gid        = host_gid_to_guest(st.st_gid);
   stx.stx_mode       = st.st_mode;
   stx.stx_ino        = st.st_ino;
   stx.stx_size       = st.st_size;

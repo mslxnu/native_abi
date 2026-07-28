@@ -192,11 +192,14 @@ init_first_proc(const char *root)
   close(rootfd);
   proc.pfutex = kh_init(pfutex);
   pthread_mutex_init(&proc.futex_mutex, NULL);
+  /* The account NABI runs as is the one the guest sees as root; remember it so
+   * ids can be mapped both ways, and start the guest as root. */
+  nabi_host_uid = getuid();
+  nabi_host_gid = getgid();
   proc.cred = (struct cred) {
     .lock = PTHREAD_RWLOCK_INITIALIZER,
-    .uid = getuid(),
-    .euid = geteuid(),
-    .suid = geteuid(),
+    .uid = 0, .euid = 0, .suid = 0,
+    .gid = 0, .egid = 0, .sgid = 0,
   };
 
   task.tid = getpid();

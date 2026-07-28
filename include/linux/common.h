@@ -102,6 +102,9 @@ typedef l_long		l_clock_t;
 typedef l_int		l_daddr_t;
 typedef l_ulong		l_dev_t;
 typedef l_uint		l_gid_t;
+
+/* Linux caps a process at this many supplementary groups. */
+#define LINUX_NGROUPS_MAX	1024
 typedef l_uint		l_uid_t;
 typedef l_ulong		l_ino_t;
 typedef l_int		l_key_t;

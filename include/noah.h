@@ -116,12 +116,44 @@ struct fileinfo {
 
 // We manage uid and suid independently on Darwin since we cannot change those of Darwin's freely.
 // Wa always hold 0 in Darwin's suid to emulate Linux suid behavior (Note: in the case where Noah has setuid bit).
+/*
+ * The guest's credentials, which are emulated rather than the host's.
+ *
+ * NABI runs as an ordinary account and owns the rootfs it serves. A distro
+ * image, though, expects to be root: apt writes /var/lib/dpkg, dpkg chowns what
+ * it unpacks, and sudo refuses to run unless the world is root-owned. Trying to
+ * make Darwin agree - the old model, which called setruid/seteuid to mirror
+ * every guest change onto the host process - cannot work without being setuid
+ * root, and the paths it could not express were outright panics.
+ *
+ * So the guest is root and nothing here touches the host process. The account
+ * NABI runs as maps to uid 0 and back, exactly as a rootless container maps a
+ * single host id into the guest's root; every file access still happens as the
+ * real account, which owns everything it needs to.
+ *
+ * What this does not do is grant privilege. A guest that becomes root can write
+ * its own rootfs because the account behind it always could. It cannot touch
+ * anything on the host that the account could not, and the kernel is the only
+ * thing enforcing that - which is the correct place for it, and unchanged.
+ */
 struct cred {
   pthread_rwlock_t lock;
   l_uid_t uid;
   l_uid_t euid;
   l_uid_t suid;
+  l_gid_t gid;
+  l_gid_t egid;
+  l_gid_t sgid;
 };
+
+/* The host account the guest sees as root, and the mapping in both directions.
+ * Anything that is not that account keeps the id it really has. */
+extern uid_t nabi_host_uid;
+extern gid_t nabi_host_gid;
+l_uid_t host_uid_to_guest(uid_t u);
+l_gid_t host_gid_to_guest(gid_t g);
+uid_t   guest_uid_to_host(l_uid_t u);
+gid_t   guest_gid_to_host(l_gid_t g);
 
 /* for private futex */
 struct pfutex_entry {
