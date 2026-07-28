@@ -164,6 +164,7 @@ bool task_should_stop(void);
 noreturn void task_stop_self(void);
 void init_fileinfo(int rootfd);
 void init_host_passthrough(void);
+int procfs_open(const char *path, int *out_fd);
 
 void init_fpu(void);
 

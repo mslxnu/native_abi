@@ -1324,7 +1324,10 @@ user_openat(int atdirfd, const char *name, int flags, int mode)
 {
   int fd;
   pthread_rwlock_wrlock(&proc.fileinfo.fdtable_lock);
-  fd = do_openat(atdirfd, name, flags, mode);
+  /* A few /proc files describe the guest rather than the nabi running it, and
+   * only NABI can answer those. Anything else falls through to the host's. */
+  if (procfs_open(name, &fd) < 0)
+    fd = do_openat(atdirfd, name, flags, mode);
   if (fd < 0) {
     goto out;
   }

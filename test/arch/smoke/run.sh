@@ -189,6 +189,18 @@ else
     fail=1
 fi
 
+# mapstest: /proc/self/maps describes the guest, not the nabi running it.
+# Looks for a mapping the test made itself, so it cannot pass against the
+# host's map by accident.
+cp "$here/mapstest" "$root/"; chmod +x "$root/mapstest"
+out=$("$NABI" -m "$root" /mapstest); rc=$?
+if [ "$rc" -eq 0 ] && { [ "$out" = "maps ok" ] || [ "$out" = "maps skipped" ]; }; then
+    echo "  ok  mapstest -> \"$out\""
+else
+    echo "  FAIL mapstest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 # procfstest: a mounted pseudo-filesystem is passed through, and survives a
 # fork - which on arm64 is fork + exec, so the child has to re-probe the host
 # for itself. Skips when nothing is mounted at /proc.

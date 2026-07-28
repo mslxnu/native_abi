@@ -64,6 +64,8 @@ guest-code cache sync.
   fault on its own data. Needs `/bigmapfile`, which `run.sh` creates shorter than
   the mapping so the tail also checks that past-EOF pages read as zero.
 
+- `mapstest` — `/proc/self/maps` describes the guest rather than the `nabi`
+  running it, before and after a fork. Looks for a mapping the test made itself.
 - `procfstest` — a mounted pseudo-filesystem is visible and stays visible across
   a fork. Skips when nothing is mounted at `/proc`, since it is about NABI
   passing one through rather than about mSL/ProcFS.

@@ -869,6 +869,47 @@ while adding a second command makes it fork first and the identical read fails.
 `test/arch/smoke/procfstest.c` covers exactly that, and skips when the host has
 nothing mounted.
 
+### 3.7.3 Talking to mSL/ProcFS
+
+Passing `/proc` through (§3.7.2) gets the guest a real procfs, and the identity
+is right: a guest process *is* a host process and its pid is the host's, so
+`/proc/self` resolves to the correct process and `ps` and `free` work. What XNU
+cannot know is what that process is *running*. From the outside it is a `nabi`
+executing a guest, so every per-process file describes the emulator.
+
+`/proc/self/maps` is the sharp end. It came back as NABI's own host address
+space — not a distorted view of the guest's, a different address space
+entirely — so anything reading it to find where the guest's code or heap live
+was comprehensively misled. NABI has that map in `proc.mm`, so `src/fs/procfs.c`
+overlays the file: `user_openat` checks a small set of paths first and, for
+those, serves generated content from an unlinked temp file. A temp file rather
+than a pipe keeps the descriptor an ordinary one — seekable, `stat`-able,
+readable more than once — and the snapshot-at-open behaviour is what procfs does
+with these files anyway.
+
+Two things are deliberately left out, both for the same reason.
+
+**Paths in `maps`.** `mm_region` records the guest fd a mapping was made from,
+but the guest closes that descriptor as soon as `ld.so` has mapped a segment and
+the number is promptly reused, so asking the host what it names answers for
+whatever holds it *now* — which is how every library in a shell's map first came
+out as `/dev/urandom`. A wrong path is worse than an absent one: a reader can
+see that nothing is claimed, but not that something claimed is a lie. Naming
+them means the region remembering its own file at mmap time, which is a new
+field in `mm_region` and so a change to the checkpoint wire format.
+
+**`cmdline`, `exe`, `comm`.** Same obstacle — they need the guest's argv and
+binary path kept across a fork that is fork + `exec`. Until then they are the
+emulator's, and `cmdline` leaks `--resume 5 6 …`.
+
+Beyond that is the other half of the problem, which is not NABI's to solve
+alone: **host** tools still see a `nabi`. Making `ps` on macOS show the guest
+needs ProcFS itself to know about guests. Its control protocol
+(`procfs_ctl.h` — a `PF_SYSTEM` kernel control with a `procfsd` daemon) is a
+request/reply channel for the kext to *pull* host data it cannot reach; there is
+no request type for a process to describe a guest it is running, and adding one
+is a change to that module rather than this one.
+
 ### 3.7.1 An interactive shell
 
 `util/nabi-shell.sh <rootfs>` drops into a login shell in the guest — `make
