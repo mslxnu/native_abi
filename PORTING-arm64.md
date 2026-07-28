@@ -845,6 +845,31 @@ line drawn here is **what a rootfs cannot hold**:
   rootfs has a legitimate claim on those. `/home` in particular must stay the
   rootfs's own or the guest shell reads the host's dotfiles (§3.7.1).
 
+None of this is required. Everything the sibling modules provide is optional by
+construction: the probe simply finds nothing, the paths resolve in the rootfs as
+they always did, and `/proc/self/{maps,cmdline,comm,exe}` still answer, because
+NABI generates those from its own state and never needed a procfs to do it.
+(ktemkin's x86 fork emulates `/proc/self/exe` the same way, with no procfs at
+all.) What is lost without them is exactly what they were providing — a real
+`/proc` for other processes, and `/boot`.
+
+Two things make that testable rather than merely asserted:
+
+- `NABI_IGNORE_HOST_FS` pretends they are not installed. On a machine that has
+  them there is otherwise no way to run the other path, and the smoke tests use
+  it to check both halves: the passthrough goes away, and the files NABI answers
+  from its own state do not.
+- `report_host_passthrough()` writes what the probe decided to the warning log
+  (`-w`), so which modules a run picked up is a question the log answers:
+
+      host filesystem: /proc passed through
+      host filesystem: /sys not provided by the host
+      host filesystem: /boot passed through
+
+  Reporting is separate from probing because the probe must run before any path
+  is resolved, which is before the debug sinks exist — anything it logged there
+  would go nowhere.
+
 *Mounted*, rather than merely existing, is the test for the first group: FHS
 creates those as empty directories at boot whether or not the module that fills
 them is installed, and an empty `/proc` passed through would mask the rootfs's

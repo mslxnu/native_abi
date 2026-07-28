@@ -383,6 +383,9 @@ main(int argc, char *argv[], char **envp)
     }
   }
 
+  /* Now that the sinks exist, say which sibling modules this run picked up. */
+  report_host_passthrough();
+
   int err;
   if ((err = do_exec(argv[0], argc, argv, envp)) < 0) {
     errno = linux_to_darwin_errno(-err);

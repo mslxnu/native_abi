@@ -224,6 +224,26 @@ else
     fail=1
 fi
 
+# The same three again with the sibling modules pretended absent. NABI has to
+# work without mSL/FHS and mSL/ProcFS, and on a machine that has them that is
+# otherwise a claim with nothing exercising it. What must hold: the passthrough
+# goes away, and the files NABI answers from its own state do not.
+for t in procfstest mapstest identtest; do
+    out=$(NABI_IGNORE_HOST_FS=1 "$NABI" -m "$root" /$t); rc=$?
+    case "$t:$out" in
+        procfstest:"procfs skipped") ok=yes ;;
+        mapstest:"maps ok")          ok=yes ;;
+        identtest:"ident ok")        ok=yes ;;
+        *)                           ok=no  ;;
+    esac
+    if [ "$rc" -eq 0 ] && [ "$ok" = yes ]; then
+        echo "  ok  $t (no host fs) -> \"$out\""
+    else
+        echo "  FAIL $t (no host fs) -> \"$out\", exit $rc"
+        fail=1
+    fi
+done
+
 # hvctest: no value in x0 may stop a syscall from reaching the host. The EL1
 # trampoline preserves the guest's registers, so x0 is live when its `hvc`
 # runs, and Apple's hypervisor answers SMCCC-shaped function IDs itself unless

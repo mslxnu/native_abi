@@ -1110,6 +1110,7 @@ static const struct {
 };
 #define NR_OPTIONAL (sizeof optional_passthrough / sizeof optional_passthrough[0])
 static bool optional_live[NR_OPTIONAL];
+static bool passthrough_ignored;
 
 /*
  * Probed rather than inherited, so it has to run on *both* ways into a process:
@@ -1125,9 +1126,21 @@ static bool optional_live[NR_OPTIONAL];
 void
 init_host_passthrough(void)
 {
+  /*
+   * NABI_IGNORE_HOST_FS pretends the sibling modules are not installed.
+   *
+   * Everything here is optional by construction, but on a machine that has FHS
+   * and ProcFS there is otherwise no way to exercise the path where it does
+   * not - and "degrades gracefully" is a claim worth being able to run rather
+   * than assert. The smoke tests use it for exactly that.
+   */
+  bool ignore = getenv("NABI_IGNORE_HOST_FS") != NULL;
+
   for (size_t i = 0; i < NR_OPTIONAL; i++) {
     const char *path = optional_passthrough[i].path;
-    if (optional_passthrough[i].needs_mount) {
+    if (ignore) {
+      optional_live[i] = false;
+    } else if (optional_passthrough[i].needs_mount) {
       struct statfs sfs;
       /* f_mntonname naming the path itself is what distinguishes a mount point
        * from a directory that merely exists on the parent's filesystem. */
@@ -1138,6 +1151,26 @@ init_host_passthrough(void)
       optional_live[i] = stat(path, &st) == 0 && S_ISDIR(st.st_mode);
     }
   }
+  passthrough_ignored = ignore;
+}
+
+/*
+ * Say what the probe decided.
+ *
+ * Separate from the probe itself because that has to run before any path is
+ * resolved, which is before the debug sinks exist - anything it logged would go
+ * nowhere. Called once main has opened them. A resumed child does not report:
+ * it parses no options, has no sinks, and its answer is the parent's anyway.
+ */
+void
+report_host_passthrough(void)
+{
+  for (size_t i = 0; i < NR_OPTIONAL; i++)
+    warnk("host filesystem: %s %s\n", optional_passthrough[i].path,
+          optional_live[i] ? "passed through"
+                           : (passthrough_ignored
+                                ? "ignored (NABI_IGNORE_HOST_FS)"
+                                : "not provided by the host"));
 }
 
 static bool

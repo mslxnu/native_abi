@@ -28,6 +28,8 @@ set -eu
 me=$(basename "$0")
 ROOT=${1:?usage: ${0##*/} <rootfs> [command ...]}
 shift
+# Kept before the positional parameters get reused to build the environment.
+if [ "$#" -gt 0 ]; then CMD=yes; ARGS="$*"; else CMD=no; ARGS=; fi
 
 [ -d "$ROOT" ] || { echo "no such rootfs: $ROOT" >&2; exit 1; }
 
@@ -75,14 +77,23 @@ home=$(awk -F: -v u="$user" '$1 == u { print $6 }' "$ROOT/etc/passwd" 2>/dev/nul
 
 PATH_G=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
-if [ "$#" -gt 0 ]; then
-    exec env -i \
-        TERM="${TERM:-xterm}" HOME="$home" USER="$user" LOGNAME="$user" \
-        SHELL=/bin/bash PATH="$PATH_G" \
-        "$NABI" -m "$ROOT" /bin/bash -lc "cd \"\$HOME\" 2>/dev/null; $*"
+# The clean environment, built up as positional parameters so that a value
+# containing a space survives.
+set -- env -i \
+    TERM="${TERM:-xterm}" HOME="$home" USER="$user" LOGNAME="$user" \
+    SHELL=/bin/bash PATH="$PATH_G"
+
+# NABI_* settings are carried across the `env -i`, which would otherwise drop
+# them - they configure the emulator rather than the guest, and a knob that
+# silently does nothing when used through this script is worse than no knob.
+for v in $(env | sed -n 's/^\(NABI_[A-Za-z0-9_]*\)=.*/\1/p'); do
+    eval "set -- \"\$@\" \"$v=\${$v}\""
+done
+
+set -- "$@" "$NABI" -m "$ROOT" /bin/bash -lc
+
+if [ "$#" -gt 0 ] && [ -n "${1:-}" ] && [ "$CMD" = yes ]; then
+    exec "$@" "cd \"\$HOME\" 2>/dev/null; $ARGS"
 fi
 
-exec env -i \
-    TERM="${TERM:-xterm}" HOME="$home" USER="$user" LOGNAME="$user" \
-    SHELL=/bin/bash PATH="$PATH_G" \
-    "$NABI" -m "$ROOT" /bin/bash -lc 'cd "$HOME" 2>/dev/null; exec bash -i'
+exec "$@" 'cd "$HOME" 2>/dev/null; exec bash -i'
