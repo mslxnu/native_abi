@@ -649,6 +649,16 @@ pt_protect(gaddr_t va, size_t size, int prot)
  * page, still record which IPA it was given. That is enough to re-establish
  * stage 2 over the freshly re-mapped file.
  */
+/* The raw level-3 descriptor for `va`, or 0 if the walk does not reach one.
+ * pt_ipa_of only says a descriptor is valid; a fault can equally be the access
+ * flag or the permission bits, which are visible only in the whole word. */
+uint64_t
+pt_pte_of(gaddr_t va)
+{
+  uint64_t *pte = walk_existing(va);
+  return pte ? *pte : 0;
+}
+
 gaddr_t
 pt_ipa_of(gaddr_t va)
 {

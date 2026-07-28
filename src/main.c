@@ -24,6 +24,33 @@
 
 #include <mach-o/dyld.h>
 
+#if defined(__arm64__)
+#include "arm64/vm.h"
+uint64_t pt_pte_of(gaddr_t);
+/* Decode the stage-1 leaf for the address that just faulted, so a report says
+ * whether the descriptor is absent, unreadable at EL0, read-only, or simply
+ * missing its access flag - four different bugs that look identical from the
+ * outside. */
+static const char *
+pte_note_for(gaddr_t va)
+{
+  static char buf[128];
+  uint64_t pte = pt_pte_of(va & ~0xfffULL);
+  if (pte == 0)
+    return " pte=absent";
+  snprintf(buf, sizeof buf,
+           " pte=0x%llx [%s%s%s%s]", (unsigned long long) pte,
+           (pte & PTE_VALID)     ? "valid "  : "INVALID ",
+           (pte & PTE_AF)        ? "af "     : "NO-AF ",
+           (pte & PTE_AP_RW_EL0) ? "el0 "    : "NO-EL0 ",
+           (pte & PTE_AP_RO)     ? "ro"      : "rw");
+  return buf;
+}
+#define pte_note() pte_note_for(exit.fault_addr)
+#else
+#define pte_note() ""
+#endif
+
 
 static int
 handle_syscall(void)
@@ -147,14 +174,14 @@ main_loop(int return_on_sigret)
               fprintf(stderr,
                       "nabi: unresolvable page fault at 0x%llx on %s; "
                       "region %s prot=%d flags=%#x base=0x%llx size=0x%llx "
-                      "esr=0x%llx\n",
+                      "esr=0x%llx%s\n",
                       (unsigned long long) exit.fault_addr,
                       acc[exit.fault_access <= 3 ? exit.fault_access : 0],
                       r ? "found" : "MISSING", r ? r->prot : -1,
                       r ? r->mm_flags : 0,
                       (unsigned long long)(r ? r->gaddr : 0),
                       (unsigned long long)(r ? r->size : 0),
-                      (unsigned long long) exit.raw_reason);
+                      (unsigned long long) exit.raw_reason, pte_note());
             }
             send_signal(getpid(), LINUX_SIGSEGV);
           }
