@@ -259,9 +259,15 @@ DEFINE_SYSCALL(mremap, gaddr_t, old_addr, size_t, old_size, size_t, new_size, in
   if (new_size == 0)
     return -LINUX_EINVAL;
 
-  /* Linux kernel also does these aligning */
-  old_size = roundup(old_size, PAGE_SIZEOF(PAGE_4KB));
-  new_size = roundup(new_size, PAGE_SIZEOF(PAGE_4KB));
+  /*
+   * Rounded to the guest's page granule, as the kernel rounds to its own -
+   * which on arm64 is the 16KiB stage-2 block, not 4KiB. Rounding to 4KiB here
+   * let a shrink hand vmm_munmap a size that is not a whole number of blocks,
+   * and the stage-2 layer cannot split one: it asserted, and took the guest
+   * down with it. dpkg's mremap on its unpack buffer is where that showed.
+   */
+  old_size = roundup(old_size, GUEST_MMAP_GRANULE);
+  new_size = roundup(new_size, GUEST_MMAP_GRANULE);
 
   gaddr_t ret = old_addr;
 

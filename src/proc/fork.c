@@ -57,6 +57,19 @@ init_task(unsigned long clone_flags, gaddr_t child_tid, gaddr_t tls)
   }
 }
 
+/*
+ * A fork that fails has to say so where it can be seen.
+ *
+ * warnk writes to the -w sink, and a resumed child has none: it is exec'd as
+ * `nabi --resume` and parses no options, so a handover that fails inside a
+ * child - which is most of them, once a guest is a few processes deep - reports
+ * nothing anywhere. The guest is left with a bare "Cannot fork" and no cause.
+ */
+#define FORKERR(fmt, ...) do {                                            \
+    warnk("fork: " fmt "\n", ##__VA_ARGS__);                              \
+    fprintf(stderr, "nabi: fork: " fmt "\n", ##__VA_ARGS__);              \
+  } while (0)
+
 #if defined(__arm64__)
 /*
  * fork by handing the guest to a fresh process.
@@ -80,8 +93,10 @@ clone_process_by_exec(unsigned long clone_flags, gaddr_t parent_tid,
 {
   char self[PATH_MAX];
   uint32_t selfsz = sizeof self;
-  if (_NSGetExecutablePath(self, &selfsz) != 0)
+  if (_NSGetExecutablePath(self, &selfsz) != 0) {
+    FORKERR("cannot find my own executable to re-exec");
     return -LINUX_ENOEXEC;
+  }
 
   /*
    * The checkpoint goes to a file rather than a pipe: the child does not read it
@@ -93,8 +108,10 @@ clone_process_by_exec(unsigned long clone_flags, gaddr_t parent_tid,
   snprintf(path, sizeof path, "%s/nabi-handover-XXXXXX",
            tmp && *tmp ? tmp : "/tmp");
   int ckpt_fd = mkstemp(path);
-  if (ckpt_fd < 0)
+  if (ckpt_fd < 0) {
+    FORKERR("no checkpoint file at %s: %s", path, strerror(errno));
     return -darwin_to_linux_errno(errno);
+  }
   unlink(path);
   fcntl(ckpt_fd, F_SETFD, 0);           /* must survive the exec */
 
@@ -110,6 +127,7 @@ clone_process_by_exec(unsigned long clone_flags, gaddr_t parent_tid,
   int snap_fd = arena_snapshot();
   if (snap_fd < 0 || checkpoint_write(ckpt_fd) < 0) {
     int e = errno;
+    FORKERR("%s failed: %s", snap_fd < 0 ? "arena snapshot" : "checkpoint write", strerror(e));
     close(ckpt_fd);
     if (snap_fd >= 0)
       close(snap_fd);
@@ -119,7 +137,9 @@ clone_process_by_exec(unsigned long clone_flags, gaddr_t parent_tid,
 
   int ret = syswrap(fork());
   if (ret < 0) {
+    FORKERR("%s", strerror(errno));
     close(ckpt_fd);
+    close(snap_fd);
     return ret;
   }
 
@@ -330,8 +350,28 @@ do_clone(unsigned long clone_flags, unsigned long newsp, gaddr_t parent_tid, gad
     int needed = LINUX_CLONE_VM | LINUX_CLONE_FS | LINUX_CLONE_FILES | LINUX_CLONE_SIGHAND | LINUX_CLONE_SYSVSEM;
     implemented |= needed;
   }
+  /*
+   * vfork is served by an ordinary fork.
+   *
+   * It asks for two things NABI cannot give: the child sharing the parent's
+   * address space, and the parent suspended until the child execs or exits.
+   * Sharing is out of reach because a child here is a separate process rebuilt
+   * from a checkpoint, and suspending the parent on *exec* has nothing to hang
+   * the resumption off. What a copy costs is only visible to a child that
+   * writes something the parent then reads, which vfork has never promised -
+   * POSIX makes it undefined - and which the callers that matter do not do:
+   * dash, and every shell like it, vforks only to exec or _exit immediately.
+   *
+   * Refusing it instead is what breaks. dash uses vfork for every command it
+   * runs, so `sh -c` inside a guest failed with "Cannot fork", and apt - which
+   * shells out for dpkg-preconfigure and the maintainer scripts - could not
+   * install anything. The flag went unimplemented because forktest and every
+   * other test forks the plain way.
+   */
+  if (clone_flags & LINUX_CLONE_VFORK)
+    implemented |= LINUX_CLONE_VFORK | LINUX_CLONE_VM;
   if ((clone_flags & ~implemented) || (clone_flags & needed) != needed) {
-    warnk("unsupported clone_flags: %lx\n", clone_flags);
+    FORKERR("unsupported clone_flags: %lx (implemented %lx)", clone_flags, implemented);
     return -LINUX_EINVAL;
   }
 
