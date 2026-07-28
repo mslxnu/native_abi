@@ -1059,45 +1059,84 @@ darwinfs_fchmodat(struct fs *fs, struct dir *dir, const char *path, l_mode_t mod
  */
 static const char *const host_passthrough[] = {
   "/Users", "/Volumes", "/dev", "/tmp", "/private",
+  /*
+   * The Data volume, because a passed-through path may be a host symlink and
+   * NABI resolves symlink targets in the *guest's* namespace. /tmp is already
+   * such a case - it is a symlink to /private/tmp, which is why /private is
+   * above - and mSL/FHS's root entries are all of this shape: /boot points at
+   * /System/Volumes/Data/boot, /home at .../home, and so on. Without the
+   * target's prefix listed too, following one lands inside the rootfs, where
+   * /System does not exist, and the lookup fails.
+   */
+  "/System/Volumes/Data",
 };
 
 /*
- * The pseudo-filesystems, which are passed through only if something has
- * actually mounted them.
+ * Host paths that are passed through only when the host actually provides them.
  *
- * These are the mount points mSL/FHS declares in /etc/synthetic.conf for its
- * sibling modules to mount on - /proc for mSL/ProcFS, /sys for mSL/SysFS - and
- * their contents are synthesised per-process by a real filesystem. That is
- * content a rootfs cannot hold: a directory of files describing the machine's
- * live state is not something that can be unpacked from a .deb. So when one is
- * mounted, the host's is the only true answer and the guest gets it.
+ * These are the directories mSL/FHS puts at the root, and they divide by what
+ * kind of thing they are:
  *
- * Being mounted is the test rather than merely existing, because FHS creates
- * these as empty directories at boot whether or not the module that fills them
- * is installed. An empty /proc passed through would mask the rootfs's own -
- * identical today, but it would be claiming to answer a question we cannot.
- * Checked once at startup: mounting procfs later needs a new nabi, which is the
- * honest behaviour for a decision made this early in path resolution.
+ *   /proc, /sys are mount points FHS declares in /etc/synthetic.conf for its
+ *     sibling modules to mount on. Their contents are synthesised per-process
+ *     by a real filesystem - a directory of files describing the machine's live
+ *     state is not something that can be unpacked from a .deb - so when one is
+ *     mounted, the host's is the only true answer. Being *mounted* is the test,
+ *     because FHS creates these as empty directories at boot whether or not the
+ *     module that fills them is installed, and an empty /proc passed through
+ *     would mask the rootfs's own while claiming to answer a question we
+ *     cannot.
  *
+ *   /boot is a real directory FHS owns on the writable Data volume, holding the
+ *     kernel, bootloader and kernel collections this machine actually boots. A
+ *     rootfs cannot know any of that: what a netinst ISO leaves in /boot is a
+ *     config file and a System.map for a kernel that is not running here. So
+ *     merely *existing* is the test - there is no filesystem to mount, and if
+ *     FHS is absent the guest keeps its own.
+ *
+ * What is deliberately not here is the rest of what FHS names - /home, /run,
+ * /root, /media, /mnt, /srv. Those are host directories that already have a
+ * macOS path, and a rootfs has its own legitimate claim on them; /home in
+ * particular must stay the rootfs's own, or the guest's shell reads the host's
+ * dotfiles and arrives wearing the host's prompt.
+ */
+static const struct {
+  const char *path;
+  bool needs_mount;        /* mounted, vs merely present */
+} optional_passthrough[] = {
+  { "/proc", true  },
+  { "/sys",  true  },
+  { "/boot", false },
+};
+#define NR_OPTIONAL (sizeof optional_passthrough / sizeof optional_passthrough[0])
+static bool optional_live[NR_OPTIONAL];
+
+/*
  * Probed rather than inherited, so it has to run on *both* ways into a process:
  * init_fileinfo for a fresh one, and resume_main for a child, since arm64's fork
  * is fork + exec and the child does not go through init_fileinfo at all. Miss
  * the second and the effect is a puzzle - `bash -c 'cat /proc/version'` works
  * because bash execs a lone command directly, while adding a second command
  * makes it fork first and the same read fails.
+ *
+ * Checked once at startup: mounting procfs later needs a new nabi, which is the
+ * honest behaviour for a decision made this early in path resolution.
  */
-static const char *const pseudo_fs[] = { "/proc", "/sys" };
-static bool pseudo_fs_live[sizeof pseudo_fs / sizeof pseudo_fs[0]];
-
 void
 init_host_passthrough(void)
 {
-  for (size_t i = 0; i < sizeof pseudo_fs / sizeof pseudo_fs[0]; i++) {
-    struct statfs sfs;
-    /* f_mntonname naming the path itself is what distinguishes a mount point
-     * from a directory that merely exists on the parent's filesystem. */
-    pseudo_fs_live[i] = statfs(pseudo_fs[i], &sfs) == 0 &&
-                        strcmp(sfs.f_mntonname, pseudo_fs[i]) == 0;
+  for (size_t i = 0; i < NR_OPTIONAL; i++) {
+    const char *path = optional_passthrough[i].path;
+    if (optional_passthrough[i].needs_mount) {
+      struct statfs sfs;
+      /* f_mntonname naming the path itself is what distinguishes a mount point
+       * from a directory that merely exists on the parent's filesystem. */
+      optional_live[i] = statfs(path, &sfs) == 0 &&
+                         strcmp(sfs.f_mntonname, path) == 0;
+    } else {
+      struct stat st;
+      optional_live[i] = stat(path, &st) == 0 && S_ISDIR(st.st_mode);
+    }
   }
 }
 
@@ -1115,8 +1154,8 @@ is_host_passthrough(const char *name)
     if (match_component(name, host_passthrough[i]))
       return true;
   }
-  for (size_t i = 0; i < sizeof pseudo_fs / sizeof pseudo_fs[0]; i++) {
-    if (pseudo_fs_live[i] && match_component(name, pseudo_fs[i]))
+  for (size_t i = 0; i < NR_OPTIONAL; i++) {
+    if (optional_live[i] && match_component(name, optional_passthrough[i].path))
       return true;
   }
   return false;

@@ -833,16 +833,32 @@ line drawn here is **what a rootfs cannot hold**:
   machine's live state cannot be unpacked from a `.deb`. When mSL/ProcFS is
   mounted, the host's `/proc` is the only true answer. With it, Debian's own
   `ps`, `free` and `/proc/self/*` work.
-- **Content under a Linux name is not.** `/home`, `/run`, `/root`, `/boot` and
-  the rest name host directories that already have a macOS path, and a rootfs
-  has a legitimate claim on those. `/home` in particular must stay the rootfs's
-  own or the guest shell reads the host's dotfiles (§3.7.1).
+- **`/boot` is, on the weaker test of merely existing.** It is a real directory
+  FHS owns on the writable Data volume, holding the kernel, bootloader and
+  kernel collections this machine actually boots — including a Linux `vmlinux`,
+  which is the case FHS built it for. A rootfs cannot know any of that: what a
+  netinst ISO leaves in `/boot` is a config file and a `System.map` for a kernel
+  that is not running here. There is no filesystem to mount, so existing is the
+  test, and where FHS is absent the guest keeps its own.
+- **The rest of what FHS names is not.** `/home`, `/run`, `/root`, `/media`,
+  `/mnt`, `/srv` name host directories that already have a macOS path, and a
+  rootfs has a legitimate claim on those. `/home` in particular must stay the
+  rootfs's own or the guest shell reads the host's dotfiles (§3.7.1).
 
-*Mounted*, rather than merely existing, is the test: FHS creates these as empty
-directories at boot whether or not the module that fills them is installed, and
-an empty `/proc` passed through would mask the rootfs's own — identical in
-effect today, but claiming to answer a question NABI cannot. `statfs`'s
-`f_mntonname` naming the path itself is what distinguishes the two.
+*Mounted*, rather than merely existing, is the test for the first group: FHS
+creates those as empty directories at boot whether or not the module that fills
+them is installed, and an empty `/proc` passed through would mask the rootfs's
+own — identical in effect today, but claiming to answer a question NABI cannot.
+`statfs`'s `f_mntonname` naming the path itself is what distinguishes the two.
+
+`/System/Volumes/Data` had to join the unconditional list for `/boot` to work at
+all. NABI resolves symlink targets in the *guest's* namespace, and FHS's root
+entries are all symlinks onto the Data volume — `/boot` is
+`/System/Volumes/Data/boot`. Following one without its target prefix listed
+lands inside the rootfs, where `/System` does not exist. `/tmp` was already this
+shape, which is why `/private` was there before; the general limitation is that
+a passed-through path whose host symlink points somewhere unlisted will not
+resolve, and the fix each time is to list the target.
 
 The probe runs at startup and, importantly, **on the resume path as well**.
 arm64's fork is fork + `exec` (§3.5.8), so a child is a fresh `nabi` rebuilt

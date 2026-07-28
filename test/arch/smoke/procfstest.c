@@ -1,5 +1,5 @@
-/* freestanding: a mounted pseudo-filesystem is visible, and stays visible
- * across a fork.
+/* freestanding: what NABI passes through to the host is visible, and stays
+ * visible across a fork.
  *
  * /proc and /sys are the mount points mSL/FHS declares for its sibling modules
  * to mount on, and NABI passes them through to the host when something has
@@ -14,8 +14,14 @@
  * bash execs a lone command without forking, while adding a second command
  * makes it fork first and the identical read fails.
  *
- * Skipped, not failed, when nothing is mounted: the host may have no procfs,
- * and this test is about NABI passing one through rather than about ProcFS.
+ * Both of NABI's tests for "the host provides this" are exercised: /proc has to
+ * be *mounted*, since FHS creates the mount point whether or not anything fills
+ * it, while /boot only has to *exist*, being a plain directory FHS owns. They
+ * are separate code, so a machine with one and not the other still covers what
+ * it has.
+ *
+ * Skipped, not failed, when the host offers neither: this is about NABI passing
+ * through what is there, not about whether the sibling modules are installed.
  */
 static long sys6(long n,long a,long b,long c,long d,long e,long f){
   register long x8 asm("x8")=n; register long x0 asm("x0")=a; register long x1 asm("x1")=b;
@@ -34,21 +40,32 @@ static long sys6(long n,long a,long b,long c,long d,long e,long f){
 
 static void put(const char*m){int i=0;while(m[i])i++;sys6(SYS_write,1,(long)m,i,0,0,0);}
 
-/* Can /proc/version be opened and read? */
-static int probe(void)
+/* Can this path be opened at all? */
+static int openable(const char *path)
 {
-  long fd = sys6(SYS_openat, AT_FDCWD, (long)"/proc/version", 0, 0, 0, 0);
+  long fd = sys6(SYS_openat, AT_FDCWD, (long)path, 0, 0, 0, 0);
   if (fd < 0)
     return 0;
-  char buf[64];
-  long n = sys6(SYS_read, fd, (long)buf, sizeof buf, 0, 0, 0);
   sys6(SYS_close, fd, 0, 0, 0, 0, 0);
-  return n > 0;
+  return 1;
+}
+
+/* Whatever the host offers, as a bitmask, so parent and child can be compared
+ * rather than each judged against a guess about the machine. */
+#define HAVE_PROC 1
+#define HAVE_BOOT 2
+static int probe(void)
+{
+  int have = 0;
+  if (openable("/proc/version")) have |= HAVE_PROC;
+  if (openable("/boot"))         have |= HAVE_BOOT;
+  return have;
 }
 
 void _start(void)
 {
-  if (!probe()) {
+  int parent_has = probe();
+  if (parent_has == 0) {
     /* Nothing mounted on the host, or no passthrough for it. Either way there
      * is nothing here to test, and saying so beats a failure that is really
      * about the machine. */
@@ -60,7 +77,7 @@ void _start(void)
   if (pid == 0) {
     /* The child is a fresh nabi resumed from a checkpoint. It has to have
      * worked out the passthrough for itself. */
-    sys6(SYS_exit, probe() ? 0 : 1, 0, 0, 0, 0, 0);
+    sys6(SYS_exit, probe() == parent_has ? 0 : 1, 0, 0, 0, 0, 0);
   }
   if (pid < 0) {
     put("procfs FAIL: fork\n");
