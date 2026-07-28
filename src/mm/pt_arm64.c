@@ -606,9 +606,38 @@ pt_restore(uint64_t saved_ipa_brk, uint64_t l1_ipa,
  * Blocks are collected first and re-mapped once each, since a 16KiB block backs
  * four guest pages and would otherwise be flushed four times.
  */
+/*
+ * Linux's PROT_* as stage-2's permission bits.
+ *
+ * The two happen to use the same values, which is exactly why this is spelled
+ * out rather than left implicit: pt_arm64 is unit-tested on its own and cannot
+ * reach mmap.c's converter, and a silent reliance on the coincidence would be
+ * invisible the day one of them moves.
+ */
+static int
+s2_prot_of(int prot)
+{
+  int f = 0;
+  if (prot & LINUX_PROT_READ)  f |= HV_MEMORY_READ;
+  if (prot & LINUX_PROT_WRITE) f |= HV_MEMORY_WRITE;
+  if (prot & LINUX_PROT_EXEC)  f |= HV_MEMORY_EXEC;
+  return f;
+}
+
 void
 pt_protect(gaddr_t va, size_t size, int prot)
 {
+  /*
+   * Stage 2 has to be re-permissioned too, not merely flushed.
+   *
+   * A region mapped PROT_NONE - a reservation an allocator later mprotects in
+   * pieces, which is what malloc does with its arena - had stage 2 established
+   * with no access. Rewriting only the stage-1 descriptors leaves stage 2
+   * refusing everything, and stage 1 cannot grant what stage 2 withholds: the
+   * guest faults on memory that every table NABI keeps says is writable, and
+   * keeps faulting, because nothing in the fault path changes the answer.
+   */
+  int s2prot = s2_prot_of(prot);
   gaddr_t pagesz = PAGE_SIZEOF(PAGE_4KB);
   gaddr_t blocks[64];
   size_t nr_blocks = 0;
@@ -629,7 +658,7 @@ pt_protect(gaddr_t va, size_t size, int prot)
       if (nr_blocks == sizeof blocks / sizeof blocks[0]) {
         /* Rare: flush what we have and carry on rather than lose a block. */
         for (size_t i = 0; i < nr_blocks; i++)
-          vmm_arm64_s2_reflush(blocks[i]);
+          vmm_arm64_s2_reprotect(blocks[i], s2prot);
         nr_blocks = 0;
       }
       blocks[nr_blocks++] = block;
@@ -637,7 +666,7 @@ pt_protect(gaddr_t va, size_t size, int prot)
   }
 
   for (size_t i = 0; i < nr_blocks; i++)
-    vmm_arm64_s2_reflush(blocks[i]);
+    vmm_arm64_s2_reprotect(blocks[i], s2prot);
 }
 
 /*

@@ -244,6 +244,18 @@ for t in procfstest mapstest identtest; do
     fi
 done
 
+# growtest: a large PROT_NONE reservation with a piece mprotected writable -
+# how malloc builds an arena - and large regions grown by mremap, touched in
+# the parent and again from a child.
+cp "$here/growtest" "$root/"; chmod +x "$root/growtest"
+out=$("$NABI" -m "$root" /growtest); rc=$?
+if [ "$rc" -eq 0 ] && [ "$out" = "grow ok" ]; then
+    echo "  ok  growtest -> \"$out\""
+else
+    echo "  FAIL growtest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 # hvctest: no value in x0 may stop a syscall from reaching the host. The EL1
 # trampoline preserves the guest's registers, so x0 is live when its `hvc`
 # runs, and Apple's hypervisor answers SMCCC-shaped function IDs itself unless

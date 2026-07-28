@@ -172,10 +172,10 @@ main_loop(int return_on_sigret)
               static const char *acc[] = { "?", "read", "write", "exec" };
               struct mm_region *r = find_region(exit.fault_addr, proc.mm);
               fprintf(stderr,
-                      "nabi: unresolvable page fault at 0x%llx on %s; "
+                      "nabi: [pid %d] unresolvable page fault at 0x%llx on %s; "
                       "region %s prot=%d flags=%#x base=0x%llx size=0x%llx "
                       "esr=0x%llx%s\n",
-                      (unsigned long long) exit.fault_addr,
+                      getpid(), (unsigned long long) exit.fault_addr,
                       acc[exit.fault_access <= 3 ? exit.fault_access : 0],
                       r ? "found" : "MISSING", r ? r->prot : -1,
                       r ? r->mm_flags : 0,

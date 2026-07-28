@@ -989,6 +989,43 @@ cannot read realtime clock"*, which names the wrong syscall entirely: the clock
 read was fine, it was the sleep that did not exist. Worth remembering when a
 guest blames a syscall that demonstrably works.
 
+### 3.5.10 `mprotect` must re-permission stage 2, not reflush it — **fixed**
+
+`dpkg -i` hung. Not slowly — the guest spun at a full core on a store, forever,
+and `wait4` in the parent never returned. The repeat-fault guard added to
+`main_loop` for exactly this printed the state, and the state made no sense:
+stage 1's level-3 descriptor was valid, `AP` said EL0 read/write, `XN` was clear,
+and stage 2 had a block mapped over the IPA it named. Both of NABI's tables
+called the page writable and the hardware kept reporting a translation fault.
+
+The missing word is *permission*. Stage 2 has permission bits of its own, and
+`hv_vm_map` takes them: a block mapped `HV_MEMORY_READ` alone will fault a store
+no matter what stage 1 permits. The final address is the intersection of the two
+walks, and stage 1 cannot grant what stage 2 withholds.
+
+What made the region unwritable was how it was born. glibc's malloc reserves an
+arena in one large `PROT_NONE` mapping and then `mprotect`s the piece it wants
+to use — a reservation first, permissions later. `vmm_mmap` establishes stage 2
+at reservation time with the region's permission, which is none. `pt_protect`
+then rewrote stage 1 correctly and called `vmm_arm64_s2_reflush`, whose whole
+job is to unmap and re-map a block to force HVF to drop a stale combined TLB
+entry — re-mapping it with the permission it was *stored* with. Still zero. The
+flush was faithful; it faithfully reinstated the wrong thing.
+
+`vmm_arm64_s2_reprotect(ipa, prot)` re-maps with the new permission instead, and
+`pt_protect` calls that. The reflush stays for its own callers, where the
+permission genuinely has not changed.
+
+Two things about this are worth carrying forward. The first is that it is
+structural, not incidental: on x86 there is no second walk to keep in step, so
+every `mprotect` in NABI's history has been a one-table operation, and arm64
+quietly made it a two-table one. Anything else that changes protection has to be
+audited the same way. The second is that nothing smaller than an arena ever
+tripped it, because a mapping created writable is mapped writable at stage 2 and
+never needs correcting — which is why the whole suite passed while dpkg hung.
+`growtest` now builds the reservation-then-`mprotect` shape deliberately, and
+fails without the fix.
+
 ---
 
 ## 4. Phased implementation

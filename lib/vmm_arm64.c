@@ -182,6 +182,28 @@ vmm_arm64_s2_restore(const struct checkpoint_s2 *saved, size_t n)
  * (PORTING-arm64.md 3.5.3). The mapping itself is unchanged; the registry
  * already knows what backs this block, so this is a flush, not a remap.
  */
+/*
+ * Re-establish one stage-2 block with a *new* permission.
+ *
+ * The distinction from a reflush matters more than it looks. A reflush
+ * re-applies the permission the block already had, which is right when only the
+ * stage-1 descriptors changed shape - but wrong when what changed is the
+ * permission itself. A guest that reserves a large range PROT_NONE and
+ * mprotects pieces of it readable (malloc's arena, and every allocator like it)
+ * gets stage 2 mapped with no access at all, and stage 1 alone cannot grant
+ * what stage 2 withholds: the guest faults forever on memory both NABI's tables
+ * describe as writable.
+ */
+void
+vmm_arm64_s2_reprotect(gaddr_t ipa, int prot)
+{
+  gaddr_t base = ipa & ~(STAGE2_GRANULE - 1);
+  khiter_t k = kh_get(s2, s2_map, base);
+  if (k == kh_end(s2_map))
+    return;                    /* nothing mapped there to re-permission */
+  vmm_arm64_map_stage2(base, STAGE2_GRANULE, prot, kh_value(s2_map, k).haddr);
+}
+
 void
 vmm_arm64_s2_reflush(gaddr_t ipa)
 {

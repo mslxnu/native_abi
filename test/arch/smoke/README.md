@@ -71,6 +71,9 @@ guest-code cache sync.
 - `procfstest` — a mounted pseudo-filesystem is visible and stays visible across
   a fork. Skips when nothing is mounted at `/proc`, since it is about NABI
   passing one through rather than about mSL/ProcFS.
+- `growtest` — a large `PROT_NONE` reservation with a piece `mprotect`ed
+  writable, and large regions grown by `mremap`, reached from the parent and
+  from a child. Stage 2 has to be re-permissioned, not merely reflushed.
 - `hvctest` — sweeps every top byte through x0 and checks each syscall still
   reaches the host. The EL1 trampoline clobbers no register, so the guest's x0
   is live at its `hvc`, and an `hvc #0` whose x0 looks like an SMCCC function ID
