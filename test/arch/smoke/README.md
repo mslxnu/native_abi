@@ -64,6 +64,9 @@ guest-code cache sync.
   fault on its own data. Needs `/bigmapfile`, which `run.sh` creates shorter than
   the mapping so the tail also checks that past-EOF pages read as zero.
 
+- `procfstest` — a mounted pseudo-filesystem is visible and stays visible across
+  a fork. Skips when nothing is mounted at `/proc`, since it is about NABI
+  passing one through rather than about mSL/ProcFS.
 - `hvctest` — sweeps every top byte through x0 and checks each syscall still
   reaches the host. The EL1 trampoline clobbers no register, so the guest's x0
   is live at its `hvc`, and an `hvc #0` whose x0 looks like an SMCCC function ID

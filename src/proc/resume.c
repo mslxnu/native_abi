@@ -148,6 +148,9 @@ checkpoint_restore(int ckpt_fd, int arena_fd)
   INIT_SIGBIT(&task.sigpending);
 
   fdtable_restore(fds, hdr.nr_fds, &hdr);
+  /* Host-derived, so it is probed here rather than carried in the checkpoint -
+   * but it must be probed, because this process never ran init_fileinfo. */
+  init_host_passthrough();
 
   vmm_restore_vcpu(&hdr.vcpu);
 

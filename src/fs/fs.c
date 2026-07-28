@@ -134,6 +134,8 @@ alloc_fdtable(struct fdtable *fdtable, int newsize)
 void
 init_fileinfo(int rootfd)
 {
+  init_host_passthrough();
+
   struct rlimit limit;
   struct fileinfo *fileinfo = &proc.fileinfo;
 
@@ -1059,13 +1061,62 @@ static const char *const host_passthrough[] = {
   "/Users", "/Volumes", "/dev", "/tmp", "/private",
 };
 
+/*
+ * The pseudo-filesystems, which are passed through only if something has
+ * actually mounted them.
+ *
+ * These are the mount points mSL/FHS declares in /etc/synthetic.conf for its
+ * sibling modules to mount on - /proc for mSL/ProcFS, /sys for mSL/SysFS - and
+ * their contents are synthesised per-process by a real filesystem. That is
+ * content a rootfs cannot hold: a directory of files describing the machine's
+ * live state is not something that can be unpacked from a .deb. So when one is
+ * mounted, the host's is the only true answer and the guest gets it.
+ *
+ * Being mounted is the test rather than merely existing, because FHS creates
+ * these as empty directories at boot whether or not the module that fills them
+ * is installed. An empty /proc passed through would mask the rootfs's own -
+ * identical today, but it would be claiming to answer a question we cannot.
+ * Checked once at startup: mounting procfs later needs a new nabi, which is the
+ * honest behaviour for a decision made this early in path resolution.
+ *
+ * Probed rather than inherited, so it has to run on *both* ways into a process:
+ * init_fileinfo for a fresh one, and resume_main for a child, since arm64's fork
+ * is fork + exec and the child does not go through init_fileinfo at all. Miss
+ * the second and the effect is a puzzle - `bash -c 'cat /proc/version'` works
+ * because bash execs a lone command directly, while adding a second command
+ * makes it fork first and the same read fails.
+ */
+static const char *const pseudo_fs[] = { "/proc", "/sys" };
+static bool pseudo_fs_live[sizeof pseudo_fs / sizeof pseudo_fs[0]];
+
+void
+init_host_passthrough(void)
+{
+  for (size_t i = 0; i < sizeof pseudo_fs / sizeof pseudo_fs[0]; i++) {
+    struct statfs sfs;
+    /* f_mntonname naming the path itself is what distinguishes a mount point
+     * from a directory that merely exists on the parent's filesystem. */
+    pseudo_fs_live[i] = statfs(pseudo_fs[i], &sfs) == 0 &&
+                        strcmp(sfs.f_mntonname, pseudo_fs[i]) == 0;
+  }
+}
+
+static bool
+match_component(const char *name, const char *prefix)
+{
+  size_t n = strlen(prefix);
+  return strncmp(name, prefix, n) == 0 && (name[n] == '\0' || name[n] == '/');
+}
+
 static bool
 is_host_passthrough(const char *name)
 {
   for (size_t i = 0; i < sizeof host_passthrough / sizeof host_passthrough[0]; i++) {
-    size_t n = strlen(host_passthrough[i]);
-    if (strncmp(name, host_passthrough[i], n) == 0 &&
-        (name[n] == '\0' || name[n] == '/'))
+    if (match_component(name, host_passthrough[i]))
+      return true;
+  }
+  for (size_t i = 0; i < sizeof pseudo_fs / sizeof pseudo_fs[0]; i++) {
+    if (pseudo_fs_live[i] && match_component(name, pseudo_fs[i]))
       return true;
   }
   return false;

@@ -817,6 +817,42 @@ package from the `data.tar` member names — keyed `<pkg>:<arch>` for `Multi-Arc
 same`, as dpkg names them. Without those, `dpkg -S` and `dpkg -L` answer nothing
 and every query warns that the package has no files installed.
 
+### 3.7.2 Talking to mSL/FHS
+
+mSL/FHS gives the *host* a Linux-shaped namespace — `/home`, `/media`, `/mnt`,
+`/run`, `/root`, `/srv`, `/boot` — out of symlinks maintained by `fhsxd`, and
+declares `/proc` and `/sys` in `/etc/synthetic.conf` as mount points for its
+sibling modules. NABI has its own notion of the namespace: a rootfs at `-m`,
+plus a short list of prefixes that resolve on the host instead.
+
+Those two overlap, and not everything FHS names should be passed through. The
+line drawn here is **what a rootfs cannot hold**:
+
+- **The pseudo-filesystems are passed through when mounted.** `/proc` and `/sys`
+  are synthesised per-process by a real filesystem; a directory describing the
+  machine's live state cannot be unpacked from a `.deb`. When mSL/ProcFS is
+  mounted, the host's `/proc` is the only true answer. With it, Debian's own
+  `ps`, `free` and `/proc/self/*` work.
+- **Content under a Linux name is not.** `/home`, `/run`, `/root`, `/boot` and
+  the rest name host directories that already have a macOS path, and a rootfs
+  has a legitimate claim on those. `/home` in particular must stay the rootfs's
+  own or the guest shell reads the host's dotfiles (§3.7.1).
+
+*Mounted*, rather than merely existing, is the test: FHS creates these as empty
+directories at boot whether or not the module that fills them is installed, and
+an empty `/proc` passed through would mask the rootfs's own — identical in
+effect today, but claiming to answer a question NABI cannot. `statfs`'s
+`f_mntonname` naming the path itself is what distinguishes the two.
+
+The probe runs at startup and, importantly, **on the resume path as well**.
+arm64's fork is fork + `exec` (§3.5.8), so a child is a fresh `nabi` rebuilt
+from a checkpoint that never runs `init_fileinfo`. Probing only on the first
+path fails in a way that reads as nonsense rather than as an error: `bash -c
+'cat /proc/version'` works, because bash execs a lone command without forking,
+while adding a second command makes it fork first and the identical read fails.
+`test/arch/smoke/procfstest.c` covers exactly that, and skips when the host has
+nothing mounted.
+
 ### 3.7.1 An interactive shell
 
 `util/nabi-shell.sh <rootfs>` drops into a login shell in the guest — `make

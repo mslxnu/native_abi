@@ -189,6 +189,18 @@ else
     fail=1
 fi
 
+# procfstest: a mounted pseudo-filesystem is passed through, and survives a
+# fork - which on arm64 is fork + exec, so the child has to re-probe the host
+# for itself. Skips when nothing is mounted at /proc.
+cp "$here/procfstest" "$root/"; chmod +x "$root/procfstest"
+out=$("$NABI" -m "$root" /procfstest); rc=$?
+if [ "$rc" -eq 0 ] && { [ "$out" = "procfs ok" ] || [ "$out" = "procfs skipped" ]; }; then
+    echo "  ok  procfstest -> \"$out\""
+else
+    echo "  FAIL procfstest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 # hvctest: no value in x0 may stop a syscall from reaching the host. The EL1
 # trampoline preserves the guest's registers, so x0 is live when its `hvc`
 # runs, and Apple's hypervisor answers SMCCC-shaped function IDs itself unless
