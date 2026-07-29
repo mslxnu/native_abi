@@ -71,6 +71,9 @@ guest-code cache sync.
 - `procfstest` — a mounted pseudo-filesystem is visible and stays visible across
   a fork. Skips when nothing is mounted at `/proc`, since it is about NABI
   passing one through rather than about mSL/ProcFS.
+- `ptytest` — `/dev/ptmx`, `TIOCSPTLCK`, `TIOCGPTN` and the `/dev/pts/<n>`
+  path, which Darwin spells differently at every step. apt runs dpkg under a
+  pty, so all four have to work or nothing installs.
 - `growtest` — a large `PROT_NONE` reservation with a piece `mprotect`ed
   writable, and large regions grown by `mremap`, reached from the parent and
   from a child. Stage 2 has to be re-permissioned, not merely reflushed.

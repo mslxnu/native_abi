@@ -32,12 +32,37 @@ ROOT=${2:?usage: mkrootfs-debian.sh <iso> <target-dir>}
 
 [ -f "$ISO" ] || { echo "no such ISO: $ISO" >&2; exit 1; }
 
+# Refused rather than warned about, because the damage is silent. Debian ships
+# files whose names differ only in case - manpages-dev has _exit.2.gz and
+# _Exit.2.gz, linux-libc-dev has xt_connmark.h and xt_CONNMARK.h - and on a
+# case-insensitive filesystem the second of each pair quietly overwrites the
+# first. The tree that comes out looks complete and is not, and nothing says so
+# until dpkg fails much later against a file that was never the problem.
+mkdir -p "$ROOT"
+probe=$(mktemp "$ROOT/.mkrootfsCASE.XXXXXX") || exit 1
+lower=$(dirname "$probe")/$(basename "$probe" | tr 'A-Z' 'a-z')
+collides=no
+[ -e "$lower" ] && collides=yes
+rm -f "$probe"
+if [ "$collides" = yes ]; then
+    cat >&2 <<EOM
+$ROOT is on a case-insensitive filesystem.
+
+Debian ships files whose names differ only in case, and this filesystem cannot
+hold both - the tree would come out quietly incomplete. Make a case-sensitive
+volume first:
+
+    util/msl-mkvolume.sh ~/.msl/disk.sparseimage /Volumes/msl
+
+then build into it, e.g. /Volumes/msl/rootfs-debian.
+EOM
+    exit 1
+fi
+
 work=$(mktemp -d)
 # Files unpacked from an ISO come out read-only, so the scratch tree has to be
 # made writable before anything can be extracted into it or removed from it.
 trap 'chmod -R u+w "$work" 2>/dev/null; rm -rf "$work"' EXIT
-
-mkdir -p "$ROOT"
 
 echo "==> extracting .deb archives from the ISO"
 tar -xf "$ISO" -C "$work" pool 2>/dev/null || true

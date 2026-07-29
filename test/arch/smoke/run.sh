@@ -244,6 +244,17 @@ for t in procfstest mapstest identtest; do
     fi
 done
 
+# ptytest: a guest allocates a pty and talks through it. Linux and Darwin
+# agree on /dev/ptmx and on nothing after it.
+cp "$here/ptytest" "$root/"; chmod +x "$root/ptytest"
+out=$("$NABI" -m "$root" /ptytest); rc=$?
+if [ "$rc" -eq 0 ] && [ "$out" = "pty ok" ]; then
+    echo "  ok  ptytest -> \"$out\""
+else
+    echo "  FAIL ptytest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 # growtest: a large PROT_NONE reservation with a piece mprotected writable -
 # how malloc builds an arena - and large regions grown by mremap, touched in
 # the parent and again from a child.

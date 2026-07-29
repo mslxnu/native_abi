@@ -1026,6 +1026,87 @@ never needs correcting — which is why the whole suite passed while dpkg hung.
 `growtest` now builds the reservation-then-`mprotect` shape deliberately, and
 fails without the fix.
 
+### 3.5.11 A pty, spelled two ways — **fixed**
+
+`apt install` stopped with *"Unlocking the slave of master fd 27 failed —
+unlockpt (1: Operation not permitted)"*. apt runs dpkg under a pty so it can
+watch the progress output, and Linux and Darwin agree on `/dev/ptmx` and on
+nothing after it:
+
+| what glibc calls | Linux                    | Darwin                       |
+|------------------|--------------------------|------------------------------|
+| `posix_openpt`   | `open("/dev/ptmx")`      | same — passthrough handles it |
+| `grantpt`        | nothing (devpts already has the node) | `ioctl(TIOCPTYGRANT)` |
+| `unlockpt`       | `ioctl(TIOCSPTLCK, &0)`  | `ioctl(TIOCPTYUNLK)`         |
+| `ptsname`        | `ioctl(TIOCGPTN, &n)` → `/dev/pts/n` | `ioctl(TIOCPTYGNAME, buf)` → `/dev/ttysNNN` |
+
+`TIOCSPTLCK` was unhandled, so it fell through to the default arm of
+`darwinfs_ioctl`, which returns `EPERM` — hence "Operation not permitted" for
+something no permission would have granted.
+
+Three things had to be added, and the third is the one that is not an ioctl.
+`TIOCSPTLCK` does the grant as well as the unlock, because Linux's `grantpt` is
+a no-op that NABI never sees and Darwin's slave is unusable without it. `TIOCGPTN`
+parses the number out of the host's name, since Darwin has no number to ask for.
+And `/dev/pts/<n>` has to reach `/dev/ttys<nnn>`: `/dev` is a passthrough, so
+the path the guest builds from that number would otherwise land on a host
+`/dev/pts` that does not exist. That translation lives in `resolve_path` rather
+than in `openat`, because `ptsname_r` stats the path before returning it and
+reports the failure as though `TIOCGPTN` had failed.
+
+`TIOCSCTTY` and `TIOCNOTTY` went in alongside; apt's child calls the first after
+`setsid`.
+
+### 3.5.12 The host filesystem is case-insensitive — **not fixable here**
+
+With the pty working, `apt install gcc` got as far as unpacking and then failed
+on four packages out of thirty-three:
+
+```
+unable to open '/usr/share/man/man2/_exit.2.gz.dpkg-new': No such file or directory
+```
+
+The four have one thing in common: each ships two files whose names differ only
+in case. `manpages-dev` has `_exit.2.gz` and `_Exit.2.gz`; `linux-libc-dev` has
+the netfilter headers, `xt_connmark.h` and `xt_CONNMARK.h`. macOS formats the
+boot volume case-insensitively, and it cannot hold both.
+
+The failure does not resemble its cause, which is worth walking through once.
+dpkg unpacks to `<name>.dpkg-new` and renames everything at the end, and before
+each unpack it clears any `.dpkg-new` left by an interrupted install. So:
+
+1. `_exit.2.gz.dpkg-new` is created and written — fine.
+2. dpkg clears the stale `_Exit.2.gz.dpkg-new`, and on this filesystem that
+   `unlink` deletes the file from step 1.
+3. `_Exit.2.gz` is a *symlink* to `_exit.2.gz`, so dpkg creates it — succeeding
+   now, because step 2 made room — pointing at a name that does not exist yet.
+4. dpkg's deferred fsync pass reopens each unpacked file and gets `ENOENT` from
+   the dangling symlink, and reports it against `_exit.2.gz`, which was never
+   the problem.
+
+Nothing in that chain mentions case, and the file named in the error is the one
+that unpacked correctly.
+
+There is no fix inside NABI. Holding both names would mean mangling them in the
+VFS, and the mangling would have to be undone in `readdir`, in `readlink`, in
+every path returned to the guest — and any host tool looking at the rootfs would
+see the mangled form. A Linux rootfs has to live on a case-sensitive filesystem.
+
+So NABI detects it instead: `fpathconf(_PC_CASE_SENSITIVE)` on the root fd,
+reported once at startup with the remedy, and only for a rootfs that holds a
+distribution — `/etc/os-release` or `/var/lib/dpkg` — since a scratch directory
+of test binaries has nothing to collide and a warning that cries wolf gets
+ignored where it counts. `mkrootfs-debian.sh` refuses outright rather than
+warning, because there the damage is silent: the tree comes out looking
+complete.
+
+`util/msl-mkvolume.sh` makes the volume. A sparse disk image rather than an APFS
+volume in the boot container, because adding a volume needs an administrator and
+this does not; the size is a ceiling, not an allocation.
+
+With the rootfs on one of those, `apt install gcc make` completes, and the
+installed gcc compiles and links a program that then runs under NABI.
+
 ---
 
 ## 4. Phased implementation

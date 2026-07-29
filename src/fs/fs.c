@@ -131,10 +131,54 @@ alloc_fdtable(struct fdtable *fdtable, int newsize)
   return 0;
 }
 
+/* Set by init_fileinfo, reported once the debug sinks exist. */
+static bool rootfs_case_insensitive;
+
+void
+report_rootfs_case(void)
+{
+  if (!rootfs_case_insensitive)
+    return;
+  /* Loud, and on stderr, because the alternative is finding out three hundred
+   * files into an install. A case-insensitive filesystem cannot hold both
+   * halves of a pair like _exit.2.gz and _Exit.2.gz, and Debian ships several:
+   * manpages-dev has two, linux-libc-dev has the netfilter headers. dpkg does
+   * not fail where the collision is. It clears a stale .dpkg-new for the
+   * second name, which deletes the first name's freshly unpacked file, writes
+   * a symlink over it, and only reports anything later when its fsync pass
+   * cannot reopen what it just extracted - as ENOENT, on the file that was
+   * fine. Nothing in that chain names the real problem. */
+  warnk("rootfs is on a case-insensitive filesystem\n");
+  fprintf(stderr,
+          "nabi: warning: the rootfs is on a case-insensitive filesystem.\n"
+          "  Linux distributions ship files whose names differ only in case,\n"
+          "  and this filesystem cannot hold both. Installing packages will\n"
+          "  fail in ways that do not mention case at all.\n"
+          "  Put the rootfs on a case-sensitive volume:\n"
+          "    util/msl-mkvolume.sh ~/.msl/disk.sparseimage /Volumes/msl\n");
+}
+
 void
 init_fileinfo(int rootfd)
 {
   init_host_passthrough();
+
+  /* pathconf answers this without touching the tree, which matters: probing by
+   * creating two files would write to a rootfs that may be read-only, and
+   * would race a second guest doing the same. A filesystem that declines to
+   * answer is left alone rather than guessed at.
+   *
+   * Only worth saying for a rootfs that holds a distribution. The colliding
+   * names all arrive with packages, so a hand-assembled tree of a few binaries
+   * - the smoke tests, anything run with -m against a scratch directory - has
+   * nothing to collide and does not need telling. Crying wolf there would
+   * teach the warning to be ignored where it matters. */
+  errno = 0;
+  long cs = fpathconf(rootfd, _PC_CASE_SENSITIVE);
+  rootfs_case_insensitive =
+    cs == 0 && errno == 0 &&
+    (faccessat(rootfd, "etc/os-release", F_OK, 0) == 0 ||
+     faccessat(rootfd, "var/lib/dpkg", F_OK, 0) == 0);
 
   struct rlimit limit;
   struct fileinfo *fileinfo = &proc.fileinfo;
@@ -188,6 +232,51 @@ int
 darwinfs_close(struct file *file)
 {
   return syswrap(close(file->fd));
+}
+
+/*
+ * The devpts <-> Darwin naming translation, in both directions.
+ *
+ * Linux names a pty slave /dev/pts/<n>, where <n> is what TIOCGPTN reports;
+ * Darwin names it /dev/ttys<n> zero-padded to three digits, and has no number
+ * to ask for - only the name. So the number the guest is told is parsed out of
+ * the host's name, and the path the guest then opens is turned back into that
+ * name. The round trip holds as long as the host's format does, which is why
+ * a name that does not parse is reported rather than guessed at.
+ */
+static bool
+devpts_number_of(const char *hostname, unsigned int *out)
+{
+  const char *p = hostname;
+  if (strncmp(p, "/dev/ttys", 9) != 0)
+    return false;
+  p += 9;
+  if (*p < '0' || *p > '9')
+    return false;              /* /dev/ttyse and the other pre-ptmx nodes */
+  unsigned int n = 0;
+  for (; *p >= '0' && *p <= '9'; p++)
+    n = n * 10 + (unsigned int) (*p - '0');
+  if (*p != '\0')
+    return false;
+  *out = n;
+  return true;
+}
+
+static bool
+devpts_to_host(const char *name, char *buf, size_t len)
+{
+  if (strncmp(name, "/dev/pts/", 9) != 0)
+    return false;
+  const char *p = name + 9;
+  if (*p < '0' || *p > '9')
+    return false;              /* /dev/pts itself, and /dev/pts/ptmx */
+  unsigned int n = 0;
+  for (; *p >= '0' && *p <= '9'; p++)
+    n = n * 10 + (unsigned int) (*p - '0');
+  if (*p != '\0')
+    return false;
+  snprintf(buf, len, "/dev/ttys%03u", n);
+  return true;
 }
 
 int
@@ -293,6 +382,62 @@ darwinfs_ioctl(struct file *file, int cmd, uint64_t val0)
     }
     return syswrap(tcflush(fd, sel));
   }
+  /*
+   * The three calls behind Linux's pty allocation, which Darwin spells
+   * differently at every step.
+   *
+   *   posix_openpt   open("/dev/ptmx")           - passthrough, works already
+   *   unlockpt       ioctl(TIOCSPTLCK, &0)       TIOCPTYGRANT + TIOCPTYUNLK
+   *   ptsname        ioctl(TIOCGPTN, &n)         TIOCPTYGNAME -> "/dev/ttysNNN"
+   *                  then "/dev/pts/n"           then that path back to ttysNNN
+   *
+   * Unhandled, TIOCSPTLCK fell through to the default arm and came back EPERM,
+   * which is how a guest that only wants a terminal to run dpkg under ends up
+   * reporting "Unlocking the slave of master fd 27 failed".
+   */
+  case LINUX_TIOCSPTLCK: {
+    int lock;
+    if (copy_from_user(&lock, val0, sizeof lock)) {
+      return -LINUX_EFAULT;
+    }
+    if (lock) {
+      /* Darwin can unlock a slave but not lock one again, and nothing does:
+       * the kernel hands every master out locked and glibc only ever clears
+       * it. Reporting that rather than returning a success we did not deliver.
+       */
+      return -LINUX_EINVAL;
+    }
+    /* grantpt's work, done here rather than where the guest calls grantpt.
+     * On Linux with devpts the slave node already exists with the right
+     * owner, so glibc's grantpt does nothing and NABI never sees it; on
+     * Darwin the slave is unusable until it has been granted. unlockpt is the
+     * call that means "I am about to use this", so it is the one place both
+     * halves can be done. */
+    if ((r = syswrap(ioctl(fd, TIOCPTYGRANT))) < 0) {
+      return r;
+    }
+    return syswrap(ioctl(fd, TIOCPTYUNLK));
+  }
+  case LINUX_TIOCGPTN: {
+    char name[PATH_MAX];
+    unsigned int n;
+    if ((r = syswrap(ioctl(fd, TIOCPTYGNAME, name))) < 0) {
+      return r;
+    }
+    if (!devpts_number_of(name, &n)) {
+      warnk("TIOCGPTN: host slave \"%s\" is not a ttysNNN\n", name);
+      return -LINUX_EINVAL;
+    }
+    if (copy_to_user(val0, &n, sizeof n)) {
+      return -LINUX_EFAULT;
+    }
+    return 0;
+  }
+  /* Both take no argument on either side; only the numbers differ. */
+  case LINUX_TIOCSCTTY:
+    return syswrap(ioctl(fd, TIOCSCTTY));
+  case LINUX_TIOCNOTTY:
+    return syswrap(ioctl(fd, TIOCNOTTY));
   case LINUX_FIONREAD: {
     int val;
     int r = syswrap(ioctl(fd, FIONREAD, &val));
@@ -1247,6 +1392,8 @@ resolve_path(const struct dir *parent, const char *name, int flags, struct path 
     return -LINUX_ELOOP;
 
   struct dir dir = *parent;
+  /* Outlives the branch below, since `name` may be made to point at it. */
+  char ptsname[32];
 
   /* resolve mountpoints */
   if (*name == '/') {
@@ -1258,6 +1405,14 @@ resolve_path(const struct dir *parent, const char *name, int flags, struct path 
     if (!is_host_passthrough(name)) {
       dir.fd = proc.fileinfo.rootfd;
       name++;
+    } else if (devpts_to_host(name, ptsname, sizeof ptsname)) {
+      /* /dev is a passthrough, so a guest that asks for the slave it was just
+       * told about would reach the host's /dev/pts/<n>, which does not exist:
+       * Darwin has no devpts. The name is rewritten here rather than in
+       * openat because stat has to find it too - glibc's ptsname_r stats the
+       * path it is about to return, and reports the failure as if TIOCGPTN
+       * had failed. */
+      name = ptsname;
     }
   }
 

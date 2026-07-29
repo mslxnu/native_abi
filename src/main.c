@@ -463,6 +463,7 @@ main(int argc, char *argv[], char **envp)
 
   /* Now that the sinks exist, say which sibling modules this run picked up. */
   report_host_passthrough();
+  report_rootfs_case();
 
   int err;
   if ((err = do_exec(argv[0], argc, argv, envp)) < 0) {
