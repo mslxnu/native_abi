@@ -186,9 +186,27 @@ do_mmap(gaddr_t addr, size_t len, int d_prot, int l_prot, int l_flags, int fd, o
    * than copying it - which is also what fork owes a shared mapping, since the
    * child must share it with the parent and not get a private snapshot.
    */
+  /*
+   * ...and only when the guest can actually write through it. A shared mapping
+   * of a descriptor opened O_RDONLY cannot propagate anything to the file, now
+   * or later - Linux clears VM_MAYWRITE for that case, so even a subsequent
+   * mprotect to PROT_WRITE is refused - which makes a private copy of the bytes
+   * indistinguishable from the real thing.
+   *
+   * Asking for one anyway does not merely waste effort, it fails: the host
+   * mapping is made PROT_READ|PROT_WRITE so a later mprotect can grant write
+   * without re-establishing it, and MAP_SHARED|PROT_WRITE on a read-only
+   * descriptor is EACCES. Mapping it PROT_READ instead only moves the failure,
+   * since hv_vm_map will not take a read-only host region. ldconfig opens every
+   * library O_RDONLY and maps it PROT_READ|MAP_SHARED to read its SONAME, so
+   * each one came back "Cannot mmap file" and the ld.so cache was never built.
+   */
+  int amode = fd >= 0 ? fcntl(fd, F_GETFL) : -1;
+  bool fd_writable = amode >= 0 && ((amode & O_ACCMODE) == O_RDWR ||
+                                    (amode & O_ACCMODE) == O_WRONLY);
   bool shared_file = fd >= 0 && (l_flags & LINUX_MAP_SHARED) &&
                      (offset & (GUEST_MMAP_GRANULE - 1)) == 0 &&
-                     !(l_prot & LINUX_PROT_EXEC);
+                     !(l_prot & LINUX_PROT_EXEC) && fd_writable;
 
   if (shared_file) {
     ptr = mmap(0, len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, offset);

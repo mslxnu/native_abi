@@ -380,8 +380,23 @@
 #define	LINUX_TIOCSBRK		0x5427
 #define	LINUX_TIOCCBRK		0x5428
 
-#define LINUX_TIOCGPTN		0x5430
-#define LINUX_TIOCSPTLCK	0x5431
+/*
+ * These two are _IOC-encoded, unlike the 0x54xx block above.
+ *
+ * asm-generic/ioctls.h hands out bare numbers up to TIOCSWINSZ for historical
+ * reasons and switches to the encoding from 0x30 on:
+ *
+ *   #define TIOCGPTN    _IOR('T', 0x30, unsigned int)
+ *   #define TIOCSPTLCK  _IOW('T', 0x31, int)
+ *
+ * so the numbers a guest actually sends are 0x80045430 and 0x40045431. Writing
+ * them as 0x5430/0x5431 - continuing the pattern of the lines above - means no
+ * guest ever matches them, and the fall-through returns EPERM: "failed to
+ * create pseudo-terminal: Operation not permitted", for a request that needed
+ * no permission.
+ */
+#define LINUX_TIOCGPTN		0x80045430	/* _IOR('T', 0x30, unsigned int) */
+#define LINUX_TIOCSPTLCK	0x40045431	/* _IOW('T', 0x31, int) */
 
 #define	LINUX_FIONCLEX		0x5450
 #define	LINUX_FIOCLEX		0x5451

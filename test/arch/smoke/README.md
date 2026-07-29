@@ -71,6 +71,9 @@ guest-code cache sync.
 - `procfstest` — a mounted pseudo-filesystem is visible and stays visible across
   a fork. Skips when nothing is mounted at `/proc`, since it is about NABI
   passing one through rather than about mSL/ProcFS.
+- `emptypathtest` — `statx`/`fstatat` with `AT_EMPTY_PATH`, the form Rust's
+  standard library uses for every file it opens. Compared against `fstat` on
+  the same descriptor, since a stat of the wrong object also returns 0.
 - `oflagtest` — `O_DIRECTORY` and `O_NOFOLLOW` refuse what they are supposed
   to refuse. arm64 permutes these four flag values relative to asm-generic, and
   a flag read as one NABI ignores is granted rather than rejected.

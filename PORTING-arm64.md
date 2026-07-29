@@ -1026,7 +1026,7 @@ never needs correcting — which is why the whole suite passed while dpkg hung.
 `growtest` now builds the reservation-then-`mprotect` shape deliberately, and
 fails without the fix.
 
-### 3.5.11 A pty, spelled two ways — **fixed**
+### 3.5.11 A pty, spelled two ways — **fixed, but see 3.5.16**
 
 `apt install` stopped with *"Unlocking the slave of master fd 27 failed —
 unlockpt (1: Operation not permitted)"*. apt runs dpkg under a pty so it can
@@ -1194,6 +1194,98 @@ or the debug sinks.
 With all of it in place, `dpkg --configure -a` finishes a 149-package Debian
 trixie with nothing left unconfigured, systemd and udev and cron included, and
 `dpkg --audit` is clean.
+
+### 3.5.15 `AT_EMPTY_PATH`, and why apt thought Debian was unsigned — **fixed**
+
+`apt-get update` reported every repository as unsigned:
+
+```
+Sub-process /usr/bin/sqv returned an error code (1), error message is:
+  Error: Reading "/tmp/apt.sig.13eCj4": No such file or directory (os error 2)
+```
+
+The file was there. A host-side watcher caught it existing at
+`/private/tmp/apt.sig.*` while apt ran, and the guest could `cat` it by that
+exact path from a forked child. The trace settled it:
+
+```
+openat(-100, "/tmp/p.sig", O_RDONLY|O_CLOEXEC): ret = 0x5     <- opened fine
+statx(dirfd: 5, path: "", flags: 4096, ...): ret = ENOENT     <- 4096 = AT_EMPTY_PATH
+```
+
+An empty pathname with `AT_EMPTY_PATH` names the *descriptor*, which may be any
+kind of file rather than a directory — so it cannot go through `vfs_grab_dir`,
+which rejects an empty name with `ENOENT`. Both `statx` and `newfstatat` did,
+and `newfstatat` additionally refused the flag outright with `EINVAL`.
+
+This is not a corner. Rust's standard library stats every file it opens as
+`statx(fd, "", AT_EMPTY_PATH)`, so it sits on the path of any Rust program that
+reads a file — and `sqv`, the OpenPGP verifier apt shells out to, is Rust. It
+opened the signature, got `ENOENT` from the stat that followed, and reported it
+against the path it had been reading. apt read that as a missing signature.
+
+The error named the right file and the wrong reason, which is why it survived
+several attempts: everything about "the temp file is missing" was false, so
+chasing where the file went never converged. What broke it open was running
+`sqv` as the top-level guest process rather than as a forked child — a forked
+child on arm64 is a fresh `nabi` with no `-s` sink, so its syscalls are
+invisible. That trick is worth reaching for early.
+
+With it fixed, `apt-get update` verifies signatures and `apt-get install gcc`
+works against the real signed archive.
+
+### 3.5.16 Two ioctl numbers that were never encoded — **fixed**
+
+`script` and apt both failed to allocate a pty:
+
+```
+script: failed to create pseudo-terminal: Operation not permitted
+E: Unlocking the slave of master fd 25 failed! - unlockpt (1: Operation not permitted)
+```
+
+`asm-generic/ioctls.h` hands out bare numbers up to `TIOCSWINSZ` for historical
+reasons and switches to `_IOC` encoding from `0x30` on:
+
+```c
+#define TIOCGPTN    _IOR('T', 0x30, unsigned int)   /* 0x80045430 */
+#define TIOCSPTLCK  _IOW('T', 0x31, int)            /* 0x40045431 */
+```
+
+NABI had them as `0x5430` and `0x5431` — continuing the pattern of the lines
+above, which is wrong. No guest ever matched, and the fall-through returns
+`EPERM` for a request that needed no permission.
+
+Worth recording plainly: §3.5.11 called this fixed, and it was not. The shape of
+that work was right — the grant, the unlock, the `/dev/pts` translation — but it
+hung on constants no guest sends. `ptytest` passed because it was written with
+the same wrong numbers, so all it verified was that NABI agreed with itself. A
+test that shares a constant with the code under test cannot catch that constant
+being wrong; it now spells the encoded values out, with a note saying why.
+
+### 3.5.17 A shared mapping only has to be real if it can be written — **fixed**
+
+Every `dpkg --configure` run printed a wall of:
+
+```
+ldconfig: Cannot mmap file /lib/aarch64-linux-gnu/libnettle.so.8.10.
+```
+
+so no `ld.so` cache was ever built. `ldconfig` opens each library `O_RDONLY` and
+maps it `PROT_READ|MAP_SHARED` to read its `SONAME`. NABI maps a shared file
+mapping for real — the point of `MAP_SHARED` is that the guest's writes reach
+the file, which a copy can never provide — and it asked the host for
+`PROT_READ|PROT_WRITE` so a later `mprotect` could grant write without
+re-establishing the mapping. `MAP_SHARED` with `PROT_WRITE` on a read-only
+descriptor is `EACCES`.
+
+Asking for `PROT_READ` instead only moves the failure: `hv_vm_map` will not take
+a read-only host region, and the guest panics rather than getting an errno. The
+right answer is that the mapping never needed to be real. A shared mapping of an
+`O_RDONLY` descriptor cannot propagate anything to the file, now or later —
+Linux clears `VM_MAYWRITE` for that case, so even a later `mprotect` to
+`PROT_WRITE` is refused — which makes the private copy NABI already builds for
+every other file mapping indistinguishable from the real thing. `shared_file`
+now also requires the descriptor to be writable.
 
 ---
 

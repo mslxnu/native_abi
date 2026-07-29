@@ -1714,22 +1714,61 @@ DEFINE_SYSCALL(symlink, gstr_t, path1_ptr, gstr_t, path2_ptr)
   return sys_symlinkat(path1_ptr, LINUX_AT_FDCWD, path2_ptr);
 }
 
+/*
+ * The AT_EMPTY_PATH form: an empty pathname naming the descriptor itself.
+ *
+ * The descriptor may be any kind of file, not just a directory, so it cannot
+ * go through vfs_grab_dir - which rejects an empty name with ENOENT, and that
+ * is exactly what went wrong. Rust's standard library stats every file it
+ * opens as statx(fd, "", AT_EMPTY_PATH), so sqv opened apt's signature file
+ * successfully and then reported "Reading /tmp/apt.sig.XXXXXX: No such file or
+ * directory" about a descriptor it was already holding. apt read that as the
+ * Debian archive being unsigned. The error named the right file and the wrong
+ * reason, which is why it survived so long.
+ *
+ * Returns 0 and fills st, or a negative errno. Callers only reach it once they
+ * have decided the flags and path say so.
+ */
+static int
+fstat_by_fd(int dirfd, struct l_newstat *st)
+{
+  struct file *file = get_file(dirfd);
+  if (file == NULL)
+    return -LINUX_EBADF;
+  return file->ops->fstat(file, st);
+}
+
+static inline bool
+is_at_empty_path(const char *path, int flags)
+{
+  return (flags & LINUX_AT_EMPTY_PATH) != 0 && path[0] == '\0';
+}
+
 DEFINE_SYSCALL(newfstatat, int, dirfd, gstr_t, path_ptr, gaddr_t, st_ptr, int, flags)
 {
   char pathname[LINUX_PATH_MAX];
   strncpy_from_user(pathname, path_ptr, sizeof pathname);
-  if (flags & ~(LINUX_AT_SYMLINK_NOFOLLOW)) {
+  if (flags & ~(LINUX_AT_SYMLINK_NOFOLLOW | LINUX_AT_EMPTY_PATH)) {
     return -LINUX_EINVAL;
   }
-  int grab_flags = flags & LINUX_AT_SYMLINK_NOFOLLOW ? LOOKUP_NOFOLLOW : 0;
-  struct path path;
-  int r = vfs_grab_dir(dirfd, pathname, grab_flags, &path);
-  if (r < 0) {
-    return r;
-  }
   struct l_newstat st;
-  r = path.fs->ops->fstatat(path.fs, path.dir, path.subpath, &st, flags);
-  vfs_ungrab_dir(&path);
+  int r;
+
+  if (is_at_empty_path(pathname, flags) && dirfd != LINUX_AT_FDCWD) {
+    r = fstat_by_fd(dirfd, &st);
+  } else {
+    /* AT_FDCWD with an empty path is the working directory. */
+    if (is_at_empty_path(pathname, flags))
+      strcpy(pathname, ".");
+    int grab_flags = flags & LINUX_AT_SYMLINK_NOFOLLOW ? LOOKUP_NOFOLLOW : 0;
+    struct path path;
+    r = vfs_grab_dir(dirfd, pathname, grab_flags, &path);
+    if (r < 0) {
+      return r;
+    }
+    r = path.fs->ops->fstatat(path.fs, path.dir, path.subpath, &st, flags);
+    vfs_ungrab_dir(&path);
+  }
   if (0 <= r && copy_to_user(st_ptr, &st, sizeof st))
     return -LINUX_EFAULT;
   return r;
@@ -1740,7 +1779,7 @@ DEFINE_SYSCALL(newfstatat, int, dirfd, gstr_t, path_ptr, gaddr_t, st_ptr, int, f
  * reuses the same fstatat fs op as newfstatat and then repacks the arch-specific
  * struct l_newstat into the fixed struct l_statx (field-for-field, all names are
  * common to both stat layouts). Only the SYMLINK_NOFOLLOW lookup flag is honored
- * from `flags`; the AT_STATX_* sync hints and AT_EMPTY_PATH are not, and `mask`
+ * from `flags` besides AT_EMPTY_PATH; the AT_STATX_* sync hints are not, and `mask`
  * is advisory - we always return the STATX_BASIC_STATS set. btime is not filled.
  */
 DEFINE_SYSCALL(statx, int, dirfd, gstr_t, path_ptr, int, flags, unsigned int, mask, gaddr_t, stx_ptr)
@@ -1749,16 +1788,26 @@ DEFINE_SYSCALL(statx, int, dirfd, gstr_t, path_ptr, int, flags, unsigned int, ma
   if (strncpy_from_user(pathname, path_ptr, sizeof pathname) < 0)
     return -LINUX_EFAULT;
 
-  int grab_flags = flags & LINUX_AT_SYMLINK_NOFOLLOW ? LOOKUP_NOFOLLOW : 0;
-  struct path path;
-  int r = vfs_grab_dir(dirfd, pathname, grab_flags, &path);
-  if (r < 0)
-    return r;
-
   struct l_newstat st;
-  r = path.fs->ops->fstatat(path.fs, path.dir, path.subpath, &st,
-                            flags & LINUX_AT_SYMLINK_NOFOLLOW);
-  vfs_ungrab_dir(&path);
+  int r;
+
+  if (is_at_empty_path(pathname, flags)) {
+    /* AT_FDCWD names the working directory rather than a descriptor. */
+    if (dirfd == LINUX_AT_FDCWD)
+      strcpy(pathname, ".");
+    else
+      r = fstat_by_fd(dirfd, &st);
+  }
+  if (!is_at_empty_path(pathname, flags) || dirfd == LINUX_AT_FDCWD) {
+    int grab_flags = flags & LINUX_AT_SYMLINK_NOFOLLOW ? LOOKUP_NOFOLLOW : 0;
+    struct path path;
+    r = vfs_grab_dir(dirfd, pathname, grab_flags, &path);
+    if (r < 0)
+      return r;
+    r = path.fs->ops->fstatat(path.fs, path.dir, path.subpath, &st,
+                              flags & LINUX_AT_SYMLINK_NOFOLLOW);
+    vfs_ungrab_dir(&path);
+  }
   if (r < 0)
     return r;
 

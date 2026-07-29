@@ -26,8 +26,15 @@ static long sys6(long n,long a,long b,long c,long d,long e,long f){
 #define AT_FDCWD -100
 #define O_RDWR 2
 #define O_NOCTTY 0400
-#define TIOCGPTN   0x5430
-#define TIOCSPTLCK 0x5431
+/* The values a real guest sends. asm-generic/ioctls.h stops handing out bare
+ * 0x54xx numbers at TIOCSWINSZ and _IOC-encodes everything from 0x30 on, so
+ * these are _IOR('T',0x30,unsigned int) and _IOW('T',0x31,int). Spelled out
+ * rather than taken from NABI's own header on purpose: a test that shares a
+ * constant with the code under test cannot catch that constant being wrong,
+ * which is exactly how the first version of this test passed while every guest
+ * pty allocation still failed. */
+#define TIOCGPTN   0x80045430
+#define TIOCSPTLCK 0x40045431
 
 static void put(const char*m){int i=0;while(m[i])i++;sys6(SYS_write,1,(long)m,i,0,0,0);}
 static void putd(long v){char b[24];int i=23;b[i--]=0;if(v==0)b[i--]='0';

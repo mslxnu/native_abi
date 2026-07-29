@@ -244,6 +244,17 @@ for t in procfstest mapstest identtest; do
     fi
 done
 
+# emptypathtest: statx and fstatat accept AT_EMPTY_PATH, which is how Rust's
+# standard library stats every file it opens.
+cp "$here/emptypathtest" "$root/"; chmod +x "$root/emptypathtest"
+out=$("$NABI" -m "$root" /emptypathtest); rc=$?
+if [ "$rc" -eq 0 ] && [ "$out" = "emptypath ok" ]; then
+    echo "  ok  emptypathtest -> \"$out\""
+else
+    echo "  FAIL emptypathtest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 # oflagtest: O_DIRECTORY and O_NOFOLLOW must refuse. arm64 permutes these four
 # flag values relative to asm-generic, and a flag read as one NABI ignores is
 # silently granted - the worst outcome for a flag whose job is to fail.
