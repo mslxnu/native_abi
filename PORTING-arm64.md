@@ -1287,6 +1287,61 @@ Linux clears `VM_MAYWRITE` for that case, so even a later `mprotect` to
 every other file mapping indistinguishable from the real thing. `shared_file`
 now also requires the descriptor to be writable.
 
+### 3.5.18 Four futex bugs, one hang — **fixed**
+
+`apt-get install gcc` hung part-way through, on a freshly built tree, and not
+every time. `sample` on the stuck process showed the shape of it:
+
+```
+main-thread   ... vmm_run -> vmm_enter -> Hv::Vcpu::run   (guest spinning)
+Thread_324784 ... main_loop -> sys_futex -> do_private_wait -> __psynch_cvwait
+```
+
+One guest thread burning a core, another asleep. That pairing is the signature
+of a futex problem, and `src/ipc/futex.c` had four, none of which announces
+itself:
+
+1. **`FUTEX_WAIT`'s timeout is relative.** It was read out of the guest's
+   `struct timespec` and then overwritten with the current time, so the deadline
+   handed to `pthread_cond_timedwait` was always "now". Every timed wait
+   returned `ETIMEDOUT` immediately and the caller's retry loop became a spin at
+   a full core. That is the burning thread.
+
+2. **`FUTEX_WAIT_BITSET` never compared the word.** The compare-and-block is the
+   whole point of a futex: the guest reads the value, decides to sleep, and
+   passes the value it saw so the kernel can refuse to sleep if a wake has
+   already landed. `FUTEX_WAIT` did this; `FUTEX_WAIT_BITSET` did not — and it
+   is the one glibc actually uses, for `pthread_cond_wait` and `sem_wait`. A
+   wake arriving in that window was lost and the thread slept forever. That is
+   the sleeping thread.
+
+3. **A timed-out waiter was freed while still on the wait list.** The wake path
+   unlinks the entry before signalling it, so it was correct; the timeout path
+   was not, and left the list pointing into freed memory for the next wake to
+   walk. With (1) making every timed wait time out instantly, this fired
+   constantly.
+
+4. **`FUTEX_WAKE_OP` computed two of its five operations wrong** — `XOR` was
+   written as `*` and `ANDN` as `&` without the complement.
+
+Also `FUTEX_WAIT` returned Darwin's `EWOULDBLOCK` (35) where the guest expects
+Linux's `EAGAIN` (11). On Linux 35 is `EDEADLK`, which no caller handles.
+
+The absolute-versus-relative distinction is the one to remember: `FUTEX_WAIT`
+takes a relative timeout, while `FUTEX_WAIT_BITSET` and the PI operations take
+an absolute one — against `CLOCK_MONOTONIC` unless the guest set
+`FUTEX_CLOCK_REALTIME`, so it has to be rebased onto the real-time clock that
+`pthread_cond_timedwait` measures against.
+
+`futextest` checks the timing rather than only the return value, because a wait
+that did not sleep at all also returns 0, and that is the bug.
+
+This is worth weighing against the fork flakiness recorded elsewhere as an HVF
+limitation. Some of what was attributed there may have been this: a guest that
+spins or sleeps forever after a fork looks very much like a fork that did not
+take. Three purge/install/compile cycles now run clean where one in a few used
+to hang.
+
 ---
 
 ## 4. Phased implementation

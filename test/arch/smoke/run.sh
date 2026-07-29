@@ -244,6 +244,18 @@ for t in procfstest mapstest identtest; do
     fi
 done
 
+# futextest: the futex operations glibc's locking primitives rely on. A
+# relative timeout read as absolute makes a sleeping guest spin; a missing
+# compare makes a woken one sleep forever.
+cp "$here/futextest" "$root/"; chmod +x "$root/futextest"
+out=$("$NABI" -m "$root" /futextest); rc=$?
+if [ "$rc" -eq 0 ] && [ "$out" = "futex ok" ]; then
+    echo "  ok  futextest -> \"$out\""
+else
+    echo "  FAIL futextest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 # emptypathtest: statx and fstatat accept AT_EMPTY_PATH, which is how Rust's
 # standard library stats every file it opens.
 cp "$here/emptypathtest" "$root/"; chmod +x "$root/emptypathtest"

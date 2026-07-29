@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <sys/time.h>
+#include <time.h>
 
 /*
 FUTEX_UNLOCK_PI_PRIVATE
@@ -100,39 +101,103 @@ do_private_wait(gaddr_t uaddr, bool use_timeout, struct timespec *ts, bool check
     if (entry->uaddr != uaddr2)
       r = -LINUX_EAGAIN;
   }
+  /*
+   * A woken entry has already been unlinked by the waker, but a timed-out or
+   * spuriously woken one has not - and freeing it while it is still on the list
+   * leaves the list pointing at freed memory for the next wake to walk. The
+   * entry is on whichever list it ended up on, which after a requeue is not the
+   * one it started on, so it is removed by its own links rather than by uaddr.
+   */
+  list_del_init(&entry->head);
   pthread_cond_destroy(&entry->cond);
   free(entry);
   return r;
 }
 
+
+/*
+ * A guest futex timeout as an absolute deadline for pthread_cond_timedwait.
+ *
+ * The two forms are not the same, and the difference is easy to miss: FUTEX_WAIT
+ * takes a *relative* timeout, while FUTEX_WAIT_BITSET and the PI operations take
+ * an absolute one. Copying the guest's struct straight into the deadline is
+ * right for the second and badly wrong for the first - it asks to wait until a
+ * moment a few seconds after the epoch, which has long passed, so the wait
+ * returns ETIMEDOUT immediately and the guest spins at a full core instead of
+ * sleeping.
+ *
+ * An absolute deadline is against CLOCK_MONOTONIC unless the guest set
+ * FUTEX_CLOCK_REALTIME, while pthread_cond_timedwait measures against the real
+ * time clock, so the monotonic case is rebased rather than passed through.
+ */
+static void
+futex_deadline(const struct l_timespec *t, bool relative, bool realtime,
+               struct timespec *out)
+{
+  struct timespec now;
+  clock_gettime(CLOCK_REALTIME, &now);
+
+  if (relative) {
+    out->tv_sec  = now.tv_sec + t->tv_sec;
+    out->tv_nsec = now.tv_nsec + t->tv_nsec;
+  } else if (realtime) {
+    out->tv_sec  = t->tv_sec;
+    out->tv_nsec = t->tv_nsec;
+    return;
+  } else {
+    /* Absolute against CLOCK_MONOTONIC: keep the interval, move the origin. */
+    struct timespec mono;
+    clock_gettime(CLOCK_MONOTONIC, &mono);
+    long sec  = t->tv_sec - mono.tv_sec;
+    long nsec = t->tv_nsec - mono.tv_nsec;
+    out->tv_sec  = now.tv_sec + sec;
+    out->tv_nsec = now.tv_nsec + nsec;
+  }
+  while (out->tv_nsec >= 1000000000L) { out->tv_sec++;  out->tv_nsec -= 1000000000L; }
+  while (out->tv_nsec < 0)            { out->tv_sec--;  out->tv_nsec += 1000000000L; }
+}
+
+/*
+ * The compare-and-block every waiting futex operation has to do.
+ *
+ * The guest reads the word, decides it should sleep, and calls futex with the
+ * value it saw. Between those two the value may have changed and a wake may
+ * already have been sent, so the kernel re-reads it under the futex lock and
+ * refuses to sleep if it no longer matches. Skipping that turns a wake that
+ * arrived a moment early into a wait that nothing will ever satisfy.
+ */
+static int
+futex_should_block(gaddr_t uaddr, uint32_t val)
+{
+  uint32_t uval;
+  if (copy_from_user(&uval, uaddr, sizeof uval))
+    return -LINUX_EFAULT;
+  if (uval != val)
+    return -LINUX_EAGAIN;
+  return 0;
+}
+
 static int
 do_private_futex(gaddr_t uaddr, int op, uint32_t val, gaddr_t timeout_ptr, gaddr_t uaddr2, int val3)
 {
-  if ((op & LINUX_FUTEX_CLOCK_REALTIME) != 0) {
-    printk("futex: FUTEX_CLOCK_REALTIME flags is not supported\n");
-  }
+  /* Which clock an absolute deadline is measured against. */
+  bool realtime_clock = (op & LINUX_FUTEX_CLOCK_REALTIME) != 0;
 
   switch (op & LINUX_FUTEX_CMD_MASK) {
   case LINUX_FUTEX_WAKE: {
     return do_private_futex_wake(uaddr, val, false, 0);
   }
   case LINUX_FUTEX_WAIT: {
-    uint32_t uval;
-    if (copy_from_user(&uval, uaddr, sizeof uval))
-      return -LINUX_EFAULT;
-    if (uval != val)
-      return -EWOULDBLOCK;
+    int r = futex_should_block(uaddr, val);
+    if (r < 0)
+      return r;             /* -LINUX_EAGAIN, not Darwin's EWOULDBLOCK */
     struct timespec ts;
     if (timeout_ptr != 0) {
       struct l_timespec timeout;
       if (copy_from_user(&timeout, timeout_ptr, sizeof timeout))
         return -LINUX_EFAULT;
-      ts.tv_sec = timeout.tv_sec;
-      ts.tv_nsec = timeout.tv_nsec;
-      struct timeval tv;
-      gettimeofday(&tv, NULL);
-      ts.tv_sec = tv.tv_sec;
-      ts.tv_nsec = tv.tv_usec * 1000;
+      /* FUTEX_WAIT's timeout is relative. */
+      futex_deadline(&timeout, true, false, &ts);
     }
     return do_private_wait(uaddr, timeout_ptr, &ts, false, 0, false, 0);
   }
@@ -150,8 +215,8 @@ do_private_futex(gaddr_t uaddr, int op, uint32_t val, gaddr_t timeout_ptr, gaddr
     case FUTEX_OP_SET: newval = LINUX_FUTEX_GETOPARG(val3); break;
     case FUTEX_OP_ADD: newval = oldval + LINUX_FUTEX_GETOPARG(val3); break;
     case FUTEX_OP_OR: newval = oldval | LINUX_FUTEX_GETOPARG(val3); break;
-    case FUTEX_OP_ANDN: newval = oldval & LINUX_FUTEX_GETOPARG(val3); break;
-    case FUTEX_OP_XOR: newval = oldval * LINUX_FUTEX_GETOPARG(val3); break;
+    case FUTEX_OP_ANDN: newval = oldval & ~LINUX_FUTEX_GETOPARG(val3); break;
+    case FUTEX_OP_XOR: newval = oldval ^ LINUX_FUTEX_GETOPARG(val3); break;
     }
     if (copy_to_user(uaddr2, &newval, sizeof newval)) {
       ret = -LINUX_EFAULT;
@@ -188,8 +253,7 @@ do_private_futex(gaddr_t uaddr, int op, uint32_t val, gaddr_t timeout_ptr, gaddr
       struct l_timespec timeout;
       if (copy_from_user(&timeout, timeout_ptr, sizeof timeout))
         return -LINUX_EFAULT;
-      ts.tv_sec = timeout.tv_sec;
-      ts.tv_nsec = timeout.tv_nsec;
+      futex_deadline(&timeout, false, realtime_clock, &ts);
     }
     int tid = do_gettid();
     /* TODO: check mprotect flags */
@@ -238,19 +302,26 @@ do_private_futex(gaddr_t uaddr, int op, uint32_t val, gaddr_t timeout_ptr, gaddr
       struct l_timespec timeout;
       if (copy_from_user(&timeout, timeout_ptr, sizeof timeout))
         return -LINUX_EFAULT;
-      ts.tv_sec = timeout.tv_sec;
-      ts.tv_nsec = timeout.tv_nsec;
+      futex_deadline(&timeout, false, realtime_clock, &ts);
     }
     return do_private_wait(uaddr, timeout_ptr, &ts, true, uaddr2, false, 0);
   }
   case LINUX_FUTEX_WAIT_BITSET: {
+    /* The compare was missing here, and this is the operation glibc actually
+     * uses - pthread_cond_wait and sem_wait go through it. Without it a wake
+     * that lands between the guest's read of the word and this call is lost,
+     * and the thread sleeps forever on a condition that has already happened. */
+    int r = futex_should_block(uaddr, val);
+    if (r < 0)
+      return r;
     struct timespec ts;
     if (timeout_ptr != 0) {
       struct l_timespec timeout;
       if (copy_from_user(&timeout, timeout_ptr, sizeof timeout))
         return -LINUX_EFAULT;
-      ts.tv_sec = timeout.tv_sec;
-      ts.tv_nsec = timeout.tv_nsec;
+      /* FUTEX_WAIT_BITSET's timeout is absolute - that is the difference from
+       * FUTEX_WAIT - against CLOCK_MONOTONIC unless the guest asked otherwise. */
+      futex_deadline(&timeout, false, realtime_clock, &ts);
     }
     return do_private_wait(uaddr, timeout_ptr, &ts, false, 0, true, val3);
   }

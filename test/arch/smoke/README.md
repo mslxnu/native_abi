@@ -71,6 +71,9 @@ guest-code cache sync.
 - `procfstest` — a mounted pseudo-filesystem is visible and stays visible across
   a fork. Skips when nothing is mounted at `/proc`, since it is about NABI
   passing one through rather than about mSL/ProcFS.
+- `futextest` — `FUTEX_WAIT`/`FUTEX_WAIT_BITSET` errno, timeout units and the
+  compare-and-block. Times the wait rather than only checking that it returned,
+  since "did not sleep at all" also returns.
 - `emptypathtest` — `statx`/`fstatat` with `AT_EMPTY_PATH`, the form Rust's
   standard library uses for every file it opens. Compared against `fstat` on
   the same descriptor, since a stat of the wrong object also returns 0.
