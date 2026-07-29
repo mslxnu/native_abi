@@ -1,0 +1,444 @@
+#!/bin/sh
+#
+# Build a Debian rootfs for NABI by downloading it from the Debian archive.
+#
+#   msl-mkrootfs [-s suite] [-a arch] [-m mirror] [-i pkg,pkg] [-v variant] <dir>
+#
+# This is debootstrap's shape, done with what macOS ships and finished inside
+# NABI itself. There are three stages and the third is the interesting one.
+#
+#   1. Resolve.  Fetch the archive's Packages index and walk Depends and
+#      Pre-Depends from the required/essential floor to a closure. Recommends
+#      is not followed; it is the difference between a 90-package base and a
+#      900-package one.
+#
+#   2. Unpack.   Download each .deb, check it against the SHA256 the index
+#      gives, and lay down its data.tar and its control members - the file
+#      list, the md5sums, and the maintainer scripts. Everything is recorded
+#      as "unpacked", not "installed", because at this point it is true.
+#
+#   3. Configure. Run `dpkg --configure -a` in the tree, under NABI. This is
+#      debootstrap's second stage, and until NABI could run dpkg there was no
+#      way to do it on macOS at all: the maintainer scripts are aarch64 shell
+#      and need a working guest to execute, which is the thing being built.
+#      Skipping it is what left the earlier ISO-based tree without /etc/shadow,
+#      without an ld.so cache, and without any update-alternatives symlink.
+#
+# What is verified: the archive is fetched over https, the Packages index is
+# checked against the SHA256 in the suite's Release file, and every .deb is
+# checked against the SHA256 in that index. What is not verified is Release's
+# OpenPGP signature - macOS ships no gpgv - so the trust root here is TLS and
+# the Debian CA chain rather than the archive key. Once the tree exists, apt
+# inside it does check signatures, with the keyring this installs.
+set -eu
+
+SUITE=trixie
+ARCH=arm64
+MIRROR=https://deb.debian.org/debian
+EXTRA=
+VARIANT=standard
+
+usage() {
+    cat >&2 <<EOM
+usage: ${0##*/} [options] <target-dir>
+
+  -s <suite>    Debian suite to build (default: $SUITE)
+  -a <arch>     dpkg architecture (default: $ARCH)
+  -m <mirror>   archive to fetch from (default: $MIRROR)
+  -i <p,p,...>  extra packages to include
+  -v <variant>  minbase (required only) or standard (adds Priority: important)
+                (default: $VARIANT)
+EOM
+    exit 2
+}
+
+while getopts s:a:m:i:v:h opt; do
+    case $opt in
+        s) SUITE=$OPTARG ;;
+        a) ARCH=$OPTARG ;;
+        m) MIRROR=$OPTARG ;;
+        i) EXTRA=$OPTARG ;;
+        v) VARIANT=$OPTARG ;;
+        *) usage ;;
+    esac
+done
+shift $((OPTIND - 1))
+[ $# -eq 1 ] || usage
+ROOT=$1
+
+case $VARIANT in
+    minbase|standard) ;;
+    *) echo "${0##*/}: unknown variant: $VARIANT" >&2; exit 2 ;;
+esac
+
+# ---------------------------------------------------------------------------
+# Guards
+# ---------------------------------------------------------------------------
+
+for t in curl gunzip tar ar awk shasum; do
+    command -v "$t" > /dev/null || { echo "${0##*/}: need $t" >&2; exit 1; }
+done
+
+# Refused rather than warned about, because the damage is silent. Debian ships
+# files whose names differ only in case - manpages-dev has _exit.2.gz and
+# _Exit.2.gz, linux-libc-dev has xt_connmark.h and xt_CONNMARK.h - and on a
+# case-insensitive filesystem the second of each pair quietly overwrites the
+# first. The tree that comes out looks complete and is not.
+mkdir -p "$ROOT"
+ROOT=$(cd "$ROOT" && pwd)
+probe=$(mktemp "$ROOT/.mslCASE.XXXXXX") || exit 1
+lower=$(dirname "$probe")/$(basename "$probe" | tr 'A-Z' 'a-z')
+collides=no
+if [ -e "$lower" ]; then collides=yes; fi
+rm -f "$probe"
+if [ "$collides" = yes ]; then
+    cat >&2 <<EOM
+$ROOT is on a case-insensitive filesystem.
+
+Debian ships files whose names differ only in case, and this filesystem cannot
+hold both - the tree would come out quietly incomplete. Make a case-sensitive
+volume first:
+
+    msl-mkvolume ~/.msl/disk.sparseimage /Volumes/msl
+
+then build into it, e.g. /Volumes/msl/rootfs-debian.
+EOM
+    exit 1
+fi
+
+# The executable that takes -m, not the perl wrapper installed beside it. Same
+# search nabi-shell.sh does, and for the same reason: the wrapper's options are
+# --root/--strace/--output and it answers -m with "Unknown option: m".
+here=$(cd "$(dirname "$0")/.." && pwd)
+for cand in ${NABI:-} "$here/out/nabi" "$here/libexec/nabi" \
+            /usr/local/libexec/nabi; do
+    [ -n "$cand" ] && [ -x "$cand" ] || continue
+    if [ "$(head -c 2 "$cand" 2>/dev/null)" = "#!" ]; then continue; fi
+    NABI=$cand
+    break
+done
+
+CACHE=${MSL_CACHE:-$HOME/.msl/cache/$SUITE-$ARCH}
+mkdir -p "$CACHE"
+
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+
+# ---------------------------------------------------------------------------
+# 1. Resolve
+# ---------------------------------------------------------------------------
+
+echo "==> fetching the $SUITE/$ARCH index from $MIRROR"
+curl -fsSL "$MIRROR/dists/$SUITE/Release" -o "$work/Release"
+
+# The index's own checksum, from the Release file, so a corrupted or
+# substituted Packages is caught before anything is resolved against it.
+want_sha=$(awk -v p="main/binary-$ARCH/Packages.gz" '
+    /^SHA256:/ { insha = 1; next }
+    /^[A-Za-z-]+:/ { insha = 0 }
+    insha && $3 == p { print $1; exit }' "$work/Release")
+[ -n "$want_sha" ] || { echo "${0##*/}: $SUITE/$ARCH is not in Release" >&2; exit 1; }
+
+curl -fsSL "$MIRROR/dists/$SUITE/main/binary-$ARCH/Packages.gz" -o "$work/Packages.gz"
+got_sha=$(shasum -a 256 "$work/Packages.gz" | cut -d' ' -f1)
+if [ "$got_sha" != "$want_sha" ]; then
+    echo "${0##*/}: Packages.gz does not match Release" >&2
+    exit 1
+fi
+gunzip -c "$work/Packages.gz" > "$work/Packages"
+
+cat > "$work/resolve.awk" <<'AWK'
+# Read a Debian Packages index, print the closure of a seed set.
+# Emits: <name> <tab> <filename> <tab> <sha256> <tab> <size>
+BEGIN { FS = ": " }
+
+function record(   i, n, pv) {
+  if (pkg == "") return
+  # A package can appear more than once; the first stanza wins, which within a
+  # single suite is the only version there is.
+  if (pkg in fname) return
+  fname[pkg] = filename; sha[pkg] = sha256; sz[pkg] = size
+  dep[pkg] = depends; pri[pkg] = priority; ess[pkg] = essential
+  # Provides makes a virtual name resolvable. Recorded only if nothing real
+  # claims the name, so a real package always beats a provider.
+  n = split(provides, pv, /, */)
+  for (i = 1; i <= n; i++) {
+    gsub(/ *\(.*\)/, "", pv[i]); gsub(/:any$/, "", pv[i]); gsub(/^ +| +$/, "", pv[i])
+    if (pv[i] != "" && !(pv[i] in virt)) virt[pv[i]] = pkg
+  }
+}
+
+/^Package: /  { record(); pkg = $2
+                filename = sha256 = size = depends = priority = essential = provides = ""
+                next }
+/^Filename: / { filename = $2; next }
+/^SHA256: /   { sha256 = $2; next }
+/^Size: /     { size = $2; next }
+/^Priority: / { priority = $2; next }
+/^Essential: /{ essential = $2; next }
+/^Depends: /     { depends = depends (depends ? ", " : "") $2; next }
+/^Pre-Depends: / { depends = depends (depends ? ", " : "") $2; next }
+/^Provides: /    { provides = $2; next }
+
+END {
+  record()
+
+  # The floor: what the archive marks required or essential. "important" on top
+  # is the difference between something dpkg can run in and something a person
+  # would recognise as a Debian system.
+  for (p in fname)
+    if (pri[p] == "required" || ess[p] == "yes" ||
+        (important && pri[p] == "important")) want[p] = 1
+  n = split(seeds, s, /,/)
+  for (i = 1; i <= n; i++)
+    if (s[i] != "") want[s[i]] = 1
+
+  # Closure over Depends and Pre-Depends only. Recommends is deliberately not
+  # followed.
+  changed = 1
+  while (changed) {
+    changed = 0
+    for (p in want) {
+      if (p in seen) continue
+      seen[p] = 1; changed = 1
+      if (!(p in fname)) {
+        if (p in virt) { want[virt[p]] = 1; continue }
+        printf "unresolved: %s\n", p > "/dev/stderr"
+        continue
+      }
+      na = split(dep[p], alts, /, */)
+      for (a = 1; a <= na; a++) {
+        # "x | y": take the first alternative the archive can satisfy, which is
+        # the one apt calls the default and the one debootstrap picks.
+        nb = split(alts[a], opt, / *\| */)
+        chosen = ""
+        for (b = 1; b <= nb; b++) {
+          d = opt[b]
+          gsub(/ *\(.*\)/, "", d); gsub(/:any$/, "", d); gsub(/:native$/, "", d)
+          gsub(/^ +| +$/, "", d)
+          if (d == "") continue
+          if (d in fname) { chosen = d; break }
+          if (d in virt)  { chosen = virt[d]; break }
+        }
+        if (chosen != "") want[chosen] = 1
+      }
+    }
+  }
+
+  for (p in want)
+    if (p in fname)
+      printf "%s\t%s\t%s\t%s\n", p, fname[p], sha[p], sz[p]
+}
+AWK
+
+important=0
+if [ "$VARIANT" = standard ]; then important=1; fi
+# ca-certificates and the keyring are not required by anything, but without
+# them apt in the finished tree cannot verify or fetch over https - which is
+# the first thing anyone will ask it to do.
+seeds=apt,bash,dpkg,ca-certificates,debian-archive-keyring
+if [ -n "$EXTRA" ]; then seeds="$seeds,$EXTRA"; fi
+
+echo "==> resolving"
+awk -v seeds="$seeds" -v important=$important -f "$work/resolve.awk" \
+    "$work/Packages" | sort > "$work/closure"
+count=$(wc -l < "$work/closure" | tr -d ' ')
+bytes=$(awk -F'\t' '{s += $4} END {print s + 0}' "$work/closure")
+echo "    $count packages, $((bytes / 1048576)) MB"
+
+# ---------------------------------------------------------------------------
+# 2. Unpack
+# ---------------------------------------------------------------------------
+
+echo "==> downloading"
+n=0
+while IFS="$(printf '\t')" read -r pkg file sha size; do
+    n=$((n + 1))
+    out="$CACHE/$(basename "$file")"
+    # A cached file is trusted only after it checks out; a truncated download
+    # from a previous run is otherwise indistinguishable from a good one.
+    if [ -f "$out" ] && [ "$(shasum -a 256 "$out" | cut -d' ' -f1)" = "$sha" ]; then
+        continue
+    fi
+    curl -fsSL "$MIRROR/$file" -o "$out.part"
+    got=$(shasum -a 256 "$out.part" | cut -d' ' -f1)
+    if [ "$got" != "$sha" ]; then
+        rm -f "$out.part"
+        echo "${0##*/}: $pkg failed its checksum" >&2
+        exit 1
+    fi
+    mv "$out.part" "$out"
+    if [ $((n % 20)) -eq 0 ]; then echo "    $n/$count"; fi
+done < "$work/closure"
+
+echo "==> unpacking"
+mkdir -p "$ROOT/var/lib/dpkg/info" "$ROOT/var/lib/dpkg/updates" \
+         "$ROOT/var/lib/dpkg/triggers" "$ROOT/var/lib/apt/lists/partial" \
+         "$ROOT/var/cache/apt/archives/partial" "$ROOT/etc/apt/apt.conf.d" \
+         "$ROOT/etc/apt/preferences.d" "$ROOT/etc/apt/sources.list.d" \
+         "$ROOT/var/log/apt" "$ROOT/run" "$ROOT/var/tmp" "$ROOT/tmp" \
+         "$ROOT/proc" "$ROOT/sys" "$ROOT/dev"
+chmod 1777 "$ROOT/tmp" "$ROOT/var/tmp"
+
+status="$work/status"
+: > "$status"
+n=0
+while IFS="$(printf '\t')" read -r pkg file sha size; do
+    n=$((n + 1))
+    deb="$CACHE/$(basename "$file")"
+    d="$work/x"; rm -rf "$d"; mkdir -p "$d"
+    ( cd "$d" && ar x "$deb" )
+
+    data=$(ls "$d"/data.tar.* 2>/dev/null | head -1)
+    ctrl=$(ls "$d"/control.tar.* 2>/dev/null | head -1)
+    [ -n "$data" ] && [ -n "$ctrl" ] || { echo "    ! $pkg is not a .deb"; continue; }
+
+    tar -xf "$data" -C "$ROOT" 2>/dev/null || true
+
+    mkdir -p "$d/c" && tar -xf "$ctrl" -C "$d/c" 2>/dev/null || true
+    [ -f "$d/c/control" ] || continue
+
+    arch=$(awk '/^Architecture:/ {print $2; exit}' "$d/c/control")
+    ma=$(awk '/^Multi-Arch:/ {print $2; exit}' "$d/c/control")
+    # Multi-Arch: same packages are keyed name:arch, everything else by name -
+    # that is how dpkg names both the status entry and these files.
+    lname=$pkg
+    if [ "$ma" = same ]; then lname="$pkg:$arch"; fi
+
+    # The file list. Without it `dpkg -L` and `dpkg -S` answer nothing and every
+    # query warns that the package has no files installed. The data.tar member
+    # names are exactly that list, once ./ becomes / and the trailing slash on
+    # directories is dropped.
+    tar -tf "$data" 2>/dev/null |
+        sed -e 's|^\./$|/.|' -e 's|^\./|/|' -e 's|\(.\)/$|\1|' \
+        > "$ROOT/var/lib/dpkg/info/$lname.list"
+
+    # The maintainer scripts and the md5sums, which the ISO-based builder never
+    # laid down - so nothing could be configured afterwards and `dpkg --audit`
+    # reported every package as missing its md5sums.
+    for m in "$d"/c/*; do
+        b=$(basename "$m")
+        case $b in
+            control|conffiles) continue ;;
+        esac
+        [ -f "$m" ] || continue
+        cp "$m" "$ROOT/var/lib/dpkg/info/$lname.$b"
+        case $b in
+            preinst|postinst|prerm|postrm|config)
+                chmod 755 "$ROOT/var/lib/dpkg/info/$lname.$b" ;;
+        esac
+    done
+    if [ -f "$d/c/conffiles" ]; then
+        cp "$d/c/conffiles" "$ROOT/var/lib/dpkg/info/$lname.conffiles"
+    fi
+
+    # "unpacked", not "installed": the files are there and nothing has been
+    # configured. Stage 3 is what turns this into "installed", by running the
+    # postinst that says so.
+    echo "Package: $pkg"                >> "$status"
+    echo "Status: install ok unpacked"  >> "$status"
+    awk 'BEGIN{d=0} /^$/{d=1} d==0 && !/^Package:/ {print}' "$d/c/control" >> "$status"
+    echo "" >> "$status"
+
+    if [ $((n % 20)) -eq 0 ]; then echo "    $n/$count"; fi
+done < "$work/closure"
+
+cp "$status" "$ROOT/var/lib/dpkg/status"
+: > "$ROOT/var/lib/dpkg/available"
+
+# usrmerge: the compatibility symlinks base-files normally provides.
+for l in bin sbin lib; do
+    [ -e "$ROOT/$l" ] || ln -s "usr/$l" "$ROOT/$l" 2>/dev/null || true
+done
+[ -e "$ROOT/lib64" ] || ln -s usr/lib "$ROOT/lib64" 2>/dev/null || true
+
+# ---------------------------------------------------------------------------
+# 3. Configure, inside NABI
+# ---------------------------------------------------------------------------
+
+# /etc/passwd and /etc/group are deliberately NOT seeded here. base-passwd's
+# postinst installs its masters only when they are absent, so a placeholder
+# survives stage 3 as the whole account database - which leaves no `utmp`
+# group, and base-files' own postinst then stops on `chown root:utmp`. Letting
+# the postinst own the file is the entire point of stage 3.
+mkdir -p "$ROOT/root" "$ROOT/usr/local"
+
+cat > "$ROOT/etc/apt/sources.list" <<EOS
+deb $MIRROR $SUITE main
+deb $MIRROR $SUITE-updates main
+deb https://security.debian.org/debian-security $SUITE-security main
+EOS
+
+# Taken from the host, so the guest resolves the way the machine does rather
+# than against a hardcoded public resolver.
+if [ -s /etc/resolv.conf ]; then
+    grep -E '^(nameserver|search|domain|options)' /etc/resolv.conf \
+        > "$ROOT/etc/resolv.conf" 2>/dev/null || true
+fi
+[ -s "$ROOT/etc/resolv.conf" ] ||
+    printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' > "$ROOT/etc/resolv.conf"
+
+cat > "$ROOT/etc/nsswitch.conf" <<'EOS'
+passwd:         files
+group:          files
+shadow:         files
+gshadow:        files
+
+hosts:          files dns
+networks:       files
+
+protocols:      db files
+services:       db files
+ethers:         db files
+rpc:            db files
+EOS
+
+printf 'msl\n' > "$ROOT/etc/hostname"
+printf '127.0.0.1\tlocalhost\n' > "$ROOT/etc/hosts"
+
+if [ -z "${NABI:-}" ] || [ ! -x "${NABI:-}" ]; then
+    cat >&2 <<EOM
+
+==> no nabi executable found, so the tree is unpacked but not configured.
+
+    Build one with 'make ARCH=arm64' or install with 'sudo make install',
+    then finish with:
+
+      msl $ROOT dpkg --configure -a
+EOM
+    exit 0
+fi
+
+echo "==> configuring (dpkg --configure -a, under NABI)"
+# Twice, because the order dpkg picks from a cold tree is not always one that
+# works. base-files' postinst runs `chown root:utmp`, and if it is configured
+# before base-passwd - which is the package that installs the group file that
+# has a utmp in it - it stops on a group that does not exist yet. Nothing is
+# wrong with either package; the second pass finds base-passwd already done and
+# base-files now able to finish. --force-depends is what lets the first pass get
+# far enough to make the second one useful.
+#
+# Anything still broken after two passes is a real failure and is counted below
+# rather than hidden.
+configure() {
+    env -i TERM="${TERM:-xterm}" HOME=/root PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+        DEBIAN_FRONTEND=noninteractive \
+        "$NABI" -m "$ROOT" /bin/bash -lc \
+        'dpkg --configure -a --force-depends 2>&1' || true
+}
+configure > /dev/null 2>&1
+configure | tail -20
+
+echo "==> done: $ROOT"
+echo "    $(grep -c '^Package:' "$ROOT/var/lib/dpkg/status") packages"
+# grep -c exits 1 when it counts nothing, which is the good case here - so the
+# count is taken with `|| true` inside the guest rather than guarded outside,
+# where the failure would be indistinguishable from not being able to ask.
+left=$(env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/root \
+    "$NABI" -m "$ROOT" /bin/bash -lc \
+    "dpkg-query -f '\${Status}\n' -W 2>/dev/null | grep -vc '^install ok installed$' || true" \
+    2>/dev/null | tr -dc '0-9')
+[ -n "$left" ] || left='?'
+echo "    $left not fully configured"
+echo
+echo "    msl $ROOT"

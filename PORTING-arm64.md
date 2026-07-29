@@ -1107,6 +1107,94 @@ this does not; the size is a ceiling, not an allocation.
 With the rootfs on one of those, `apt install gcc make` completes, and the
 installed gcc compiles and links a program that then runs under NABI.
 
+### 3.5.13 arm64 permutes four `O_*` flags — **fixed**
+
+`mv a b` failed for every `b` that already existed:
+
+```
+mv: cannot stat 'f2/f1': Not a directory
+```
+
+`f2` is a regular file, and `mv` had appended the source's name to it as though
+it were a directory. `stat` in the guest reported `f2` correctly, which made no
+sense until the reason coreutils disagreed turned up: it does not ask `stat`. It
+asks `open(dest, O_DIRECTORY)`, and takes success as the answer.
+
+Four of the `O_*` flags are not common between architectures.
+`asm-generic/fcntl.h` defines them and x86 takes the defaults, but
+`arch/arm64/include/uapi/asm/fcntl.h` overrides all four — and not by shifting
+them, by permuting them:
+
+|             | x86-64     | arm64     |
+|-------------|------------|-----------|
+| `O_DIRECT`  | `00040000` | `0200000` |
+| `O_LARGEFILE`| `00100000`| `0400000` |
+| `O_DIRECTORY`| `00200000`| `040000`  |
+| `O_NOFOLLOW`| `00400000` | `0100000` |
+
+NABI carried the x86 numbers unconditionally. So an arm64 guest's `O_DIRECTORY`
+arrived looking like `O_DIRECT`, and its `O_NOFOLLOW` like `O_LARGEFILE` — both
+hints NABI drops. The requests were not mistranslated, they were *silently
+granted*, which for a flag whose entire job is to make an open fail is the worst
+available outcome: `open(O_DIRECTORY)` succeeded on regular files, and
+`open(O_NOFOLLOW)` followed the symlink it was told to refuse.
+
+Nothing noticed for a long time because a wrongly-granted open still returns a
+working fd. Everything that overwrites a file noticed at once, which is most of
+what installing a package does.
+
+`oflagtest` checks the two that must *refuse*, since a flag being ignored passes
+any test that only asks for success.
+
+### 3.5.14 Open file description locks, and `/proc/self/fd` — **fixed**
+
+With those out of the way, `dpkg --configure -a` got as far as systemd and
+stopped: *"Failed to take /etc/passwd lock: Invalid argument"*, taking udev and
+cron down with it. A trace named it exactly — `fcntl(fd, 0x26, ...)`, and 0x26
+is 38, `F_OFD_SETLKW`.
+
+Open file description locks belong to the open file description rather than to
+the process, so an unrelated `close` does not drop them and two descriptions in
+one process contend. Darwin has no `F_OFD_*` — but that description is precisely
+BSD `flock()`, so whole-file OFD locks map onto it exactly. Byte ranges do not,
+and are refused rather than widened: a lock quietly covering more of a file than
+was asked for is a deadlock that gets blamed on something else. Nothing seen so
+far asks for one.
+
+The warning that would have named this was invisible for a familiar reason —
+`systemd-sysusers` runs as a forked child, and on arm64 a fork is a fork plus an
+exec, so the child is a fresh `nabi` with no `-w` sink. Running the binary as the
+top-level process is the way to see anything a forked guest does.
+
+That got systemd past the lock and into *"Failed to flush /etc/.#group…: Invalid
+argument"*, from `fsync_directory_of_file`, which finds a file's directory by
+reading `/proc/self/fd/<n>`. The host's procfs cannot answer that even when it is
+mounted: the descriptors it describes are `nabi`'s, and a guest fd number means
+nothing there. What it does serve are directories rather than symlinks, so
+`readlink` on one returns `EINVAL`.
+
+So NABI serves `/proc/self/fd/<n>` itself, from its own fd table:
+
+- **readlink** answers with the path from `F_GETPATH`, translated out of host
+  terms. That translation is the part that matters — the guest opens what it
+  reads here, and a rootfs path handed back whole sends it to `/Volumes/…`, a
+  name that only means something on the other side of the boundary. Passthrough
+  prefixes need no translation and get none; none of them is under the root.
+- **open** reaches the file rather than the name, which is the point of it.
+  Darwin cannot reopen an unlinked file, so a regular one is copied into a fresh
+  unlinked temp file — an independent description starting at offset zero, which
+  is what a real open gives and what `dup()` would not. `pread` leaves the
+  guest's own offset alone. A pipe or socket has no contents to copy and no
+  offset to get wrong, so those are duplicated.
+
+Guest fds only, in both. NABI keeps its own descriptors at the top of the table,
+and without that bound a guest could read the path of the arena, the checkpoint,
+or the debug sinks.
+
+With all of it in place, `dpkg --configure -a` finishes a 149-package Debian
+trixie with nothing left unconfigured, systemd and udev and cron included, and
+`dpkg --audit` is clean.
+
 ---
 
 ## 4. Phased implementation

@@ -71,6 +71,9 @@ guest-code cache sync.
 - `procfstest` — a mounted pseudo-filesystem is visible and stays visible across
   a fork. Skips when nothing is mounted at `/proc`, since it is about NABI
   passing one through rather than about mSL/ProcFS.
+- `oflagtest` — `O_DIRECTORY` and `O_NOFOLLOW` refuse what they are supposed
+  to refuse. arm64 permutes these four flag values relative to asm-generic, and
+  a flag read as one NABI ignores is granted rather than rejected.
 - `ptytest` — `/dev/ptmx`, `TIOCSPTLCK`, `TIOCGPTN` and the `/dev/pts/<n>`
   path, which Darwin spells differently at every step. apt runs dpkg under a
   pty, so all four have to work or nothing installs.

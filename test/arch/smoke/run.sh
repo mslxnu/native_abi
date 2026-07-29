@@ -244,6 +244,18 @@ for t in procfstest mapstest identtest; do
     fi
 done
 
+# oflagtest: O_DIRECTORY and O_NOFOLLOW must refuse. arm64 permutes these four
+# flag values relative to asm-generic, and a flag read as one NABI ignores is
+# silently granted - the worst outcome for a flag whose job is to fail.
+cp "$here/oflagtest" "$root/"; chmod +x "$root/oflagtest"
+out=$("$NABI" -m "$root" /oflagtest); rc=$?
+if [ "$rc" -eq 0 ] && [ "$out" = "oflag ok" ]; then
+    echo "  ok  oflagtest -> \"$out\""
+else
+    echo "  FAIL oflagtest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 # ptytest: a guest allocates a pty and talks through it. Linux and Darwin
 # agree on /dev/ptmx and on nothing after it.
 cp "$here/ptytest" "$root/"; chmod +x "$root/ptytest"

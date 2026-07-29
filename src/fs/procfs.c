@@ -37,6 +37,8 @@
 #include "common.h"
 #include "noah.h"
 #include "mm.h"
+#include <sys/stat.h>
+
 #include "page.h"
 
 #include "linux/common.h"
@@ -150,10 +152,11 @@ build_maps(size_t *len_out)
  * is another guest, its state lives in a different nabi.
  */
 enum procfs_file { PROCFS_NONE, PROCFS_MAPS, PROCFS_CMDLINE, PROCFS_COMM,
-                   PROCFS_EXE };
+                   PROCFS_EXE, PROCFS_FD };
 
+/* For PROCFS_FD, the number after /fd/. Meaningless for the others. */
 static enum procfs_file
-own_procfs_file(const char *path)
+own_procfs_file_n(const char *path, int *fd_out)
 {
   if (strncmp(path, "/proc/", 6) != 0)
     return PROCFS_NONE;
@@ -178,8 +181,33 @@ own_procfs_file(const char *path)
   if (strcmp(slash, "/cmdline") == 0) return PROCFS_CMDLINE;
   if (strcmp(slash, "/comm") == 0)    return PROCFS_COMM;
   if (strcmp(slash, "/exe") == 0)     return PROCFS_EXE;
+
+  /* /proc/self/fd/<n>. The host's procfs cannot answer this even when it is
+   * mounted: the fds it would describe are nabi's, and a guest fd number means
+   * nothing there. Worse, what it does serve are directories rather than
+   * symlinks, so readlink on one comes back EINVAL - which is how systemd's
+   * fsync_directory_of_file, which finds a file's directory by reading
+   * /proc/self/fd/<n>, reported "Failed to flush /etc/.#group...: Invalid
+   * argument" and stopped systemd, udev and cron from configuring. */
+  if (strncmp(slash, "/fd/", 4) == 0) {
+    const char *p = slash + 4;
+    if (*p < '0' || *p > '9')
+      return PROCFS_NONE;
+    int n = 0;
+    for (; *p >= '0' && *p <= '9'; p++) {
+      n = n * 10 + (*p - '0');
+      if (n > 1 << 24)
+        return PROCFS_NONE;
+    }
+    if (*p != '\0')
+      return PROCFS_NONE;
+    if (fd_out)
+      *fd_out = n;
+    return PROCFS_FD;
+  }
   return PROCFS_NONE;
 }
+
 
 /* comm is the executable's basename and a newline - Linux truncates it to 15
  * characters, and something reading it to compare against a process name will
@@ -213,8 +241,48 @@ procfs_open(const char *path, int *out_fd)
 {
   size_t len = 0;
   char *content = NULL;
+  int fdno = -1;
 
-  switch (own_procfs_file(path)) {
+  switch (own_procfs_file_n(path, &fdno)) {
+  case PROCFS_FD: {
+    /*
+     * Opening /proc/self/fd/<n> reaches the *file*, not the name - which is
+     * the whole point of it, and why apt uses it: it writes a signature to a
+     * temp file, unlinks the name immediately, and hands sqv "/proc/self/fd/N"
+     * to read instead. Passed through to the host, that path finds nabi's own
+     * procfs entry, which is a directory, and apt reports the unlinked name it
+     * remembers - "Reading /tmp/apt.sig.XXXXXX: No such file or directory" -
+     * naming a file that was never meant to still be there.
+     *
+     * Darwin has no way to reopen an unlinked file, so a regular one is copied
+     * into a fresh unlinked temp file: an independent description starting at
+     * offset zero, which is what a real open would give and what dup() would
+     * not. The read is by pread so the guest's own offset is left where it was.
+     */
+    if (fdno < 0 || fdno >= proc.fileinfo.vkern_fdtable.start)
+      return -1;
+    struct stat st;
+    if (fstat(fdno, &st) < 0)
+      return -1;
+    if (!S_ISREG(st.st_mode)) {
+      /* A pipe, socket or tty has no contents to copy and no offset to get
+       * wrong; sharing the description is the closest thing to Linux here. */
+      int dupped = dup(fdno);
+      if (dupped < 0)
+        return -1;
+      *out_fd = dupped;
+      return 0;
+    }
+    len = (size_t) st.st_size;
+    content = malloc(len ? len : 1);
+    if (!content)
+      return -1;
+    if (len && pread(fdno, content, len, 0) != (ssize_t) len) {
+      free(content);
+      return -1;
+    }
+    break;
+  }
   case PROCFS_MAPS:
     content = build_maps(&len);
     break;
@@ -268,12 +336,59 @@ procfs_open(const char *path, int *out_fd)
 int
 procfs_readlink(const char *path, char *buf, size_t bufsize)
 {
-  if (own_procfs_file(path) != PROCFS_EXE || !proc.ident.exe)
-    return -1;
+  int fd = -1;
+  const char *link;
+  char fdpath[PATH_MAX];
 
-  size_t n = strlen(proc.ident.exe);
+  switch (own_procfs_file_n(path, &fd)) {
+  case PROCFS_EXE:
+    if (!proc.ident.exe)
+      return -1;
+    link = proc.ident.exe;
+    break;
+  case PROCFS_FD:
+    /* The fd is open right now, by definition - the guest just named it - so
+     * F_GETPATH describes the file it actually refers to. That is not true of
+     * a number remembered from earlier, where the fd may have been closed and
+     * the number reused, and it is why /proc/self/maps does not carry paths. */
+    /* Guest fds only. NABI keeps its own descriptors at the top of the table,
+     * and those are not the guest's to look at - without this bound a guest
+     * could read the path of the arena, the checkpoint, or the debug sinks. */
+    if (fd < 0 || fd >= proc.fileinfo.vkern_fdtable.start ||
+        fcntl(fd, F_GETPATH, fdpath) < 0 || fdpath[0] == '\0')
+      return -1;
+    /* F_GETPATH answers in the host's terms, and the guest cannot use that
+     * answer: what it reads here it will turn around and open. systemd's
+     * fsync_directory_of_file opens the parent of whatever this returns, and
+     * a rootfs path handed back whole sends it to /Volumes/... - a name that
+     * only means something on the far side of the boundary.
+     *
+     * A passthrough prefix needs no translation and gets none: /Users and
+     * /tmp are the same name on both sides, and none of them is under the
+     * root, so the prefix test leaves them alone by construction. */
+    {
+      char rootpath[PATH_MAX];
+      size_t rn;
+      if (fcntl(proc.fileinfo.rootfd, F_GETPATH, rootpath) == 0 &&
+          (rn = strlen(rootpath)) > 0) {
+        while (rn > 1 && rootpath[rn - 1] == '/')
+          rn--;
+        if (rn > 1 && strncmp(fdpath, rootpath, rn) == 0 &&
+            (fdpath[rn] == '/' || fdpath[rn] == '\0')) {
+          link = fdpath[rn] ? fdpath + rn : "/";
+          break;
+        }
+      }
+    }
+    link = fdpath;
+    break;
+  default:
+    return -1;
+  }
+
+  size_t n = strlen(link);
   if (n > bufsize)
     n = bufsize;
-  memcpy(buf, proc.ident.exe, n);
+  memcpy(buf, link, n);
   return (int) n;
 }

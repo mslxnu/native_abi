@@ -139,6 +139,9 @@ SHELLCMD := util/nabi-shell.sh
 # Makes the case-sensitive volume a rootfs has to live on. Under libexec rather
 # than bin: it is a step in setting a rootfs up, not something to run daily.
 VOLCMD := util/msl-mkvolume.sh
+# Builds a rootfs by downloading it. Also libexec: it is run once to make a
+# tree, not every time someone wants a shell in one.
+MKROOTFS := util/msl-mkrootfs
 
 # ---------------------------------------------------------------------------
 # Build
@@ -324,6 +327,7 @@ install: require-root require-built migrate
 	install -m 755 -o root -g wheel $(SHELLCMD) $(PREFIX)/bin/msl
 	install -m 755 -o root -g wheel $(NABI)     $(PREFIX)/libexec/nabi
 	install -m 755 -o root -g wheel $(VOLCMD)   $(PREFIX)/libexec/msl-mkvolume
+	install -m 755 -o root -g wheel $(MKROOTFS) $(PREFIX)/libexec/msl-mkrootfs
 	install -m 644 -o root -g wheel man/nabi.1  $(PREFIX)/man/man1/nabi.1
 	@echo "nabi: installed to $(PREFIX)."
 	@echo "      'nabi' provisions a rootfs in ~/.nabi/tree and starts it."
@@ -331,6 +335,8 @@ install: require-root require-built migrate
 	@echo "      'libexec/msl-mkvolume' makes the case-sensitive volume a"
 	@echo "      rootfs needs; macOS formats the boot disk case-insensitively"
 	@echo "      and no Linux distribution can be unpacked there."
+	@echo "      'libexec/msl-mkrootfs <dir>' downloads and builds a Debian"
+	@echo "      rootfs into it."
 
 # ---------------------------------------------------------------------------
 # Migration from the pre-rename install (the command was called noah).
@@ -356,7 +362,8 @@ migrate: require-root
 
 uninstall: require-root
 	rm -f $(PREFIX)/bin/nabi $(PREFIX)/bin/msl $(PREFIX)/libexec/nabi \
-	      $(PREFIX)/libexec/msl-mkvolume $(PREFIX)/man/man1/nabi.1
+	      $(PREFIX)/libexec/msl-mkvolume $(PREFIX)/libexec/msl-mkrootfs \
+	      $(PREFIX)/man/man1/nabi.1
 	@echo "nabi: uninstalled. ~/.nabi/tree is left alone - remove it by hand if"
 	@echo "      you want the rootfs gone; it may be several gigabytes."
 

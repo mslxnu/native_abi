@@ -81,10 +81,40 @@ DECLARE_CENUM(at, LINUX_AT);
 #define	LINUX_O_NDELAY		LINUX_O_NONBLOCK
 #define	LINUX_O_SYNC		00010000
 #define	LINUX_FASYNC		00020000
+/*
+ * These four are not common. asm-generic/fcntl.h defines them, and x86 takes
+ * the defaults, but arch/arm64/include/uapi/asm/fcntl.h overrides all four -
+ * and not by shifting them, by permuting them:
+ *
+ *              x86-64     arm64
+ *   O_DIRECT   00040000  0200000
+ *   O_LARGEFILE 00100000 0400000
+ *   O_DIRECTORY 00200000  040000
+ *   O_NOFOLLOW 00400000  0100000
+ *
+ * So a single set of values is not merely imprecise on the other arch, it is
+ * actively wrong: with the x86 numbers, an arm64 guest's O_DIRECTORY arrives
+ * looking like O_DIRECT and its O_NOFOLLOW like O_LARGEFILE. Both of those are
+ * hints NABI drops, so both requests are silently granted - open(O_DIRECTORY)
+ * succeeds on a regular file, and open(O_NOFOLLOW) follows the symlink it was
+ * asked to refuse.
+ *
+ * The first of those broke `mv a b` for every b that already existed, because
+ * coreutils asks whether the destination is a directory by opening it with
+ * O_DIRECTORY rather than by calling stat. Told yes, it appended the source's
+ * basename and went looking for "b/a".
+ */
+#if defined(__arm64__) || defined(__aarch64__)
+#define	LINUX_O_DIRECTORY	00040000	/* Must be a directory */
+#define	LINUX_O_NOFOLLOW	00100000	/* Do not follow links */
+#define	LINUX_O_DIRECT		00200000	/* Direct disk access hint */
+#define	LINUX_O_LARGEFILE	00400000
+#else
 #define	LINUX_O_DIRECT		00040000	/* Direct disk access hint */
 #define	LINUX_O_LARGEFILE	00100000
 #define	LINUX_O_DIRECTORY	00200000	/* Must be a directory */
 #define	LINUX_O_NOFOLLOW	00400000	/* Do not follow links */
+#endif
 #define	LINUX_O_NOATIME		01000000
 #define	LINUX_O_CLOEXEC		02000000
 #define	LINUX_O_PATH		010000000
@@ -123,9 +153,22 @@ DECLARE_CENUM(at, LINUX_AT);
 #define	LINUX_F_SETPIPE_SZ	(LINUX_F_SPECIFIC_BASE + 7)
 #define	LINUX_F_GETPIPE_SZ	(LINUX_F_SPECIFIC_BASE + 8)
 
-#define	LINUX_F_GETLKP		36
-#define	LINUX_F_SETLKP		37
-#define	LINUX_F_SETLKPW		38
+/*
+ * Open file description locks. Linux calls these F_OFD_*; the older names here
+ * are kept because they are what the rest of the tree spelled them as, but the
+ * kernel's own names are the ones a reader will be looking for.
+ *
+ * Unlike POSIX record locks these belong to the open file description rather
+ * than to the process, so they are not dropped when some unrelated fd for the
+ * same file is closed, and two descriptions in one process can contend. That
+ * is exactly BSD flock()'s model, which is how Darwin can serve them at all.
+ */
+#define	LINUX_F_OFD_GETLK	36
+#define	LINUX_F_OFD_SETLK	37
+#define	LINUX_F_OFD_SETLKW	38
+#define	LINUX_F_GETLKP		LINUX_F_OFD_GETLK
+#define	LINUX_F_SETLKP		LINUX_F_OFD_SETLK
+#define	LINUX_F_SETLKPW		LINUX_F_OFD_SETLKW
 
 #define	LINUX_F_OWNER_TID	0
 #define	LINUX_F_OWNER_PID	1

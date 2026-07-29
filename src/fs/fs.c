@@ -60,6 +60,7 @@
 #include <dirent.h>
 #include <termios.h>
 #include <sys/ioctl.h>
+#include <sys/file.h>
 
 #include <mach-o/dyld.h>
 
@@ -625,6 +626,58 @@ darwinfs_fcntl(struct file *file, unsigned int cmd, unsigned long arg)
     }
     linux_to_darwin_flock(&lflock, &dflock);
     return syswrap(fcntl(file->fd, (cmd == LINUX_F_SETLK) ? F_SETLK : F_SETLKW, &dflock));
+  /*
+   * Open file description locks, served with flock().
+   *
+   * Darwin has no F_OFD_*, but it has BSD flock(), and for a whole-file lock
+   * the two describe the same thing: ownership by the open file description
+   * rather than by the process, so an unrelated close does not drop the lock
+   * and two descriptions in one process contend with each other. That is the
+   * property callers reach for OFD locks to get, and the property POSIX record
+   * locks famously do not have.
+   *
+   * Only whole-file. flock() cannot express a byte range, so a ranged request
+   * is refused rather than widened - a lock quietly covering more of the file
+   * than was asked for is a deadlock waiting to be blamed on something else.
+   * Nothing yet seen asks for one: systemd takes the /etc/passwd lock whole,
+   * which is what turned every sysusers run into "Failed to take /etc/passwd
+   * lock: Invalid argument" and stopped systemd, udev and cron configuring.
+   */
+  case LINUX_F_OFD_SETLK: case LINUX_F_OFD_SETLKW: {
+    if (copy_from_user(&lflock, arg, sizeof lflock)) {
+      return -LINUX_EFAULT;
+    }
+    /* SEEK_SET is 0 on both sides; a whole-file lock is the only shape
+     * flock() can express, and any other whence makes the range depend on the
+     * file position, which cannot be whole-file either. */
+    if (lflock.l_whence != SEEK_SET || lflock.l_start != 0 ||
+        lflock.l_len != 0) {
+      warnk("F_OFD_SETLK%s over a byte range (start %lld len %lld); "
+            "flock() can only take the whole file\n",
+            cmd == LINUX_F_OFD_SETLKW ? "W" : "",
+            (long long) lflock.l_start, (long long) lflock.l_len);
+      return -LINUX_EINVAL;
+    }
+    int op;
+    switch (lflock.l_type) {
+    case LINUX_F_RDLCK: op = LOCK_SH; break;
+    case LINUX_F_WRLCK: op = LOCK_EX; break;
+    case LINUX_F_UNLCK: op = LOCK_UN; break;
+    default:            return -LINUX_EINVAL;
+    }
+    /* The non-waiting form is the one that must not block; SETLKW may. */
+    if (cmd == LINUX_F_OFD_SETLK && op != LOCK_UN)
+      op |= LOCK_NB;
+    r = syswrap(flock(file->fd, op));
+    /* flock says EWOULDBLOCK where fcntl says EAGAIN. They are the same errno
+     * on Linux, but syswrap has already mapped it, so only the name differs. */
+    return r;
+  }
+  case LINUX_F_OFD_GETLK:
+    /* flock() cannot be asked who holds a lock, and inventing an answer would
+     * be worse than saying so: a caller told "unlocked" would proceed. */
+    warnk("F_OFD_GETLK: flock() cannot report the holder of a lock\n");
+    return -LINUX_EINVAL;
   default:
     warnk("unknown fcntl cmd: %d\n", cmd);
     return -LINUX_EINVAL;
