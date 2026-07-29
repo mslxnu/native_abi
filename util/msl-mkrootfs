@@ -32,19 +32,49 @@
 # inside it does check signatures, with the keyring this installs.
 set -eu
 
-SUITE=trixie
+DISTRO=debian
+SUITE=
 ARCH=arm64
-MIRROR=https://deb.debian.org/debian
+MIRROR=
 EXTRA=
 VARIANT=standard
+
+# Per-distro defaults. Both are apt archives with the same layout, so the same
+# resolver and unpacker serve them; only the mirror, the suite and the name of
+# the keyring package differ. Anything not built on dpkg - Fedora's rpm, Arch's
+# pkg.tar.zst - needs a different second stage and is not handled here.
+distro_defaults() {
+    case $1 in
+        debian)
+            : "${SUITE:=trixie}"
+            : "${MIRROR:=https://deb.debian.org/debian}"
+            KEYRING=debian-archive-keyring
+            SECURITY="deb https://security.debian.org/debian-security $SUITE-security main"
+            ;;
+        ubuntu)
+            : "${SUITE:=noble}"
+            # ports/ is the arm64 archive; archive.ubuntu.com carries amd64 only.
+            : "${MIRROR:=https://ports.ubuntu.com/ubuntu-ports}"
+            KEYRING=ubuntu-keyring
+            SECURITY="deb $MIRROR $SUITE-security main universe"
+            ;;
+        *)
+            echo "${0##*/}: unknown distro: $1" >&2
+            echo "  debian and ubuntu are apt archives and share this machinery." >&2
+            echo "  fedora and arch use different package formats and are not built yet." >&2
+            exit 2
+            ;;
+    esac
+}
 
 usage() {
     cat >&2 <<EOM
 usage: ${0##*/} [options] <target-dir>
 
-  -s <suite>    Debian suite to build (default: $SUITE)
+  -d <distro>   debian or ubuntu (default: $DISTRO)
+  -s <suite>    suite to build (default: trixie for debian, noble for ubuntu)
   -a <arch>     dpkg architecture (default: $ARCH)
-  -m <mirror>   archive to fetch from (default: $MIRROR)
+  -m <mirror>   archive to fetch from (default: the distro's)
   -i <p,p,...>  extra packages to include
   -v <variant>  minbase (required only) or standard (adds Priority: important)
                 (default: $VARIANT)
@@ -52,8 +82,9 @@ EOM
     exit 2
 }
 
-while getopts s:a:m:i:v:h opt; do
+while getopts d:s:a:m:i:v:h opt; do
     case $opt in
+        d) DISTRO=$OPTARG ;;
         s) SUITE=$OPTARG ;;
         a) ARCH=$OPTARG ;;
         m) MIRROR=$OPTARG ;;
@@ -65,6 +96,8 @@ done
 shift $((OPTIND - 1))
 [ $# -eq 1 ] || usage
 ROOT=$1
+
+distro_defaults "$DISTRO"
 
 case $VARIANT in
     minbase|standard) ;;
@@ -118,7 +151,7 @@ for cand in ${NABI:-} "$here/out/nabi" "$here/libexec/nabi" \
     break
 done
 
-CACHE=${MSL_CACHE:-$HOME/.msl/cache/$SUITE-$ARCH}
+CACHE=${MSL_CACHE:-$HOME/.msl/cache/$DISTRO-$SUITE-$ARCH}
 mkdir -p "$CACHE"
 
 work=$(mktemp -d)
@@ -128,7 +161,7 @@ trap 'rm -rf "$work"' EXIT
 # 1. Resolve
 # ---------------------------------------------------------------------------
 
-echo "==> fetching the $SUITE/$ARCH index from $MIRROR"
+echo "==> fetching the $DISTRO $SUITE/$ARCH index from $MIRROR"
 curl -fsSL "$MIRROR/dists/$SUITE/Release" -o "$work/Release"
 
 # The index's own checksum, from the Release file, so a corrupted or
@@ -236,7 +269,7 @@ if [ "$VARIANT" = standard ]; then important=1; fi
 # ca-certificates and the keyring are not required by anything, but without
 # them apt in the finished tree cannot verify or fetch over https - which is
 # the first thing anyone will ask it to do.
-seeds=apt,bash,dpkg,ca-certificates,debian-archive-keyring
+seeds="apt,bash,dpkg,ca-certificates,$KEYRING"
 if [ -n "$EXTRA" ]; then seeds="$seeds,$EXTRA"; fi
 
 echo "==> resolving"
@@ -366,7 +399,7 @@ mkdir -p "$ROOT/root" "$ROOT/usr/local"
 cat > "$ROOT/etc/apt/sources.list" <<EOS
 deb $MIRROR $SUITE main
 deb $MIRROR $SUITE-updates main
-deb https://security.debian.org/debian-security $SUITE-security main
+$SECURITY
 EOS
 
 # Taken from the host, so the guest resolves the way the machine does rather

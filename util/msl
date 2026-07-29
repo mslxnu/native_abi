@@ -1,0 +1,300 @@
+#!/bin/sh
+#
+# msl - run Linux on macOS, one process at a time.
+#
+#   msl                     what is installed, and what to type next
+#   msl install debian      download and build a rootfs
+#   msl login debian        a shell inside it
+#   msl run debian <cmd>    one command inside it
+#   msl list                installed rootfs trees
+#   msl del debian          remove one
+#   msl help
+#
+# A path still works where a name would go, so `msl /path/to/rootfs` keeps
+# doing what it always did.
+#
+# Where the trees live, and why it is not ~/.msl
+# ---------------------------------------------
+# macOS formats the boot volume case-insensitively, and no Linux distribution
+# can be unpacked there: Debian ships _exit.2.gz alongside _Exit.2.gz and
+# xt_connmark.h alongside xt_CONNMARK.h, and one such pair is enough to make an
+# install fail in a way that never mentions case. So the trees live on a
+# case-sensitive sparse image, created on demand, attached at /Volumes/msl.
+#
+# A symlink at ~/.msl/<name> points at each tree, because that is the path
+# people expect to type; it dangles when the image is detached, which is why
+# every command here attaches first rather than trusting the link.
+set -eu
+
+VERSION=0.1
+
+MSL_HOME=${MSL_HOME:-$HOME/.msl}
+IMAGE=${MSL_IMAGE:-$MSL_HOME/disk.sparseimage}
+MOUNT=${MSL_MOUNT:-/Volumes/msl}
+
+me=${0##*/}
+here=$(cd "$(dirname "$0")" && pwd)
+
+# ---------------------------------------------------------------------------
+# Output
+# ---------------------------------------------------------------------------
+
+# Colour only when a terminal is going to read it. A pipe or a log file gets
+# plain text, so `msl list | grep` matches what it looks like it should.
+if [ -t 1 ] && [ "${TERM:-dumb}" != dumb ] && [ -z "${NO_COLOR:-}" ]; then
+    B=$(printf '\033[1m');  D=$(printf '\033[90m')
+    A=$(printf '\033[35m'); C=$(printf '\033[36m')
+    R=$(printf '\033[31m'); Z=$(printf '\033[0m')
+else
+    B= D= A= C= R= Z=
+fi
+
+# The box is drawn rather than written out, because the two content lines have
+# different lengths and hand-counted padding gets one of them wrong every time
+# the wording changes. Interior width is fixed; the icon is two display columns
+# and the text is ASCII, so a byte count is a column count here.
+BOXW=54
+boxline() {
+    icon=$1; text=$2
+    pad=$((BOXW - 6 - ${#text}))
+    [ $pad -lt 0 ] && pad=0
+    printf '  %s│%s  %s%s%s  %b%*s%s│%s\n' \
+        "$D" "$Z" "$A" "$icon" "$Z" "$text" "$pad" "" "$D" "$Z"
+}
+
+banner() {
+    printf '\n  %s╭' "$D"
+    i=0; while [ $i -lt $BOXW ]; do printf '─'; i=$((i + 1)); done
+    printf '╮%s\n' "$Z"
+    boxline '  ' ''
+    boxline '▚▚' "$A$B""msl$Z $D""v$VERSION$Z"
+    boxline '▚▚' "$D""Linux processes, not a virtual machine.$Z"
+    boxline '  ' ''
+    printf '  %s╰' "$D"
+    i=0; while [ $i -lt $BOXW ]; do printf '─'; i=$((i + 1)); done
+    printf '╯%s\n\n' "$Z"
+}
+
+section() { printf '  %s%s%s%s\n\n' "$A" "$B" "$1" "$Z"; }
+die()     { printf '  %serror%s %s\n' "$R" "$Z" "$1" >&2; exit 1; }
+note()    { printf '  %s%s%s\n' "$D" "$1" "$Z"; }
+
+# ---------------------------------------------------------------------------
+# The case-sensitive volume
+# ---------------------------------------------------------------------------
+
+is_case_sensitive() {
+    d=$1
+    [ -d "$d" ] && [ -w "$d" ] || return 1
+    p=$(mktemp "$d/.mslCASE.XXXXXX") || return 1
+    l=$(dirname "$p")/$(basename "$p" | tr 'A-Z' 'a-z')
+    if [ -e "$l" ]; then rc=1; else rc=0; fi
+    rm -f "$p"
+    return $rc
+}
+
+# Attach the image, creating it first if this is the first run. Quiet when
+# there is nothing to say - it runs before every other command.
+ensure_volume() {
+    if is_case_sensitive "$MOUNT"; then
+        return 0
+    fi
+    if [ ! -e "$IMAGE" ]; then
+        mkdir -p "$(dirname "$IMAGE")"
+        printf '  %screating %s (%s, sparse - it grows as you use it)%s\n' \
+            "$D" "$IMAGE" "${MSL_VOLUME_SIZE:-64g}" "$Z"
+        hdiutil create -size "${MSL_VOLUME_SIZE:-64g}" -type SPARSE \
+            -fs "Case-sensitive APFS" -volname "$(basename "$MOUNT")" \
+            -quiet "${IMAGE%.sparseimage}" ||
+            die "could not create $IMAGE"
+    fi
+    hdiutil attach -nobrowse -mountpoint "$MOUNT" "$IMAGE" > /dev/null 2>&1 ||
+        die "could not attach $IMAGE at $MOUNT"
+    is_case_sensitive "$MOUNT" ||
+        die "$MOUNT came up case-insensitive - refusing to install there"
+}
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+# A name resolves to a tree on the volume; anything with a slash is a path and
+# is taken as given, which is what keeps `msl /some/rootfs` working.
+resolve() {
+    case $1 in
+        */*|/*) printf '%s' "$1" ;;
+        *)      printf '%s/%s' "$MOUNT" "$1" ;;
+    esac
+}
+
+installed() {
+    [ -d "$MOUNT" ] || return 0
+    for d in "$MOUNT"/*; do
+        [ -d "$d/etc" ] || continue
+        basename "$d"
+    done
+}
+
+helper() {
+    for cand in "$here/$1" "$here/../libexec/$1" "/usr/local/libexec/$1"; do
+        [ -x "$cand" ] && { printf '%s' "$cand"; return 0; }
+    done
+    return 1
+}
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+
+cmd_status() {
+    banner
+    section "Installed"
+    names=$(installed)
+    if [ -z "$names" ]; then
+        note "nothing yet"
+        printf '\n'
+    else
+        n=0
+        for name in $names; do
+            printf '  %s●%s %s%s%s  %s%s%s\n' "$D" "$Z" "$B" "$name" "$Z" \
+                "$D" "$MOUNT/$name" "$Z"
+            n=$((n + 1))
+        done
+        printf '\n  %s%s installed%s\n\n' "$D" "$n" "$Z"
+    fi
+    section "Get started"
+    printf '    %s$%s %smsl install debian%s   %s# or ubuntu%s\n' \
+        "$D" "$Z" "$C" "$Z" "$D" "$Z"
+    printf '    %s$%s %smsl login debian%s\n\n' "$D" "$Z" "$C" "$Z"
+    note "msl help for everything else"
+    printf '\n'
+}
+
+cmd_help() {
+    banner
+    section "Rootfs lifecycle"
+    printf '    %sinstall%s <distro> [name]   Download and build a rootfs\n' "$C" "$Z"
+    printf '    %slogin%s <name>              Open a shell inside it\n' "$C" "$Z"
+    printf '    %srun%s <name> <cmd>...       Run one command inside it\n' "$C" "$Z"
+    printf '    %sdel%s <name>                Remove it\n\n' "$C" "$Z"
+    section "Inspection"
+    printf '    %slist%s                      Installed rootfs trees\n' "$C" "$Z"
+    printf '    %svolume%s                    Attach the case-sensitive volume\n' "$C" "$Z"
+    printf '    %shelp%s                      Show this\n\n' "$C" "$Z"
+    section "Install options"
+    printf '    %s-s <suite>   Suite to build   (trixie / noble)%s\n' "$D" "$Z"
+    printf '    %s-v <variant> minbase or standard (default: standard)%s\n' "$D" "$Z"
+    printf '    %s-i <p,p>     Extra packages to include%s\n\n' "$D" "$Z"
+    section "Distros"
+    printf '    %sdebian%s, %subuntu%s  %s- apt archives, fully supported%s\n' \
+        "$C" "$Z" "$C" "$Z" "$D" "$Z"
+    printf '    %sfedora, arch    - different package formats, not built yet%s\n\n' "$D" "$Z"
+    section "Where things are"
+    printf '    %sTrees      %s/<name>%s\n' "$D" "$MOUNT" "$Z"
+    printf '    %sImage      %s%s\n' "$D" "$IMAGE" "$Z"
+    printf '    %sCache      %s/cache%s\n\n' "$D" "$MSL_HOME" "$Z"
+    note "macOS formats the boot disk case-insensitively and no Linux"
+    note "distribution can be unpacked there, so the trees live on a"
+    note "case-sensitive image that msl creates and attaches for you."
+    printf '\n'
+}
+
+cmd_list() {
+    names=$(installed)
+    [ -n "$names" ] || return 0
+    for name in $names; do
+        printf '%s\n' "$name"
+    done
+}
+
+cmd_install() {
+    distro=debian
+    name=
+    opts=""
+    while [ $# -gt 0 ]; do
+        case $1 in
+            -s|-v|-i) opts="$opts $1 $2"; shift 2 ;;
+            -*)       die "unknown option: $1" ;;
+            *)        if [ -z "${distro_set:-}" ]; then distro=$1; distro_set=1
+                      else name=$1; fi; shift ;;
+        esac
+    done
+    [ -n "$name" ] || name=$distro
+
+    mk=$(helper msl-mkrootfs) || die "msl-mkrootfs not found beside $me"
+    ensure_volume
+    target=$MOUNT/$name
+    [ -e "$target" ] && die "$name already exists - 'msl del $name' first"
+
+    printf '\n'
+    # shellcheck disable=SC2086
+    "$mk" -d "$distro" $opts "$target"
+
+    # The path people expect to type. It points into the volume rather than
+    # holding anything, and dangles while the image is detached - which is why
+    # every command attaches before it looks.
+    mkdir -p "$MSL_HOME"
+    ln -sfn "$target" "$MSL_HOME/$name"
+    printf '\n'
+    note "also reachable as $MSL_HOME/$name"
+    printf '    %s$%s %smsl login %s%s\n\n' "$D" "$Z" "$C" "$name" "$Z"
+}
+
+cmd_login() {
+    [ $# -ge 1 ] || die "usage: $me login <name> [command ...]"
+    name=$1; shift
+    ensure_volume
+    root=$(resolve "$name")
+    [ -d "$root" ] || die "no such rootfs: $name"
+
+    sh=$(helper nabi-shell.sh) || sh=$(helper msl-shell) ||
+        die "the shell helper was not found beside $me"
+    exec "$sh" "$root" "$@"
+}
+
+cmd_del() {
+    [ $# -eq 1 ] || die "usage: $me del <name>"
+    name=$1
+    ensure_volume
+    root=$(resolve "$name")
+    [ -d "$root" ] || die "no such rootfs: $name"
+    case $root in
+        "$MOUNT"/*) ;;
+        *) die "$name is not on $MOUNT - remove it yourself" ;;
+    esac
+    printf '  remove %s%s%s and everything in it? [y/N] ' "$B" "$root" "$Z"
+    read -r answer
+    case $answer in
+        y|Y|yes|YES) ;;
+        *) note "left alone"; exit 0 ;;
+    esac
+    chmod -R u+w "$root" 2>/dev/null || true
+    rm -rf "$root"
+    rm -f "$MSL_HOME/$name"
+    note "removed $name"
+}
+
+cmd_volume() {
+    ensure_volume
+    note "$MOUNT is attached and case-sensitive"
+}
+
+# ---------------------------------------------------------------------------
+
+[ $# -gt 0 ] || { cmd_status; exit 0; }
+
+# --mkrootfs and --login are accepted as well as the bare subcommands, since
+# both spellings have been in use.
+cmd=$1; shift
+case $cmd in
+    install|--mkrootfs)  cmd_install "$@" ;;
+    login|--login)       cmd_login "$@" ;;
+    run)                 cmd_login "$@" ;;
+    list|--list)         cmd_list ;;
+    del|delete|rm)       cmd_del "$@" ;;
+    volume)              cmd_volume ;;
+    help|--help|-h)      cmd_help ;;
+    version|--version)   printf 'msl %s\n' "$VERSION" ;;
+    # A path, or a name that already exists: the old `msl <rootfs>` spelling.
+    *)                   cmd_login "$cmd" "$@" ;;
+esac

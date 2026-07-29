@@ -1342,6 +1342,44 @@ spins or sleeps forever after a fork looks very much like a fork that did not
 take. Three purge/install/compile cycles now run clean where one in a few used
 to hang.
 
+### 3.5.19 `msl`, and where a rootfs can actually live
+
+The pieces built above — a downloader, a volume maker, a shell launcher — are
+now behind one command:
+
+```
+msl                     what is installed, and what to type next
+msl install debian      download and build a rootfs
+msl login debian        a shell inside it
+msl run debian <cmd>    one command inside it
+msl list / del / help
+```
+
+`msl <path>` still works, so the older spelling that took a rootfs directory is
+unchanged.
+
+The awkward part is where the trees go. `~/.msl/rootfs-debian` is the obvious
+answer and it cannot work: `~` is on the boot volume, macOS formats that
+case-insensitively, and §3.5.12 covers what that does to a Debian tree. So the
+trees live on a case-sensitive sparse image that `msl` creates on first use and
+attaches at `/Volumes/msl` — no administrator needed, and sparse, so the size is
+a ceiling rather than an allocation. A symlink at `~/.msl/<name>` points at each
+tree, because that is the path people expect to type; it dangles while the image
+is detached, which is why every command attaches before it looks at anything
+rather than trusting the link.
+
+Debian and Ubuntu are both apt archives with the same layout, so one resolver
+and one unpacker serve both — only the mirror, the suite and the keyring package
+differ, and those are a four-line table. Ubuntu's arm64 packages are on
+`ports.ubuntu.com` rather than `archive.ubuntu.com`, which carries amd64 only.
+Both are reachable over https, so the integrity chain in §3.5.12 holds for
+either. Fedora and Arch are not apt archives and would need a different second
+stage; `msl install fedora` says so rather than pretending.
+
+Verified end to end: `msl install debian` and `msl install ubuntu` each produce a
+tree with nothing unconfigured — Debian 13 trixie and Ubuntu 24.04 LTS — and
+`msl run` works against both from the source tree and from an install layout.
+
 ---
 
 ## 4. Phased implementation
