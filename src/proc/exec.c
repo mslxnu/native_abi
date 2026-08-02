@@ -432,7 +432,14 @@ do_exec(const char *elf_path, int argc, char *argv[], char **envp)
   }
 
   /* Now do exec */
-  fstat(fd, &st);
+  /* Checked, unlike before: an unchecked fstat leaves st full of stack, the
+   * S_ISREG below then fails, and execve reports EACCES for a file that is
+   * perfectly executable. That is how a bad descriptor used to present. */
+  if (fstat(fd, &st) < 0) {
+    warnk("execve: fstat(%s) failed: %s\n", elf_path, strerror(errno));
+    vkern_close(fd);
+    return -LINUX_EACCES;
+  }
   if (!S_ISREG(st.st_mode)) {
     vkern_close(fd);
     return -LINUX_EACCES;
@@ -465,8 +472,8 @@ do_exec(const char *elf_path, int argc, char *argv[], char **envp)
      * rewritten argv as cmdline, which is exactly the inner call.
      */
     proc_set_ident(elf_path, argc, argv);
-    if (st.st_mode & 04000) {
-      elevate_privilege();
+    if (st.st_mode & (S_ISUID | S_ISGID)) {
+      elevate_privilege(st.st_uid, st.st_gid, st.st_mode);
     }
   }
   else if (2 <= st.st_size && data[0] == '#' && data[1] == '!') {

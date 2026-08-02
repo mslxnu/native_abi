@@ -133,6 +133,9 @@ checkpoint_restore(int ckpt_fd, int arena_fd)
   proc.cred.uid = hdr.uid;
   proc.cred.euid = hdr.euid;
   proc.cred.suid = hdr.suid;
+  proc.cred.gid = hdr.gid;
+  proc.cred.egid = hdr.egid;
+  proc.cred.sgid = hdr.sgid;
   memcpy(proc.sigaction, sigactions,
          hdr.nr_sigactions * sizeof proc.sigaction[0]);
   proc.pfutex = kh_init(pfutex);

@@ -210,11 +210,50 @@ init_fileinfo(int rootfd)
   fileinfo->rootfd = vkern_dup_fd(rootfd, false);
 }
 
+/*
+ * RLIMIT_NOFILE, in both directions.
+ *
+ * NABI keeps its own descriptors in the top vkern_fdtable_maxsize slots of the
+ * host's table, so the guest is told a limit that excludes them. The inverse
+ * has to exist, and did not: a guest that reads its limits and writes them back
+ * - which is exactly what su, login and PAM all do - had the reduced number
+ * applied to the host verbatim, dropping the host's limit onto the reserved
+ * range. Every dup2 into the vkern table then failed with EBADF, and since
+ * vkern_dup_fd did not check dup2 the caller got a slot with nothing behind it.
+ * The first thing to notice was execve: it fstats the descriptor it just
+ * opened, got EBADF, decided the file was not regular, and returned EACCES -
+ * "su: failed to execute /bin/bash: Permission denied", about a file that is
+ * plainly executable.
+ *
+ * Both fields are shifted, not just rlim_max, so the round trip is exact.
+ */
 void
 darwin_to_linux_rlimit_nofile(struct rlimit *darwin_rlimit, struct l_rlimit *linux_rlimit)
 {
-  linux_rlimit->rlim_cur = darwin_rlimit->rlim_cur;
-  linux_rlimit->rlim_max = darwin_rlimit->rlim_max - vkern_fdtable_maxsize;
+  linux_rlimit->rlim_cur = darwin_rlimit->rlim_cur == RLIM_INFINITY
+                             ? LINUX_RLIM_INFINITY
+                             : darwin_rlimit->rlim_cur - vkern_fdtable_maxsize;
+  linux_rlimit->rlim_max = darwin_rlimit->rlim_max == RLIM_INFINITY
+                             ? LINUX_RLIM_INFINITY
+                             : darwin_rlimit->rlim_max - vkern_fdtable_maxsize;
+}
+
+void
+linux_to_darwin_rlimit_nofile(struct l_rlimit *linux_rlimit, struct rlimit *darwin_rlimit)
+{
+  darwin_rlimit->rlim_cur = linux_rlimit->rlim_cur == LINUX_RLIM_INFINITY
+                              ? RLIM_INFINITY
+                              : linux_rlimit->rlim_cur + vkern_fdtable_maxsize;
+  darwin_rlimit->rlim_max = linux_rlimit->rlim_max == LINUX_RLIM_INFINITY
+                              ? RLIM_INFINITY
+                              : linux_rlimit->rlim_max + vkern_fdtable_maxsize;
+}
+
+/* The lowest host limit that still leaves NABI's own descriptors addressable. */
+int
+vkern_fd_floor(void)
+{
+  return proc.fileinfo.vkern_fdtable.start + vkern_fdtable_maxsize;
 }
 
 int
@@ -849,7 +888,14 @@ vkern_dup_fd(int fd, bool is_cloexec)
   if (vkern_fd == -1) {
     panic("Too many files opened in the kernel space");
   }
-  dup2(fd, vkern_fd);
+  /* Checked, because the failure is otherwise invisible and arrives much later
+   * as a descriptor that every syscall rejects. dup2 refuses a target above
+   * RLIMIT_NOFILE, which is how a guest lowering its own limit used to poison
+   * the whole vkern table. */
+  if (dup2(fd, vkern_fd) < 0) {
+    warnk("vkern_dup_fd: dup2(%d, %d) failed: %s\n", fd, vkern_fd, strerror(errno));
+    return -LINUX_EBADF;
+  }
   set_fdbit(&proc.fileinfo.vkern_fdtable, proc.fileinfo.vkern_fdtable.open_fds, vkern_fd);
   if (is_cloexec) {
     set_fdbit(&proc.fileinfo.vkern_fdtable, proc.fileinfo.vkern_fdtable.cloexec_fds, vkern_fd);

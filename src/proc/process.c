@@ -122,6 +122,25 @@ uid_t nabi_host_uid;
 gid_t nabi_host_gid;
 
 /*
+ * Remember which host account the guest sees as root.
+ *
+ * Called from both entry points on purpose. These are a property of the host
+ * process, identical across a fork, and are not carried in the checkpoint - so
+ * a resumed child that never sets them leaves both at zero, and every mapping
+ * silently becomes the identity: files owned by the account NABI runs as stop
+ * reading back as root. Since a fork on arm64 is a fork plus an exec, that was
+ * every guest process except the first, and sudo said so - "/etc/sudo.conf is
+ * owned by uid 501, should be 0" - about a file the first process had been
+ * reading as root's all along.
+ */
+void
+init_host_ids(void)
+{
+  nabi_host_uid = getuid();
+  nabi_host_gid = getgid();
+}
+
+/*
  * The account NABI runs as is the guest's root; anything else keeps the id it
  * really has. One mapping applied both ways, so a file the guest chowns to root
  * lands on the account that can actually own it and reads back as root.
@@ -344,6 +363,32 @@ DEFINE_SYSCALL(getsid, l_pid_t, pid)
 static l_gid_t guest_groups[LINUX_NGROUPS_MAX];
 static int nr_guest_groups;
 
+/* For the checkpoint, which has to carry these across a fork like everything
+ * else in struct cred. Kept here so the array stays file-local. */
+int
+guest_groups_get(l_gid_t *out)
+{
+  if (out && nr_guest_groups > 0)
+    memcpy(out, guest_groups, nr_guest_groups * sizeof guest_groups[0]);
+  return nr_guest_groups;
+}
+
+const l_gid_t *
+guest_groups_ptr(void)
+{
+  return guest_groups;
+}
+
+void
+guest_groups_set(const l_gid_t *g, int n)
+{
+  if (n < 0 || n > LINUX_NGROUPS_MAX)
+    return;
+  if (n > 0)
+    memcpy(guest_groups, g, n * sizeof guest_groups[0]);
+  nr_guest_groups = n;
+}
+
 DEFINE_SYSCALL(getgroups, int, gidsetsize, gaddr_t, grouplist_ptr)
 {
   pthread_rwlock_rdlock(&proc.cred.lock);
@@ -393,8 +438,43 @@ DEFINE_SYSCALL(gettid)
   return do_gettid();
 }
 
+/*
+ * A Linux resource as a Darwin one, or -1 when Darwin has no such thing.
+ *
+ * -1 rather than a silent 0: the old default aliased every unknown resource
+ * onto RLIMIT_CPU, which would have set a CPU-time limit for a guest asking
+ * about something else entirely.
+ */
+/*
+ * The resources Darwin does not have, kept here instead.
+ *
+ * Linux's own defaults, so a guest reading them sees what it would see on
+ * Linux; a guest writing them is remembered rather than refused. Nothing in
+ * NABI enforces any of these - there is no realtime scheduling to bound and no
+ * message queues to fill - so this is bookkeeping, and honest bookkeeping is
+ * better than the EINVAL that used to come back.
+ */
+static struct l_rlimit emulated_rlimits[LINUX_RLIM_NLIMITS];
+static bool emulated_rlimits_ready;
+
+static struct l_rlimit *
+emulated_rlimit(unsigned int l_resource)
+{
+  if (!emulated_rlimits_ready) {
+    for (int i = 0; i < LINUX_RLIM_NLIMITS; i++)
+      emulated_rlimits[i] = (struct l_rlimit) { LINUX_RLIM_INFINITY,
+                                                LINUX_RLIM_INFINITY };
+    emulated_rlimits[LINUX_RLIMIT_SIGPENDING] = (struct l_rlimit) { 15738, 15738 };
+    emulated_rlimits[LINUX_RLIMIT_MSGQUEUE]   = (struct l_rlimit) { 819200, 819200 };
+    emulated_rlimits[LINUX_RLIMIT_NICE]       = (struct l_rlimit) { 0, 0 };
+    emulated_rlimits[LINUX_RLIMIT_RTPRIO]     = (struct l_rlimit) { 0, 0 };
+    emulated_rlimits_ready = true;
+  }
+  return &emulated_rlimits[l_resource];
+}
+
 int linux_to_darwin_rlimopts(int l_resource) {
-  int resource = 0;
+  int resource = -1;
   switch (l_resource) {
   case LINUX_RLIMIT_CPU: resource = RLIMIT_CPU; break;
   case LINUX_RLIMIT_FSIZE: resource = RLIMIT_FSIZE; break;
@@ -420,6 +500,14 @@ DEFINE_SYSCALL(getrlimit, int, l_resource, gaddr_t, rl_ptr)
   }
 
   int resource = linux_to_darwin_rlimopts(l_resource);
+
+  /* The ones Darwin has no equivalent for are kept by NABI; see
+   * emulated_rlimit. */
+  if (resource < 0) {
+    if (copy_to_user(rl_ptr, emulated_rlimit(l_resource), sizeof l_rl))
+      return -LINUX_EFAULT;
+    return 0;
+  }
 
   int r = syswrap(getrlimit(resource, &rl));
   if (r < 0)
@@ -455,6 +543,15 @@ DEFINE_SYSCALL(prlimit64, int, pid, unsigned int, l_resource, gaddr_t, new_ptr, 
 
   int resource = linux_to_darwin_rlimopts(l_resource);
 
+  if (resource < 0) {
+    struct l_rlimit *e = emulated_rlimit(l_resource);
+    if (old_ptr && copy_to_user(old_ptr, e, sizeof *e))
+      return -LINUX_EFAULT;
+    if (new_ptr && copy_from_user(e, new_ptr, sizeof *e))
+      return -LINUX_EFAULT;
+    return 0;
+  }
+
   struct rlimit rl;
   int r = syswrap(getrlimit(resource, &rl));
   if (r < 0)
@@ -471,11 +568,50 @@ DEFINE_SYSCALL(prlimit64, int, pid, unsigned int, l_resource, gaddr_t, new_ptr, 
     struct l_rlimit newl;
     if (copy_from_user(&newl, new_ptr, sizeof newl))
       return -LINUX_EFAULT;
-    struct rlimit drl = {
-      .rlim_cur = newl.rlim_cur == LINUX_RLIM_INFINITY ? RLIM_INFINITY : newl.rlim_cur,
-      .rlim_max = newl.rlim_max == LINUX_RLIM_INFINITY ? RLIM_INFINITY : newl.rlim_max,
-    };
+    struct rlimit drl;
+    if (resource == RLIMIT_NOFILE) {
+      /* The inverse of what getrlimit reported, so a read-then-write round
+       * trip is a no-op rather than a steady erosion of the host's limit. */
+      linux_to_darwin_rlimit_nofile(&newl, &drl);
+      /* And never below the descriptors NABI is holding, whatever the guest
+       * asks for: they are already open, and losing the ability to address
+       * them breaks the emulator rather than the guest. */
+      if (drl.rlim_cur != RLIM_INFINITY &&
+          drl.rlim_cur < (rlim_t) vkern_fd_floor())
+        drl.rlim_cur = vkern_fd_floor();
+      if (drl.rlim_max != RLIM_INFINITY &&
+          drl.rlim_max < (rlim_t) vkern_fd_floor())
+        drl.rlim_max = vkern_fd_floor();
+    } else {
+      drl.rlim_cur = newl.rlim_cur == LINUX_RLIM_INFINITY ? RLIM_INFINITY : newl.rlim_cur;
+      drl.rlim_max = newl.rlim_max == LINUX_RLIM_INFINITY ? RLIM_INFINITY : newl.rlim_max;
+    }
     r = syswrap(setrlimit(resource, &drl));
+    if (r < 0 && r == -LINUX_EPERM) {
+      /*
+       * The guest believes it is root and that raising its own hard limit is
+       * allowed; the host process is an ordinary account and it is not. Rather
+       * than fail - sudo calls this on every invocation and stops when it
+       * fails - the request is clamped to what the host will actually grant.
+       *
+       * The guest is told this succeeded, which is a small lie of the same
+       * kind as chown being a no-op: the limit it asked for is not one NABI
+       * can hand out, and refusing only breaks programs that had no way to
+       * ask for less.
+       */
+      struct rlimit host;
+      if (getrlimit(resource, &host) == 0) {
+        if (drl.rlim_cur == RLIM_INFINITY || drl.rlim_cur > host.rlim_max)
+          drl.rlim_cur = host.rlim_max;
+        drl.rlim_max = host.rlim_max;
+        r = syswrap(setrlimit(resource, &drl));
+      }
+      if (r < 0) {
+        warnk("prlimit: resource %u could not be set, reporting success\n",
+              l_resource);
+        r = 0;
+      }
+    }
     if (r < 0)
       return r;
   }

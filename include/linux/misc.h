@@ -77,8 +77,21 @@ struct l___sysctl_args
 #define	LINUX_RLIMIT_NOFILE	7
 #define	LINUX_RLIMIT_MEMLOCK	8
 #define	LINUX_RLIMIT_AS		9	/* Address space limit */
+/*
+ * The six Linux has that Darwin does not. They still have to exist: pam_limits
+ * walks every resource on every session, and one EINVAL from the middle of that
+ * walk fails the whole PAM stack - which is how sudo came to report
+ * "pam_open_session: Permission denied" while having nothing to do with
+ * permissions.
+ */
+#define	LINUX_RLIMIT_LOCKS	10
+#define	LINUX_RLIMIT_SIGPENDING	11
+#define	LINUX_RLIMIT_MSGQUEUE	12
+#define	LINUX_RLIMIT_NICE	13
+#define	LINUX_RLIMIT_RTPRIO	14
+#define	LINUX_RLIMIT_RTTIME	15
 
-#define	LINUX_RLIM_NLIMITS	10
+#define	LINUX_RLIM_NLIMITS	16
 
 #define	LINUX_RLIM_INFINITY	(~0UL)
 

@@ -92,8 +92,38 @@ done
 
 set -- "$@" "$NABI" -m "$ROOT" /bin/bash -lc
 
-if [ "$#" -gt 0 ] && [ -n "${1:-}" ] && [ "$CMD" = yes ]; then
-    exec "$@" "cd \"\$HOME\" 2>/dev/null; $ARGS"
+# Who to be inside the guest.
+#
+# The guest starts as root - NABI maps the host account to uid 0 - and stays
+# there unless the rootfs has an account of this name, which msl-mkrootfs
+# creates at install time with sudo rights. Being that user is the point of
+# having created it: root is one `sudo -i` away, and running as root by default
+# is how a tree accumulates root-owned files that the account cannot then touch.
+#
+# MSL_ROOT=1 keeps the root shell, for the times when that is what is wanted.
+as_user=
+if [ -z "${MSL_ROOT:-}" ] && [ "$user" != root ] &&
+   awk -F: -v u="$user" '$1 == u { found = 1 } END { exit !found }' \
+       "$ROOT/etc/passwd" 2>/dev/null; then
+    as_user=$user
 fi
 
+if [ -n "$as_user" ]; then
+    # su starts that account's login shell itself, so the interactive case
+    # needs no command at all - and the cd to $HOME, the environment and the
+    # groups all come from the guest's own login path rather than from an
+    # approximation built out here.
+    if [ "$CMD" = no ]; then
+        exec "$@" "exec su - $as_user"
+    fi
+    # For a command, single quotes are the only quoting su -c is guaranteed to
+    # see intact through bash -lc, so the command is wrapped in them and any
+    # single quote inside is closed, escaped and reopened.
+    esc=$(printf '%s' "$ARGS" | sed "s/'/'\\\\''/g")
+    exec "$@" "exec su - $as_user -c 'cd \"\$HOME\" 2>/dev/null; $esc'"
+fi
+
+if [ "$CMD" = yes ]; then
+    exec "$@" "cd \"\$HOME\" 2>/dev/null; $ARGS"
+fi
 exec "$@" 'cd "$HOME" 2>/dev/null; exec bash -i'

@@ -269,8 +269,7 @@ init_first_proc(const char *root)
   pthread_mutex_init(&proc.futex_mutex, NULL);
   /* The account NABI runs as is the one the guest sees as root; remember it so
    * ids can be mapped both ways, and start the guest as root. */
-  nabi_host_uid = getuid();
-  nabi_host_gid = getgid();
+  init_host_ids();
   proc.cred = (struct cred) {
     .lock = PTHREAD_RWLOCK_INITIALIZER,
     .uid = 0, .euid = 0, .suid = 0,
@@ -292,23 +291,45 @@ init_vkernel(const char *root)
   init_first_proc(root);
 }
 
+/*
+ * The guest's privileges live in struct cred, so these move that and leave the
+ * host process where it is.
+ *
+ * Both used to call seteuid on the host, which only did anything when nabi had
+ * itself been installed setuid-root - and elevate_privilege *panicked* when it
+ * had not, so any setuid binary in the guest killed the emulator outright.
+ * That is backwards twice over: the host account is already the guest's root,
+ * so there is nothing to raise; and a guest exec must never be able to take the
+ * host process anywhere, least of all to uid 0.
+ */
 void
 drop_privilege(void)
 {
-  if (seteuid(getuid()) != 0) {
-    panic("drop_privilege");
-  }
+  /* Only meaningful for a setuid-root install, which is optional; otherwise
+   * euid already equals uid. Reported rather than fatal either way. */
+  if (geteuid() != getuid() && seteuid(getuid()) != 0)
+    warnk("drop_privilege: seteuid(%d) failed: %s\n", getuid(), strerror(errno));
 }
 
-int sys_setresuid(int, int, int);
+/*
+ * A set-user-ID or set-group-ID image, applied to the guest's credentials.
+ *
+ * The ids are the file's owner as the guest sees it, not a hardcoded zero: a
+ * rootfs unpacked by an ordinary account has every file owned by that account,
+ * which host_uid_to_guest already reports as root, and a binary owned by
+ * somebody else should elevate to somebody else.
+ */
 void
-elevate_privilege(void)
+elevate_privilege(uid_t owner_uid, gid_t owner_gid, mode_t mode)
 {
   pthread_rwlock_wrlock(&proc.cred.lock);
-  proc.cred.euid = 0;
-  proc.cred.suid = 0;
-  if (seteuid(0) != 0) {
-    panic("elevate_privilege");
+  if (mode & S_ISUID) {
+    proc.cred.euid = host_uid_to_guest(owner_uid);
+    proc.cred.suid = proc.cred.euid;
+  }
+  if (mode & S_ISGID) {
+    proc.cred.egid = host_gid_to_guest(owner_gid);
+    proc.cred.sgid = proc.cred.egid;
   }
   pthread_rwlock_unlock(&proc.cred.lock);
 }
@@ -367,6 +388,10 @@ resume_main(int ckpt_fd, int arena_fd, unsigned long clone_flags,
 {
   init_mm(&vkern_mm);
   init_shm_malloc();
+  /* Same host process and the same account as the parent, but not carried in
+   * the checkpoint - so it has to be asked for again rather than inherited.
+   * Left unset, every host-to-guest id mapping becomes the identity. */
+  init_host_ids();
 
   /*
    * Deliberately no init_signal(): it *imports* the host's dispositions and

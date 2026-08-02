@@ -1380,6 +1380,66 @@ Verified end to end: `msl install debian` and `msl install ubuntu` each produce 
 tree with nothing unconfigured — Debian 13 trixie and Ubuntu 24.04 LTS — and
 `msl run` works against both from the source tree and from an install layout.
 
+### 3.5.20 An account of your own, and five things in the way — **fixed**
+
+`msl install` now creates an account in the guest named after whoever ran it,
+with a home directory, a locked password and passwordless `sudo`; `msl login`
+lands in it. Getting there turned up five separate bugs, none of which had
+anything to do with user accounts.
+
+**`RLIMIT_NOFILE` had no inverse.** NABI keeps its own descriptors in the top 64
+slots of the host's table and tells the guest a limit that excludes them — but
+applied the guest's number back to the host verbatim. `su`, `login` and PAM all
+read their limits and write them back, which quietly lowered the host's limit
+onto the reserved range. Every `dup2` into the vkern table then failed with
+`EBADF`.
+
+**`vkern_dup_fd` did not check `dup2`,** so it returned a slot with nothing
+behind it. **And `do_exec` did not check `fstat`,** so `st` was stack garbage,
+`S_ISREG` was false, and execve returned `EACCES`. That is the chain that
+produced *"su: failed to execute /bin/bash: Permission denied"* about a file
+that is plainly executable — three unchecked returns deep, and nothing in the
+message pointing at any of them.
+
+**`nabi_host_uid` was set in `main` and never in `resume_main`.** It is not in
+the checkpoint, so every forked child left it zero and every host-to-guest id
+mapping became the identity: files owned by the account NABI runs as stopped
+reading back as root. Since a fork here is a fork plus an exec, that was every
+process except the first, and `sudo` said so — *"/etc/sudo.conf is owned by uid
+501, should be 0"* — about a file the first process had been reading as root's
+all along.
+
+**`elevate_privilege` called `seteuid(0)` and panicked when it failed.** That
+only ever worked for a setuid-root install, and it is backwards twice over:
+the host account is already the guest's root, so there is nothing to raise, and
+a guest exec must never be able to move the host process. It now moves
+`struct cred` and takes the ids from the file's owner rather than assuming zero.
+
+**The checkpoint carried the uids but not the gids.** Added in version 3, along
+with the supplementary group list as a trailing blob. Before it, `id` in any
+forked process reported a real user in group 0 with no groups — the uids
+survived and the gids did not, which is a confusing thing to look at.
+
+Two smaller things: `LINUX_RLIM_NLIMITS` was 10 where Linux has 16, so
+`pam_limits` got `EINVAL` from the middle of its walk over every resource; the
+six Darwin lacks are now emulated with Linux's defaults. And the rootfs builder
+restores the set-user-ID bits that tar drops for a non-root extractor, without
+which sudo will not run at all.
+
+What is *not* solved: `pam_limits` still fails under NABI, returning
+`PAM_PERM_DENIED` from `pam_open_session`, and marking it `optional` makes the
+call hang rather than fail — so it is the module running at all that is the
+problem, not its return code. Every `getrlimit` and `setrlimit` it makes
+succeeds, so the refusal is internal to it and is not yet understood. The
+builder comments the line out of sudo's stack and says why in the file. Nothing
+is lost by that here: there is no kernel to enforce a resource limit, and both
+Debian and Ubuntu ship `limits.conf` entirely commented out.
+
+The account uses uid 1000 rather than the host's uid on purpose. The host
+account is already what the guest sees as root, so giving this user the same
+number would make its files read back as root's and defeat the exercise.
+`MSL_ROOT=1` still gives a root shell.
+
 ---
 
 ## 4. Phased implementation

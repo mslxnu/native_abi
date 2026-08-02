@@ -346,6 +346,27 @@ while IFS="$(printf '\t')" read -r pkg file sha size; do
         sed -e 's|^\./$|/.|' -e 's|^\./|/|' -e 's|\(.\)/$|\1|' \
         > "$ROOT/var/lib/dpkg/info/$lname.list"
 
+    # macOS drops set-user-ID and set-group-ID when a non-root account extracts
+    # an archive, so sudo, su, mount and the rest come out as plain 0755 and
+    # sudo refuses to run at all ("must be owned by uid 0 and have the setuid
+    # bit set"). The bits are in the archive; they are put back here. Only
+    # entries that carry one are touched, which is a handful per tree.
+    tar -tvf "$data" 2>/dev/null | awk '
+        substr($1, 4, 1) == "s" || substr($1, 7, 1) == "s" ||
+        substr($1, 4, 1) == "S" || substr($1, 7, 1) == "S" {
+            mode = ""
+            if (substr($1, 4, 1) ~ /[sS]/) mode = mode "u+s,"
+            if (substr($1, 7, 1) ~ /[sS]/) mode = mode "g+s,"
+            sub(/,$/, "", mode)
+            # The name is the last field; a symlink prints "name -> target",
+            # and a symlink cannot carry these bits anyway.
+            if ($0 !~ / -> /) print mode "\t" $NF
+        }' |
+    while IFS="$(printf '\t')" read -r m f; do
+        f=${f#./}
+        [ -e "$ROOT/$f" ] && chmod "$m" "$ROOT/$f" 2>/dev/null || true
+    done
+
     # The maintainer scripts and the md5sums, which the ISO-based builder never
     # laid down - so nothing could be configured afterwards and `dpkg --audit`
     # reported every package as missing its md5sums.
@@ -426,8 +447,13 @@ ethers:         db files
 rpc:            db files
 EOS
 
-printf 'msl\n' > "$ROOT/etc/hostname"
-printf '127.0.0.1\tlocalhost\n' > "$ROOT/etc/hosts"
+# The guest gets the host's hostname from uname, so /etc/hosts has to know it
+# or every lookup of the machine's own name fails - sudo says "unable to
+# resolve host" on each invocation, and it is only a warning until something
+# treats it as an error.
+HOSTNAME=$(hostname -s 2>/dev/null || echo msl)
+printf '%s\n' "$HOSTNAME" > "$ROOT/etc/hostname"
+printf '127.0.0.1\tlocalhost\n127.0.1.1\t%s\n' "$HOSTNAME" > "$ROOT/etc/hosts"
 
 if [ -z "${NABI:-}" ] || [ ! -x "${NABI:-}" ]; then
     cat >&2 <<EOM
@@ -462,6 +488,91 @@ configure() {
 configure > /dev/null 2>&1
 configure | tail -20
 
+# ---------------------------------------------------------------------------
+# 4. An account to be, inside the guest
+# ---------------------------------------------------------------------------
+#
+# Named after whoever is running this, because the point of it is to be your
+# account rather than root's. It is created with the distro's own useradd, so
+# /etc/shadow, the home directory and the skeleton files are laid down the way
+# the distro means them to be - none of which this script could do from outside.
+#
+# uid 1000, not the host's uid: the host account is already what the guest sees
+# as root (see struct cred), so giving this user the same number would make its
+# files read back as root's and defeat the whole exercise.
+#
+# NOPASSWD, because there is no password to type. The account has no usable
+# password by construction, and PAM cannot check one here in any case; a sudo
+# that always refuses would be worse than no sudo. The host account is the real
+# security boundary, and it is unchanged either way - the guest's root is an
+# emulation, not a way out.
+GUEST_USER=${MSL_USER:-$(id -un)}
+case $GUEST_USER in
+    root|''|*[!a-zA-Z0-9._-]*)
+        echo "==> skipping the guest account: '$GUEST_USER' is not a usable name"
+        GUEST_USER=
+        ;;
+esac
+
+if [ -n "$GUEST_USER" ]; then
+    echo "==> creating $GUEST_USER (uid 1000, sudo)"
+    # Written to a file and run, rather than passed as a quoted argument: the
+    # script has to survive this shell, bash -lc and the guest's own quoting,
+    # and one layer of that going wrong is silent.
+    #
+    # /var/tmp, not /tmp: /tmp is one of NABI's host passthrough prefixes, so
+    # the guest's /tmp is the host's and a file written to $ROOT/tmp is not
+    # where the guest will look for it.
+    cat > "$ROOT/var/tmp/msl-adduser.sh" <<EOS
+#!/bin/bash
+set -e
+u=$GUEST_USER
+id -u "\$u" >/dev/null 2>&1 || useradd -m -u 1000 -s /bin/bash -c "\$u" "\$u"
+# sudo is the group both Debian and Ubuntu grant admin rights to.
+for g in sudo adm users; do
+    getent group "\$g" >/dev/null 2>&1 && usermod -aG "\$g" "\$u" || true
+done
+# Locked rather than empty: an empty password would let anything that does
+# check one straight in.
+passwd -l "\$u" >/dev/null 2>&1 || true
+mkdir -p /etc/sudoers.d
+printf '%s ALL=(ALL) NOPASSWD: ALL\n' "\$u" > /etc/sudoers.d/"\$u"
+chmod 0440 /etc/sudoers.d/"\$u"
+
+# pam_limits is taken out of sudo's session stack.
+#
+# With it in, sudo stops before running anything: pam_open_session comes back
+# PAM_PERM_DENIED. Every getrlimit and setrlimit NABI is asked for during that
+# call succeeds, so the refusal is internal to the module and is not yet
+# understood. Marking it "optional" is not enough - the call then hangs instead,
+# so it is the module running at all that is the problem, not its return code.
+#
+# Nothing is lost by removing it. There is no kernel here to enforce a resource
+# limit, and Debian and Ubuntu both ship limits.conf entirely commented out, so
+# the module has nothing to apply even where it works. The line is commented
+# rather than deleted, and says why, so it can be put back.
+if [ -f /etc/pam.d/sudo ] && grep -q '^session.*pam_limits' /etc/pam.d/sudo; then
+    sed -i 's|^\(session.*pam_limits.so.*\)$|# msl: disabled, see the note at the end of this file\n# \1|' \
+        /etc/pam.d/sudo
+    cat >> /etc/pam.d/sudo <<'PAMNOTE'
+
+# msl: pam_limits was commented out when this rootfs was built. Under NABI it
+# returns PAM_PERM_DENIED, and as a required module that stops sudo running at
+# all; marking it optional makes the call hang instead. It has nothing to do
+# here in any case - there is no kernel to enforce a resource limit, and
+# limits.conf ships empty. Uncomment it to get the original behaviour back.
+PAMNOTE
+fi
+id "\$u"
+EOS
+    chmod 755 "$ROOT/var/tmp/msl-adduser.sh"
+    env -i TERM="${TERM:-xterm}" HOME=/root PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+        DEBIAN_FRONTEND=noninteractive MSL_ROOT=1 \
+        "$NABI" -m "$ROOT" /bin/bash -lc /var/tmp/msl-adduser.sh 2>&1 |
+        sed 's/^/    /'
+    rm -f "$ROOT/var/tmp/msl-adduser.sh"
+fi
+
 echo "==> done: $ROOT"
 echo "    $(grep -c '^Package:' "$ROOT/var/lib/dpkg/status") packages"
 # grep -c exits 1 when it counts nothing, which is the good case here - so the
@@ -473,5 +584,9 @@ left=$(env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/root \
     2>/dev/null | tr -dc '0-9')
 [ -n "$left" ] || left='?'
 echo "    $left not fully configured"
+echo
+if [ -n "$GUEST_USER" ]; then
+    echo "    log in as $GUEST_USER; sudo works without a password"
+fi
 echo
 echo "    msl $ROOT"

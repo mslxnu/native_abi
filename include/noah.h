@@ -17,7 +17,6 @@
 /* privilege management */
 
 void drop_privilege(void);
-void elevate_privilege(void);
 
 /* interface to user memory */
 
@@ -212,6 +211,11 @@ void init_fileinfo(int rootfd);
 void init_host_passthrough(void);
 void report_host_passthrough(void);
 void report_rootfs_case(void);
+void init_host_ids(void);
+int  guest_groups_get(l_gid_t *out);
+const l_gid_t *guest_groups_ptr(void);
+void guest_groups_set(const l_gid_t *g, int n);
+void elevate_privilege(uid_t owner_uid, gid_t owner_gid, mode_t mode);
 int procfs_open(const char *path, int *out_fd);
 int procfs_readlink(const char *path, char *buf, size_t bufsize);
 void proc_set_ident(const char *exe, int argc, char *argv[]);
@@ -250,6 +254,8 @@ int linux_to_darwin_signal(int signum);
 int darwin_to_linux_signal(int signum);
 void darwin_to_linux_rlimit(int resource, struct rlimit *darwin_rlimit, struct l_rlimit *linux_rlimit);
 void darwin_to_linux_rlimit_nofile(struct rlimit *darwin_rlimit, struct l_rlimit *linux_rlimit);
+void linux_to_darwin_rlimit_nofile(struct l_rlimit *linux_rlimit, struct rlimit *darwin_rlimit);
+int  vkern_fd_floor(void);
 
 
 /* debug */

@@ -115,6 +115,10 @@ checkpoint_write(int fd)
   hdr.uid  = proc.cred.uid;
   hdr.euid = proc.cred.euid;
   hdr.suid = proc.cred.suid;
+  hdr.gid  = proc.cred.gid;
+  hdr.egid = proc.cred.egid;
+  hdr.sgid = proc.cred.sgid;
+  hdr.nr_groups = (uint32_t) guest_groups_get(NULL);
 
   hdr.tid             = task.tid;
   hdr.set_child_tid   = task.set_child_tid;
@@ -167,7 +171,9 @@ checkpoint_write(int fd)
        * and a mask - so the whole table goes as it stands. */
       write_all(fd, proc.sigaction, LINUX_NSIG * sizeof proc.sigaction[0]) == 0 &&
       write_all(fd, proc.ident.exe, hdr.exe_len) == 0 &&
-      write_all(fd, proc.ident.cmdline, hdr.cmdline_len) == 0)
+      write_all(fd, proc.ident.cmdline, hdr.cmdline_len) == 0 &&
+      (hdr.nr_groups == 0 ||
+       write_all(fd, guest_groups_ptr(), hdr.nr_groups * sizeof(l_gid_t)) == 0))
     rc = 0;
 
   free(regions); free(s2); free(chunks); free(fds);
@@ -218,17 +224,30 @@ checkpoint_read(int fd, struct checkpoint_header *hdr,
   /* The identity blobs. Absent (length zero) is normal for a guest that has not
    * exec'd anything yet, so it is not an error. */
   char *exe = NULL, *cmdline = NULL;
+  l_gid_t *groups = NULL;
+  size_t groups_bytes = hdr->nr_groups * sizeof *groups;
   if ((hdr->exe_len && !(exe = malloc(hdr->exe_len))) ||
       (hdr->cmdline_len && !(cmdline = malloc(hdr->cmdline_len))) ||
+      (groups_bytes && !(groups = malloc(groups_bytes))) ||
       read_all(fd, exe, hdr->exe_len) < 0 ||
-      read_all(fd, cmdline, hdr->cmdline_len) < 0) {
+      read_all(fd, cmdline, hdr->cmdline_len) < 0 ||
+      read_all(fd, groups, groups_bytes) < 0) {
     free(regions); free(s2); free(chunks); free(fds); free(sigactions);
-    free(exe); free(cmdline);
+    free(exe); free(cmdline); free(groups);
     errno = errno ? errno : ENOMEM;
     return -1;
   }
   *exe_out = exe;
   *cmdline_out = cmdline;
+  /* Applied rather than handed back: the group list has no other owner, and a
+   * caller that only wants to inspect a checkpoint has the count in the
+   * header. */
+  if (groups) {
+    guest_groups_set(groups, (int) hdr->nr_groups);
+    free(groups);
+  } else if (hdr->nr_groups == 0) {
+    guest_groups_set(NULL, 0);
+  }
 
   *regions_out = regions;
   *s2_out = s2;

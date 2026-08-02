@@ -52,6 +52,28 @@ panic(const char *fmt, ...)
 /* ---- the live machine, faked ---- */
 
 struct proc proc;
+
+/*
+ * The guest's supplementary groups live in process.c, which this test does not
+ * link - the point is to exercise the format, not the credential model. A tiny
+ * stub stands in, and it is a real one rather than an empty shell so the round
+ * trip below actually checks that the list travels.
+ */
+static l_gid_t stub_groups[32];
+static int stub_ngroups;
+int guest_groups_get(l_gid_t *out)
+{
+  if (out && stub_ngroups > 0)
+    memcpy(out, stub_groups, stub_ngroups * sizeof stub_groups[0]);
+  return stub_ngroups;
+}
+const l_gid_t *guest_groups_ptr(void) { return stub_groups; }
+void guest_groups_set(const l_gid_t *g, int n)
+{
+  if (n > 0)
+    memcpy(stub_groups, g, n * sizeof stub_groups[0]);
+  stub_ngroups = n;
+}
 _Thread_local struct task task;
 
 #define FAKE_S2     3
@@ -133,6 +155,11 @@ main(void)
   mm.current_mmap_top = 0xc0400000;
 
   proc.cred.uid = 501; proc.cred.euid = 0; proc.cred.suid = 0;
+  /* The gids and the group list travel too, since version 3. They did not
+   * before, and because a fork on arm64 is a fork plus an exec that meant
+   * every child came back with gid 0 and no groups at all. */
+  proc.cred.gid = 1000; proc.cred.egid = 1001; proc.cred.sgid = 1002;
+  { l_gid_t g[] = { 4, 27, 100 }; guest_groups_set(g, 3); }
   task.tid = 4242;
   task.set_child_tid = 0xc0ffee; task.clear_child_tid = 0xdeadbe;
   task.robust_list = 0xb0b; task.sigmask.__mask = 0x8000000000000042ULL;
@@ -237,6 +264,17 @@ main(void)
         "page-table chunks did not survive");
 
   /* Credentials and task identity. */
+  CHECK(hdr.gid == 1000 && hdr.egid == 1001 && hdr.sgid == 1002,
+        "gids did not survive: %u/%u/%u", hdr.gid, hdr.egid, hdr.sgid);
+  CHECK(hdr.nr_groups == 3, "group count did not survive: %u", hdr.nr_groups);
+  {
+    /* checkpoint_read applies the list rather than handing it back, so it is
+     * read out of the stub - which is exactly where a resumed guest gets it. */
+    l_gid_t g[8] = { 0 };
+    int n = guest_groups_get(g);
+    CHECK(n == 3 && g[0] == 4 && g[1] == 27 && g[2] == 100,
+          "group list did not survive: n=%d %u,%u,%u", n, g[0], g[1], g[2]);
+  }
   CHECK(hdr.uid == 501 && hdr.euid == 0 && hdr.suid == 0,
         "credentials did not survive");
   CHECK(hdr.tid == 4242 && hdr.set_child_tid == 0xc0ffee &&

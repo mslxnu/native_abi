@@ -26,7 +26,7 @@
 #include "linux/signal.h"
 
 #define CHECKPOINT_MAGIC   0x4E414249434B5031ULL  /* "NABICKP1" */
-#define CHECKPOINT_VERSION 2
+#define CHECKPOINT_VERSION 3
 
 /* One guest memory region, as src/mm/mmap.c tracks it, with the host address
  * replaced by the arena offset that names the same bytes elsewhere. */
@@ -90,8 +90,19 @@ struct checkpoint_header {
   uint64_t ipa_brk;
   uint64_t l1_ipa;
 
-  /* credentials, kept apart from the host's - see struct cred */
+  /*
+   * Credentials, kept apart from the host's - see struct cred.
+   *
+   * The gids travel too, and did not until version 3. A fork on arm64 is a
+   * fork plus an exec, so anything not written here is not merely stale in the
+   * child, it is absent: every forked process came back with gid 0 and no
+   * supplementary groups, however carefully su had set them a moment earlier.
+   * The symptom is confusing because the uids did survive, so `id` reported a
+   * real user in a root group.
+   */
   uint32_t uid, euid, suid;
+  uint32_t gid, egid, sgid;
+  uint32_t nr_groups;       /* the list itself is a trailing blob */
   uint32_t _pad3;
 
   /* the task: what a resumed thread has to believe about itself */
