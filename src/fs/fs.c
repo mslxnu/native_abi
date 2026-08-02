@@ -60,6 +60,7 @@
 #include <dirent.h>
 #include <termios.h>
 #include <sys/ioctl.h>
+#include <sys/xattr.h>
 #include <sys/file.h>
 
 #include <mach-o/dyld.h>
@@ -773,6 +774,154 @@ darwinfs_fsync(struct file *file)
   return syswrap(fsync(file->fd));
 }
 
+/* ---------------------------------------------------------------------------
+ * Guest ownership
+ *
+ * The host cannot represent it. Every file in a rootfs belongs to the single
+ * account nabi runs as; chown to anybody else needs privileges nabi does not
+ * have; and host_uid_to_guest maps that one account onto guest root. So a file
+ * created by the guest's own user came back owned by root, useradd's chown of a
+ * home directory did nothing, and `ls -ln ~` on a fresh account read
+ * "drwx------ 0 0". Enforcing permissions on top of that would have locked
+ * every user out of their own home on the first check.
+ *
+ * The guest's idea of who owns a file is therefore kept beside the file, in an
+ * extended attribute. It travels with the file, survives a copy within the
+ * volume, can be read from the host with `xattr -p`, and - unlike anything held
+ * in nabi's memory - is shared by every process, which matters here because a
+ * fork is a fork plus an exec and sibling guests are separate host processes.
+ *
+ * Absent, the owner is the host account, which the guest already reads as root.
+ * That is both the sensible default and the common case: everything a
+ * distribution unpacks is installed by root and carries no attribute at all, so
+ * the ordinary path costs one failed lookup and no storage.
+ * ------------------------------------------------------------------------ */
+
+#define GUEST_OWNER_XATTR "msl.nabi.owner"
+
+struct guest_owner {
+  uint32_t uid;
+  uint32_t gid;
+};
+
+/*
+ * An absolute host path for a (dirfd, relative path) pair.
+ *
+ * macOS has no getxattrat, so the attribute calls need a name rather than a
+ * descriptor. The directory's own path comes from F_GETPATH, cached for one
+ * descriptor because path resolution asks about the same one over and over -
+ * nearly always the rootfs.
+ */
+static bool
+abs_path_at(int dirfd, const char *rel, char *out, size_t len)
+{
+  static int cached_fd = -1;
+  static char cached_path[PATH_MAX];
+
+  if (rel[0] == '/')
+    return (size_t) snprintf(out, len, "%s", rel) < len;
+
+  if (dirfd == AT_FDCWD) {
+    char cwd[PATH_MAX];
+    if (getcwd(cwd, sizeof cwd) == NULL)
+      return false;
+    return (size_t) snprintf(out, len, "%s/%s", cwd, rel) < len;
+  }
+
+  if (dirfd != cached_fd) {
+    if (fcntl(dirfd, F_GETPATH, cached_path) < 0) {
+      cached_fd = -1;
+      return false;
+    }
+    cached_fd = dirfd;
+  }
+  return (size_t) snprintf(out, len, "%s/%s", cached_path, rel) < len;
+}
+
+static bool
+guest_owner_read(const char *abs, bool nofollow, struct guest_owner *out)
+{
+  ssize_t n = getxattr(abs, GUEST_OWNER_XATTR, out, sizeof *out, 0,
+                       nofollow ? XATTR_NOFOLLOW : 0);
+  return n == (ssize_t) sizeof *out;
+}
+
+static int
+guest_owner_write(const char *abs, bool nofollow, const struct guest_owner *o)
+{
+  return setxattr(abs, GUEST_OWNER_XATTR, o, sizeof *o, 0,
+                  nofollow ? XATTR_NOFOLLOW : 0);
+}
+
+/* Overlay the recorded owner onto a stat already converted for the guest. */
+static void
+guest_owner_overlay(int dirfd, const char *path, bool nofollow,
+                    struct l_newstat *l_st)
+{
+  char abs[PATH_MAX];
+  struct guest_owner o;
+  if (!abs_path_at(dirfd, path, abs, sizeof abs))
+    return;
+  if (guest_owner_read(abs, nofollow, &o)) {
+    l_st->st_uid = o.uid;
+    l_st->st_gid = o.gid;
+  }
+}
+
+static void
+guest_owner_overlay_fd(int fd, struct l_newstat *l_st)
+{
+  struct guest_owner o;
+  if (fgetxattr(fd, GUEST_OWNER_XATTR, &o, sizeof o, 0, 0) == (ssize_t) sizeof o) {
+    l_st->st_uid = o.uid;
+    l_st->st_gid = o.gid;
+  }
+}
+
+/*
+ * Record an owner. -1 for either means "leave as it is", as chown does.
+ *
+ * Root - the host account - is written out rather than left implicit, so that
+ * chowning something back to root removes an attribute that said otherwise
+ * rather than being ignored.
+ */
+static int
+guest_owner_record(int dirfd, const char *path, bool nofollow,
+                   l_uid_t uid, l_gid_t gid)
+{
+  char abs[PATH_MAX];
+  struct guest_owner o = { 0, 0 };
+  if (!abs_path_at(dirfd, path, abs, sizeof abs))
+    return -LINUX_ENOENT;
+  guest_owner_read(abs, nofollow, &o);          /* keep whatever is not changing */
+  if (uid != (l_uid_t) -1) o.uid = uid;
+  if (gid != (l_gid_t) -1) o.gid = gid;
+  if (o.uid == 0 && o.gid == 0) {
+    removexattr(abs, GUEST_OWNER_XATTR, nofollow ? XATTR_NOFOLLOW : 0);
+    return 0;
+  }
+  return syswrap(guest_owner_write(abs, nofollow, &o));
+}
+
+/*
+ * Called after the guest creates something. Only when it is not root: a root
+ * guest's files are the host account's, which is what an absent attribute
+ * already means.
+ */
+static void
+guest_owner_stamp_new(int dirfd, const char *path)
+{
+  l_uid_t uid;
+  l_gid_t gid;
+  pthread_rwlock_rdlock(&proc.cred.lock);
+  uid = proc.cred.euid;
+  gid = proc.cred.egid;
+  pthread_rwlock_unlock(&proc.cred.lock);
+  if (uid == 0 && gid == 0)
+    return;
+  guest_owner_record(dirfd, path, true, uid, gid);
+}
+
 int
 darwinfs_fstat(struct file *file, struct l_newstat *l_st)
 {
@@ -782,6 +931,7 @@ darwinfs_fstat(struct file *file, struct l_newstat *l_st)
     return ret;
   }
   stat_darwin_to_linux(&st, l_st);
+  guest_owner_overlay_fd(file->fd, l_st);
   return ret;
 }
 
@@ -923,6 +1073,147 @@ find_emptyfd(struct fdtable *table)
     }
   }
   return -1;
+}
+
+
+/* ---------------------------------------------------------------------------
+ * Permission checks
+ *
+ * Until now the guest's credentials decided nothing: every access was performed
+ * by the host account, which owns the whole tree, so an unprivileged guest user
+ * could open anything. `apt install` without sudo got as far as dpkg before
+ * anything objected, where a real Linux refuses at the lock file.
+ *
+ * These are Linux's discretionary rules, applied to the ownership recorded
+ * above. The host still performs the access - it has to, there is only one
+ * account - so this is the only place the guest's own answer is decided.
+ *
+ * Root costs nothing. A guest running as root, which is the default and most of
+ * what happens, short-circuits before any stat: root bypasses read and write,
+ * and the one rule it does not bypass - that an executable needs an execute bit
+ * somewhere - is checked from a stat the caller already had.
+ * ------------------------------------------------------------------------ */
+
+/* Bits shared with access(2): 4 read, 2 write, 1 execute. */
+#define WANT_R 4
+#define WANT_W 2
+#define WANT_X 1
+
+/*
+ * `real` asks against the real uid rather than the effective one, which is what
+ * access(2) does and faccessat2 does not unless AT_EACCESS is set.
+ */
+static int
+cred_may(const struct l_newstat *st, int want, bool real)
+{
+  l_uid_t uid;
+  l_gid_t gid;
+  pthread_rwlock_rdlock(&proc.cred.lock);
+  uid = real ? proc.cred.uid : proc.cred.euid;
+  gid = real ? proc.cred.gid : proc.cred.egid;
+  pthread_rwlock_unlock(&proc.cred.lock);
+
+  if (uid == 0) {
+    /* The single rule root does not get to ignore: something must be
+     * executable by somebody before root may execute it. Directories are
+     * always searchable by root. */
+    if ((want & WANT_X) && !S_ISDIR(st->st_mode) && (st->st_mode & 0111) == 0)
+      return -LINUX_EACCES;
+    return 0;
+  }
+
+  int shift;
+  if (st->st_uid == uid)
+    shift = 6;
+  else if (st->st_gid == gid || guest_in_group(st->st_gid))
+    shift = 3;
+  else
+    shift = 0;
+
+  return ((st->st_mode >> shift) & want) == (unsigned) want ? 0 : -LINUX_EACCES;
+}
+
+/* Whether the guest is root, without a stat - the fast path every check takes
+ * when nothing has dropped privileges. */
+static bool
+cred_is_root(void)
+{
+  bool r;
+  pthread_rwlock_rdlock(&proc.cred.lock);
+  r = proc.cred.euid == 0;
+  pthread_rwlock_unlock(&proc.cred.lock);
+  return r;
+}
+
+/* Stat one path and rule on it. */
+static int
+permit_at(int dirfd, const char *path, bool nofollow, int want, bool real)
+{
+  struct stat dst;
+  struct l_newstat st;
+  if (fstatat(dirfd, path, &dst, nofollow ? AT_SYMLINK_NOFOLLOW : 0) < 0)
+    return -darwin_to_linux_errno(errno);
+  stat_darwin_to_linux(&dst, &st);
+  guest_owner_overlay(dirfd, path, nofollow, &st);
+  return cred_may(&st, want, real);
+}
+
+/*
+ * Whether the guest may create, remove or rename `entry`: write and search on
+ * the directory that holds it.
+ *
+ * The directory is derived from the entry rather than passed in, because the
+ * two are named relative to the same descriptor and getting that wrong is
+ * silent - an earlier version asked about "." and so ruled on the rootfs root
+ * every time, which denied a user the right to write in their own home.
+ *
+ * `removing` turns on the sticky-bit rule: in a directory like /tmp, only the
+ * owner of an entry - or of the directory, or root - may take it away.
+ */
+static int
+permit_parent(int dirfd, const char *entry, bool removing)
+{
+  if (cred_is_root())
+    return 0;
+
+  char dirpath[LINUX_PATH_MAX];
+  const char *slash = strrchr(entry, '/');
+  if (slash == NULL) {
+    strcpy(dirpath, ".");
+  } else {
+    size_t n = (size_t) (slash - entry);
+    if (n == 0)
+      n = 1;                            /* "/x" is held by "/" */
+    if (n >= sizeof dirpath)
+      n = sizeof dirpath - 1;
+    memcpy(dirpath, entry, n);
+    dirpath[n] = '\0';
+  }
+
+  struct stat dst;
+  struct l_newstat dir;
+  if (fstatat(dirfd, dirpath, &dst, 0) < 0)
+    return -darwin_to_linux_errno(errno);
+  stat_darwin_to_linux(&dst, &dir);
+  guest_owner_overlay(dirfd, dirpath, false, &dir);
+
+  int r = cred_may(&dir, WANT_W | WANT_X, false);
+  if (r < 0 || !removing || !(dir.st_mode & S_ISVTX))
+    return r;
+
+  struct l_newstat v;
+  if (fstatat(dirfd, entry, &dst, AT_SYMLINK_NOFOLLOW) < 0)
+    return 0;                           /* nothing there to protect */
+  stat_darwin_to_linux(&dst, &v);
+  guest_owner_overlay(dirfd, entry, true, &v);
+
+  l_uid_t euid;
+  pthread_rwlock_rdlock(&proc.cred.lock);
+  euid = proc.cred.euid;
+  pthread_rwlock_unlock(&proc.cred.lock);
+  if (v.st_uid == euid || dir.st_uid == euid)
+    return 0;
+  return -LINUX_EACCES;
 }
 
 int
@@ -1241,27 +1532,85 @@ int
 darwinfs_openat(struct fs *fs, struct dir *dir, const char *path, int l_flags, int mode)
 {
   int flags = linux_to_darwin_o_flags(l_flags);
-  return syswrap(openat(dir->fd, path, flags, mode));
+  /* Whether this open is about to create the file, asked before it does.
+   * O_CREAT alone does not say - it succeeds either way - and stamping an
+   * ownership attribute onto a file that already existed would quietly hand
+   * somebody else's file to whoever opened it. The extra stat is only on the
+   * O_CREAT path, which is rare next to plain opens. */
+  bool creating = false;
+  if (flags & O_CREAT) {
+    struct stat probe;
+    creating = fstatat(dir->fd, path, &probe, AT_SYMLINK_NOFOLLOW) < 0;
+  }
+
+  if (!cred_is_root()) {
+    int want = 0;
+    switch (flags & O_ACCMODE) {
+    case O_RDONLY: want = WANT_R; break;
+    case O_WRONLY: want = WANT_W; break;
+    case O_RDWR:   want = WANT_R | WANT_W; break;
+    }
+    if (flags & O_TRUNC)
+      want |= WANT_W;
+    int r;
+    if (creating) {
+      /* A new entry needs permission on the directory that will hold it,
+       * not on a file that does not exist yet. */
+      if ((r = permit_parent(dir->fd, path, false)) < 0)
+        return r;
+    } else if (want && (r = permit_at(dir->fd, path, false, want, false)) < 0) {
+      return r;
+    }
+  }
+
+  int fd = syswrap(openat(dir->fd, path, flags, mode));
+  if (fd >= 0 && creating)
+    guest_owner_stamp_new(dir->fd, path);
+  return fd;
 }
 
 int
 darwinfs_symlinkat(struct fs *fs, const char *target, struct dir *dir, const char *name)
 {
-  return syswrap(symlinkat(target, dir->fd, name));
+  int r;
+  if ((r = permit_parent(dir->fd, name, false)) < 0)
+    return r;
+  r = syswrap(symlinkat(target, dir->fd, name));
+  if (r >= 0)
+    guest_owner_stamp_new(dir->fd, name);
+  return r;
 }
 
 int
 darwinfs_faccessat(struct fs *fs, struct dir *dir, const char *path, int mode, int l_flags)
 {
-  /* AT_EACCESS is 0x200 on Linux and 0x0010 on Darwin, so it has to be
-   * converted rather than passed through - and it is the flag that matters
-   * here, since it asks for the check to use the effective ids. */
-  return syswrap(faccessat(dir->fd, path, mode, linux_to_darwin_at_flags(l_flags)));
+  /*
+   * Answered against the guest's credentials, not the host's.
+   *
+   * Handing this to the host was wrong in both directions: the host account
+   * owns the whole tree, so it said yes to everything an unprivileged guest
+   * asked about, and it knew nothing of the ownership recorded for the guest.
+   *
+   * access(2) asks with the *real* ids and faccessat2 with the effective ones
+   * unless AT_EACCESS says otherwise, which is the whole reason that flag
+   * exists.
+   */
+  if (mode == 0)                                  /* F_OK: existence only */
+    return syswrap(faccessat(dir->fd, path, F_OK,
+                             linux_to_darwin_at_flags(l_flags)));
+  return permit_at(dir->fd, path,
+                   (l_flags & LINUX_AT_SYMLINK_NOFOLLOW) != 0,
+                   mode & (WANT_R | WANT_W | WANT_X),
+                   (l_flags & LINUX_AT_EACCESS) == 0);
 }
 
 int
 darwinfs_renameat(struct fs *fs, struct dir *dir1, const char *from, struct dir *dir2, const char *to)
 {
+  int r;
+  if ((r = permit_parent(dir1->fd, from, true)) < 0 ||
+      (r = permit_parent(dir2->fd, to, true)) < 0)
+    return r;
   return syswrap(renameat(dir1->fd, from, dir2->fd, to));
 }
 
@@ -1269,6 +1618,9 @@ int
 darwinfs_linkat(struct fs *fs, struct dir *dir1, const char *from, struct dir *dir2, const char *to, int l_flags)
 {
   int flags = linux_to_darwin_at_flags(l_flags);
+  int r;
+  if ((r = permit_parent(dir2->fd, to, false)) < 0)
+    return r;
   return syswrap(linkat(dir1->fd, from, dir2->fd, to, flags));
 }
 
@@ -1281,6 +1633,9 @@ darwinfs_unlinkat(struct fs *fs, struct dir *dir, const char *path, int l_flags)
     flags &= ~AT_EACCESS;
     flags |= AT_REMOVEDIR;
   }
+  int r;
+  if ((r = permit_parent(dir->fd, path, true)) < 0)
+    return r;
   return syswrap(unlinkat(dir->fd, path, flags));
 }
 
@@ -1293,7 +1648,13 @@ darwinfs_readlinkat(struct fs *fs, struct dir *dir, const char *path, char *buf,
 int
 darwinfs_mkdirat(struct fs *fs, struct dir *dir, const char *path, int mode)
 {
-  return syswrap(mkdirat(dir->fd, path, mode));
+  int r;
+  if ((r = permit_parent(dir->fd, path, false)) < 0)
+    return r;
+  r = syswrap(mkdirat(dir->fd, path, mode));
+  if (r >= 0)
+    guest_owner_stamp_new(dir->fd, path);
+  return r;
 }
 
 int
@@ -1306,6 +1667,7 @@ darwinfs_fstatat(struct fs *fs, struct dir *dir, const char *path, struct l_news
     return ret;
   }
   stat_darwin_to_linux(&st, l_st);
+  guest_owner_overlay(dir->fd, path, (flags & AT_SYMLINK_NOFOLLOW) != 0, l_st);
   return ret;
 }
 
@@ -1338,19 +1700,62 @@ darwinfs_statfs(struct fs *fs, struct dir *dir, const char *path, struct l_statf
   return r;
 }
 
+
 int
 darwinfs_fchownat(struct fs *fs, struct dir *dir, const char *path, l_uid_t uid, l_gid_t gid, int l_flags)
 {
-  if (chown_is_noop(uid, gid))
-    return 0;
-  int flags = linux_to_darwin_at_flags(l_flags);
-  return syswrap(fchownat(dir->fd, path, guest_uid_to_host(uid),
-                          guest_gid_to_host(gid), flags));
+  /*
+   * Who may. Only root gives a file to another user; an owner may change the
+   * group, but only to one they belong to. Anything else is EPERM, which is
+   * what chown returns rather than EACCES.
+   */
+  if (!cred_is_root()) {
+    struct stat dst;
+    struct l_newstat st;
+    bool nf = (l_flags & LINUX_AT_SYMLINK_NOFOLLOW) != 0;
+    if (fstatat(dir->fd, path, &dst, nf ? AT_SYMLINK_NOFOLLOW : 0) < 0)
+      return -darwin_to_linux_errno(errno);
+    stat_darwin_to_linux(&dst, &st);
+    guest_owner_overlay(dir->fd, path, nf, &st);
+    l_uid_t euid;
+    pthread_rwlock_rdlock(&proc.cred.lock);
+    euid = proc.cred.euid;
+    pthread_rwlock_unlock(&proc.cred.lock);
+    if (st.st_uid != euid)
+      return -LINUX_EPERM;
+    if (uid != (l_uid_t) -1 && uid != st.st_uid)
+      return -LINUX_EPERM;
+    if (gid != (l_gid_t) -1 && !guest_in_group(gid))
+      return -LINUX_EPERM;
+  }
+  /* Recorded rather than performed: the host has one account and no way to
+   * hand a file to another, so this is the only place the guest's answer can
+   * live. See "Guest ownership" above. */
+  return guest_owner_record(dir->fd, path,
+                            (l_flags & LINUX_AT_SYMLINK_NOFOLLOW) != 0,
+                            uid, gid);
 }
 
 int
 darwinfs_fchmodat(struct fs *fs, struct dir *dir, const char *path, l_mode_t mode)
 {
+  /* Only the owner may change a file's mode, and only root may do it to
+   * somebody else's. Nothing else in the check is about permission bits, so
+   * this one is spelled out rather than routed through cred_may. */
+  if (!cred_is_root()) {
+    struct stat dst;
+    struct l_newstat st;
+    if (fstatat(dir->fd, path, &dst, 0) < 0)
+      return -darwin_to_linux_errno(errno);
+    stat_darwin_to_linux(&dst, &st);
+    guest_owner_overlay(dir->fd, path, false, &st);
+    l_uid_t euid;
+    pthread_rwlock_rdlock(&proc.cred.lock);
+    euid = proc.cred.euid;
+    pthread_rwlock_unlock(&proc.cred.lock);
+    if (st.st_uid != euid)
+      return -LINUX_EPERM;
+  }
   return syswrap(fchmodat(dir->fd, path, mode, 0));
 }
 
@@ -1590,6 +1995,26 @@ resolve_path(const struct dir *parent, const char *name, int flags, struct path 
           return resolve_path(&dir, buf2, flags, path, loop + 1);
         }
       }
+    }
+    /*
+     * Search permission on every directory walked through.
+     *
+     * Without this the rest of the checks are a formality: a file may be
+     * readable by everybody and still sit inside a directory that is not, and
+     * on Linux the directory decides. /root is 0700, and whatever is under it
+     * is out of reach whatever its own mode says.
+     *
+     * One stat per component, and only for a guest that is not root - which is
+     * the whole reason cred_is_root is asked first rather than inside
+     * permit_at.
+     */
+    /* subpath is empty for the leading slash of an absolute passthrough path,
+     * where the first component boundary arrives before any characters have
+     * been copied. There is no directory to rule on yet. */
+    if (*c == '/' && path->subpath[0] != '\0' && !cred_is_root()) {
+      int r = permit_at(dir.fd, path->subpath, false, WANT_X, false);
+      if (r < 0)
+        return r;
     }
     if (*c) {
       *sp++ = *c++;

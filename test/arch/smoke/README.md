@@ -71,6 +71,10 @@ guest-code cache sync.
 - `procfstest` — a mounted pseudo-filesystem is visible and stays visible across
   a fork. Skips when nothing is mounted at `/proc`, since it is about NABI
   passing one through rather than about mSL/ProcFS.
+- `permtest` — the guest's credentials decide what it may open, create and
+  remove, including through a directory it may not search. Drops from root to an
+  ordinary uid partway through, which is the transition that matters, and checks
+  that a recorded `chown` survives a `stat`.
 - `aligntest` — the stack is 16-byte aligned at process entry, checked across
   sixteen environment lengths because one would only catch a misalignment half
   the time. An 8-byte-off stack does not fault; it corrupts a heap much later.

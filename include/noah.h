@@ -212,6 +212,7 @@ void init_host_passthrough(void);
 void report_host_passthrough(void);
 void report_rootfs_case(void);
 void init_host_ids(void);
+bool guest_in_group(l_gid_t gid);
 int  guest_groups_get(l_gid_t *out);
 const l_gid_t *guest_groups_ptr(void);
 void guest_groups_set(const l_gid_t *g, int n);

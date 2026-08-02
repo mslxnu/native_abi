@@ -363,6 +363,24 @@ DEFINE_SYSCALL(getsid, l_pid_t, pid)
 static l_gid_t guest_groups[LINUX_NGROUPS_MAX];
 static int nr_guest_groups;
 
+/* Whether the guest's credentials put it in this group - the primary one or
+ * any supplementary. Used by the permission checks, which is why it lives
+ * beside the list rather than exporting the array. */
+bool
+guest_in_group(l_gid_t gid)
+{
+  l_gid_t egid;
+  pthread_rwlock_rdlock(&proc.cred.lock);
+  egid = proc.cred.egid;
+  pthread_rwlock_unlock(&proc.cred.lock);
+  if (gid == egid)
+    return true;
+  for (int i = 0; i < nr_guest_groups; i++)
+    if (guest_groups[i] == gid)
+      return true;
+  return false;
+}
+
 /* For the checkpoint, which has to carry these across a fork like everything
  * else in struct cred. Kept here so the array stays file-local. */
 int

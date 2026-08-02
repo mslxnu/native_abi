@@ -1651,6 +1651,85 @@ guest's unprivileged user could open apt's lock. The refusal still happens, from
 `dpkg`, just later. That is the same fiction §3.5.20 describes from the other
 side, and the README says so plainly.
 
+### 3.5.25 Guest ownership, and enforcing it — **implemented**
+
+Until now the guest's credentials decided nothing about files. Every access was
+performed by the host account, which owns the whole tree, so an unprivileged
+guest could open anything: `apt install` without `sudo` downloaded 25 MB and got
+as far as `dpkg` before anything objected, where a real Linux refuses at the
+lock file in the first second.
+
+**Enforcement could not be switched on as it stood, and the evidence was one
+command:**
+
+```
+$ id -u
+1000
+$ touch ~/mine && ls -ln ~/mine
+-rw-rw-r-- 1 0 0 ... /home/sunneva/mine
+$ ls -lnd ~
+drwx------ 10 0 0 ... /home/sunneva
+```
+
+A file the user creates comes back owned by root, and the user's own home is
+`drwx------ root root`. Checking permissions against that would have locked
+every account out of its own home on the first check.
+
+The reason is structural. There is one host account; `chown` to anybody else
+needs privileges NABI has not got, which is why `chown` was a documented no-op;
+and `host_uid_to_guest` maps that single account onto guest root. So the host
+cannot represent guest ownership at all, and until it can, nothing can be
+enforced.
+
+**Ownership is now recorded beside the file, in an extended attribute.** It
+travels with the file, survives a copy within the volume, can be read from the
+host with `xattr -p`, and — unlike anything held in NABI's memory — is shared by
+every process, which matters here because a fork is a fork plus an exec and
+sibling guests are separate host processes. Absent, the owner is the host
+account, which the guest already reads as root: that is both the sensible
+default and the common case, so everything a distribution unpacks carries no
+attribute and costs one failed lookup.
+
+`chown` records; `stat` overlays; and anything created by a guest that is *not*
+root is stamped with the creator's ids. A root guest stamps nothing, because an
+absent attribute already means exactly that.
+
+**On top of that, Linux's discretionary rules.** The checks cover `open` (by
+access mode, plus `O_TRUNC`), `access`/`faccessat` — which previously answered
+for the host account and so said yes to everything — creating, removing and
+renaming (write and search on the containing directory, with the sticky-bit
+rule for `/tmp`), `chmod` and `chown`'s own ownership rules, and **search
+permission on every directory along the path**. That last one is not optional:
+a file may be readable by everybody inside a directory that is not, and on Linux
+the directory decides. Without it the rest is a formality.
+
+Root costs nothing. A guest running as root — the default, and most of what
+happens — short-circuits before any `stat`, so the common path is unchanged: a
+full `msl install debian` still takes about 68 seconds and still finishes with
+nothing unconfigured. The one rule root does not bypass is that an executable
+needs an execute bit somewhere, which is checked from a `stat` the caller
+already had.
+
+Two mistakes worth recording, because both were silent. Deriving the containing
+directory as `"."` rather than from the entry meant every create was ruled on
+against the rootfs root, which denied a user the right to write in their own
+home. And the search check fired on the empty first component of an absolute
+passthrough path — the leading `/` — which stats `""` and returns `ENOENT`, so
+`/dev/null` briefly stopped existing.
+
+What this is not: there are no ACLs, no capabilities, and no `CAP_DAC_OVERRIDE`
+distinct from being root. The host account remains the real boundary, exactly as
+the README says — this makes the guest's *own* model honest, it does not make
+the guest a sandbox.
+
+```
+$ apt-get install hello            # as the user
+E: Could not open lock file /var/lib/dpkg/lock-frontend - open (13: Permission denied)
+E: Unable to acquire the dpkg frontend lock, are you root?
+$ sudo apt-get install -y hello && hello
+Hello, world!
+```
+
 ---
 
 ## 4. Phased implementation

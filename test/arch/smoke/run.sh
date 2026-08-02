@@ -244,6 +244,17 @@ for t in procfstest mapstest identtest; do
     fi
 done
 
+# permtest: the guest's own credentials decide what it may touch - which needs
+# ownership to be real first, since the host cannot represent it.
+cp "$here/permtest" "$root/"; chmod +x "$root/permtest"
+out=$("$NABI" -m "$root" /permtest); rc=$?
+if [ "$rc" -eq 0 ] && [ "$out" = "perm ok" ]; then
+    echo "  ok  permtest -> \"$out\""
+else
+    echo "  FAIL permtest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 # aligntest: the stack is 16-byte aligned at process entry. Re-execs itself
 # sixteen times with a growing environment, since one length would only catch a
 # misalignment half the time.
