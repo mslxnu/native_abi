@@ -35,6 +35,10 @@ static long sys6(long n,long a,long b,long c,long d,long e,long f){
  * pty allocation still failed. */
 #define TIOCGPTN   0x80045430
 #define TIOCSPTLCK 0x40045431
+#define TCGETS     0x5401
+#define TCSETSF    0x5404
+#define TIOCSWINSZ 0x5414
+#define TIOCGWINSZ 0x5413
 
 static void put(const char*m){int i=0;while(m[i])i++;sys6(SYS_write,1,(long)m,i,0,0,0);}
 static void putd(long v){char b[24];int i=23;b[i--]=0;if(v==0)b[i--]='0';
@@ -60,6 +64,37 @@ void _start(void)
   if ((r = sys6(SYS_ioctl, m, TIOCGPTN, (long) &n, 0, 0, 0)) < 0)
     fail("TIOCGPTN", r);
   if (n == 0xffffffffu) { put("pty FAIL: TIOCGPTN wrote nothing\n"); sys6(SYS_exit,1,0,0,0,0,0); }
+
+  /*
+   * The master must be a terminal the moment it is unlocked, before anything
+   * has opened the slave.
+   *
+   * On Linux a pty is a pair from the start and the termios and window size
+   * belong to the pair, so this is when programs set them - apt sizes the
+   * terminal it will run dpkg under before it forks. Darwin attaches no line
+   * discipline until the slave has been opened at least once, and until then
+   * every one of these comes back ENOTTY.
+   */
+  struct { unsigned short row, col, xpixel, ypixel; } ws = { 24, 80, 0, 0 };
+  if ((r = sys6(SYS_ioctl, m, TIOCSWINSZ, (long) &ws, 0, 0, 0)) < 0)
+    fail("TIOCSWINSZ on a fresh master", r);
+  ws.row = ws.col = 0;
+  if ((r = sys6(SYS_ioctl, m, TIOCGWINSZ, (long) &ws, 0, 0, 0)) < 0)
+    fail("TIOCGWINSZ on a fresh master", r);
+  if (ws.row != 24 || ws.col != 80) {
+    put("pty FAIL: window size did not stick, got "); putd(ws.row);
+    put("x"); putd(ws.col); put("\n");
+    sys6(SYS_exit, 1, 0,0,0,0,0);
+  }
+
+  /* termios too, in all three set forms - TCSETSF was missing entirely, and
+   * an unhandled ioctl here returns EPERM, which reads as a permission
+   * problem rather than a gap. */
+  char tio[64];
+  if ((r = sys6(SYS_ioctl, m, TCGETS, (long) tio, 0, 0, 0)) < 0)
+    fail("TCGETS on a fresh master", r);
+  if ((r = sys6(SYS_ioctl, m, TCSETSF, (long) tio, 0, 0, 0)) < 0)
+    fail("TCSETSF on a fresh master", r);
 
   /* The path the guest builds from that number has to reach the slave the
    * master is actually paired with, which is the half that lives in path

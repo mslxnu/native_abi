@@ -358,6 +358,20 @@ darwinfs_ioctl(struct file *file, int cmd, uint64_t val0)
     linux_to_darwin_termios(&lios, &dios);
     return syswrap(tcsetattr(fd, TCSADRAIN, &dios));
   }
+  /* The third of the three, and it was missing - so tcsetattr(TCSAFLUSH) fell
+   * through to the default arm and came back EPERM. apt uses it on stdin when
+   * it sets up a terminal for dpkg, and reported "Setting in Start via
+   * TCSAFLUSH for stdin failed! - Operation not permitted" about something that
+   * needed no permission. */
+  case LINUX_TCSETSF: {
+    struct termios dios;
+    struct linux_termios lios;
+    if (copy_from_user(&lios, val0, sizeof lios)) {
+      return -LINUX_EFAULT;
+    }
+    linux_to_darwin_termios(&lios, &dios);
+    return syswrap(tcsetattr(fd, TCSAFLUSH, &dios));
+  }
   case LINUX_TIOCGPGRP: {
     l_pid_t pgrp;
     if ((r = syswrap(ioctl(fd, TIOCGPGRP, &pgrp))) < 0) {
@@ -456,7 +470,37 @@ darwinfs_ioctl(struct file *file, int cmd, uint64_t val0)
     if ((r = syswrap(ioctl(fd, TIOCPTYGRANT))) < 0) {
       return r;
     }
-    return syswrap(ioctl(fd, TIOCPTYUNLK));
+    if ((r = syswrap(ioctl(fd, TIOCPTYUNLK))) < 0) {
+      return r;
+    }
+    /*
+     * Open the slave once and let it go again.
+     *
+     * On Linux a pty is a pair from the moment the master exists, and the
+     * termios and window size live on the pair - so a program may set them on
+     * the master before anything has opened the slave, and everything does:
+     * apt sizes the terminal it is about to run dpkg under before it forks.
+     *
+     * Darwin attaches no line discipline until the slave has been opened at
+     * least once. Until then TCGETS, TCSETS and TIOCSWINSZ on the master all
+     * return ENOTTY - which is how "Setting TIOCSWINSZ for master fd 76 failed"
+     * came about, for a descriptor that was a perfectly good master.
+     *
+     * Opening it here and closing it immediately is enough: the state persists
+     * after the descriptor goes, and the transient open costs nothing the guest
+     * can observe. Holding it open instead would be wrong - the master's read
+     * returns EOF when the last slave closes, and a slave NABI never released
+     * would mean that EOF never arrives and the reader waits forever.
+     */
+    {
+      char slave[PATH_MAX];
+      if (ioctl(fd, TIOCPTYGNAME, slave) == 0) {
+        int probe = open(slave, O_RDWR | O_NOCTTY);
+        if (probe >= 0)
+          close(probe);
+      }
+    }
+    return 0;
   }
   case LINUX_TIOCGPTN: {
     char name[PATH_MAX];

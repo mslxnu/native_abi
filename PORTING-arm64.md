@@ -1592,6 +1592,65 @@ rootfs builder was writing is gone. A fresh `msl install debian` now gives a tre
 where `sudo apt-get update` reports no warnings at all, `sudo apt-get install
 gcc` completes, and the compiler works.
 
+### 3.5.24 A pty master is not a terminal until the slave has been opened — **fixed**
+
+Installing a package with a terminal attached printed three errors and carried
+on:
+
+```
+Error: Setting TIOCSWINSZ for master fd 76 failed! - ioctl (25: Inappropriate ioctl for device)
+Error: Setting in Start via TCSANOW for master fd 76 failed! - tcsetattr (25: Inappropriate ioctl for device)
+Error: Setting in Start via TCSAFLUSH for stdin failed! - tcsetattr (1: Operation not permitted)
+```
+
+Two separate bugs, and the errnos say which is which: `ENOTTY` twice on a
+descriptor that really was a pty master, and `EPERM` once on a descriptor that
+really was the terminal.
+
+**The master.** On Linux a pty is a pair from the moment the master exists, and
+the termios and window size belong to the pair — so a program may set them on
+the master before anything has opened the slave, and that is exactly when
+programs do it. apt sizes the terminal it is about to run `dpkg` under, then
+forks.
+
+Darwin attaches no line discipline until the slave has been opened at least
+once. Until then `TCGETS`, `TCSETS` and `TIOCSWINSZ` on the master all return
+`ENOTTY`. Measured directly, and the useful half of the measurement is that the
+state **persists once the slave has been opened and closed again**:
+
+```
+BEFORE opening the slave:  TIOCSWINSZ: ENOTTY   tcgetattr: ENOTTY
+AFTER  opening the slave:  TIOCSWINSZ: ok       tcgetattr: ok
+AFTER  closing it again:   tcgetattr: ok
+```
+
+So `TIOCSPTLCK` — the unlock, which is the point Linux considers the pair usable
+— now opens the slave once and immediately closes it. Holding it open instead
+would be wrong in a way that would not show up for a while: the master's read
+returns EOF when the last slave closes, and a slave NABI never released would
+mean that EOF never arrives and whoever is waiting for the child waits forever.
+A transient open was checked for that too — the master still sees EOF when the
+guest's own slave closes.
+
+**stdin.** `tcsetattr(TCSAFLUSH)` is `TCSETSF`, and the ioctl switch handled
+`TCGETS`, `TCSETS` and `TCSETSW` but not it. Unhandled ioctls fall through to a
+default arm that returns `EPERM`, so a missing case reads as a permissions
+problem rather than as a gap — which is the second time that default has sent an
+investigation the wrong way (see §3.5.11).
+
+`ptytest` now sets and reads the window size and does all three termios set
+forms **on a fresh master, before the slave is opened**, which is the order that
+was broken. It fails with `ENOTTY` without the fix.
+
+A note on something that is *not* a bug, from the same session: `apt install`
+without `sudo` downloaded everything before failing at `dpkg` with "requested
+operation requires superuser privilege", where a real Linux refuses at once on
+the lock file. NABI does not enforce the guest's own permission bits — the host
+performs every access with the host account, which owns the whole tree — so the
+guest's unprivileged user could open apt's lock. The refusal still happens, from
+`dpkg`, just later. That is the same fiction §3.5.20 describes from the other
+side, and the README says so plainly.
+
 ---
 
 ## 4. Phased implementation
