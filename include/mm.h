@@ -18,6 +18,24 @@
 
 #include "types.h"
 #include "noah.h"
+
+/*
+ * The unit guest mappings are rounded to.
+ *
+ * On arm64 it is the stage-2 granule rather than the guest's own page size: a
+ * mapping smaller than a 16KiB block cannot be given back independently, since
+ * vmm_munmap works a block at a time. It lives here rather than in mmap.c
+ * because brk has to agree with it - rounding the break to 4KiB while the
+ * mapping behind it was rounded to 16KiB left the recorded region reaching past
+ * current_brk, so the next brk mapped from inside a region that already existed
+ * and record_region panicked with "recording overlapping regions".
+ */
+#if defined(__arm64__)
+#include "arm64/vm.h"
+#define GUEST_MMAP_GRANULE STAGE2_GRANULE
+#else
+#define GUEST_MMAP_GRANULE PAGE_SIZEOF(PAGE_4KB)
+#endif
 #include "util/list.h"
 #include "util/tree.h"
 

@@ -85,9 +85,34 @@ static struct s2_chunk cur_chunk;
  * on a fault path, and the count is small; a tree would be more code for no
  * measurable gain.
  */
-#define MAX_CHUNKS 4096
-static struct s2_chunk chunks[MAX_CHUNKS];
+/*
+ * Grown rather than capped, for the same reason the arena's span table is: a
+ * fixed 4096 was a guess at how much guest-physical space anything would ever
+ * need, and `pacman -Sy` needs more. A guest cannot see the limit coming and
+ * cannot stay under it, so reaching it brought the whole thing down with
+ * "stage-2 chunk table full".
+ *
+ * Each chunk is one 16KiB stage-2 block, so the table grows by one entry per
+ * 16KiB of guest page tables - doubling keeps that to a handful of reallocs.
+ */
+#define INIT_CHUNKS 1024
+static struct s2_chunk *chunks;
 static size_t nr_chunks;
+static size_t chunks_cap;
+
+static void
+chunk_record(struct s2_chunk c)
+{
+  if (nr_chunks == chunks_cap) {
+    size_t want = chunks_cap ? chunks_cap * 2 : INIT_CHUNKS;
+    struct s2_chunk *bigger = realloc(chunks, want * sizeof *bigger);
+    if (bigger == NULL)
+      panic("out of memory growing the stage-2 chunk table to %zu", want);
+    chunks = bigger;
+    chunks_cap = want;
+  }
+  chunks[nr_chunks++] = c;
+}
 
 static void *
 ipa_to_host(gaddr_t ipa)
@@ -130,9 +155,7 @@ alloc_guest_page(gaddr_t *ipa_out)
     vmm_arm64_map_stage2(cur_chunk.ipa, STAGE2_GRANULE,
              HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC, cur_chunk.hva);
 
-    if (nr_chunks == MAX_CHUNKS)
-      panic("stage-2 chunk table full");
-    chunks[nr_chunks++] = cur_chunk;
+    chunk_record(cur_chunk);
   }
 
   size_t off = (size_t) cur_chunk.used * PAGE_SIZEOF(PAGE_4KB);
@@ -569,14 +592,12 @@ pt_restore(uint64_t saved_ipa_brk, uint64_t l1_ipa,
     if (hva == NULL)
       panic("restoring stage-1: arena offset %lld for IPA 0x%llx is not mapped",
             (long long) saved[i].arena_off, (unsigned long long) saved[i].ipa);
-    if (nr_chunks == MAX_CHUNKS)
-      panic("restoring stage-1: too many chunks");
-    chunks[nr_chunks++] = (struct s2_chunk){
+    chunk_record((struct s2_chunk){
       .hva = hva,
       .off = saved[i].arena_off,
       .ipa = saved[i].ipa,
       .used = saved[i].used,
-    };
+    });
   }
 
   ipa_brk = saved_ipa_brk;

@@ -79,15 +79,37 @@ static off_t  arena_capacity;   /* how far the file has been grown */
  */
 struct arena_span { void *addr; size_t size; off_t off; };
 off_t arena_offset_of(void *addr);
-#define ARENA_MAX_SPANS 16384
-static struct arena_span arena_spans[ARENA_MAX_SPANS];
+
+/*
+ * Grown rather than capped.
+ *
+ * This was a fixed array of 16384 and a panic when it filled, on the reasoning
+ * that no guest would hold that many mappings at once. `pacman -Sy` does: it
+ * decompresses several package databases, and glibc satisfies enough of that
+ * through mmap to fill the table and bring the whole guest down with "too many
+ * live arena spans" - a limit the guest has no way to see coming and no way to
+ * stay under.
+ *
+ * Doubling costs one realloc per doubling and removes the cliff. The array is
+ * still walked linearly, which is fine where it is used - creating a mapping,
+ * or taking a checkpoint - and never on a fault path.
+ */
+#define ARENA_INIT_SPANS 1024
+static struct arena_span *arena_spans;
 static size_t nr_arena_spans;
+static size_t arena_spans_cap;
 
 static void
 arena_span_record(void *addr, size_t size, off_t off)
 {
-  if (nr_arena_spans == ARENA_MAX_SPANS)
-    panic("too many live arena spans");
+  if (nr_arena_spans == arena_spans_cap) {
+    size_t want = arena_spans_cap ? arena_spans_cap * 2 : ARENA_INIT_SPANS;
+    struct arena_span *bigger = realloc(arena_spans, want * sizeof *bigger);
+    if (bigger == NULL)
+      panic("out of memory growing the arena span table to %zu", want);
+    arena_spans = bigger;
+    arena_spans_cap = want;
+  }
   arena_spans[nr_arena_spans++] = (struct arena_span){ addr, size, off };
 }
 

@@ -1730,6 +1730,77 @@ $ sudo apt-get install -y hello && hello
 Hello, world!
 ```
 
+### 3.5.26 Fedora and Arch — **rootfs working, package managers not**
+
+Neither is an apt archive, so the resolver-and-configure machinery does not
+apply. Both publish a complete rootfs instead, which is much less work precisely
+because somebody else did the resolving — what it costs is a trust root, since
+the content is whatever the project published. The builder now has three shapes:
+
+| | Source | Verified by |
+|---|---|---|
+| `apt` | archive of packages, resolved and configured here | `Release` → `Packages` SHA256 → per-`.deb` SHA256, over https |
+| `oci` | Fedora's published container image | SHA256 from the `CHECKSUM` beside it, over https |
+| `tar` | Arch Linux ARM's rootfs tarball | md5 beside it, over https |
+
+An OCI archive needs no container runtime to unpack: `index.json` names a
+manifest, the manifest lists layers, and the layers are ordinary tarballs
+applied in order. Arch's own host has no certificate for its name, so the
+default is a mirror that does — the download *is* the trust root here, and its
+md5 catches a corrupt transfer and nothing else.
+
+**Both produce a rootfs you can log into**, with your account, its home, and the
+right groups. What neither can do yet is install a package, and the reasons are
+worth recording separately from the distro work.
+
+`pacman -Sy` walked into four NABI limits in a row, three of them fixed here:
+
+- **`brk` had no limit.** Linux stops the break at the first mapping in its way
+  and returns the *old* break — which is the signal malloc uses to fall back to
+  mmap. NABI grew regardless, so pacman took the heap from `0x488000` to
+  `0xc0000000` in 2MiB steps and then recorded a region on top of a loaded
+  image. That is a panic rather than an answer.
+- **The arena's span table** was a fixed 16384 with a panic when full, and
+  **the stage-2 chunk table** a fixed 4096. Both were guesses at how much any
+  guest would need; pacman needs more. Neither limit is one a guest can see
+  coming or stay under, so both now grow.
+- The fourth is `hv_vm_map` refusing, and that one is still open.
+
+Along the way `record_region`'s panic learned to name both regions. "recording
+overlapping regions" alone says nothing about which mapping was already there;
+with the addresses it took one run to see that the heap had marched three
+gigabytes into the mmap area.
+
+`dnf` gets further and stops elsewhere: *"getaddrinfo() thread failed to start"*
+— its resolver wants a thread it cannot have. That is a separate gap and is not
+investigated here.
+
+Two smaller things both images needed. **pacman 7 confines its downloader with
+Landlock**, which there is no kernel here to provide, so it refuses to fetch
+anything at all; the builder turns the sandbox off, which gives up nothing —
+it exists to confine a root helper on a real kernel, and this root is emulated.
+And **neither image ships `sudo`**, which only the apt path can seed, so `msl`
+now says so instead of repeating a promise that belongs to Debian and Ubuntu.
+
+### 3.5.27 A host mode can lock the guest's root out — **worked around**
+
+Fedora's image stops `useradd` at *"cannot open /etc/gshadow"*, and root cannot
+write `/root`. Both are the same thing, and it is not about the guest's
+credentials at all: `/etc/gshadow` is mode 0000 and `/root` is `dr-xr-x---`, and
+NABI performs every access as the ordinary host account. **An entry that denies
+its own owner cannot be reached by anybody but real root, and NABI is not real
+root** — so the guest's root, which §3.5.25 made a fiction deliberately, cannot
+reach it either.
+
+The builder gives the owner back read on files and write on directories, which
+touches about a dozen entries in either image. What the guest sees shifts —
+0000 becomes 0600, 0550 becomes 0750 — which nothing checks, and which still
+keeps both to root.
+
+The general answer is the one §3.5.25 already built for ownership: record the
+guest's *mode* beside its owner, so the host mode can stay permissive while the
+guest sees the real one. That is the right fix and it is not done.
+
 ---
 
 ## 4. Phased implementation

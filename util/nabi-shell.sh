@@ -104,8 +104,19 @@ set -- "$@" "$NABI" -m "$ROOT" /bin/bash -lc
 as_user=
 if [ -z "${MSL_ROOT:-}" ] && [ "$user" != root ] &&
    awk -F: -v u="$user" '$1 == u { found = 1 } END { exit !found }' \
-       "$ROOT/etc/passwd" 2>/dev/null; then
+       "$ROOT/etc/passwd" 2>/dev/null &&
+   { [ -x "$ROOT/bin/su" ] || [ -x "$ROOT/usr/bin/su" ]; }; then
     as_user=$user
+fi
+
+# Without su there is no way in: Fedora's minimal container image does not ship
+# util-linux, and `exec su - <user>` in a tree that has no su takes the shell
+# down with "exec: su: not found" rather than logging anybody in. A root shell
+# is the honest fallback, said once so it is not a mystery.
+if [ -z "$as_user" ] && [ -z "${MSL_ROOT:-}" ] && [ "$user" != root ] &&
+   awk -F: -v u="$user" '$1 == u { found = 1 } END { exit !found }' \
+       "$ROOT/etc/passwd" 2>/dev/null; then
+    echo "$me: this image has no su, so this is a root shell." >&2
 fi
 
 if [ -n "$as_user" ]; then

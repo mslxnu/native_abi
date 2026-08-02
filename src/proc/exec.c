@@ -121,7 +121,15 @@ load_elf_interp(const char *path, ulong load_addr)
   }
 
   vmm_set_reg(VREG_PC, load_addr + h->e_entry);
-  proc.mm->start_brk = map_top;
+  /* Rounded to the mapping granule, not merely to a page.
+   *
+   * brk maps from here in granule-sized pieces, and do_mmap rounds a length up
+   * to the granule while accepting any 4KiB-aligned address. Starting the break
+   * part-way into a block meant the first mapping reached past the new break,
+   * and the next brk then mapped from inside a region that already existed -
+   * record_region panicking with "recording overlapping regions", from a guest
+   * that had only called malloc. */
+  proc.mm->start_brk = roundup(map_top, GUEST_MMAP_GRANULE);
 
   munmap(data, st.st_size);
 
@@ -211,7 +219,15 @@ load_elf(Elf64_Ehdr *ehdr, int argc, char *argv[], char **envp)
   }
   else {
     vmm_set_reg(VREG_PC, ehdr->e_entry + global_offset);
-    proc.mm->start_brk = map_top;
+    /* Rounded to the mapping granule, not merely to a page.
+   *
+   * brk maps from here in granule-sized pieces, and do_mmap rounds a length up
+   * to the granule while accepting any 4KiB-aligned address. Starting the break
+   * part-way into a block meant the first mapping reached past the new break,
+   * and the next brk then mapped from inside a region that already existed -
+   * record_region panicking with "recording overlapping regions", from a guest
+   * that had only called malloc. */
+  proc.mm->start_brk = roundup(map_top, GUEST_MMAP_GRANULE);
   }
 
   init_userstack(argc, argv, envp, load_base, ehdr, global_offset, interp ? map_top : 0);

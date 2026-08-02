@@ -145,8 +145,17 @@ record_region(struct mm *mm, void *haddr, gaddr_t gaddr, size_t size, int prot, 
     .pgoff = pgoff
   };
 
-  if (RB_INSERT(mm_region_tree, &mm->mm_region_tree, region) != NULL) {
-    panic("recording overlapping regions\n");
+  struct mm_region *clash = RB_INSERT(mm_region_tree, &mm->mm_region_tree, region);
+  if (clash != NULL) {
+    /* Naming both is the difference between a panic that ends an
+     * investigation and one that starts it: the message alone says nothing
+     * about which mapping was already there or how far the new one reached
+     * into it. */
+    panic("recording overlapping regions: new [%#llx, %#llx) over "
+          "existing [%#llx, %#llx)\n",
+          (unsigned long long) gaddr, (unsigned long long) (gaddr + size),
+          (unsigned long long) clash->gaddr,
+          (unsigned long long) (clash->gaddr + clash->size));
   }
   struct mm_region *prev = RB_PREV(mm_region_tree, &mm->mm_region_tree, region);
   if (prev == NULL) {
@@ -202,7 +211,12 @@ DEFINE_SYSCALL(munlock, gaddr_t, addr, size_t, length)
 DEFINE_SYSCALL(brk, unsigned long, brk)
 {
   uint64_t ret;
-  brk = roundup(brk, PAGE_SIZEOF(PAGE_4KB));
+  /* The granule the mapping behind the break is rounded to, not the guest's
+   * page size. Rounding to 4KiB while do_mmap rounded the mapping to 16KiB left
+   * the region reaching past current_brk, so the next brk started inside a
+   * region that already existed. The guest is told AT_PAGESZ is 16KiB anyway,
+   * so this is the size it already believes a page to be. */
+  brk = roundup(brk, GUEST_MMAP_GRANULE);
 
   pthread_rwlock_wrlock(&proc.mm->alloc_lock);
   if (brk < proc.mm->start_brk) {
@@ -213,9 +227,27 @@ DEFINE_SYSCALL(brk, unsigned long, brk)
   if (brk < proc.mm->current_brk) {
     do_munmap(brk, proc.mm->current_brk - brk);
     ret = proc.mm->current_brk = brk;
-  } else {
+  } else if (brk > proc.mm->current_brk) {
+    /*
+     * Stop at the first thing already mapped, and answer with the break as it
+     * stands.
+     *
+     * That is what Linux does, and returning the *old* break is the signal
+     * malloc uses to give up on the heap and switch to mmap - brk(2) reports
+     * the break it managed, not the one it was asked for. Growing regardless
+     * marched the heap straight into the mmap area: pacman took it from
+     * 0x488000 to 0xc0000000 in 2MiB steps and then recorded a region on top of
+     * a loaded image, which is a panic rather than an answer.
+     */
+    if (find_region_range(proc.mm->current_brk,
+                          brk - proc.mm->current_brk, proc.mm) != NULL) {
+      ret = proc.mm->current_brk;
+      goto out;
+    }
     do_mmap(proc.mm->current_brk, brk - proc.mm->current_brk, PROT_READ | PROT_WRITE, LINUX_PROT_READ | LINUX_PROT_WRITE, LINUX_MAP_PRIVATE | LINUX_MAP_FIXED | LINUX_MAP_ANONYMOUS, -1, 0);
     ret = proc.mm->current_brk = brk;
+  } else {
+    ret = proc.mm->current_brk;
   }
 
 out:

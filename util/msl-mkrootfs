@@ -39,29 +39,56 @@ MIRROR=
 EXTRA=
 VARIANT=standard
 
-# Per-distro defaults. Both are apt archives with the same layout, so the same
-# resolver and unpacker serve them; only the mirror, the suite and the name of
-# the keyring package differ. Anything not built on dpkg - Fedora's rpm, Arch's
-# pkg.tar.zst - needs a different second stage and is not handled here.
+# Per-distro defaults, and which of the three shapes each one is.
+#
+#   apt  debian, ubuntu - an archive of packages with a dependency graph. The
+#        base system has to be resolved out of it and then configured, which is
+#        what debootstrap does and what stages 1 to 3 below do.
+#   oci  fedora         - a published container image: an OCI layout holding a
+#        manifest and one or more filesystem layers, already complete.
+#   tar  arch           - a published rootfs tarball, already complete.
+#
+# The last two are much less work precisely because somebody else did the
+# resolving. What they cost instead is a trust root: their content is whatever
+# the project published, taken on the strength of a checksum served beside it.
 distro_defaults() {
     case $1 in
         debian)
+            FAMILY=apt
             : "${SUITE:=trixie}"
             : "${MIRROR:=https://deb.debian.org/debian}"
             KEYRING=debian-archive-keyring
             SECURITY="deb https://security.debian.org/debian-security $SUITE-security main"
             ;;
         ubuntu)
+            FAMILY=apt
             : "${SUITE:=noble}"
             # ports/ is the arm64 archive; archive.ubuntu.com carries amd64 only.
             : "${MIRROR:=https://ports.ubuntu.com/ubuntu-ports}"
             KEYRING=ubuntu-keyring
             SECURITY="deb $MIRROR $SUITE-security main universe"
             ;;
+        fedora)
+            FAMILY=oci
+            : "${SUITE:=43}"
+            : "${MIRROR:=https://dl.fedoraproject.org/pub/fedora/linux/releases}"
+            IMAGES="$MIRROR/$SUITE/Container/aarch64/images"
+            ;;
+        arch)
+            FAMILY=tar
+            # Arch Linux ARM's own host has no certificate for its name, so the
+            # default is a mirror that does - the download is the trust root
+            # here and http would leave nothing holding it up. Its checksum is
+            # an md5 served beside the file, which catches a corrupt transfer
+            # and is worth exactly nothing against a hostile one; TLS is what
+            # is actually being relied on.
+            : "${SUITE:=latest}"
+            : "${MIRROR:=https://de3.mirror.archlinuxarm.org/os}"
+            ARCHIVE="ArchLinuxARM-aarch64-$SUITE.tar.gz"
+            ;;
         *)
             echo "${0##*/}: unknown distro: $1" >&2
-            echo "  debian and ubuntu are apt archives and share this machinery." >&2
-            echo "  fedora and arch use different package formats and are not built yet." >&2
+            echo "  known: debian, ubuntu, fedora, arch" >&2
             exit 2
             ;;
     esac
@@ -71,8 +98,8 @@ usage() {
     cat >&2 <<EOM
 usage: ${0##*/} [options] <target-dir>
 
-  -d <distro>   debian or ubuntu (default: $DISTRO)
-  -s <suite>    suite to build (default: trixie for debian, noble for ubuntu)
+  -d <distro>   debian, ubuntu, fedora or arch (default: $DISTRO)
+  -s <suite>    suite, release or tag (trixie / noble / 43 / latest)
   -a <arch>     dpkg architecture (default: $ARCH)
   -m <mirror>   archive to fetch from (default: the distro's)
   -i <p,p,...>  extra packages to include
@@ -157,6 +184,132 @@ mkdir -p "$CACHE"
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
+
+# ---------------------------------------------------------------------------
+# Prebuilt rootfs archives (fedora, arch)
+# ---------------------------------------------------------------------------
+
+# tar drops set-user-ID and set-group-ID when an ordinary account extracts an
+# archive, so sudo, su and mount come out as plain 0755 and sudo refuses to run
+# at all. The bits are in the archive; this puts them back. Only entries that
+# carry one are touched, which is a handful per tree.
+restore_setuid_bits() {
+    tar -tvf "$1" 2>/dev/null | awk '
+        substr($1, 4, 1) ~ /[sS]/ || substr($1, 7, 1) ~ /[sS]/ {
+            mode = ""
+            if (substr($1, 4, 1) ~ /[sS]/) mode = mode "u+s,"
+            if (substr($1, 7, 1) ~ /[sS]/) mode = mode "g+s,"
+            sub(/,$/, "", mode)
+            if ($0 !~ / -> /) print mode "\t" $NF
+        }' |
+    while IFS="$(printf '\t')" read -r m f; do
+        f=${f#./}
+        [ -e "$ROOT/$f" ] && chmod "$m" "$ROOT/$f" 2>/dev/null || true
+    done
+}
+
+# A file fetched once and kept, checked against a digest before it is trusted.
+# A cached copy is only believed after it verifies: a truncated download from an
+# earlier run is otherwise indistinguishable from a good one.
+fetch_verified() {
+    url=$1; out=$2; algo=$3; want=$4
+    if [ -f "$out" ] &&
+       [ "$(shasum -a "$algo" "$out" 2>/dev/null | cut -d' ' -f1)" = "$want" ]; then
+        return 0
+    fi
+    if [ -f "$out" ] && [ "$algo" = md5 ] &&
+       [ "$(md5 -q "$out" 2>/dev/null)" = "$want" ]; then
+        return 0
+    fi
+    echo "    fetching $(basename "$out")"
+    curl -fsSL "$url" -o "$out.part"
+    if [ "$algo" = md5 ]; then
+        got=$(md5 -q "$out.part")
+    else
+        got=$(shasum -a "$algo" "$out.part" | cut -d' ' -f1)
+    fi
+    if [ "$got" != "$want" ]; then
+        rm -f "$out.part"
+        echo "${0##*/}: $(basename "$out") failed its checksum" >&2
+        exit 1
+    fi
+    mv "$out.part" "$out"
+}
+
+# Fedora publishes the base system as an OCI image: a layout directory holding
+# a manifest and the filesystem layers it names. index.json points at the
+# manifest, the manifest lists the layers, and the layers are ordinary tarballs
+# applied in order. Nothing here needs a container runtime.
+build_oci() {
+    echo "==> fetching the $DISTRO $SUITE image index"
+    index=$(curl -fsSL "$IMAGES/") ||
+        { echo "${0##*/}: cannot reach $IMAGES" >&2; exit 1; }
+
+    case $VARIANT in
+        minbase) want='Base-Generic-Minimal' ;;
+        *)       want='Base-Generic' ;;
+    esac
+    # -Minimal also matches the plain pattern, so the standard variant has to
+    # exclude it explicitly rather than take whichever sorted first.
+    img=$(printf '%s' "$index" |
+          grep -oE "Fedora-Container-$want-[0-9.]+-[0-9.]+\.aarch64\.oci\.tar\.xz" |
+          { [ "$VARIANT" = minbase ] && cat || grep -v Minimal; } |
+          sort -u | head -1)
+    sums=$(printf '%s' "$index" |
+           grep -oE 'Fedora-Container-[0-9.-]+-aarch64-CHECKSUM' | sort -u | head -1)
+    [ -n "$img" ] && [ -n "$sums" ] ||
+        { echo "${0##*/}: no $want image for Fedora $SUITE" >&2; exit 1; }
+
+    # The digest comes from the checksum file beside the image, over https.
+    # There is no signature check here: Fedora signs these, but with an OpenPGP
+    # key and macOS ships no gpgv, so the trust root is TLS - the same
+    # compromise the apt path documents.
+    want_sha=$(curl -fsSL "$IMAGES/$sums" |
+               sed -n "s/^SHA256 ($img) = \\([0-9a-f]*\\)$/\\1/p" | head -1)
+    [ -n "$want_sha" ] ||
+        { echo "${0##*/}: $img is not in $sums" >&2; exit 1; }
+
+    echo "    $img"
+    fetch_verified "$IMAGES/$img" "$CACHE/$img" 256 "$want_sha"
+
+    echo "==> unpacking"
+    rm -rf "$work/oci"; mkdir -p "$work/oci"
+    tar -xf "$CACHE/$img" -C "$work/oci"
+
+    manifest=$(grep -oE 'sha256:[0-9a-f]{64}' "$work/oci/index.json" |
+               head -1 | cut -d: -f2)
+    [ -n "$manifest" ] ||
+        { echo "${0##*/}: no manifest in the image index" >&2; exit 1; }
+
+    # Everything after "layers" - the config digest appears before it, and
+    # taking every digest in the file would apply the config as a layer.
+    layers=$(tr -d '\n' < "$work/oci/blobs/sha256/$manifest" |
+             sed 's/.*"layers"//' |
+             grep -oE 'sha256:[0-9a-f]{64}' | cut -d: -f2)
+    [ -n "$layers" ] ||
+        { echo "${0##*/}: the manifest lists no layers" >&2; exit 1; }
+
+    for l in $layers; do
+        blob=$work/oci/blobs/sha256/$l
+        tar -xf "$blob" -C "$ROOT" 2>/dev/null || true
+        restore_setuid_bits "$blob"
+    done
+}
+
+# Arch Linux ARM publishes a plain rootfs tarball, already complete.
+build_tar() {
+    echo "==> fetching the $DISTRO rootfs"
+    want_md5=$(curl -fsSL "$MIRROR/$ARCHIVE.md5" | awk '{print $1; exit}')
+    [ -n "$want_md5" ] ||
+        { echo "${0##*/}: no checksum for $ARCHIVE" >&2; exit 1; }
+    fetch_verified "$MIRROR/$ARCHIVE" "$CACHE/$ARCHIVE" md5 "$want_md5"
+
+    echo "==> unpacking"
+    tar -xf "$CACHE/$ARCHIVE" -C "$ROOT" 2>/dev/null || true
+    restore_setuid_bits "$CACHE/$ARCHIVE"
+}
+
+build_apt() {
 # ---------------------------------------------------------------------------
 # 1. Resolve
 # ---------------------------------------------------------------------------
@@ -410,6 +563,37 @@ for l in bin sbin lib; do
 done
 [ -e "$ROOT/lib64" ] || ln -s usr/lib "$ROOT/lib64" 2>/dev/null || true
 
+}
+
+# ---------------------------------------------------------------------------
+# Lay the tree down, by whichever route this distro takes
+# ---------------------------------------------------------------------------
+
+case $FAMILY in
+    apt) build_apt ;;
+    oci) build_oci ;;
+    tar) build_tar ;;
+esac
+
+# An entry that denies its own owner cannot be reached by anybody except real
+# root, and nabi is not real root: it performs every access as the ordinary
+# account that started it, so the guest's root cannot reach one either. A
+# published image has a handful - Fedora ships /etc/shadow and /etc/gshadow as
+# mode 0000 and /root as dr-xr-x---, so shadow-utils stops at "useradd: cannot
+# open /etc/gshadow" and root cannot write its own home.
+#
+# Giving the owner back read on files and write on directories is enough, and
+# touches about a dozen entries in either image. What the guest sees changes -
+# 0000 becomes 0600, 0550 becomes 0750 - which nothing checks, and which still
+# keeps both to root.
+#
+# The general answer is to record the guest's mode beside its owner, the way
+# ownership already is, so the host mode can stay permissive while the guest
+# sees the real one. That is a larger piece of work; it is written up in
+# PORTING-arm64.md rather than started here.
+find "$ROOT" -type d ! -perm -u+w -exec chmod u+w {} + 2>/dev/null || true
+find "$ROOT" -type f ! -perm -u+r -exec chmod u+r {} + 2>/dev/null || true
+
 # ---------------------------------------------------------------------------
 # 3. Configure, inside NABI
 # ---------------------------------------------------------------------------
@@ -421,11 +605,22 @@ done
 # the postinst own the file is the entire point of stage 3.
 mkdir -p "$ROOT/root" "$ROOT/usr/local"
 
+if [ "$FAMILY" = apt ]; then
 cat > "$ROOT/etc/apt/sources.list" <<EOS
 deb $MIRROR $SUITE main
 deb $MIRROR $SUITE-updates main
 $SECURITY
 EOS
+fi
+
+# Replaced rather than written through. Arch ships /etc/resolv.conf as a symlink
+# to /run/systemd/resolve/resolv.conf, which nothing here creates, so a redirect
+# follows the link into a directory that does not exist and fails with ENOENT -
+# about a file that is plainly there. The same goes for the others: what is
+# wanted is a real file, not an edit to whatever a runtime directory would have
+# held.
+rm -f "$ROOT/etc/resolv.conf" "$ROOT/etc/nsswitch.conf" \
+      "$ROOT/etc/hostname" "$ROOT/etc/hosts"
 
 # Taken from the host, so the guest resolves the way the machine does rather
 # than against a hardcoded public resolver.
@@ -456,6 +651,29 @@ EOS
 # resolve host" on each invocation, and it is only a warning until something
 # treats it as an error.
 HOSTNAME=$(hostname -s 2>/dev/null || echo msl)
+# pacman 7 confines its download helper with Landlock and drops to an `alpm`
+# user to do it. There is no kernel here to provide Landlock, so it fails at the
+# first step - "restricting filesystem access failed because Landlock is not
+# supported by the kernel" - and refuses to fetch anything at all.
+#
+# Turning the sandbox off gives up nothing that was protecting anything: it
+# exists to confine a download helper running as root on a real kernel, and the
+# guest's root is emulated - the host process stays the ordinary account that
+# started nabi whichever uid the guest believes it has. The line is added under
+# [options] rather than appended, which would land it in the last repository
+# section instead.
+if [ "$FAMILY" = tar ] && [ -f "$ROOT/etc/pacman.conf" ] &&
+   ! grep -q '^DisableSandbox' "$ROOT/etc/pacman.conf"; then
+    awk '{ print }
+         /^\[options\]/ && !done {
+             print "# msl: no Landlock under NABI, and the guest root it would"
+             print "# confine is emulated - see the notes in msl-mkrootfs."
+             print "DisableSandbox"
+             done = 1
+         }' "$ROOT/etc/pacman.conf" > "$ROOT/etc/pacman.conf.msl" &&
+        mv "$ROOT/etc/pacman.conf.msl" "$ROOT/etc/pacman.conf"
+fi
+
 printf '%s\n' "$HOSTNAME" > "$ROOT/etc/hostname"
 printf '127.0.0.1\tlocalhost\n127.0.1.1\t%s\n' "$HOSTNAME" > "$ROOT/etc/hosts"
 
@@ -472,6 +690,7 @@ EOM
     exit 0
 fi
 
+if [ "$FAMILY" = apt ]; then
 echo "==> configuring (dpkg --configure -a, under NABI)"
 # Twice, because the order dpkg picks from a cold tree is not always one that
 # works. base-files' postinst runs `chown root:utmp`, and if it is configured
@@ -491,6 +710,7 @@ configure() {
 }
 configure > /dev/null 2>&1
 configure | tail -20
+fi
 
 # ---------------------------------------------------------------------------
 # 4. An account to be, inside the guest
@@ -531,9 +751,21 @@ if [ -n "$GUEST_USER" ]; then
 #!/bin/bash
 set -e
 u=$GUEST_USER
-id -u "\$u" >/dev/null 2>&1 || useradd -m -u 1000 -s /bin/bash -c "\$u" "\$u"
+# shadow-utils refuses to add a user when these are missing, and a minimal
+# container image ships neither: Fedora's stops at "useradd: cannot open
+# /etc/gshadow" and no account is made at all.
+for f in /etc/shadow /etc/gshadow; do
+    [ -e "\$f" ] || { : > "\$f"; chmod 0000 "\$f"; }
+done
+sh=/bin/bash; [ -x /bin/bash ] || sh=/bin/sh
+# uid 1000 is the conventional first account, but some images already have
+# one there - Arch ships one called alarm. Asked for, and given up on rather
+# fought over: which number it lands on does not matter to anything here.
+id -u "\$u" >/dev/null 2>&1 ||
+    useradd -m -u 1000 -s "\$sh" -c "\$u" "\$u" 2>/dev/null ||
+    useradd -m -s "\$sh" -c "\$u" "\$u"
 # sudo is the group both Debian and Ubuntu grant admin rights to.
-for g in sudo adm users; do
+for g in sudo wheel adm users; do
     getent group "\$g" >/dev/null 2>&1 && usermod -aG "\$g" "\$u" || true
 done
 # Locked rather than empty: an empty password would let anything that does
@@ -589,25 +821,54 @@ fi
 # Best-effort: a machine that is offline, or behind a proxy this does not know
 # about, should still get a rootfs. `apt update` is one command away.
 echo "==> fetching package lists"
+case $FAMILY in
+    apt) refresh='apt-get update' ;;
+    oci) refresh='dnf -q makecache || dnf5 -q makecache' ;;
+    tar) refresh='pacman -Sy --noconfirm' ;;
+esac
 env -i TERM="${TERM:-xterm}" HOME=/root PATH=/usr/sbin:/usr/bin:/sbin:/bin \
     DEBIAN_FRONTEND=noninteractive MSL_ROOT=1 \
-    "$NABI" -m "$ROOT" /bin/bash -lc 'apt-get update' 2>&1 |
+    "$NABI" -m "$ROOT" /bin/bash -lc "$refresh" 2>&1 |
     tail -3 | sed 's/^/    /' || true
 
 echo "==> done: $ROOT"
-echo "    $(grep -c '^Package:' "$ROOT/var/lib/dpkg/status") packages"
-# grep -c exits 1 when it counts nothing, which is the good case here - so the
-# count is taken with `|| true` inside the guest rather than guarded outside,
-# where the failure would be indistinguishable from not being able to ask.
-left=$(env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/root \
-    "$NABI" -m "$ROOT" /bin/bash -lc \
-    "dpkg-query -f '\${Status}\n' -W 2>/dev/null | grep -vc '^install ok installed$' || true" \
-    2>/dev/null | tr -dc '0-9')
-[ -n "$left" ] || left='?'
-echo "    $left not fully configured"
+# How many packages, asked the way this distro counts them. dpkg reads its own
+# status file from outside; rpm and pacman keep databases only their own tools
+# can open, so those are asked from within the guest.
+case $FAMILY in
+    apt)
+        echo "    $(grep -c '^Package:' "$ROOT/var/lib/dpkg/status") packages"
+        # grep -c exits 1 when it counts nothing, which is the good case here -
+        # so the count is taken with `|| true` inside the guest rather than
+        # guarded outside, where the failure would be indistinguishable from
+        # not being able to ask.
+        left=$(env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/root \
+            "$NABI" -m "$ROOT" /bin/bash -lc \
+            "dpkg-query -f '\${Status}\n' -W 2>/dev/null | grep -vc '^install ok installed$' || true" \
+            2>/dev/null | tr -dc '0-9')
+        [ -n "$left" ] || left='?'
+        echo "    $left not fully configured"
+        ;;
+    *)
+        n=$(env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin HOME=/root \
+            "$NABI" -m "$ROOT" /bin/bash -lc \
+            "{ rpm -qa 2>/dev/null || pacman -Qq 2>/dev/null; } | wc -l" \
+            2>/dev/null | tr -dc '0-9')
+        [ -n "$n" ] && [ "$n" != 0 ] && echo "    $n packages"
+        ;;
+esac
 echo
 if [ -n "$GUEST_USER" ]; then
-    echo "    log in as $GUEST_USER; sudo works without a password"
+    if [ -x "$ROOT/usr/bin/sudo" ] || [ -x "$ROOT/bin/sudo" ]; then
+        echo "    log in as $GUEST_USER; sudo works without a password"
+    else
+        # Only Debian and Ubuntu get sudo seeded, because only there can a
+        # package be added while the tree is being built. A published image
+        # brings whatever it brings, and neither Fedora's minimal container nor
+        # Arch's base includes sudo - so say what is true rather than repeat a
+        # promise that belongs to the other two.
+        echo "    log in as $GUEST_USER; no sudo in this image - use su for root"
+    fi
 fi
 echo
 echo "    msl $ROOT"

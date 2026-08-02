@@ -30,7 +30,6 @@
 #if defined(__arm64__)
 #include "arm64/vm.h"
 void pt_protect(gaddr_t va, size_t size, int prot);
-#define GUEST_MMAP_GRANULE STAGE2_GRANULE
 /*
  * Guest permissions live in the stage-1 descriptors, so that is what mprotect
  * rewrites (pt_protect). Not hv_vm_protect, which the x86 path uses: it takes an
@@ -51,7 +50,6 @@ void pt_protect(gaddr_t va, size_t size, int prot);
  */
 #define NABI_HOST_PROTECT(region, prot) ((void)0)
 #else
-#define GUEST_MMAP_GRANULE PAGE_SIZEOF(PAGE_4KB)
 #define NABI_VM_PROTECT(region) hv_vm_protect((region)->gaddr, (region)->size, hvprot)
 #define NABI_HOST_PROTECT(region, prot) mprotect((region)->haddr, (region)->size, prot)
 #endif
