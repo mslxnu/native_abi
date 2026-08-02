@@ -1,0 +1,27 @@
+name: C/C++ CI
+
+on:
+  push:
+    branches: [ "master" ]
+  pull_request:
+    branches: [ "master" ]
+
+jobs:
+  build:
+
+    runs-on: macos-26
+
+    steps:
+    - uses: actions/checkout@v4
+    - name: make ARCH=arm64
+      run: make ARCH=arm64
+    - name: make check
+      run: make check
+    - name: make distcheck
+      run: make distcheck
+    - name: make ARCH=x86_64
+      run: make ARCH=x86_64
+    - name: make check
+      run: make check
+    - name: make distcheck
+      run: make distcheck
