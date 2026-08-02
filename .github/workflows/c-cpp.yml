@@ -13,15 +13,47 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
+
+    # arm64 is the primary target. x86_64 is built too, as the compile baseline
+    # and reference implementation it is (README, "Status"), but it cannot be
+    # executed on Apple Silicon.
     - name: make ARCH=arm64
       run: make ARCH=arm64
-    - name: make check
-      run: make check
-    - name: make distcheck
-      run: make distcheck
+
+    # The one assertion worth making about a build.
+    #
+    # Everything lands in out/ under a name with no architecture in it, so
+    # before the Makefile grew a per-architecture stamp, `make ARCH=x86_64`
+    # after `make ARCH=arm64` found the binary newer than every source, printed
+    # "Nothing to be done", and left the previous architecture's build in place.
+    # This job did exactly that and went green having compiled arm64 twice. A
+    # green tick that means nothing is worse than a red one.
+    - name: Verify the binary is arm64
+      run: file out/nabi | grep -q 'arm64'
+
+    - name: make check (arm64)
+      run: make ARCH=arm64 check
+
     - name: make ARCH=x86_64
       run: make ARCH=x86_64
-    - name: make check
-      run: make check
-    - name: make distcheck
-      run: make distcheck
+
+    - name: Verify the binary is x86_64
+      run: file out/nabi | grep -q 'x86_64'
+
+    - name: make check (x86_64)
+      run: make ARCH=x86_64 check
+
+# Two things this deliberately does not do.
+#
+# `make distcheck` is not run, because this repository has no such target.
+# mSL/FHS and mSL/ProcFS build installer payloads and check them; NABI installs
+# from `make install` and has nothing to verify a payload against, so the step
+# only ever produced "No rule to make target 'distcheck'".
+#
+# Nothing here needs a working hypervisor. Every test that does - the aarch64
+# backend unit tests, the end-to-end smoke suite, the guest suite - asks the
+# host whether it can create a VM and skips with a reason when it cannot, which
+# a runner that is itself a VM generally cannot. What still runs everywhere is
+# the compile of both architectures, the instruction decoder, the arena and the
+# checkpoint format. If this machine ever does gain a usable hypervisor, the
+# rest starts running with no change here.

@@ -6,3 +6,6 @@ GTAGS
 tags
 out/
 .DS_Store
+
+# Scratch files the guest suite leaves behind in test/.
+test/noah-mv.*

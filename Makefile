@@ -133,6 +133,21 @@ HEADERS := $(wildcard include/*.h include/*/*.h)
 
 NABI    := $(OUT)/nabi
 WRAPPER := $(OUT)/nabi.pl
+
+# A stamp so that changing ARCH rebuilds.
+#
+# Everything lands in out/ under a name with no architecture in it, and ARCH is
+# a variable rather than a file - so `make ARCH=x86_64` straight after
+# `make ARCH=arm64` found out/nabi newer than every source, reported "Nothing to
+# be done", and left the arm64 binary sitting there. That is worse than an
+# error: CI ran both builds in one job and went green without ever compiling the
+# second one.
+#
+# The stamp is named for the architecture and is a normal prerequisite, so
+# switching ARCH creates a file newer than the binary and forces the relink.
+# Switching back does the same. Building the same architecture twice touches
+# nothing.
+ARCH_STAMP := $(OUT)/.built-for-$(ARCH)
 # The front end, installed under the family name, and the shell helper it
 # calls. Both are plain scripts with nothing to build, so they are taken from
 # the source tree. nabi-shell.sh moves to libexec: it takes a rootfs path and
@@ -159,7 +174,11 @@ build: $(NABI) $(WRAPPER)
 # signature and takes the entitlement with it - which surfaces much later as
 # hv_vm_create() returning HV_DENIED, and reads like a permissions problem
 # rather than a build problem.
-$(NABI): $(SRCS) $(HEADERS) | $(OUT)
+$(ARCH_STAMP): | $(OUT)
+	@rm -f $(OUT)/.built-for-*
+	@touch $@
+
+$(NABI): $(SRCS) $(HEADERS) $(ARCH_STAMP) | $(OUT)
 	$(CC) $(CFLAGS) -o $@ $(SRCS) $(FRAMEWORKS)
 	$(CODESIGN) --force --sign $(SIGNCERT) --entitlements $(ENTITLEMENTS) $@
 
@@ -198,20 +217,24 @@ check: check-decode check-arm64 check-smoke check-guest
 # backend available on a non-Intel host.
 DECODE_TEST := $(OUT)/test_exit_decode
 
-$(DECODE_TEST): test/arch/test_exit_decode.c lib/vmm_x86_exit.c $(HEADERS) | $(OUT)
+$(DECODE_TEST): test/arch/test_exit_decode.c lib/vmm_x86_exit.c $(HEADERS) $(ARCH_STAMP) | $(OUT)
 	$(CC) -arch x86_64 -std=gnu11 -O0 -g \
 	    -Wall -Wextra -Wno-unused-parameter -Iinclude \
 	    -o $@ test/arch/test_exit_decode.c lib/vmm_x86_exit.c
 
 check-decode: $(DECODE_TEST)
-	@$(DECODE_TEST)
+	@if [ "$(NATIVE_ARCH)" = "arm64" ] && ! arch -x86_64 /usr/bin/true >/dev/null 2>&1; then \
+		echo "SKIP: the x86 decode test is an x86_64 binary and needs Rosetta here."; \
+	else \
+		$(DECODE_TEST); \
+	fi
 
 # Hardware test for the aarch64 backend. Creates a real VM, so it needs Apple
 # Silicon and the hypervisor entitlement - but unlike the x86 guest suite, it
 # does run on the development machine. Skips on Intel.
 ARM64_TEST := $(OUT)/test_arm64_backend
 
-$(ARM64_TEST): test/arch/test_arm64_backend.c lib/vmm_arm64.c lib/vmm_arm64_exit.c $(HEADERS) | $(OUT)
+$(ARM64_TEST): test/arch/test_arm64_backend.c lib/vmm_arm64.c lib/vmm_arm64_exit.c $(HEADERS) $(ARCH_STAMP) | $(OUT)
 	$(CC) -arch arm64 -std=gnu11 -O0 -g \
 	    -Wall -Wextra -Wno-unused-parameter -Iinclude \
 	    -o $@ test/arch/test_arm64_backend.c lib/vmm_arm64.c lib/vmm_arm64_exit.c src/mm/arena.c \
@@ -220,7 +243,7 @@ $(ARM64_TEST): test/arch/test_arm64_backend.c lib/vmm_arm64.c lib/vmm_arm64_exit
 
 MMU_TEST := $(OUT)/test_arm64_mmu
 
-$(MMU_TEST): test/arch/test_arm64_mmu.c src/mm/pt_arm64.c src/mm/arena.c src/mm/mm_arm64.c lib/vmm_arm64.c lib/vmm_arm64_exit.c $(HEADERS) | $(OUT)
+$(MMU_TEST): test/arch/test_arm64_mmu.c src/mm/pt_arm64.c src/mm/arena.c src/mm/mm_arm64.c lib/vmm_arm64.c lib/vmm_arm64_exit.c $(HEADERS) $(ARCH_STAMP) | $(OUT)
 	$(CC) -arch arm64 -std=gnu11 -O0 -g \
 	    -Wall -Wextra -Wno-unused-parameter -Iinclude \
 	    -o $@ test/arch/test_arm64_mmu.c src/mm/pt_arm64.c src/mm/arena.c src/mm/mm_arm64.c lib/vmm_arm64.c lib/vmm_arm64_exit.c \
@@ -232,7 +255,7 @@ $(MMU_TEST): test/arch/test_arm64_mmu.c src/mm/pt_arm64.c src/mm/arena.c src/mm/
 # guarded.
 VMMAP_TEST := $(OUT)/test_arm64_vmmap
 
-$(VMMAP_TEST): test/arch/test_arm64_vmmap.c src/mm/pt_arm64.c src/mm/arena.c lib/vmm_arm64.c lib/vmm_arm64_exit.c $(HEADERS) | $(OUT)
+$(VMMAP_TEST): test/arch/test_arm64_vmmap.c src/mm/pt_arm64.c src/mm/arena.c lib/vmm_arm64.c lib/vmm_arm64_exit.c $(HEADERS) $(ARCH_STAMP) | $(OUT)
 	$(CC) -arch arm64 -std=gnu11 -O0 -g \
 	    -Wall -Wextra -Wno-unused-parameter -Iinclude \
 	    -o $@ test/arch/test_arm64_vmmap.c src/mm/pt_arm64.c src/mm/arena.c lib/vmm_arm64.c lib/vmm_arm64_exit.c \
@@ -241,7 +264,7 @@ $(VMMAP_TEST): test/arch/test_arm64_vmmap.c src/mm/pt_arm64.c src/mm/arena.c lib
 
 BOOT_TEST := $(OUT)/test_arm64_boot
 
-$(BOOT_TEST): test/arch/test_arm64_boot.c src/main_arm64.c src/mm/pt_arm64.c src/mm/arena.c lib/vmm_arm64.c lib/vmm_arm64_exit.c $(HEADERS) | $(OUT)
+$(BOOT_TEST): test/arch/test_arm64_boot.c src/main_arm64.c src/mm/pt_arm64.c src/mm/arena.c lib/vmm_arm64.c lib/vmm_arm64_exit.c $(HEADERS) $(ARCH_STAMP) | $(OUT)
 	$(CC) -arch arm64 -std=gnu11 -O0 -g \
 	    -Wall -Wextra -Wno-unused-parameter -Iinclude \
 	    -o $@ test/arch/test_arm64_boot.c src/main_arm64.c src/mm/pt_arm64.c src/mm/arena.c lib/vmm_arm64.c lib/vmm_arm64_exit.c \
@@ -250,7 +273,7 @@ $(BOOT_TEST): test/arch/test_arm64_boot.c src/main_arm64.c src/mm/pt_arm64.c src
 
 MUNMAP_TEST := $(OUT)/test_arm64_munmap
 
-$(MUNMAP_TEST): test/arch/test_arm64_munmap.c src/mm/pt_arm64.c src/mm/arena.c lib/vmm_arm64.c lib/vmm_arm64_exit.c $(HEADERS) | $(OUT)
+$(MUNMAP_TEST): test/arch/test_arm64_munmap.c src/mm/pt_arm64.c src/mm/arena.c lib/vmm_arm64.c lib/vmm_arm64_exit.c $(HEADERS) $(ARCH_STAMP) | $(OUT)
 	$(CC) -arch arm64 -std=gnu11 -O0 -g \
 	    -Wall -Wextra -Wno-unused-parameter -Iinclude \
 	    -o $@ test/arch/test_arm64_munmap.c src/mm/pt_arm64.c src/mm/arena.c lib/vmm_arm64.c lib/vmm_arm64_exit.c \
@@ -261,7 +284,7 @@ $(MUNMAP_TEST): test/arch/test_arm64_munmap.c src/mm/pt_arm64.c src/mm/arena.c l
 # replay / restore) in-process. Same link set as the boot test.
 REENTRY_TEST := $(OUT)/test_arm64_reentry
 
-$(REENTRY_TEST): test/arch/test_arm64_reentry.c src/main_arm64.c src/mm/pt_arm64.c src/mm/arena.c lib/vmm_arm64.c lib/vmm_arm64_exit.c $(HEADERS) | $(OUT)
+$(REENTRY_TEST): test/arch/test_arm64_reentry.c src/main_arm64.c src/mm/pt_arm64.c src/mm/arena.c lib/vmm_arm64.c lib/vmm_arm64_exit.c $(HEADERS) $(ARCH_STAMP) | $(OUT)
 	$(CC) -arch arm64 -std=gnu11 -O0 -g \
 	    -Wall -Wextra -Wno-unused-parameter -Iinclude \
 	    -o $@ test/arch/test_arm64_reentry.c src/main_arm64.c src/mm/pt_arm64.c src/mm/arena.c lib/vmm_arm64.c lib/vmm_arm64_exit.c \
@@ -271,21 +294,32 @@ $(REENTRY_TEST): test/arch/test_arm64_reentry.c src/main_arm64.c src/mm/pt_arm64
 # The arena is plain VM plumbing - no VM, no entitlement, runs anywhere.
 ARENA_TEST := $(OUT)/test_arena
 
-$(ARENA_TEST): test/arch/test_arena.c src/mm/arena.c $(HEADERS) | $(OUT)
+$(ARENA_TEST): test/arch/test_arena.c src/mm/arena.c $(HEADERS) $(ARCH_STAMP) | $(OUT)
 	$(CC) -arch $(NATIVE_ARCH) -std=gnu11 -O0 -g \
 	    -Wall -Wextra -Wno-unused-parameter -Iinclude \
 	    -o $@ test/arch/test_arena.c src/mm/arena.c
 
 CKPT_TEST := $(OUT)/test_checkpoint
 
-$(CKPT_TEST): test/arch/test_checkpoint.c src/proc/checkpoint.c src/mm/arena.c $(HEADERS) | $(OUT)
+$(CKPT_TEST): test/arch/test_checkpoint.c src/proc/checkpoint.c src/mm/arena.c $(HEADERS) $(ARCH_STAMP) | $(OUT)
 	$(CC) -arch $(NATIVE_ARCH) -std=gnu11 -O0 -g \
 	    -Wall -Wextra -Wno-unused-parameter -Iinclude \
 	    -o $@ test/arch/test_checkpoint.c src/proc/checkpoint.c src/mm/arena.c
 
-check-arm64: $(CKPT_TEST) $(ARM64_TEST) $(MMU_TEST) $(VMMAP_TEST) $(BOOT_TEST) $(MUNMAP_TEST) $(REENTRY_TEST) $(ARENA_TEST)
+# Whether this host can create a VM at all, asked by trying rather than by
+# reading a sysctl - see the comment in the source. Codesigned like nabi,
+# because the entitlement is what the call needs.
+HV_PROBE := $(OUT)/hv_probe
+$(HV_PROBE): test/arch/hv_probe.c $(ARCH_STAMP) | $(OUT)
+	$(CC) $(CFLAGS) -o $@ test/arch/hv_probe.c $(FRAMEWORKS)
+	$(CODESIGN) --force --sign $(SIGNCERT) --entitlements $(ENTITLEMENTS) $@
+
+check-arm64: $(CKPT_TEST) $(ARM64_TEST) $(MMU_TEST) $(VMMAP_TEST) $(BOOT_TEST) $(MUNMAP_TEST) $(REENTRY_TEST) $(ARENA_TEST) $(HV_PROBE)
 	@if [ "$(NATIVE_ARCH)" != "arm64" ]; then \
 		echo "SKIP: the aarch64 backend tests need Apple Silicon to run."; \
+	elif ! $(HV_PROBE); then \
+		echo "SKIP: this host cannot create a VM, so the backend tests cannot run."; \
+		$(ARENA_TEST) && $(CKPT_TEST); \
 	else \
 		$(ARENA_TEST) && $(CKPT_TEST) && $(ARM64_TEST) && $(MMU_TEST) && $(VMMAP_TEST) && $(BOOT_TEST) && $(MUNMAP_TEST) && $(REENTRY_TEST); \
 	fi
@@ -294,28 +328,39 @@ check-arm64: $(CKPT_TEST) $(ARM64_TEST) $(MMU_TEST) $(VMMAP_TEST) $(BOOT_TEST) $
 # Apple Silicon and a full arm64 build; skips otherwise. This is the first test
 # that exercises the whole pipeline on a real ELF (load, translation, syscall
 # dispatch, cache sync), rather than a component in isolation.
-check-smoke:
+check-smoke: $(HV_PROBE)
 	@if [ "$(NATIVE_ARCH)" != "arm64" ]; then \
 		echo "SKIP: the smoke test needs Apple Silicon to run a nabi."; \
+	elif ! $(HV_PROBE); then \
+		echo "SKIP: this host cannot create a VM, so nabi cannot run."; \
 	else \
 		$(MAKE) --no-print-directory ARCH=arm64 build >/dev/null && \
 		echo "==> arm64 end-to-end smoke test" && \
 		test/arch/smoke/run.sh $(NABI); \
 	fi
 
-# The full guest suite. Runs prebuilt Linux binaries, so it needs a host that
-# can actually create a VM: an x86_64 build on an Intel Mac with VT-x.
+# The full guest suite. Runs prebuilt Linux binaries, and they are x86-64 ELF -
+# inherited from upstream Noah, which had no other architecture. NABI does not
+# emulate instructions, so an arm64 build cannot run them at all: this needs an
+# x86_64 build on an Intel Mac with VT-x, and skips everywhere else.
+#
+# The architecture of the *binaries* is the thing to test, and testing only
+# `ARCH != NATIVE_ARCH` was not it: an arm64 build on an Apple Silicon host
+# passed that check, ran the x86 programs, and failed all of them. `make check`
+# had been red on Apple Silicon for that reason alone.
 #
 # Note kern.hv_support is NOT a usable signal for that. An x86_64 process on
 # Apple Silicon reads it as 1 - it reports ARM HVF, not VT-x - and then
 # hv_vm_create() fails with HV_UNSUPPORTED. The architecture comparison is what
 # actually decides this; the sysctl check only catches an Intel host with
 # virtualisation disabled.
-check-guest: build
-	@if [ "$(ARCH)" != "$(NATIVE_ARCH)" ]; then \
+check-guest: build $(HV_PROBE)
+	@if [ "$(ARCH)" != "x86_64" ]; then \
+		echo "SKIP: the guest suite's programs are x86-64 Linux ELF and need an x86_64 nabi."; \
+	elif [ "$(ARCH)" != "$(NATIVE_ARCH)" ]; then \
 		echo "SKIP: built for $(ARCH) on a $(NATIVE_ARCH) host; the guest tests cannot run."; \
-	elif [ "$$(sysctl -n kern.hv_support 2>/dev/null)" != "1" ]; then \
-		echo "SKIP: kern.hv_support is not 1; this host cannot create VMs."; \
+	elif ! $(HV_PROBE); then \
+		echo "SKIP: this host cannot create a VM, so the guest tests cannot run."; \
 	else \
 		cd test && ./test.rb ../$(NABI); \
 	fi
