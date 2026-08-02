@@ -372,7 +372,8 @@ check-guest: build $(HV_PROBE)
 install: require-root require-built migrate
 	install -d -m 755 -o root -g wheel $(PREFIX)/bin $(PREFIX)/libexec $(PREFIX)/man/man1
 	install -m 755 -o root -g wheel $(WRAPPER)  $(PREFIX)/bin/nabi
-	install -m 755 -o root -g wheel $(MSLCMD)   $(PREFIX)/bin/msl
+	@sed -e 's|@PROJECT_VERSION@|$(VERSION)|g' $(MSLCMD) > $(OUT)/msl
+	install -m 755 -o root -g wheel $(OUT)/msl  $(PREFIX)/bin/msl
 	install -m 755 -o root -g wheel $(SHELLCMD) $(PREFIX)/libexec/msl-shell
 	install -m 755 -o root -g wheel $(NABI)     $(PREFIX)/libexec/nabi
 	install -m 755 -o root -g wheel $(VOLCMD)   $(PREFIX)/libexec/msl-mkvolume

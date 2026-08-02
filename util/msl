@@ -26,7 +26,9 @@
 # every command here attaches first rather than trusting the link.
 set -eu
 
-VERSION=0.1
+# Baked in by `make install`; when run straight out of the source tree the
+# substitution has not happened, so the tree's own VERSION file answers instead.
+VERSION=@PROJECT_VERSION@
 
 MSL_HOME=${MSL_HOME:-$HOME/.msl}
 IMAGE=${MSL_IMAGE:-$MSL_HOME/disk.sparseimage}
@@ -34,6 +36,10 @@ MOUNT=${MSL_MOUNT:-/Volumes/msl}
 
 me=${0##*/}
 here=$(cd "$(dirname "$0")" && pwd)
+case $VERSION in
+    *PROJECT_VERSION*) VERSION=$(cat "$here/../VERSION" 2>/dev/null || echo 0.0.0) ;;
+esac
+URL=https://github.com/somestupidgirl/mSL-NABI
 
 # ---------------------------------------------------------------------------
 # Output
@@ -49,35 +55,68 @@ else
     B= D= A= C= R= Z=
 fi
 
-# The box is drawn rather than written out, because the two content lines have
-# different lengths and hand-counted padding gets one of them wrong every time
-# the wording changes. Interior width is fixed; the icon is two display columns
-# and the text is ASCII, so a byte count is a column count here.
-BOXW=54
-boxline() {
-    icon=$1; text=$2
-    pad=$((BOXW - 6 - ${#text}))
+# The box is drawn rather than written out, because the lines beside the logo
+# are of different lengths and hand-counted padding gets one of them wrong every
+# time the wording changes. The logo column is fixed; the text is ASCII, so a
+# byte count is a column count.
+LOGO_W=24
+BOX_W=70
+
+# "mSL" - the m, S and L set beside each other, with the m's trailing stroke
+# doubling as the S's opening one.
+#
+# Printed with %s rather than as a format string: printf interprets escapes in
+# a format, and the row with two backslashes in it came out one character short
+# and a column out of line.
+logo_line() {
+    case $1 in
+        1) printf '%s' '            ____  _     ' ;;
+        2) printf '%s' '  _ __ ___ / ___|| |    ' ;;
+        3) printf '%s' ' | '\''_ ` _ \\___ \| |    ' ;;
+        4) printf '%s' ' | | | | | |___) | |___ ' ;;
+        5) printf '%s' ' |_| |_| |_|____/|_____|' ;;
+        *) printf '%*s' "$LOGO_W" '' ;;
+    esac
+}
+
+boxrule() {
+    printf '  %s%s' "$D" "$1"
+    i=0; while [ $i -lt $BOX_W ]; do printf '─'; i=$((i + 1)); done
+    printf '%s%s\n' "$2" "$Z"
+}
+
+# One row: the logo column, then a line of text, padded to the box.
+boxrow() {
+    logo=$(logo_line "$1")
+    text=$2
+    plain=$3
+    pad=$((BOX_W - 1 - LOGO_W - 1 - ${#plain}))
     [ $pad -lt 0 ] && pad=0
-    printf '  %s│%s  %s%s%s  %b%*s%s│%s\n' \
-        "$D" "$Z" "$A" "$icon" "$Z" "$text" "$pad" "" "$D" "$Z"
+    printf '  %s│%s %s%s%s %b%*s%s│%s\n' \
+        "$D" "$Z" "$A" "$logo" "$Z" "$text" "$pad" "" "$D" "$Z"
 }
 
 banner() {
-    printf '\n  %s╭' "$D"
-    i=0; while [ $i -lt $BOXW ]; do printf '─'; i=$((i + 1)); done
-    printf '╮%s\n' "$Z"
-    boxline '  ' ''
-    boxline '▚▚' "$A$B""msl$Z $D""v$VERSION$Z"
-    boxline '▚▚' "$D""Linux processes, not a virtual machine.$Z"
-    boxline '  ' ''
-    printf '  %s╰' "$D"
-    i=0; while [ $i -lt $BOXW ]; do printf '─'; i=$((i + 1)); done
-    printf '╯%s\n\n' "$Z"
+    printf '\n'
+    boxrule '╭' '╮'
+    boxrow 1 '' ''
+    boxrow 2 "$B""macOS Subsystem for Linux / Native ABI$Z" \
+             'macOS Subsystem for Linux / Native ABI'
+    boxrow 3 "$D""Linux processes, not a virtual machine$Z" \
+             'Linux processes, not a virtual machine'
+    boxrow 4 "$D""Version $VERSION$Z"   "Version $VERSION"
+    boxrow 5 "$D$URL$Z"                 "$URL"
+    boxrow 6 '' ''
+    boxrule '╰' '╯'
+    printf '\n'
 }
 
-section() { printf '  %s%s%s%s\n\n' "$A" "$B" "$1" "$Z"; }
-die()     { printf '  %serror%s %s\n' "$R" "$Z" "$1" >&2; exit 1; }
-note()    { printf '  %s%s%s\n' "$D" "$1" "$Z"; }
+# One indent for a heading, two for what is under it.
+section() { printf '    %s%s%s:%s\n\n' "$A" "$B" "$1" "$Z"; }
+item()    { printf '        %b\n' "$1"; }
+hint()    { printf '    %s%s%s\n' "$D" "$1" "$Z"; }
+die()     { printf '    %serror%s %s\n' "$R" "$Z" "$1" >&2; exit 1; }
+note()    { printf '        %s%s%s\n' "$D" "$1" "$Z"; }
 
 # ---------------------------------------------------------------------------
 # The case-sensitive volume
@@ -152,50 +191,50 @@ cmd_status() {
     names=$(installed)
     if [ -z "$names" ]; then
         note "nothing yet"
-        printf '\n'
     else
-        n=0
         for name in $names; do
-            printf '  %s●%s %s%s%s  %s%s%s\n' "$D" "$Z" "$B" "$name" "$Z" \
-                "$D" "$MOUNT/$name" "$Z"
-            n=$((n + 1))
+            item "$B$name$Z  $D$MOUNT/$name$Z"
         done
-        printf '\n  %s%s installed%s\n\n' "$D" "$n" "$Z"
     fi
+    printf '\n'
     section "Get started"
-    printf '    %s$%s %smsl install debian%s   %s# or ubuntu%s\n' \
-        "$D" "$Z" "$C" "$Z" "$D" "$Z"
-    printf '    %s$%s %smsl login debian%s\n\n' "$D" "$Z" "$C" "$Z"
-    note "msl help for everything else"
+    item "$D\$$Z $C$me install <distro>$Z   $D# debian | ubuntu | fedora | arch$Z"
+    item "$D\$$Z $C$me login debian$Z"
+    printf '\n'
+    hint "Type '$me help' for more options..."
     printf '\n'
 }
 
 cmd_help() {
     banner
     section "Rootfs lifecycle"
-    printf '    %sinstall%s <distro> [name]   Download and build a rootfs\n' "$C" "$Z"
-    printf '    %slogin%s <name>              Open a shell inside it\n' "$C" "$Z"
-    printf '    %srun%s <name> <cmd>...       Run one command inside it\n' "$C" "$Z"
-    printf '    %sdel%s <name>                Remove it\n\n' "$C" "$Z"
+    item "$C""install$Z <distro> [name]   Download and build a rootfs"
+    item "$C""login$Z <name>              Open a shell inside it"
+    item "$C""run$Z <name> <cmd>...       Run one command inside it"
+    item "$C""del$Z <name>                Remove it"
+    printf '\n'
     section "Inspection"
-    printf '    %slist%s                      Installed rootfs trees\n' "$C" "$Z"
-    printf '    %svolume%s                    Attach the case-sensitive volume\n' "$C" "$Z"
-    printf '    %shelp%s                      Show this\n\n' "$C" "$Z"
+    item "$C""list$Z                      Installed rootfs trees"
+    item "$C""volume$Z                    Attach the case-sensitive volume"
+    item "$C""help$Z                      Show this"
+    printf '\n'
     section "Install options"
-    printf '    %s-s <suite>   Suite to build   (trixie / noble)%s\n' "$D" "$Z"
-    printf '    %s-v <variant> minbase or standard (default: standard)%s\n' "$D" "$Z"
-    printf '    %s-i <p,p>     Extra packages to include%s\n\n' "$D" "$Z"
+    item "$D-s <suite>   Suite to build   (trixie / noble)$Z"
+    item "$D-v <variant> minbase or standard (default: standard)$Z"
+    item "$D-i <p,p>     Extra packages to include$Z"
+    printf '\n'
     section "Distros"
-    printf '    %sdebian%s, %subuntu%s  %s- apt archives, fully supported%s\n' \
-        "$C" "$Z" "$C" "$Z" "$D" "$Z"
-    printf '    %sfedora, arch    - different package formats, not built yet%s\n\n' "$D" "$Z"
+    item "$C""debian$Z, $C""ubuntu$Z  $D- apt archives, fully supported$Z"
+    item "$D""fedora, arch    - different package formats, not built yet$Z"
+    printf '\n'
     section "Where things are"
-    printf '    %sTrees      %s/<name>%s\n' "$D" "$MOUNT" "$Z"
-    printf '    %sImage      %s%s\n' "$D" "$IMAGE" "$Z"
-    printf '    %sCache      %s/cache%s\n\n' "$D" "$MSL_HOME" "$Z"
+    item "$D""Trees      $MOUNT/<name>$Z"
+    item "$D""Image      $IMAGE$Z"
+    item "$D""Cache      $MSL_HOME/cache$Z"
+    printf '\n'
     note "macOS formats the boot disk case-insensitively and no Linux"
     note "distribution can be unpacked there, so the trees live on a"
-    note "case-sensitive image that msl creates and attaches for you."
+    note "case-sensitive image that $me creates and attaches for you."
     printf '\n'
 }
 
@@ -236,8 +275,10 @@ cmd_install() {
     mkdir -p "$MSL_HOME"
     ln -sfn "$target" "$MSL_HOME/$name"
     printf '\n'
-    note "also reachable as $MSL_HOME/$name"
-    printf '    %s$%s %smsl login %s%s\n\n' "$D" "$Z" "$C" "$name" "$Z"
+    section "Ready"
+    item "$D""also reachable as $MSL_HOME/$name$Z"
+    item "$D\$$Z $C$me login $name$Z"
+    printf '\n'
 }
 
 cmd_login() {
@@ -262,7 +303,7 @@ cmd_del() {
         "$MOUNT"/*) ;;
         *) die "$name is not on $MOUNT - remove it yourself" ;;
     esac
-    printf '  remove %s%s%s and everything in it? [y/N] ' "$B" "$root" "$Z"
+    printf '\n    remove %s%s%s and everything in it? [y/N] ' "$B" "$root" "$Z"
     read -r answer
     case $answer in
         y|Y|yes|YES) ;;
@@ -277,6 +318,7 @@ cmd_del() {
 cmd_volume() {
     ensure_volume
     note "$MOUNT is attached and case-sensitive"
+    printf '\n'
 }
 
 # ---------------------------------------------------------------------------
