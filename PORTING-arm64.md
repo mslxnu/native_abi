@@ -1440,6 +1440,51 @@ account is already what the guest sees as root, so giving this user the same
 number would make its files read back as root's and defeat the exercise.
 `MSL_ROOT=1` still gives a root shell.
 
+### 3.5.21 A tree you can actually install into — **fixed, with one open bug**
+
+Two things were wrong with a freshly installed tree, and both were mine.
+
+`sudo: command not found`. The account created in §3.5.20 is put in the `sudo`
+group and given a `sudoers.d` entry, but `sudo` itself is `Priority: optional`
+in both archives, so neither the required floor nor "important" brings it in. A
+sudoers entry without the binary to read it is not a privilege. It is seeded
+explicitly now.
+
+`apt install gcc` answering *"Unable to locate package gcc"*. The builder never
+ran `apt-get update`, so the tree had a working apt and nothing for it to work
+on — and the message reads like a missing package rather than an empty index.
+The lists are fetched as the last install step, best-effort, so a machine that
+is offline still gets a rootfs.
+
+That second one only became fixable after finding why `apt-get update` hung.
+
+**apt's download sandbox deadlocks under NABI.** apt runs its fetch methods as
+the unprivileged `_apt` user. With that drop in place, `apt-get update` prints
+nothing at all and never returns; `sample` shows apt blocked in `pselect6` and
+the method it forked blocked in `pselect6` too — each waiting for the other.
+`APT::Sandbox::User=root` avoids the drop and the same fetch completes in two
+seconds. It reproduces on a fresh tree, with the parent commit's `nabi` as well
+as the current one, so it is not a regression from the credential work; and it
+is not the restored set-user-ID bits, not DNS, and not IPv6, all of which were
+ruled out separately. What it is, exactly, is not yet known — the method is a
+forked child, so its syscalls are invisible, and the two-sided `pselect6` points
+at the descriptor handover across NABI's fork-plus-exec rather than at anything
+apt does.
+
+The builder writes `APT::Sandbox::User "root"` into the tree with a note saying
+why. Nothing is given up by that here: the sandbox exists to stop a compromised
+download method acting with root's authority, but the guest's root is emulated
+and the host process stays the ordinary account that started `nabi` whichever
+uid the guest believes it has. Dropping to `_apt` inside the guest moves nothing
+real. The boundary that matters is the host account, and it is untouched either
+way.
+
+Verified end to end afterwards: `apt-cache policy gcc` finds a candidate,
+`sudo apt-get install gcc` completes, an unprivileged `apt-get install` fails
+cleanly with *"requested operation requires superuser privilege"* rather than
+claiming the package does not exist, and the installed gcc compiles and runs a
+program.
+
 ---
 
 ## 4. Phased implementation

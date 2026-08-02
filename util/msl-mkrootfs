@@ -269,7 +269,11 @@ if [ "$VARIANT" = standard ]; then important=1; fi
 # ca-certificates and the keyring are not required by anything, but without
 # them apt in the finished tree cannot verify or fetch over https - which is
 # the first thing anyone will ask it to do.
-seeds="apt,bash,dpkg,ca-certificates,$KEYRING"
+# sudo is here because the account created in stage 4 is given sudo rights, and
+# a sudoers entry without the binary to read it is not a privilege, it is a
+# "sudo: command not found". It is Priority: optional in both archives, so
+# neither the required floor nor "important" brings it in.
+seeds="apt,bash,dpkg,sudo,ca-certificates,$KEYRING"
 if [ -n "$EXTRA" ]; then seeds="$seeds,$EXTRA"; fi
 
 echo "==> resolving"
@@ -432,6 +436,25 @@ fi
 [ -s "$ROOT/etc/resolv.conf" ] ||
     printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' > "$ROOT/etc/resolv.conf"
 
+# apt's download sandbox is turned off.
+#
+# apt normally runs its fetch methods as the unprivileged _apt user. Under NABI
+# that deadlocks: apt and the method it forked both end up blocked in pselect6
+# waiting for each other, and apt-get update never prints a line. Setting the
+# sandbox user to root avoids the privilege drop and it works immediately.
+#
+# Nothing is given up. The sandbox exists to stop a compromised download method
+# from acting with root's authority - but the guest's root is emulated, and the
+# host process stays the ordinary account that started nabi no matter which uid
+# the guest believes it has. Dropping to _apt inside the guest moves nothing
+# real; the boundary that matters is the host account, and it is unchanged.
+cat > "$ROOT/etc/apt/apt.conf.d/99msl-sandbox" <<'EOS'
+// msl: apt's fetch methods deadlock under NABI when they drop to _apt.
+// The guest's root is emulated and the host account is the real boundary,
+// so this drops nothing that was protecting anything.
+APT::Sandbox::User "root";
+EOS
+
 cat > "$ROOT/etc/nsswitch.conf" <<'EOS'
 passwd:         files
 group:          files
@@ -572,6 +595,23 @@ EOS
         sed 's/^/    /'
     rm -f "$ROOT/var/tmp/msl-adduser.sh"
 fi
+
+# ---------------------------------------------------------------------------
+# 5. Package lists
+# ---------------------------------------------------------------------------
+#
+# Without this the tree has a working apt and nothing for it to work on:
+# `apt install gcc` answers "Unable to locate package gcc", which reads like a
+# missing package rather than an empty index. Fetching it here means the tree
+# is usable the moment it is built.
+#
+# Best-effort: a machine that is offline, or behind a proxy this does not know
+# about, should still get a rootfs. `apt update` is one command away.
+echo "==> fetching package lists"
+env -i TERM="${TERM:-xterm}" HOME=/root PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+    DEBIAN_FRONTEND=noninteractive MSL_ROOT=1 \
+    "$NABI" -m "$ROOT" /bin/bash -lc 'apt-get update' 2>&1 |
+    tail -3 | sed 's/^/    /' || true
 
 echo "==> done: $ROOT"
 echo "    $(grep -c '^Package:' "$ROOT/var/lib/dpkg/status") packages"
