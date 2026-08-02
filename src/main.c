@@ -368,6 +368,47 @@ check_platform_version(void)
   }
 }
 
+enum {PRINTK_PATH, WARNK_PATH, STRACE_PATH, MAX_DEBUG_PATH};
+
+/*
+ * The debug sinks, carried across a fork.
+ *
+ * A fork on arm64 is a fork plus an exec of a fresh nabi, and that child parsed
+ * no -s/-w/-o - so every forked guest ran with no trace and no warnings at all.
+ * Since a shell forks for every command, that is nearly everything, and it has
+ * sent more than one investigation down the wrong path: the visible evidence
+ * came only from the one process that happened to be started directly.
+ *
+ * The paths travel in the environment rather than in argv, because the child is
+ * exec'd with a fixed argument list that resume_main parses positionally, and
+ * because an inherited environment is exactly the right lifetime for this.
+ */
+static const char *const debug_env[MAX_DEBUG_PATH] = {
+  [PRINTK_PATH] = "NABI_PRINTK_PATH",
+  [STRACE_PATH] = "NABI_STRACE_PATH",
+  [WARNK_PATH]  = "NABI_WARNK_PATH",
+};
+
+static void
+open_debug_sinks(char paths[][PATH_MAX])
+{
+  static void (* init_funcs[3])(const char *path) = {
+    [PRINTK_PATH] = init_printk,
+    [STRACE_PATH] = init_meta_strace,
+    [WARNK_PATH]  = init_warnk
+  };
+  for (int i = PRINTK_PATH; i < MAX_DEBUG_PATH; i++) {
+    if (paths[i][0] == '\0')
+      continue;
+    init_funcs[i](paths[i]);
+    /* The base name is what travels, so grandchildren derive their own from
+     * the same stem rather than from their parent's suffixed name. */
+    if (getenv(debug_env[i]) == NULL)
+      setenv(debug_env[i], paths[i], 1);
+  }
+}
+
+
 #if defined(__arm64__)
 /*
  * Come up as an already-running guest, handed over by another process.
@@ -381,6 +422,31 @@ check_platform_version(void)
  * the plain fork path. It is here so the switch is a change to fork alone.
  */
 void resume_apply_clone(unsigned long clone_flags, gaddr_t child_tid, gaddr_t tls);
+
+/* The other half: what a resumed child picks up. */
+static void
+open_inherited_debug_sinks(void)
+{
+  char paths[MAX_DEBUG_PATH][PATH_MAX];
+  for (int i = PRINTK_PATH; i < MAX_DEBUG_PATH; i++) {
+    const char *v = getenv(debug_env[i]);
+    paths[i][0] = '\0';
+    if (!v || !*v)
+      continue;
+    /*
+     * One file per process, named for the pid.
+     *
+     * Sharing a single file looked tidier and was useless: several guests
+     * writing a line at a time with no locking splice their output together,
+     * and a spliced trace is worse than no trace because it reads as though
+     * one process did both halves. The parent keeps the name it was given;
+     * every forked child gets that name with its pid appended, so a run
+     * leaves trace, trace.1234, trace.1235 and each is a whole story.
+     */
+    snprintf(paths[i], PATH_MAX, "%s.%d", v, getpid());
+  }
+  open_debug_sinks(paths);
+}
 
 static noreturn void
 resume_main(int ckpt_fd, int arena_fd, unsigned long clone_flags,
@@ -401,6 +467,10 @@ resume_main(int ckpt_fd, int arena_fd, unsigned long clone_flags,
    * so the handlers that route a signal into the guest are re-installed below.
    */
   checkpoint_restore(ckpt_fd, arena_fd);
+  /* After the restore, not before: the sinks take descriptors out of the vkern
+   * table, and checkpoint_restore rebuilds that table wholesale. Opened first,
+   * they are opened into a table that is about to be replaced. */
+  open_inherited_debug_sinks();
   reinstall_host_sigactions();
   resume_apply_clone(clone_flags, child_tid, tls);
 
@@ -428,8 +498,7 @@ main(int argc, char *argv[], char **envp)
   char root[PATH_MAX] = {};
 
   int c;
-  enum {PRINTK_PATH, WARNK_PATH, STRACE_PATH, MAX_DEBUG_PATH};
-  char debug_paths[3][PATH_MAX] = {};
+  char debug_paths[MAX_DEBUG_PATH][PATH_MAX] = {};
   struct option long_options[] = {
     { "output", required_argument, NULL, 'o'},
     { "strace", required_argument, NULL, 's'},
@@ -475,16 +544,7 @@ main(int argc, char *argv[], char **envp)
 
   init_vkernel(root);
 
-  for (int i = PRINTK_PATH; i < MAX_DEBUG_PATH; i++) {
-    static void (* init_funcs[3])(const char *path) = {
-      [PRINTK_PATH] = init_printk,
-      [STRACE_PATH] = init_meta_strace,
-      [WARNK_PATH]  = init_warnk
-    };
-    if (debug_paths[i][0] != '\0') {
-      init_funcs[i](debug_paths[i]);
-    }
-  }
+  open_debug_sinks(debug_paths);
 
   /* Now that the sinks exist, say which sibling modules this run picked up. */
   report_host_passthrough();

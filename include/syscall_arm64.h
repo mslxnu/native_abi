@@ -136,7 +136,7 @@
   SYSCALL(127, unimplemented) \
   SYSCALL(128, unimplemented) \
   SYSCALL(129, kill) \
-  SYSCALL(130, unimplemented) \
+  SYSCALL(130, tkill) \
   SYSCALL(131, tgkill) \
   SYSCALL(132, sigaltstack) \
   SYSCALL(133, rt_sigsuspend) \
@@ -445,7 +445,7 @@
   SYSCALL(436, unimplemented) \
   SYSCALL(437, unimplemented) \
   SYSCALL(438, unimplemented) \
-  SYSCALL(439, unimplemented) \
+  SYSCALL(439, faccessat2) \
   SYSCALL(440, unimplemented) \
   SYSCALL(441, unimplemented) \
   SYSCALL(442, unimplemented) \

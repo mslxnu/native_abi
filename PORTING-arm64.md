@@ -1485,6 +1485,73 @@ cleanly with *"requested operation requires superuser privilege"* rather than
 claiming the package does not exist, and the installed gcc compiles and runs a
 program.
 
+### 3.5.22 The apt method deadlock — **fixed**
+
+`apt-get update` hung with the `_apt` sandbox enabled: no output at all, no
+return. `sample` showed apt blocked in `pselect6` and the method it forked
+blocked in `pselect6` too, each waiting for the other.
+
+The first thing to fix was not the bug, it was the blindness. A fork on arm64 is
+a fork plus an exec of a fresh `nabi`, and that child parsed no `-s`/`-w`, so
+**every forked guest ran with no trace and no warnings**. A shell forks for each
+command, so that was nearly everything — and it had already sent two
+investigations this session down the wrong road, because the only visible
+evidence came from whichever process happened to be started directly. The sink
+paths now travel in the environment and a resumed child reopens them, after the
+checkpoint restore rather than before, since the restore rebuilds the descriptor
+table wholesale. Each process writes its own file, named for its pid: sharing
+one file spliced several guests' output together, and a spliced trace is worse
+than none because it reads as though one process did both halves.
+
+With that, the method was visible immediately:
+
+```
+writev(fd: 2, iovcnt: 2) = 0x18
+gettid(); getpid()
+tgkill(tgid, tid, sig: 6)          <- SIGABRT
+```
+
+**`tgkill` was a stub returning `ENOSYS`**, and that is how glibc's `abort()`
+delivers `SIGABRT` to itself. A process that decides to die and cannot then does
+not die: it carries on with the signal never raised, holding whatever its parent
+is waiting on. apt's method aborted, could not, and never closed its end of the
+pipe; apt waited for a greeting or an EOF that were both never coming. A syscall
+that cannot fail visibly is a syscall whose absence turns an error into a hang.
+
+`tgkill` and `tkill` now deliver per-process. NABI runs a guest's threads as
+pthreads inside one host process and keeps no `pthread_t` to aim at, so a signal
+addressed to a thread goes to the process — exact for the single-threaded case,
+which is every caller that was hanging, and an approximation for a guest aiming
+at a specific sibling.
+
+Two genuinely missing syscalls turned up on the way. **`getrandom` rejected
+`GRND_INSECURE`** (0x4, Linux 5.6) with `EINVAL` — and Rust's standard library
+asks for it first, so that was every Rust program wanting a random number.
+**`faccessat2` was unimplemented**, and glibc's fallback for it is not a syscall:
+it works the answer out in userspace from the file's mode and owner against the
+ids it *believes* it has, which under NABI are the guest's. A process that had
+dropped to an unprivileged account therefore decided it could not write
+directories it could in fact write.
+
+`apt-get update` now returns in under a second where it used to hang forever.
+
+**What is still wrong, and it is not the deadlock.** Verification still fails
+under the sandbox, because `sqv` — Rust, via Sequoia — aborts with
+*"free(): invalid pointer"*. That is heap corruption, and the reproducer is
+sharp: run the same `sqv` on the same inputs as different users and it depends
+on the **length of the user's name**. Two, three, four and seven characters
+abort; five and six succeed. `su` to root works, `su` to `nobody` works, `su` to
+`_apt` does not, and a hand-made account with `_apt`'s exact uid, gid, home,
+shell and empty GECOS works fine. The two traces are byte-identical for 174
+syscalls and then one of them aborts.
+
+So it is nothing to do with privileges, with apt, or with `_apt`: the username
+reaches the guest through the environment, the environment sets where the stack
+and heap land, and some NABI memory bug is sensitive to that. The rootfs builder
+sets `APT::Sandbox::User "root"` to route around it, which costs nothing here —
+the guest's root is emulated and the host account is the real boundary either
+way — but it is a workaround for a memory bug that is still open.
+
 ---
 
 ## 4. Phased implementation

@@ -650,10 +650,39 @@ DEFINE_SYSCALL(exit_group, int, reason)
   _exit(reason);
 }
 
-DEFINE_SYSCALL(tgkill)
+/*
+ * tgkill and tkill: a signal aimed at one thread.
+ *
+ * Unimplemented, these returned ENOSYS - and that is much worse than it sounds,
+ * because tgkill is how glibc's abort() delivers SIGABRT to itself. A process
+ * that decides to die and cannot then does not die: it carries on with the
+ * signal never raised, and anything waiting for it to exit waits forever. That
+ * is what deadlocked apt. Its download method aborted after dropping privileges
+ * to _apt, could not, and never closed its end of the pipe; apt sat in pselect6
+ * waiting for a greeting or an EOF that were both never coming, and
+ * `apt-get update` printed nothing at all.
+ *
+ * The delivery is per-process rather than per-thread. NABI runs a guest's
+ * threads as pthreads inside one host process and keeps no pthread_t to aim
+ * at, so the signal goes to the process. For the single-threaded case - abort,
+ * raise, assert, every caller that was hanging - that is exact. For a guest
+ * aiming at a specific sibling thread it is an approximation: the signal
+ * arrives, but possibly on another thread. Worth knowing, and still a great
+ * deal better than telling the caller the operation does not exist.
+ */
+DEFINE_SYSCALL(tgkill, l_pid_t, tgid, l_pid_t, tid, int, sig)
 {
-  printk("unimplemented syscall: tgkill\n");
-  return -LINUX_ENOSYS;
+  if (tgid <= 0 || tid <= 0)
+    return -LINUX_EINVAL;
+  return send_signal(tgid, sig);
+}
+
+/* The older form, without the thread-group check. Same delivery. */
+DEFINE_SYSCALL(tkill, l_pid_t, tid, int, sig)
+{
+  if (tid <= 0)
+    return -LINUX_EINVAL;
+  return send_signal(tid, sig);
 }
 
 DEFINE_SYSCALL(capget, gaddr_t, header_ptr, gaddr_t, data_ptr)

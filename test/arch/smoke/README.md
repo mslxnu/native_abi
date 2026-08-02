@@ -71,6 +71,9 @@ guest-code cache sync.
 - `procfstest` — a mounted pseudo-filesystem is visible and stays visible across
   a fork. Skips when nothing is mounted at `/proc`, since it is about NABI
   passing one through rather than about mSL/ProcFS.
+- `signaltest` — `tgkill`/`tkill` actually kill. Checked from a parent with
+  `wait4`, because the point is not that the call returns 0 but that the process
+  goes away; a stub turns every `abort()` into a hang.
 - `futextest` — `FUTEX_WAIT`/`FUTEX_WAIT_BITSET` errno, timeout units and the
   compare-and-block. Times the wait rather than only checking that it returned,
   since "did not sleep at all" also returns.

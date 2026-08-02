@@ -203,7 +203,7 @@
   SYSCALL(197, unimplemented)                   \
   SYSCALL(198, unimplemented)                   \
   SYSCALL(199, unimplemented)                   \
-  SYSCALL(200, unimplemented)                   \
+  SYSCALL(200, tkill)                           \
   SYSCALL(201, time)                            \
   SYSCALL(202, futex)                           \
   SYSCALL(203, unimplemented)                   \

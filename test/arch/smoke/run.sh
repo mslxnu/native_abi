@@ -244,6 +244,17 @@ for t in procfstest mapstest identtest; do
     fi
 done
 
+# signaltest: a process that asks to die, dies. tgkill is how abort() delivers
+# SIGABRT to itself, and a stub turns every abort into a hang.
+cp "$here/signaltest" "$root/"; chmod +x "$root/signaltest"
+out=$("$NABI" -m "$root" /signaltest); rc=$?
+if [ "$rc" -eq 0 ] && [ "$out" = "signal ok" ]; then
+    echo "  ok  signaltest -> \"$out\""
+else
+    echo "  FAIL signaltest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 # futextest: the futex operations glibc's locking primitives rely on. A
 # relative timeout read as absolute makes a sleeping guest spin; a missing
 # compare makes a woken one sleep forever.

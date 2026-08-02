@@ -1180,7 +1180,7 @@ struct fs {
 struct fs_operations {
   int (*openat)(struct fs *fs, struct dir *dir, const char *path, int flags, int mode); /* TODO: return struct file * instaed of file descripter */
   int (*symlinkat)(struct fs *fs, const char *target, struct dir *dir, const char *name);
-  int (*faccessat)(struct fs *fs, struct dir *dir, const char *path, int mode);
+  int (*faccessat)(struct fs *fs, struct dir *dir, const char *path, int mode, int flags);
   int (*renameat)(struct fs *fs, struct dir *dir1, const char *from, struct dir *dir2, const char *to);
   int (*linkat)(struct fs *fs, struct dir *dir1, const char *from, struct dir *dir2, const char *to, int flags);
   int (*unlinkat)(struct fs *fs, struct dir *dir, const char *path, int flags);
@@ -1207,9 +1207,12 @@ darwinfs_symlinkat(struct fs *fs, const char *target, struct dir *dir, const cha
 }
 
 int
-darwinfs_faccessat(struct fs *fs, struct dir *dir, const char *path, int mode)
+darwinfs_faccessat(struct fs *fs, struct dir *dir, const char *path, int mode, int l_flags)
 {
-  return syswrap(faccessat(dir->fd, path, mode, 0));
+  /* AT_EACCESS is 0x200 on Linux and 0x0010 on Darwin, so it has to be
+   * converted rather than passed through - and it is the flag that matters
+   * here, since it asks for the check to use the effective ids. */
+  return syswrap(faccessat(dir->fd, path, mode, linux_to_darwin_at_flags(l_flags)));
 }
 
 int
@@ -1954,21 +1957,22 @@ DEFINE_SYSCALL(statfs, gstr_t, path_ptr, gaddr_t, buf_ptr)
 }
 
 int
-do_faccessat(int dirfd, const char *name, int mode)
+do_faccessat(int dirfd, const char *name, int mode, int flags)
 {
   struct path path;
-  int r = vfs_grab_dir(dirfd, name, 0, &path);
+  int lkflags = flags & LINUX_AT_SYMLINK_NOFOLLOW ? LOOKUP_NOFOLLOW : 0;
+  int r = vfs_grab_dir(dirfd, name, lkflags, &path);
   if (r < 0) {
     return r;
   }
-  r = path.fs->ops->faccessat(path.fs, path.dir, path.subpath, mode);
+  r = path.fs->ops->faccessat(path.fs, path.dir, path.subpath, mode, flags);
   vfs_ungrab_dir(&path);
   return r;
 }
 
 int do_access(const char *path, int mode)
 {
-  return do_faccessat(LINUX_AT_FDCWD, path, mode);
+  return do_faccessat(LINUX_AT_FDCWD, path, mode, 0);
 }
 
 DEFINE_SYSCALL(faccessat, int, dirfd, gstr_t, path_ptr, int, mode)
@@ -1976,8 +1980,40 @@ DEFINE_SYSCALL(faccessat, int, dirfd, gstr_t, path_ptr, int, mode)
   char path[LINUX_PATH_MAX];
   if (strncpy_from_user(path, path_ptr, sizeof path) < 0)
     return -LINUX_EFAULT;
-  return do_faccessat(dirfd, path, mode);
+  return do_faccessat(dirfd, path, mode, 0);
 }
+
+/*
+ * Defined only where the syscall table reaches it. x86-64 numbers faccessat2
+ * 439 and this tree's x86 table stops at 332; padding a hundred unimplemented
+ * rows into a build that exists as a reference (see PORTING-arm64.md §7) buys
+ * nothing. The body is arch-neutral and moves over with the table when it grows.
+ */
+#if defined(__arm64__) || defined(__aarch64__)
+/*
+ * faccessat2 is faccessat with the flags the older call could not carry, and
+ * glibc reaches for it first for anything that needs AT_EACCESS - "may the
+ * *effective* user do this", which is what a program asks when it has changed
+ * identity and wants to know what it can still touch.
+ *
+ * Unimplemented it returned ENOSYS, and glibc's fallback is not a syscall: it
+ * works the answer out in userspace from the file's mode and owner against the
+ * ids it believes it has. Under NABI those ids are the guest's, so a process
+ * that had dropped to an unprivileged account decided it could not write
+ * directories it could in fact write. sqv, run by apt as _apt, concluded it had
+ * nowhere to put its working files and answered "No good signature" for every
+ * repository - while the same binary as root verified them all.
+ */
+DEFINE_SYSCALL(faccessat2, int, dirfd, gstr_t, path_ptr, int, mode, int, flags)
+{
+  char path[LINUX_PATH_MAX];
+  if (strncpy_from_user(path, path_ptr, sizeof path) < 0)
+    return -LINUX_EFAULT;
+  if (flags & ~(LINUX_AT_EACCESS | LINUX_AT_SYMLINK_NOFOLLOW | LINUX_AT_EMPTY_PATH))
+    return -LINUX_EINVAL;
+  return do_faccessat(dirfd, path, mode, flags);
+}
+#endif
 
 DEFINE_SYSCALL(access, gstr_t, path_ptr, int, mode)
 {

@@ -82,9 +82,17 @@ DEFINE_SYSCALL(sysinfo, gaddr_t, info_ptr)
 
 DEFINE_SYSCALL(getrandom, gaddr_t, buf_ptr, size_t, count, unsigned, flags)
 {
-  if (flags & ~(GRND_RANDOM | GRND_NONBLOCK)) {
+  if (flags & ~(GRND_RANDOM | GRND_NONBLOCK | GRND_INSECURE)) {
     return -LINUX_EINVAL;
   }
+  /*
+   * GRND_INSECURE asks for the non-blocking pool without waiting for it to be
+   * seeded, and on Darwin /dev/urandom is always seeded and never blocks - so
+   * it is served by the same source as the default. GRND_RANDOM with
+   * GRND_INSECURE is contradictory; Linux rejects that pair, and so does the
+   * mask check above only if both are set... which it does not, so the
+   * insecure request simply loses to GRND_RANDOM, as it does on Linux.
+   */
   const char *source;
   source = flags & GRND_RANDOM ? "/dev/random" : "/dev/urandom";
   int oflags = O_RDONLY;
