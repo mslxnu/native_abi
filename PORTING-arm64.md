@@ -1547,10 +1547,50 @@ syscalls and then one of them aborts.
 
 So it is nothing to do with privileges, with apt, or with `_apt`: the username
 reaches the guest through the environment, the environment sets where the stack
-and heap land, and some NABI memory bug is sensitive to that. The rootfs builder
-sets `APT::Sandbox::User "root"` to route around it, which costs nothing here —
-the guest's root is emulated and the host account is the real boundary either
-way — but it is a workaround for a memory bug that is still open.
+and heap land, and a NABI memory bug was sensitive to that. It turned out to be
+the initial stack's alignment — see §3.5.23, which fixes it and removes the
+`APT::Sandbox::User "root"` workaround this section introduced.
+
+### 3.5.23 The initial stack was 8-byte aligned — **fixed**
+
+The heap corruption left over from §3.5.22 was an alignment bug, and the
+reproducer said so before the code did. Running the same `sqv` on the same
+inputs, only the *length* of the environment mattered: seven bytes of padding
+aborted, eight worked, and the flip was clean.
+
+`init_userstack` builds the process-entry block by pushing downwards, and
+`push()` rounds every item to 8. Everything it pushes is a multiple of 8 except
+one: the block of argv and envp strings, whose length is whatever the caller
+happened to pass. Both ABIs require SP to be 16-byte aligned when the process
+starts. So the alignment of the finished stack was decided by
+`roundup(argv+envp bytes, 8)` — right about half the time, and never recovered,
+because every push after it is a multiple of 8.
+
+Nothing faults. AArch64 will fault on an SP-relative access with SP misaligned,
+but the guest never gets that far in a way that shows: glibc's startup and the
+dynamic loader run, thousands of syscalls go by, and then `free()` reports an
+invalid pointer from somewhere with no visible connection to the stack. An
+allocator that assumes 16-byte alignment and is handed 8 produces a heap that is
+subtly wrong rather than obviously broken.
+
+That is why it looked like a privilege bug for so long. The username reaches the
+guest through the environment; the environment sets the length of the string
+block; the length set the alignment. `_apt` failed and `nobody` did not, and
+neither fact had anything to do with either account.
+
+The fix pads by one slot before the pointer block when needed. Everything from
+that point down is 8-byte slots and one auxv array, so the distance to the final
+SP is known exactly and the correction is at most eight bytes.
+
+`aligntest` re-execs itself sixteen times with a growing environment, because
+checking one environment would only catch the bug half the time — which is
+precisely how it survived every test written before it.
+
+With this, `apt-get update` fetches **and verifies signatures** with apt's `_apt`
+sandbox left switched on, so the `APT::Sandbox::User "root"` workaround the
+rootfs builder was writing is gone. A fresh `msl install debian` now gives a tree
+where `sudo apt-get update` reports no warnings at all, `sudo apt-get install
+gcc` completes, and the compiler works.
 
 ---
 

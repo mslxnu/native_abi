@@ -244,6 +244,18 @@ for t in procfstest mapstest identtest; do
     fi
 done
 
+# aligntest: the stack is 16-byte aligned at process entry. Re-execs itself
+# sixteen times with a growing environment, since one length would only catch a
+# misalignment half the time.
+cp "$here/aligntest" "$root/"; chmod +x "$root/aligntest"
+out=$("$NABI" -m "$root" /aligntest); rc=$?
+if [ "$rc" -eq 0 ] && [ "$out" = "align ok" ]; then
+    echo "  ok  aligntest -> \"$out\""
+else
+    echo "  FAIL aligntest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 # signaltest: a process that asks to die, dies. tgkill is how abort() delivers
 # SIGABRT to itself, and a stub turns every abort into a hang.
 cp "$here/signaltest" "$root/"; chmod +x "$root/signaltest"

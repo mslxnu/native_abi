@@ -436,33 +436,6 @@ fi
 [ -s "$ROOT/etc/resolv.conf" ] ||
     printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' > "$ROOT/etc/resolv.conf"
 
-# apt's download sandbox is turned off.
-#
-# apt normally runs its fetch methods, and the sqv it shells out to for
-# signature verification, as the unprivileged _apt user. sqv is a Rust binary
-# and under NABI it dies with "free(): invalid pointer" - heap corruption -
-# whenever the process environment happens to land a certain way. It is nothing
-# to do with privileges: a user named _apt fails, one named probeA does not, and
-# a sweep of names shows two, three, four and seven characters failing while
-# five and six succeed. Same binary, same inputs, byte-identical syscall traces
-# for 174 calls and then one of them aborts. The trigger is the layout the
-# environment gives the guest's heap, and the bug behind it is NABI's, not
-# apt's. It is written up in PORTING-arm64.md and not yet fixed.
-#
-# Running the methods as root sidesteps it, and gives up nothing. The sandbox
-# exists to stop a compromised download method acting with root's authority -
-# but the guest's root is emulated, and the host process stays the ordinary
-# account that started nabi whichever uid the guest believes it has. Dropping to
-# _apt inside the guest moves nothing real; the boundary that matters is the
-# host account, and it is unchanged either way.
-cat > "$ROOT/etc/apt/apt.conf.d/99msl-sandbox" <<'EOS'
-// msl: sqv crashes under NABI when apt runs it as _apt - a heap bug that
-// depends on the environment layout, not on privileges. The guest's root is
-// emulated and the host account is the real boundary, so running the fetch
-// methods as root drops nothing that was protecting anything.
-APT::Sandbox::User "root";
-EOS
-
 cat > "$ROOT/etc/nsswitch.conf" <<'EOS'
 passwd:         files
 group:          files

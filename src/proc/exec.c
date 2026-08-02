@@ -357,6 +357,38 @@ init_userstack(int argc, char *argv[], char **envp, uint64_t exe_base, const Elf
     { AT_NULL, 0 },
   };
 
+  /*
+   * Land the finished stack on a 16-byte boundary.
+   *
+   * Both ABIs require SP to be 16-byte aligned when the process starts, and
+   * push() rounds to 8 - so the string block, whose length is whatever argv and
+   * envp happen to add up to, leaves the stack 8-aligned half the time. Every
+   * push after this one is a multiple of 8, so the parity is decided here and
+   * never recovers.
+   *
+   * The symptom is not a fault. The guest starts, runs for thousands of
+   * syscalls, and then glibc reports "free(): invalid pointer" from somewhere
+   * unrelated - because a 16-byte-aligned allocator handed a stack-derived
+   * value that is 8 off produces a heap that is subtly wrong rather than
+   * obviously broken. It showed up as sqv, the OpenPGP verifier apt runs,
+   * aborting for some user names and not others: the name travels in the
+   * environment, the environment sets the length of the string block, and the
+   * length decided the alignment. Eight bytes of padding in the environment
+   * flipped it either way.
+   *
+   * Everything below pushes 8-byte slots and one auxv array, so the distance
+   * from here to the final SP is known exactly and the correction is at most
+   * one slot.
+   */
+  {
+    size_t nslots = (size_t) argc + (size_t) (renvp - envp) + 3;
+    size_t after = sizeof aux + 8 * nslots;   /* argv NUL, envp NUL, argc */
+    uint64_t sp_now;
+    vmm_get_reg(VREG_SP, &sp_now);
+    if ((sp_now - after) % 16 != 0)
+      push(&zero, sizeof zero);
+  }
+
   push(aux, sizeof aux);
 
   push(&zero, sizeof zero);

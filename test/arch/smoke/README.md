@@ -71,6 +71,9 @@ guest-code cache sync.
 - `procfstest` — a mounted pseudo-filesystem is visible and stays visible across
   a fork. Skips when nothing is mounted at `/proc`, since it is about NABI
   passing one through rather than about mSL/ProcFS.
+- `aligntest` — the stack is 16-byte aligned at process entry, checked across
+  sixteen environment lengths because one would only catch a misalignment half
+  the time. An 8-byte-off stack does not fault; it corrupts a heap much later.
 - `signaltest` — `tgkill`/`tkill` actually kill. Checked from a parent with
   `wait4`, because the point is not that the call returns 0 but that the process
   goes away; a stub turns every `abort()` into a hang.
