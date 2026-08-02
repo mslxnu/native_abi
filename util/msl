@@ -199,7 +199,7 @@ cmd_status() {
     printf '\n'
     section "Get started"
     item "$D\$$Z $C$me install <distro>$Z   $D# debian | ubuntu | fedora | arch$Z"
-    item "$D\$$Z $C$me login debian$Z"
+    item "$D\$$Z $C$me login <distro>$Z"
     printf '\n'
     hint "Type '$me help' for more options..."
     printf '\n'
