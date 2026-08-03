@@ -451,6 +451,16 @@ else
     fail=1
 fi
 
+# priotest: getpriority's 20 - nice encoding, which is not what Darwin returns.
+cp "$here/priotest" "$root/"; chmod +x "$root/priotest"
+out=$("$NABI" -m "$root" /priotest); rc=$?
+if [ "$rc" -eq 0 ] && [ "$out" = "prio ok" ]; then
+    echo "  ok  priotest -> \"$out\", exit 0"
+else
+    echo "  FAIL priotest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 if [ "$fail" -eq 0 ]; then
     echo "smoke: PASS"
 else

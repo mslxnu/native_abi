@@ -2181,6 +2181,58 @@ Sudo now loads and runs. It stops later, inside PAM session setup
 (`pam_open_session: Permission denied`), which is a different layer and not
 investigated here.
 
+### 3.5.41 `sudo` stopped on a nice value — **fixed**
+
+`sudo id` reached the point of running something and then stopped:
+
+```
+sudo: pam_open_session: Permission denied
+sudo: policy plugin failed session initialization
+```
+
+The builder had been working around this since §3.5.25 by commenting `pam_limits`
+out of sudo's session stack, with a note saying the refusal was "internal to the
+module and is not yet understood". It was NABI's, and the trace says so plainly
+once the whole sequence is read together rather than the failing call alone:
+
+```
+getpriority(0, 0)               -> 0        the value Darwin reports
+setpriority(0, 0, niceval: 20)  -> 0        the guest applies what it read
+getpriority(0, 0)               -> 20       so it is now true
+setpriority(0, 0, niceval: 0)   -> EACCES
+```
+
+**Linux's getpriority syscall does not return the nice value.** It returns
+`20 - nice`, so the result is 1..40 and can never be mistaken for an error, and
+glibc's wrapper converts it back. Darwin's `getpriority(3)` returns the nice
+value itself, and handing that over unchanged means the guest computes
+`20 - nice` a second time - so an ordinary nice of 0 reads as 20, the lowest
+priority there is.
+
+pam_limits believed it and applied it, which really did drop the host process to
+nice 20. Putting it back to 0 was then a *raise* in priority, which Darwin
+refuses to an unprivileged process, and pam_limits is `required` in sudo's
+session stack. So sudo failed at session setup because of a nice value, and the
+error named neither.
+
+The workaround is removed and pam_limits left where the distribution put it.
+`sudo id` returns `uid=0(root)` for an unprivileged guest user, and `su` works
+in every form.
+
+### 3.5.42 Why Fedora had no `su` — **and now does**
+
+Not a bug. Fedora's container image installs **`util-linux-core`**, which is 151
+files and does not include `su`, `runuser`, `login` or `setpriv`; `su` lives in
+the full `util-linux`. A container is entered with `docker exec -u`, so nothing
+in that image needs it. Arch's base tarball ships neither `su` nor `sudo`
+either.
+
+That was worth stating rather than fixing while neither package manager worked -
+a published image brought whatever it brought. Both work now, so the builder
+installs `sudo` and `util-linux` for the oci and tar families after the index
+exists, which is the same thing the apt families get by seeding. The closing
+message no longer promises `su` to a tree that has not got it.
+
 ---
 
 ## 4. Phased implementation

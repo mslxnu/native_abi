@@ -133,6 +133,13 @@ guest-code cache sync.
   account, so a mode with no owner read is one it cannot open at all - Fedora's
   sudo installed correctly and then answered "Permission denied".
 
+- `priotest` — `getpriority` returns `20 - nice`, not `nice`. Linux encodes it
+  so the result can never look like a negative errno; Darwin's returns the value
+  itself, and passing that through made a guest read an ordinary nice of 0 as
+  20. pam_limits applied what it read, which really did drop the process to nice
+  20, and putting it back was then a privileged operation - so sudo stopped at
+  "pam_open_session: Permission denied" over a nice value.
+
 The ELF binaries are committed prebuilt (as the x86 guest tests under
 `test/*/build/` are), so the check needs no cross-toolchain. The `.s` sources
 are here for reference; rebuild with an aarch64-linux clang + ld.lld:

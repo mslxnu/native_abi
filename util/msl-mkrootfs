@@ -780,30 +780,17 @@ mkdir -p /etc/sudoers.d
 printf '%s ALL=(ALL) NOPASSWD: ALL\n' "\$u" > /etc/sudoers.d/"\$u"
 chmod 0440 /etc/sudoers.d/"\$u"
 
-# pam_limits is taken out of sudo's session stack.
+# pam_limits used to be taken out of sudo's session stack here.
 #
-# With it in, sudo stops before running anything: pam_open_session comes back
-# PAM_PERM_DENIED. Every getrlimit and setrlimit NABI is asked for during that
-# call succeeds, so the refusal is internal to the module and is not yet
-# understood. Marking it "optional" is not enough - the call then hangs instead,
-# so it is the module running at all that is the problem, not its return code.
+# It is not any more, because the reason it failed turned out to be nabi's and
+# has been fixed. getpriority returned Darwin's nice value where Linux's
+# syscall returns 20 - nice, so the guest read a perfectly ordinary nice of 0 as
+# 20, and pam_limits then applied what it thought it had found. That really did
+# drop the process to nice 20, after which putting it back was a raise in
+# priority and Darwin refused it - so pam_open_session came back
+# PAM_PERM_DENIED, about a nice value.
 #
-# Nothing is lost by removing it. There is no kernel here to enforce a resource
-# limit, and Debian and Ubuntu both ship limits.conf entirely commented out, so
-# the module has nothing to apply even where it works. The line is commented
-# rather than deleted, and says why, so it can be put back.
-if [ -f /etc/pam.d/sudo ] && grep -q '^session.*pam_limits' /etc/pam.d/sudo; then
-    sed -i 's|^\(session.*pam_limits.so.*\)$|# msl: disabled, see the note at the end of this file\n# \1|' \
-        /etc/pam.d/sudo
-    cat >> /etc/pam.d/sudo <<'PAMNOTE'
-
-# msl: pam_limits was commented out when this rootfs was built. Under NABI it
-# returns PAM_PERM_DENIED, and as a required module that stops sudo running at
-# all; marking it optional makes the call hang instead. It has nothing to do
-# here in any case - there is no kernel to enforce a resource limit, and
-# limits.conf ships empty. Uncomment it to get the original behaviour back.
-PAMNOTE
-fi
+# The module is left where the distribution put it.
 id "\$u"
 EOS
     chmod 755 "$ROOT/var/tmp/msl-adduser.sh"
@@ -960,6 +947,36 @@ fi
 # booted, and anything that tries to boot it is not going to work regardless of
 # what /boot holds.
 
+# What the base image left out.
+#
+# A published image is not a base system, it is a container image, and both of
+# these leave out things a person logging in will expect. Fedora's ships
+# util-linux-*core*, which is 151 files and does not include `su` - containers
+# are entered with `docker exec -u`, so nothing there needs it - and no sudo
+# either. Arch's base has neither.
+#
+# This is only possible now that both package managers work inside NABI; before
+# that the image brought whatever it brought. Best-effort and quiet: a tree
+# without sudo is still a tree, and the closing message below says which one
+# this turned out to be.
+case $FAMILY in
+    oci) latecomers='dnf -y install sudo util-linux' ;;
+    tar) latecomers='pacman -S --noconfirm --needed sudo util-linux' ;;
+    *)   latecomers= ;;
+esac
+if [ -n "$latecomers" ]; then
+    echo "==> adding sudo and su"
+    if run_bounded "${MSL_LATECOMER_TIMEOUT:-600}" \
+            env -i TERM="${TERM:-xterm}" HOME=/root \
+            PATH=/usr/sbin:/usr/bin:/sbin:/bin MSL_ROOT=1 \
+            "$NABI" -m "$ROOT" /bin/bash -lc "$latecomers"; then
+        echo "    ok"
+    else
+        tail -2 "$work/step.log" | sed 's/^/    /'
+        echo "    could not add them - the image's own set is what you get"
+    fi
+fi
+
 echo "==> /boot"
 mkdir -p "$ROOT/boot/grub"
 
@@ -1063,12 +1080,11 @@ if [ -n "$GUEST_USER" ]; then
     if [ -x "$ROOT/usr/bin/sudo" ] || [ -x "$ROOT/bin/sudo" ]; then
         echo "    log in as $GUEST_USER; sudo works without a password"
     else
-        # Only Debian and Ubuntu get sudo seeded, because only there can a
-        # package be added while the tree is being built. A published image
-        # brings whatever it brings, and neither Fedora's minimal container nor
-        # Arch's base includes sudo - so say what is true rather than repeat a
-        # promise that belongs to the other two.
-        echo "    log in as $GUEST_USER; no sudo in this image - use su for root"
+        # Said rather than assumed: sudo is seeded for the apt distros and
+        # installed afterwards for the other two, so reaching here means one of
+        # those steps did not work - and a promise of sudo that is not there is
+        # worse than no promise.
+        echo "    log in as $GUEST_USER; no sudo in this tree"
     fi
 fi
 echo

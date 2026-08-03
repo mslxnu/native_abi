@@ -921,7 +921,29 @@ DEFINE_SYSCALL(getrusage, int, who, gaddr_t, rusage_ptr)
 
 DEFINE_SYSCALL(getpriority, int, which, int, who)
 {
-  return syswrap(getpriority(which, who));
+  /*
+   * Linux's getpriority syscall does not return the nice value. It returns
+   * 20 - nice, so that the result is 1..40 and can never be mistaken for an
+   * error, and glibc's wrapper converts it back. Darwin's getpriority(3)
+   * returns the nice value itself, so handing it straight over means the guest
+   * computes 20 - nice a second time.
+   *
+   * At the usual nice of 0 that reads as 20 - the lowest priority there is -
+   * and the guest believes it. pam_limits then applies what it thinks it
+   * found, so `setpriority(20)` really did drop the host process to nice 20;
+   * the attempt to put it back to 0 was then a *raise* in priority, which
+   * Darwin refuses to an unprivileged process with EACCES. pam_limits is
+   * `required` in sudo's session stack, so sudo stopped with
+   * "pam_open_session: Permission denied" - about a nice value.
+   *
+   * -1 is a legitimate nice value, so failure is distinguished by errno rather
+   * than by the return, which is the whole reason the Linux encoding exists.
+   */
+  errno = 0;
+  int nice = getpriority(which, who);
+  if (nice == -1 && errno != 0)
+    return -darwin_to_linux_errno(errno);
+  return 20 - nice;
 }
 
 DEFINE_SYSCALL(setpriority, int, which, int, who, int, niceval)
