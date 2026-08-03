@@ -220,7 +220,24 @@ DEFINE_SYSCALL(brk, unsigned long, brk)
 
   pthread_rwlock_wrlock(&proc.mm->alloc_lock);
   if (brk < proc.mm->start_brk) {
-    ret = proc.mm->start_brk;
+    /*
+     * Below the floor, so nothing moves - and the answer is the break as it
+     * stands, not where it started.
+     *
+     * brk(0) is how every libc asks what the break *is*, and it lands here
+     * because 0 is below any floor. Answering with start_brk told glibc the
+     * heap was empty when it was not: static startup takes its TLS block with
+     * sbrk, so by the time it asks, the break has already moved. glibc believed
+     * the lower number, and the next allocation handed out the same memory a
+     * second time, on top of the thread pointer.
+     *
+     * The symptom was a segfault on 0x6e756f46206572a7 - ASCII text rather than
+     * an address, a pointer with a string written through it - and it only
+     * appeared when LANG was set, because a C-locale process never allocates
+     * again after TLS and so never notices that it was handed the same bytes
+     * twice.
+     */
+    ret = proc.mm->current_brk;
     goto out;
   }
 

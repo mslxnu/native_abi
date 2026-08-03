@@ -120,6 +120,12 @@ guest-code cache sync.
   descriptor irrelevant and Linux does not look at it - rpm opens the root that
   way before unpacking anything.
 
+- `brktest` — `brk(0)` answers with the break as it stands, agrees with the
+  value the preceding move returned, and follows it back down. It answered
+  `start_brk` instead, which is the same number only until something has grown
+  the heap - and static glibc grows it during startup, taking its TLS block with
+  `sbrk`. The next allocation was then handed the same bytes again.
+
 The ELF binaries are committed prebuilt (as the x86 guest tests under
 `test/*/build/` are), so the check needs no cross-toolchain. The `.s` sources
 are here for reference; rebuild with an aarch64-linux clang + ld.lld:

@@ -428,6 +428,16 @@ else
     fail=1
 fi
 
+# brktest: brk(0) must answer with the break as it stands, not where it began.
+cp "$here/brktest" "$root/"; chmod +x "$root/brktest"
+out=$("$NABI" -m "$root" /brktest); rc=$?
+if [ "$rc" -eq 0 ] && [ "$out" = "brk ok" ]; then
+    echo "  ok  brktest -> \"$out\", exit 0"
+else
+    echo "  FAIL brktest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 if [ "$fail" -eq 0 ]; then
     echo "smoke: PASS"
 else

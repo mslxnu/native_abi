@@ -2076,6 +2076,51 @@ again, arriving at runtime rather than at build time, and the answer is the same
 one that is still not done: record the guest's mode beside its owner so the host
 mode can stay permissive.
 
+### 3.5.39 `brk(0)` answered the wrong question — **fixed**
+
+The ldconfig crash was recorded in §3.5.38 as happening "when it is a forked
+child". That was wrong, and it is worth saying how the framing misled the
+search. `bash -lc ldconfig` crashed and `bash -c ldconfig` did not, so fork
+generations looked like the variable; a minimal fork-plus-execve harness never
+reproduced it, at any parent size. What a login shell actually does differently
+is **set LANG**, and `ldconfig` run top-level with `LANG=C.UTF-8` crashes just
+the same. There was no fork in it anywhere.
+
+With a one-process reproducer the trace showed the bug plainly:
+
+```
+brk(brk: 0x4d8b20): ret = 0x4dc000     <- raise, granted
+brk(brk: 0x0):      ret = 0x4d8000     <- query, answered lower
+```
+
+`brk(0)` is how every libc asks where the break *is*. Zero is below any floor,
+so it fell into the "below start_brk" arm, which answered `start_brk` - the
+address the heap began at. That is the same number only until something has
+grown it, and static glibc grows it before anything else: `__libc_setup_tls`
+takes the thread block with `sbrk` during startup. So glibc recorded a break
+below memory it had already been given, and the next allocation was handed the
+same bytes a second time, on top of the thread pointer.
+
+LANG is what decides whether that matters. A C-locale process does not allocate
+again after TLS, so it never discovers the overlap; `setlocale` for any real
+locale does, immediately.
+
+The symptom named none of this. The faulting address was `0x6e756f46206572a7` -
+ASCII text rather than an address, a pointer with a string written through it -
+which says memory corruption and says nothing whatever about `brk`. Linux
+returns `mm->brk` for a request it declines, and so does this now.
+
+`dnf` installs 35 packages and reports Complete; `ldconfig` runs under a login
+shell; the glibc-common lua trigger that calls it succeeds. Debian and Ubuntu
+were checked too and were never affected - their tools do not run a static
+binary early enough with a locale set.
+
+Two things about the search are worth keeping. The fault took the `addr_ok`
+branch, which reports through **printk**, so with no `-o` sink it is silent -
+and `-p` is not the flag. And the strace sink is a buffered `FILE*`, so a
+process that dies takes its last lines with it: "the crash is right after this
+call" is a guess unless the process exited cleanly.
+
 ---
 
 ## 4. Phased implementation
