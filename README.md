@@ -211,7 +211,7 @@ signature verification, and installs and runs a C toolchain.
 | Terminals | **Working** — `/dev/ptmx` and the `/dev/pts` translation |
 | Filesystem | **Working** — host-backed, with passthrough prefixes |
 | `/proc/self/{maps,cmdline,comm,exe,fd}` | **Working** — served by NABI |
-| Credentials, `su`, `sudo` | **Working** — emulated in software |
+| Credentials, `su`, `sudo` | **Working** — emulated in software, with per-file owner and mode |
 | apt, dpkg, pacman, gcc | **Working** |
 | Sibling modules (`/proc`, `/sys`) | **Detected**, optional; NABI runs without them |
 | Debian, Ubuntu | **Working** — resolved from the archive, apt works inside |

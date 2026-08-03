@@ -1166,6 +1166,187 @@ guest_owner_record(int dirfd, const char *path, bool nofollow,
   return syswrap(guest_owner_write(abs, nofollow, &o));
 }
 
+/* ---------------------------------------------------------------------------
+ * Guest mode
+ *
+ * The same problem as ownership, arriving from the other side. A mode that
+ * denies its own owner cannot be worked around by being the owner: nabi is the
+ * host account, so `---s--x--x` - which is what every distribution ships sudo
+ * as - means nabi cannot *read* the file, and reading it is exactly what
+ * loading an ELF requires. Fedora's sudo installed correctly and then could not
+ * run, reporting "Permission denied" about a file the guest was perfectly
+ * entitled to execute.
+ *
+ * It cannot be fixed by relaxing the mode outright, because the mode is also
+ * what the guest sees and what nabi's own permission checks are made of;
+ * turning sudo into 0755 would hand it to everybody. So the guest's mode is
+ * recorded beside the file, exactly as its owner is, and the host keeps a mode
+ * that lets nabi do its job.
+ *
+ * What the host is left with is the guest's mode plus owner access, and without
+ * the setuid bits - those are honoured by nabi against the recorded mode, and
+ * leaving them on a host file owned by an ordinary account only invites
+ * confusion. Granting the owner what it already had is not a concession: nabi
+ * owns the tree and can chmod anything in it whenever it likes, so this changes
+ * what other host tools see and nothing about what the guest can reach.
+ *
+ * Absent, the mode is the host's, which is the common case and costs one failed
+ * lookup: everything a distribution unpacks with ordinary permissions needs no
+ * attribute at all.
+ * ------------------------------------------------------------------------ */
+
+#define GUEST_MODE_XATTR "msl.nabi.mode"
+
+/* Permission and setuid bits; the file-type bits are the host's to state. */
+#define GUEST_MODE_BITS 07777
+
+static bool
+guest_mode_read(const char *abs, bool nofollow, uint32_t *out)
+{
+  ssize_t n = getxattr(abs, GUEST_MODE_XATTR, out, sizeof *out, 0,
+                       nofollow ? XATTR_NOFOLLOW : 0);
+  return n == (ssize_t) sizeof *out;
+}
+
+/* What the host should carry so that nabi can still read, write and traverse.
+ * Directories need search as well, or nothing beneath them can be reached. */
+static mode_t
+host_mode_for(uint32_t guest_mode, bool is_dir)
+{
+  mode_t m = (mode_t) (guest_mode & 0777);
+  return m | (is_dir ? 0700 : 0600);
+}
+
+/* Overlay the recorded mode onto a stat already converted for the guest. */
+static void
+guest_mode_overlay(int dirfd, const char *path, bool nofollow,
+                   struct l_newstat *l_st)
+{
+  char abs[PATH_MAX];
+  uint32_t m;
+  if (!abs_path_at(dirfd, path, abs, sizeof abs))
+    return;
+  if (guest_mode_read(abs, nofollow, &m))
+    l_st->st_mode = (l_st->st_mode & ~(uint32_t) GUEST_MODE_BITS)
+                  | (m & GUEST_MODE_BITS);
+}
+
+static void
+guest_mode_overlay_fd(int fd, struct l_newstat *l_st)
+{
+  uint32_t m;
+  if (fgetxattr(fd, GUEST_MODE_XATTR, &m, sizeof m, 0, 0) == (ssize_t) sizeof m)
+    l_st->st_mode = (l_st->st_mode & ~(uint32_t) GUEST_MODE_BITS)
+                  | (m & GUEST_MODE_BITS);
+}
+
+/*
+ * Record a mode and put a workable one on the host.
+ *
+ * A mode the host can carry as it stands is left alone and any old attribute
+ * dropped, so the ordinary case stores nothing and the attribute's presence
+ * always means "the host's mode is not the answer".
+ */
+static int
+guest_mode_record(int dirfd, const char *path, bool nofollow, uint32_t mode)
+{
+  char abs[PATH_MAX];
+  if (!abs_path_at(dirfd, path, abs, sizeof abs))
+    return -LINUX_ENOENT;
+
+  struct stat dst;
+  if (fstatat(dirfd, path, &dst, nofollow ? AT_SYMLINK_NOFOLLOW : 0) < 0)
+    return -darwin_to_linux_errno(errno);
+  bool is_dir = S_ISDIR(dst.st_mode);
+
+  /* The host mode goes on first, and that ordering is not cosmetic: writing an
+   * extended attribute needs write permission on the file, and the mode being
+   * recorded is precisely one that does not grant it. Recording first fails
+   * with EACCES on exactly the files this exists for. */
+  mode_t host = host_mode_for(mode, is_dir);
+  int r = syswrap(fchmodat(dirfd, path, host, nofollow ? AT_SYMLINK_NOFOLLOW : 0));
+  if (r < 0)
+    return r;
+
+  if ((mode & GUEST_MODE_BITS) == (uint32_t) host) {
+    removexattr(abs, GUEST_MODE_XATTR, nofollow ? XATTR_NOFOLLOW : 0);
+    return 0;
+  }
+  uint32_t m = mode & GUEST_MODE_BITS;
+  if (setxattr(abs, GUEST_MODE_XATTR, &m, sizeof m, 0,
+               nofollow ? XATTR_NOFOLLOW : 0) < 0)
+    return -darwin_to_linux_errno(errno);
+  return 0;
+}
+
+/*
+ * Adopt a mode that was already on disk when nabi could not use it.
+ *
+ * Trees built before any of this exists, and anything a package manager laid
+ * down through a path that is not chmod, carry a restrictive mode and no
+ * attribute - so the first open fails and there is nothing recorded to explain
+ * why. Rather than require the tree to be swept, the failure repairs itself:
+ * the mode that is there becomes the mode the guest sees, and the host gets one
+ * that works.
+ *
+ * Only for a file nabi owns, and only when the mode really is the problem.
+ * Anything else is a genuine refusal and is left to stand.
+ */
+static bool
+guest_mode_adopt(int dirfd, const char *path)
+{
+  char abs[PATH_MAX];
+  struct stat dst;
+  uint32_t existing;
+
+  if (!abs_path_at(dirfd, path, abs, sizeof abs))
+    return false;
+  if (guest_mode_read(abs, false, &existing))
+    return false;                 /* already recorded; EACCES meant something else */
+  if (fstatat(dirfd, path, &dst, 0) < 0 || dst.st_uid != geteuid())
+    return false;
+
+  bool is_dir = S_ISDIR(dst.st_mode);
+  mode_t host = host_mode_for(dst.st_mode, is_dir);
+  if ((mode_t) (dst.st_mode & 0777) == host)
+    return false;                 /* the host mode was never the obstacle */
+
+  /* Mode first, attribute second, for the same reason as guest_mode_record:
+   * the file cannot be given an attribute while its mode forbids writing it. */
+  uint32_t m = dst.st_mode & GUEST_MODE_BITS;
+  if (fchmodat(dirfd, path, host, 0) < 0)
+    return false;
+  if (setxattr(abs, GUEST_MODE_XATTR, &m, sizeof m, 0, 0) < 0) {
+    fchmodat(dirfd, path, dst.st_mode & 07777, 0);      /* put it back */
+    return false;
+  }
+  return true;
+}
+
+/*
+ * The guest's view of an open file: who owns it and what its mode is, with both
+ * recorded attributes applied.
+ *
+ * exec needs this and cannot assemble it itself. A raw host fstat answers with
+ * the account nabi runs as and with the mode the host carries, and since a
+ * setuid bit is deliberately not left on the host file, asking the host means
+ * never seeing one. Both halves of the answer live here.
+ */
+void
+guest_view_of_fd(int fd, uint32_t *uid, uint32_t *gid, uint32_t *mode)
+{
+  struct stat dst;
+  struct l_newstat st;
+  if (fstat(fd, &dst) < 0)
+    return;
+  stat_darwin_to_linux(&dst, &st);
+  guest_owner_overlay_fd(fd, &st);
+  guest_mode_overlay_fd(fd, &st);
+  if (uid)  *uid  = st.st_uid;
+  if (gid)  *gid  = st.st_gid;
+  if (mode) *mode = st.st_mode;
+}
+
 /*
  * Called after the guest creates something. Only when it is not root: a root
  * guest's files are the host account's, which is what an absent attribute
@@ -1195,6 +1376,7 @@ darwinfs_fstat(struct file *file, struct l_newstat *l_st)
   }
   stat_darwin_to_linux(&st, l_st);
   guest_owner_overlay_fd(file->fd, l_st);
+  guest_mode_overlay_fd(file->fd, l_st);
   return ret;
 }
 
@@ -1231,6 +1413,12 @@ darwinfs_fchown(struct file *file, l_uid_t uid, l_gid_t gid)
 int
 darwinfs_fchmod(struct file *file, l_mode_t mode)
 {
+  /* Same reasoning as fchmodat, reached through a descriptor. F_GETPATH names
+   * the file so the attribute can be written by name, since macOS has no
+   * fsetxattr-by-mode helper that would keep this to one call. */
+  char abs[PATH_MAX];
+  if (fcntl(file->fd, F_GETPATH, abs) == 0)
+    return guest_mode_record(AT_FDCWD, abs, false, mode);
   return syswrap(fchmod(file->fd, mode));
 }
 
@@ -1420,6 +1608,7 @@ permit_at(int dirfd, const char *path, bool nofollow, int want, bool real)
     return -darwin_to_linux_errno(errno);
   stat_darwin_to_linux(&dst, &st);
   guest_owner_overlay(dirfd, path, nofollow, &st);
+  guest_mode_overlay(dirfd, path, nofollow, &st);
   return cred_may(&st, want, real);
 }
 
@@ -1461,6 +1650,7 @@ permit_parent(int dirfd, const char *entry, bool removing)
     return -darwin_to_linux_errno(errno);
   stat_darwin_to_linux(&dst, &dir);
   guest_owner_overlay(dirfd, dirpath, false, &dir);
+  guest_mode_overlay(dirfd, dirpath, false, &dir);
 
   int r = cred_may(&dir, WANT_W | WANT_X, false);
   if (r < 0 || !removing || !(dir.st_mode & S_ISVTX))
@@ -1471,6 +1661,7 @@ permit_parent(int dirfd, const char *entry, bool removing)
     return 0;                           /* nothing there to protect */
   stat_darwin_to_linux(&dst, &v);
   guest_owner_overlay(dirfd, entry, true, &v);
+  guest_mode_overlay(dirfd, entry, true, &v);
 
   l_uid_t euid;
   pthread_rwlock_rdlock(&proc.cred.lock);
@@ -1793,6 +1984,21 @@ struct fs_operations {
   int (*fchmodat)(struct fs *fs, struct dir *dir, const char *path, l_mode_t mode);
 };
 
+/*
+ * Set while nabi is reading a program image on the guest's behalf.
+ *
+ * execve(2) requires *execute* permission and then reads the file regardless of
+ * whether the caller could have read it - which is the whole point of a mode
+ * like `---s--x--x`. Loading an ELF here means an ordinary open, so without
+ * this the guest's own read check refuses the very files this is for: sudo, run
+ * by a user who may execute it and may not read it, failed at the open with
+ * EACCES after passing the execute check a few lines earlier.
+ *
+ * Only the file's own read check is suppressed. Search permission on the
+ * directories leading to it still applies, because Linux enforces that too.
+ */
+static _Thread_local bool loading_image;
+
 int
 darwinfs_openat(struct fs *fs, struct dir *dir, const char *path, int l_flags, int mode)
 {
@@ -1808,7 +2014,7 @@ darwinfs_openat(struct fs *fs, struct dir *dir, const char *path, int l_flags, i
     creating = fstatat(dir->fd, path, &probe, AT_SYMLINK_NOFOLLOW) < 0;
   }
 
-  if (!cred_is_root()) {
+  if (!cred_is_root() && !loading_image) {
     int want = 0;
     switch (flags & O_ACCMODE) {
     case O_RDONLY: want = WANT_R; break;
@@ -1829,8 +2035,24 @@ darwinfs_openat(struct fs *fs, struct dir *dir, const char *path, int l_flags, i
   }
 
   int fd = syswrap(openat(dir->fd, path, flags, mode));
-  if (fd >= 0 && creating)
+
+  /*
+   * The host refused, and the mode may be why. A file that denies its own owner
+   * cannot be opened by nabi at all, and trees built before any of this - or
+   * anything a package manager writes without going through chmod - carry
+   * exactly that with nothing recorded to explain it. Adopt the mode as the
+   * guest's, put a workable one on the host, and try once more.
+   */
+  if (fd == -LINUX_EACCES && guest_mode_adopt(dir->fd, path))
+    fd = syswrap(openat(dir->fd, path, flags, mode));
+
+  if (fd >= 0 && creating) {
     guest_owner_stamp_new(dir->fd, path);
+    /* Created with a mode the host cannot carry - `mkstemp` then `fchmod 0600`
+     * is common, but O_CREAT with 0400 happens too. */
+    if ((mode & 0600) != 0600)
+      guest_mode_record(dir->fd, path, false, (uint32_t) mode);
+  }
   return fd;
 }
 
@@ -1933,6 +2155,7 @@ darwinfs_fstatat(struct fs *fs, struct dir *dir, const char *path, struct l_news
   }
   stat_darwin_to_linux(&st, l_st);
   guest_owner_overlay(dir->fd, path, (flags & AT_SYMLINK_NOFOLLOW) != 0, l_st);
+  guest_mode_overlay(dir->fd, path, (flags & AT_SYMLINK_NOFOLLOW) != 0, l_st);
   return ret;
 }
 
@@ -1982,6 +2205,7 @@ darwinfs_fchownat(struct fs *fs, struct dir *dir, const char *path, l_uid_t uid,
       return -darwin_to_linux_errno(errno);
     stat_darwin_to_linux(&dst, &st);
     guest_owner_overlay(dir->fd, path, nf, &st);
+    guest_mode_overlay(dir->fd, path, nf, &st);
     l_uid_t euid;
     pthread_rwlock_rdlock(&proc.cred.lock);
     euid = proc.cred.euid;
@@ -2014,6 +2238,7 @@ darwinfs_fchmodat(struct fs *fs, struct dir *dir, const char *path, l_mode_t mod
       return -darwin_to_linux_errno(errno);
     stat_darwin_to_linux(&dst, &st);
     guest_owner_overlay(dir->fd, path, false, &st);
+    guest_mode_overlay(dir->fd, path, false, &st);
     l_uid_t euid;
     pthread_rwlock_rdlock(&proc.cred.lock);
     euid = proc.cred.euid;
@@ -2021,7 +2246,11 @@ darwinfs_fchmodat(struct fs *fs, struct dir *dir, const char *path, l_mode_t mod
     if (st.st_uid != euid)
       return -LINUX_EPERM;
   }
-  return syswrap(fchmodat(dir->fd, path, mode, 0));
+  /* Recorded, not applied verbatim. A mode that denies its own owner would
+   * lock nabi out of a file the guest may still use - `chmod 4111 sudo` is the
+   * ordinary case - so the guest's answer is kept beside the file and the host
+   * gets one that can be worked with. See "Guest mode" above. */
+  return guest_mode_record(dir->fd, path, false, mode);
 }
 
 #define LOOKUP_NOFOLLOW   0x0001
@@ -2525,6 +2754,15 @@ guest_to_host_path(const char *name, char *out, size_t outsz)
   if (n < 0 || (size_t) n >= outsz)
     return -LINUX_ENAMETOOLONG;
   return 0;
+}
+
+int
+vkern_open_exec(const char *path)
+{
+  loading_image = true;
+  int fd = vkern_open(path, LINUX_O_RDONLY, 0);
+  loading_image = false;
+  return fd;
 }
 
 int

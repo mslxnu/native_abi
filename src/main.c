@@ -315,20 +315,26 @@ drop_privilege(void)
  * A set-user-ID or set-group-ID image, applied to the guest's credentials.
  *
  * The ids are the file's owner as the guest sees it, not a hardcoded zero: a
- * rootfs unpacked by an ordinary account has every file owned by that account,
- * which host_uid_to_guest already reports as root, and a binary owned by
- * somebody else should elevate to somebody else.
+ * binary owned by somebody other than root should elevate to somebody other
+ * than root.
+ *
+ * They arrive already in the guest's terms, and that is the point. They used to
+ * be a host stat's st_uid put through host_uid_to_guest, which was right only
+ * while every file in the tree belonged to the one account nabi runs as. Once
+ * ownership is recorded per file, a binary given away to a guest user still
+ * stats as the host account, and mapping that would have elevated to root -
+ * the opposite of what the file says.
  */
 void
 elevate_privilege(uid_t owner_uid, gid_t owner_gid, mode_t mode)
 {
   pthread_rwlock_wrlock(&proc.cred.lock);
   if (mode & S_ISUID) {
-    proc.cred.euid = host_uid_to_guest(owner_uid);
+    proc.cred.euid = owner_uid;
     proc.cred.suid = proc.cred.euid;
   }
   if (mode & S_ISGID) {
-    proc.cred.egid = host_gid_to_guest(owner_gid);
+    proc.cred.egid = owner_gid;
     proc.cred.sgid = proc.cred.egid;
   }
   pthread_rwlock_unlock(&proc.cred.lock);

@@ -438,6 +438,19 @@ else
     fail=1
 fi
 
+# suidtest: a mode that denies its own owner, and the setuid bit on it. The
+# helper's mode is set from here rather than by the test, so this also covers a
+# file that was already on disk with nothing recorded about it.
+cp "$here/suidtest" "$here/suidhelper" "$root/"
+chmod +x "$root/suidtest"; chmod 4111 "$root/suidhelper"
+out=$("$NABI" -m "$root" /suidtest); rc=$?
+if [ "$rc" -eq 0 ] && [ "$out" = "suid ok" ]; then
+    echo "  ok  suidtest -> \"$out\", exit 0"
+else
+    echo "  FAIL suidtest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 if [ "$fail" -eq 0 ]; then
     echo "smoke: PASS"
 else

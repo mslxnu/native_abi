@@ -217,6 +217,8 @@ int  guest_groups_get(l_gid_t *out);
 const l_gid_t *guest_groups_ptr(void);
 void guest_groups_set(const l_gid_t *g, int n);
 void elevate_privilege(uid_t owner_uid, gid_t owner_gid, mode_t mode);
+void guest_view_of_fd(int fd, uint32_t *uid, uint32_t *gid, uint32_t *mode);
+int vkern_open_exec(const char *path);
 int procfs_open(const char *path, int *out_fd);
 void procfs_close_fd(int fd);
 bool procfs_refresh_fddir(int fd);

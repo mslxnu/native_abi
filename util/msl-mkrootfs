@@ -580,24 +580,24 @@ case $FAMILY in
     tar) build_tar ;;
 esac
 
-# An entry that denies its own owner cannot be reached by anybody except real
+# A directory that denies its own owner cannot be written by anybody except real
 # root, and nabi is not real root: it performs every access as the ordinary
-# account that started it, so the guest's root cannot reach one either. A
-# published image has a handful - Fedora ships /etc/shadow and /etc/gshadow as
-# mode 0000 and /root as dr-xr-x---, so shadow-utils stops at "useradd: cannot
-# open /etc/gshadow" and root cannot write its own home.
+# account that started it, so the guest's root cannot write one either. Fedora
+# ships /root as dr-xr-x---, and root could not write its own home.
 #
-# Giving the owner back read on files and write on directories is enough, and
-# touches about a dozen entries in either image. What the guest sees changes -
-# 0000 becomes 0600, 0550 becomes 0750 - which nothing checks, and which still
-# keeps both to root.
+# Files used to be swept the same way, because /etc/shadow and /etc/gshadow ship
+# as mode 0000 and useradd stopped at "cannot open /etc/gshadow". They are not
+# any more: nabi records the guest's mode beside the file now and keeps a
+# workable one on the host, so a file that denies its owner repairs itself on
+# first use and the guest goes on seeing the mode the distribution set. Sweeping
+# them here would throw that away - 0000 would become 0600 permanently, with
+# nothing left to say it had ever been anything else.
 #
-# The general answer is to record the guest's mode beside its owner, the way
-# ownership already is, so the host mode can stay permissive while the guest
-# sees the real one. That is a larger piece of work; it is written up in
-# PORTING-arm64.md rather than started here.
+# Directories are still swept, because the repair happens when a file is opened
+# and there is no equivalent moment for a directory the *builder* itself has to
+# write into. What the guest sees changes for those - 0550 becomes 0750 - which
+# nothing checks and which still keeps them to root.
 find "$ROOT" -type d ! -perm -u+w -exec chmod u+w {} + 2>/dev/null || true
-find "$ROOT" -type f ! -perm -u+r -exec chmod u+r {} + 2>/dev/null || true
 
 # ---------------------------------------------------------------------------
 # 3. Configure, inside NABI

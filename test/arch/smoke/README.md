@@ -126,6 +126,13 @@ guest-code cache sync.
   the heap - and static glibc grows it during startup, taking its TLS block with
   `sbrk`. The next allocation was then handed the same bytes again.
 
+- `suidtest` (with `suidhelper`) — a file at mode `4111`, which is how every
+  distribution ships sudo: executable by all, readable by none, set-user-ID
+  root. Checks that the guest still *sees* `4111`, that the file can be executed
+  anyway, and that the bit elevates. NABI performs every access as the host
+  account, so a mode with no owner read is one it cannot open at all - Fedora's
+  sudo installed correctly and then answered "Permission denied".
+
 The ELF binaries are committed prebuilt (as the x86 guest tests under
 `test/*/build/` are), so the check needs no cross-toolchain. The `.s` sources
 are here for reference; rebuild with an aarch64-linux clang + ld.lld:

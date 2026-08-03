@@ -58,7 +58,7 @@ load_elf_interp(const char *path, ulong load_addr)
   int fd;
   struct stat st;
 
-  if ((fd = vkern_open(path, LINUX_O_RDONLY, 0)) < 0) {
+  if ((fd = vkern_open_exec(path)) < 0) {
     fprintf(stderr, "load_elf_interp, could not open file: %s\n", path);
     return -1;
   }
@@ -466,7 +466,7 @@ do_exec(const char *elf_path, int argc, char *argv[], char **envp)
   if ((err = do_access(elf_path, X_OK)) < 0) {
     return err;
   }
-  if ((fd = vkern_open(elf_path, LINUX_O_RDONLY, 0)) < 0) {
+  if ((fd = vkern_open_exec(elf_path)) < 0) {
     return fd;
   }
   /*
@@ -492,6 +492,12 @@ do_exec(const char *elf_path, int argc, char *argv[], char **envp)
     vkern_close(fd);
     return -LINUX_EACCES;
   }
+
+  /* Taken while the descriptor is still open, since the setuid check below
+   * happens after it is closed - and taken from the guest's view rather than
+   * the host's, which carries neither the recorded owner nor the setuid bit. */
+  uint32_t g_uid = 0, g_gid = 0, g_mode = st.st_mode;
+  guest_view_of_fd(fd, &g_uid, &g_gid, &g_mode);
 
   prepare_newproc();
 
@@ -520,8 +526,8 @@ do_exec(const char *elf_path, int argc, char *argv[], char **envp)
      * rewritten argv as cmdline, which is exactly the inner call.
      */
     proc_set_ident(elf_path, argc, argv);
-    if (st.st_mode & (S_ISUID | S_ISGID)) {
-      elevate_privilege(st.st_uid, st.st_gid, st.st_mode);
+    if (g_mode & (S_ISUID | S_ISGID)) {
+      elevate_privilege(g_uid, g_gid, g_mode);
     }
   }
   else if (2 <= st.st_size && data[0] == '#' && data[1] == '!') {

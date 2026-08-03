@@ -2121,6 +2121,66 @@ and `-p` is not the flag. And the strace sink is a buffered `FILE*`, so a
 process that dies takes its last lines with it: "the crash is right after this
 call" is a guess unless the process exited cleanly.
 
+### 3.5.40 A mode that denies its own owner — **fixed**
+
+§3.5.27 worked around this in the builder and wrote up the real answer as
+outstanding. Fedora made it unavoidable: `dnf install sudo` succeeds and the
+result cannot run.
+
+Every distribution ships sudo as `---s--x--x` - executable by anyone, readable
+by no one, set-user-ID root. NABI performs every access as the ordinary host
+account that owns the tree, and loading an ELF means *reading* it, so a mode
+with no owner read is a file NABI cannot open however entitled the guest is to
+execute it. Relaxing the mode is not available either, because the mode is also
+what the guest sees and what the permission checks are made of; turning sudo
+into 0755 hands it to everybody.
+
+So the guest's mode is recorded beside the file exactly as its owner already
+was, in `msl.nabi.mode`, and the host keeps a mode NABI can work with - the
+guest's permission bits plus owner access, and without the setuid bits, which
+are honoured against the recorded mode instead. Granting the owner what it
+already had concedes nothing: NABI owns the tree and may chmod anything in it at
+any time, so this changes what other host tools see and nothing about what the
+guest can reach.
+
+Absent, the mode is the host's. That is the common case and costs one failed
+lookup - everything a distribution unpacks with ordinary permissions needs no
+attribute at all, and `ls -lR /usr` measured no slower than before.
+
+Four things had to change together, and each was found by the previous one:
+
+- **Order.** The host mode must be relaxed *before* the attribute is written,
+  because writing an extended attribute needs write permission on the file and
+  the mode being recorded is precisely one that denies it. Recording first fails
+  with EACCES on exactly the files this exists for.
+- **Repair.** Trees that already exist carry restrictive modes and no attribute,
+  so there is nothing recorded to explain the refusal. Rather than require a
+  sweep, an open that fails with EACCES adopts the mode it finds as the guest's,
+  puts a workable one on the host, and tries once more.
+- **execve reads what it may not read.** Linux checks *execute* permission and
+  then reads the file regardless - which is the entire point of `---s--x--x`.
+  Loading an image here is an ordinary open, so the guest's own read check
+  refused sudo a few lines after the execute check had allowed it. The file's
+  read check is now suppressed while NABI is loading an image; search permission
+  on the directories leading to it still applies, as Linux enforces that too.
+- **The setuid bit is not on the host file.** `elevate_privilege` read it from a
+  host `fstat`, which now never carries it, so exec takes the guest's view
+  instead. That fixed a second bug in passing: the ids were a host `st_uid` put
+  through `host_uid_to_guest`, which was right only while every file belonged to
+  the one account NABI runs as. Since §3.5.25 recorded ownership per file, a
+  setuid binary given away to a guest user still stats as the host account, and
+  mapping that would have elevated to **root** - the opposite of what the file
+  says.
+
+`suidtest` checks all three properties at once, because any two without the
+third looks like a plausible hole: the guest still sees `4111`, the file can be
+executed, and the bit elevates. The helper's mode is set from the host side, so
+the repair path for pre-existing trees is covered too.
+
+Sudo now loads and runs. It stops later, inside PAM session setup
+(`pam_open_session: Permission denied`), which is a different layer and not
+investigated here.
+
 ---
 
 ## 4. Phased implementation
