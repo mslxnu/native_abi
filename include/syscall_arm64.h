@@ -273,7 +273,7 @@
   SYSCALL(264, unimplemented) \
   SYSCALL(265, unimplemented) \
   SYSCALL(266, unimplemented) \
-  SYSCALL(267, unimplemented) \
+  SYSCALL(267, syncfs) \
   SYSCALL(268, unimplemented) \
   SYSCALL(269, sendmmsg) \
   SYSCALL(270, unimplemented) \

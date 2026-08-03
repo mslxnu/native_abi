@@ -105,6 +105,12 @@ guest-code cache sync.
   both ends, and `PROT_NONE` the inter-segment hole. Needs `bigmapfile` in the
   root.
 
+- `synctest` — `fsync`, `fdatasync` and `syncfs` on a file, then reading the
+  bytes back. `syncfs` was not implemented, and coreutils' `sync(1)` reports the
+  resulting ENOSYS as "Function not implemented" - which is what stopped
+  `apt-get install linux-image-arm64`, since the kernel postinst syncs the
+  initrd it just built and treats a failure as fatal.
+
 The ELF binaries are committed prebuilt (as the x86 guest tests under
 `test/*/build/` are), so the check needs no cross-toolchain. The `.s` sources
 are here for reference; rebuild with an aarch64-linux clang + ld.lld:

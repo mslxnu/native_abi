@@ -169,10 +169,31 @@
 #define TCR_SH0_INNER   (3ull << 12)
 #define TCR_TG0_4K      (0ull << 14)
 #define TCR_EPD1        (1ull << 23)
-#define TCR_IPS_36BIT   (1ull << 32)
 
-#define TCR_EL1_VALUE   (TCR_T0SZ(25) | TCR_IRGN0_WBWA | TCR_ORGN0_WBWA | \
-                         TCR_SH0_INNER | TCR_TG0_4K | TCR_EPD1 | TCR_IPS_36BIT)
+/*
+ * IPS caps what stage 1 may *output*, and it has to agree with the size the VM
+ * was created with - two ceilings on the same address, and the lower one wins
+ * silently.
+ *
+ * This was fixed at 36 bits while the VM took the platform default, which is
+ * also 36, so they agreed by coincidence. Raising only the VM's moved the
+ * failure rather than fixing it: hv_vm_map accepted an IPA above 64GiB, stage 1
+ * then refused to translate to it, and the guest took a level-3 translation
+ * fault on a page whose descriptor read "valid af el0 rw". A page table that
+ * describes a mapping the MMU will not perform is about as misleading as a
+ * fault gets, so TCR is now built from what the VM actually has.
+ *
+ * Encoding is 0=32, 1=36, 2=40, 3=42, 4=44, 5=48, 6=52 bits; anything not on
+ * that ladder rounds down to the entry below it, since claiming more than the
+ * VM has is the failure this is here to prevent.
+ */
+#define TCR_IPS(bits)   ((uint64_t)((bits) >= 52 ? 6 : (bits) >= 48 ? 5 : \
+                                    (bits) >= 44 ? 4 : (bits) >= 42 ? 3 : \
+                                    (bits) >= 40 ? 2 : (bits) >= 36 ? 1 : 0) << 32)
+
+#define TCR_EL1_BASE    (TCR_T0SZ(25) | TCR_IRGN0_WBWA | TCR_ORGN0_WBWA | \
+                         TCR_SH0_INNER | TCR_TG0_4K | TCR_EPD1)
+#define TCR_EL1_FOR(bits) (TCR_EL1_BASE | TCR_IPS(bits))
 
 /* Stage-2 granularity, imposed by hv_vm_map. Measured, not assumed: it rejects
  * anything not 16KiB-aligned on host address, IPA and size alike. */

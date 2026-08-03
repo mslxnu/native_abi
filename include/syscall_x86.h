@@ -309,7 +309,7 @@
   SYSCALL(303, unimplemented)                   \
   SYSCALL(304, unimplemented)                   \
   SYSCALL(305, unimplemented)                   \
-  SYSCALL(306, unimplemented)                   \
+  SYSCALL(306, syncfs)                          \
   SYSCALL(307, sendmmsg)                        \
   SYSCALL(308, unimplemented)                   \
   SYSCALL(309, unimplemented)                   \

@@ -336,7 +336,8 @@ pt_init(void)
   l1_table = alloc_table();
 
   vmm_arm64_write_sysreg(HV_SYS_REG_MAIR_EL1, MAIR_EL1_VALUE);
-  vmm_arm64_write_sysreg(HV_SYS_REG_TCR_EL1, TCR_EL1_VALUE);
+  vmm_arm64_write_sysreg(HV_SYS_REG_TCR_EL1,
+                         TCR_EL1_FOR(vmm_arm64_ipa_bits()));
   vmm_arm64_write_sysreg(HV_SYS_REG_TTBR0_EL1, l1_table.ipa);
 }
 

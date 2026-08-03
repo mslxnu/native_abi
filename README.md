@@ -213,9 +213,10 @@ signature verification, and installs and runs a C toolchain.
 | `/proc/self/{maps,cmdline,comm,exe,fd}` | **Working** — served by NABI |
 | Credentials, `su`, `sudo` | **Working** — emulated in software |
 | apt, dpkg, gcc | **Working** |
-| Sibling modules (`/proc`, `/sys`, `/boot`) | **Detected**, optional; NABI runs without them |
+| Sibling modules (`/proc`, `/sys`) | **Detected**, optional; NABI runs without them |
+| Debian, Ubuntu | **Working** — resolved from the archive, apt works inside |
+| Fedora, Arch | **Rootfs works**, from the published image; dnf and pacman do not run yet |
 | x86-64 | **Builds, unverified** — see below |
-| Fedora, Arch | **Not built** — not apt archives, so a different second stage |
 
 The x86-64 backend is the original Noah VT-x code. It compiles, and is kept as the
 reference implementation of what each syscall path is meant to do — the arm64 code

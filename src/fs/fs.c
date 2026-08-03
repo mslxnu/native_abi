@@ -1810,18 +1810,30 @@ static const char *const host_passthrough[] = {
  *     would mask the rootfs's own while claiming to answer a question we
  *     cannot.
  *
- *   /boot is a real directory FHS owns on the writable Data volume, holding the
- *     kernel, bootloader and kernel collections this machine actually boots. A
- *     rootfs cannot know any of that: what a netinst ISO leaves in /boot is a
- *     config file and a System.map for a kernel that is not running here. So
- *     merely *existing* is the test - there is no filesystem to mount, and if
- *     FHS is absent the guest keeps its own.
- *
  * What is deliberately not here is the rest of what FHS names - /home, /run,
  * /root, /media, /mnt, /srv. Those are host directories that already have a
  * macOS path, and a rootfs has its own legitimate claim on them; /home in
  * particular must stay the rootfs's own, or the guest's shell reads the host's
  * dotfiles and arrives wearing the host's prompt.
+ *
+ * /boot used to be here too, on the reasoning that FHS owns the real one and a
+ * rootfs cannot know what this machine boots. That was answering a different
+ * question from the one a guest asks. A Linux distribution reading /boot wants
+ * its own kernel, its own System.map, its own grub.cfg - not the kernel
+ * collections macOS boots - and passing the host's through gave a wrong answer
+ * to that question while making the right one unreachable:
+ *
+ *   - Arch Linux ARM ships a kernel, an initramfs and a tree of device trees in
+ *     the tarball, and the guest could not see any of it.
+ *   - `apt-get install linux-image-arm64` stopped at "unable to create
+ *     /boot/System.map-...dpkg-new: Permission denied", because dpkg was
+ *     writing into the host's /boot as an ordinary account. A guest package
+ *     manager installing a Linux kernel into the Mac's boot directory would
+ *     have been worse than the failure.
+ *
+ * So the guest keeps its own /boot unconditionally. Nothing NABI does boots
+ * anything, and the files there are read - by initramfs hooks, by os-prober, by
+ * postinsts - rather than executed.
  */
 static const struct {
   const char *path;
@@ -1829,7 +1841,6 @@ static const struct {
 } optional_passthrough[] = {
   { "/proc", true  },
   { "/sys",  true  },
-  { "/boot", false },
 };
 #define NR_OPTIONAL (sizeof optional_passthrough / sizeof optional_passthrough[0])
 static bool optional_live[NR_OPTIONAL];
@@ -3275,6 +3286,25 @@ DEFINE_SYSCALL(sync)
 {
   sync();
   return 0;
+}
+
+/*
+ * Flush the filesystem holding one descriptor.
+ *
+ * Darwin has no syncfs, and the nearest thing - F_FULLFSYNC - is a stronger
+ * promise about one file rather than a weaker one about the filesystem. fsync
+ * on the descriptor is the honest approximation: every caller that reaches here
+ * wants the bytes it just wrote to be durable, and they are.
+ *
+ * Missing entirely, this returned ENOSYS, which coreutils' sync(1) reports as
+ * "error syncing '<file>': Function not implemented". That is what stopped
+ * `apt-get install linux-image-arm64`: update-initramfs builds the initrd and
+ * syncs it, the kernel postinst treats a failure there as fatal, and the whole
+ * package was left unconfigured over a flush.
+ */
+DEFINE_SYSCALL(syncfs, int, fd)
+{
+  return syswrap(fsync(fd));
 }
 
 /*

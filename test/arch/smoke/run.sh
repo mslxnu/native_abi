@@ -406,6 +406,17 @@ else
     fail=1
 fi
 
+# synctest: fsync, fdatasync and syncfs. syncfs was missing entirely, and an
+# ENOSYS there is what left a freshly unpacked kernel package unconfigured.
+cp "$here/synctest" "$root/"; chmod +x "$root/synctest"
+out=$("$NABI" -m "$root" /synctest); rc=$?
+if [ "$rc" -eq 0 ] && [ "$out" = "sync ok" ]; then
+    echo "  ok  synctest -> \"$out\", exit 0"
+else
+    echo "  FAIL synctest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 if [ "$fail" -eq 0 ]; then
     echo "smoke: PASS"
 else

@@ -1801,6 +1801,104 @@ The general answer is the one §3.5.25 already built for ownership: record the
 guest's *mode* beside its owner, so the host mode can stay permissive while the
 guest sees the real one. That is the right fix and it is not done.
 
+### 3.5.28 Two ceilings on the same address — **fixed**
+
+`pacman -Sy` panicked with `hv_vm_map failed`, and that message is all it said.
+The first fix was to make it say something: which IPA, which host address, which
+protection, and how far up the address space the request was. One run then
+answered it — the IPA was past `0x10_0000_0000`, which is 36 bits.
+
+Two separate things cap a guest-physical address, and they have to agree:
+
+- the size the VM is created with — `hv_vm_create(NULL)` takes the platform
+  default, **36 bits**, though the framework will give 40 for the asking;
+- `TCR_EL1.IPS`, which caps what stage 1 may *output* — hardcoded to **36**.
+
+They agreed by coincidence, so nothing had ever noticed. Raising only the VM's
+moved the failure rather than fixing it: `hv_vm_map` accepted an IPA above
+64GiB, stage 1 then refused to translate to it, and the guest took a level-3
+translation fault on a page whose descriptor read `valid af el0 rw`. A page
+table that describes a mapping the MMU will not perform is about as misleading
+as a fault gets. `TCR_EL1` is now built from what the VM actually has.
+
+That is 16× the room, and it is not a fix for why the room ran out. IPAs come
+from a bump allocator that only reclaims what a guest explicitly unmaps, so a
+process that churns mappings walks up the address space and never comes back
+down. pacman got through 63GiB of it. **Reclaiming freed IPA ranges is not
+done**, and with a terabyte to walk through it is no longer what stops pacman:
+what stops it now is time. Every `mmap` re-establishes stage 2 one 16KiB block
+at a time, so a large mapping costs thousands of hypervisor calls, and
+`pacman -Sy` was still synchronising after fifteen minutes with `do_mmap` on top
+of the stack. Batching contiguous blocks into one call is the next piece of
+work.
+
+### 3.5.29 `msl install arch` hung — **fixed**
+
+Not on anything NABI did. pacman crashed, and its crash handler asked *"Set the
+ulimit value to unlimited to generate the coredump? [Y/n]"* — on the terminal
+the installer inherited, and through a `tail` that showed nothing until the
+command finished. So it waited for an answer to a question nobody could see.
+
+Guest steps in the builder now read `/dev/null` and run under a time limit.
+Neither is about pacman: an installer that can block on an invisible prompt will
+do it again for a different reason, and a step that is merely slow is
+indistinguishable from a hung one to somebody watching. When the limit is hit
+the tree is still finished and handed over, with the one thing it lacks named
+and the command to retry it printed.
+
+### 3.5.30 `/boot` belongs to the guest — **changed**
+
+`/boot` was a host passthrough: when mSL/FHS provides one, the guest saw the
+host's. The reasoning was that FHS owns the real `/boot` and a rootfs cannot
+know what this machine boots. That answers a different question from the one a
+guest asks. A Linux distribution reading `/boot` wants its own kernel, its own
+`System.map`, its own `grub.cfg` — not the kernel collections macOS boots — and
+passing the host's through gave a wrong answer while making the right one
+unreachable:
+
+- Arch Linux ARM ships a kernel, an initramfs and a tree of device trees in its
+  tarball, and the guest could not see any of it.
+- `apt-get install linux-image-arm64` stopped at *"unable to create
+  /boot/System.map-…dpkg-new: Permission denied"*, because dpkg was writing into
+  the host's `/boot` as an ordinary account. A guest package manager installing
+  a Linux kernel into the Mac's boot directory would have been worse than the
+  failure.
+
+The guest keeps its own `/boot` now. `/proc` and `/sys` still pass through, and
+for a reason that does not apply here: their contents describe the live machine,
+which no rootfs can know. `/boot` holds files a distribution ships.
+
+### 3.5.31 `syncfs` was missing — **fixed**
+
+With `/boot` writable, the kernel package unpacked and then failed to
+*configure*: `sync: error syncing '/boot/initrd.img-…': Function not
+implemented`. `syncfs` was not implemented at all, `update-initramfs` syncs the
+initrd it just built, and the kernel postinst treats a failure there as fatal —
+so a 37MB kernel landed correctly and was left unconfigured over a flush.
+
+Darwin has no `syncfs`, and the nearest thing, `F_FULLFSYNC`, is a stronger
+promise about one file rather than a weaker one about a filesystem. `fsync` on
+the descriptor is the honest approximation; every caller that reaches here wants
+the bytes it just wrote to be durable, and they are.
+
+### 3.5.32 What goes in `/boot`
+
+The distro's own kernel package where its package manager works — only the apt
+family today — skipped when the image already shipped one, as Arch's does. And a
+`grub.cfg` naming whichever kernel is there.
+
+fakegrub is the tool that generates these, and this does not use it: it carries
+no licence at all, which means all rights reserved rather than public domain,
+and has not been touched since 2019. Neither vendoring it nor fetching it at
+install time is something to do to somebody else's machine. What it emits is a
+`menuentry` block, so the builder writes one directly and a `grub.cfg` from
+either is the same file.
+
+The entry describes a kernel that will never be executed — NABI *is* the kernel
+here. It is there to be read, by an initramfs hook globbing `/boot/vmlinuz-*`,
+by a postinst calling `update-grub`, by os-prober, and an empty `/boot` answers
+those wrongly rather than not at all.
+
 ---
 
 ## 4. Phased implementation

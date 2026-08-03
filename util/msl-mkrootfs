@@ -38,6 +38,7 @@ ARCH=arm64
 MIRROR=
 EXTRA=
 VARIANT=standard
+KERNEL=auto
 
 # Per-distro defaults, and which of the three shapes each one is.
 #
@@ -105,13 +106,17 @@ usage: ${0##*/} [options] <target-dir>
   -i <p,p,...>  extra packages to include
   -v <variant>  minbase (required only) or standard (adds Priority: important)
                 (default: $VARIANT)
+  -k <yes|no>   install the distro's kernel package into /boot, where the
+                package manager can (default: $KERNEL - yes for apt distros,
+                which is the only family whose package manager works yet)
 EOM
     exit 2
 }
 
-while getopts d:s:a:m:i:v:h opt; do
+while getopts d:s:a:m:i:v:k:h opt; do
     case $opt in
         d) DISTRO=$OPTARG ;;
+        k) KERNEL=$OPTARG ;;
         s) SUITE=$OPTARG ;;
         a) ARCH=$OPTARG ;;
         m) MIRROR=$OPTARG ;;
@@ -809,6 +814,44 @@ EOS
     rm -f "$ROOT/var/tmp/msl-adduser.sh"
 fi
 
+# Run something inside the guest with a time limit and no way to ask a question.
+#
+# Both halves are here because of the same bug report. pacman crashed during
+# `pacman -Sy`, and its crash handler asked "Set the ulimit value to unlimited
+# to generate the coredump? [Y/n]" - on the terminal this script inherited, and
+# through a `tail` that showed nothing until the command finished. So it waited
+# for an answer to a question the user could not see, and `msl install arch`
+# sat on "==> fetching package lists" indefinitely.
+#
+# Reading /dev/null turns any such prompt into an immediate default, and the
+# limit catches the rest: a step that is merely slow is still a step that never
+# ends, from the point of view of somebody watching an installer.
+#
+# No `timeout(1)`: it is GNU coreutils and macOS does not ship it. Backgrounding
+# and polling is portable to any POSIX shell.
+#
+# Children first, then the process itself. A guest that has forked is several
+# nabi processes, and killing only the one this script started leaves the rest
+# reparented to init with nothing to report to - so they are swept while their
+# parent is still there to name them.
+run_bounded() {
+    limit=$1; shift
+    "$@" < /dev/null > "$work/step.log" 2>&1 &
+    bpid=$!
+    waited=0
+    while kill -0 "$bpid" 2>/dev/null; do
+        if [ "$waited" -ge "$limit" ]; then
+            pkill -9 -P "$bpid" 2>/dev/null || true
+            kill -9 "$bpid" 2>/dev/null || true
+            wait "$bpid" 2>/dev/null || true
+            return 124
+        fi
+        sleep 2
+        waited=$((waited + 2))
+    done
+    wait "$bpid" 2>/dev/null || return $?
+}
+
 # ---------------------------------------------------------------------------
 # 5. Package lists
 # ---------------------------------------------------------------------------
@@ -826,10 +869,135 @@ case $FAMILY in
     oci) refresh='dnf -q makecache || dnf5 -q makecache' ;;
     tar) refresh='pacman -Sy --noconfirm' ;;
 esac
-env -i TERM="${TERM:-xterm}" HOME=/root PATH=/usr/sbin:/usr/bin:/sbin:/bin \
-    DEBIAN_FRONTEND=noninteractive MSL_ROOT=1 \
-    "$NABI" -m "$ROOT" /bin/bash -lc "$refresh" 2>&1 |
-    tail -3 | sed 's/^/    /' || true
+
+# A lock left behind by a killed run is refused rather than waited on - "unable
+# to lock database" from a tree that has never had a package manager finish in
+# it is a confusing thing to hit on a first install.
+rm -f "$ROOT/var/lib/pacman/db.lck" "$ROOT/var/lib/rpm/.rpm.lock" \
+      "$ROOT/var/lib/dpkg/lock" "$ROOT/var/lib/dpkg/lock-frontend" 2>/dev/null || true
+
+if run_bounded "${MSL_REFRESH_TIMEOUT:-600}" \
+        env -i TERM="${TERM:-xterm}" HOME=/root \
+        PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+        DEBIAN_FRONTEND=noninteractive MSL_ROOT=1 \
+        "$NABI" -m "$ROOT" /bin/bash -lc "$refresh"; then
+    tail -3 "$work/step.log" | sed 's/^/    /'
+else
+    rc=$?
+    tail -3 "$work/step.log" | sed 's/^/    /'
+    if [ "$rc" = 124 ]; then
+        echo "    (gave up after ${MSL_REFRESH_TIMEOUT:-600}s)"
+    fi
+    # Said plainly rather than left as a silence: the tree is complete and
+    # usable, and the one thing it has not got is an index. What that costs is
+    # `install`, so name the command that would retry it.
+    case $FAMILY in
+        apt) again='apt-get update' ;;
+        oci) again='dnf makecache' ;;
+        tar) again='pacman -Sy' ;;
+    esac
+    echo "    no package index - installing packages will not work yet."
+    echo "    run '$again' inside the guest to try again."
+fi
+
+# ---------------------------------------------------------------------------
+# 6. /boot
+# ---------------------------------------------------------------------------
+#
+# A rootfs built to run under NABI has no kernel of its own and never boots, so
+# /boot comes out empty. Nothing needs it to run, but a fair amount of software
+# reads it anyway - an initramfs hook globbing /boot/vmlinuz-*, a postinst
+# calling update-grub, anything asking os-prober what is installed - and an
+# empty /boot answers those questions wrongly rather than not at all.
+#
+# Two things go in. The distro's own kernel package, where its package manager
+# works, so the image and its System.map are the ones that distribution ships.
+# And a grub.cfg naming it.
+#
+# On the grub.cfg: fakegrub (github.com/MOZGIII/fakegrub) is the tool that does
+# this, and this does not use it. It carries no licence at all - which means all
+# rights reserved, not "public domain" - and has not been touched since 2019, so
+# neither vendoring it nor fetching it at install time is something to do to
+# somebody else's machine. What it generates is a menuentry block; that is
+# written directly below, in the same shape fakegrub produces, so a grub.cfg
+# from either is the same file.
+#
+# What this deliberately does not claim: the entry describes a kernel that will
+# never be executed. NABI *is* the kernel here. It is there to be read, not
+# booted, and anything that tries to boot it is not going to work regardless of
+# what /boot holds.
+
+echo "==> /boot"
+mkdir -p "$ROOT/boot/grub"
+
+# The distro's kernel package, when its package manager can install one. Only
+# the apt family qualifies today - dnf and pacman do not get far enough inside
+# NABI yet - and it is skipped when the image already shipped a kernel, which
+# the Arch Linux ARM tarball does.
+kernel_pkg=
+case $FAMILY in
+    apt) kernel_pkg=linux-image-$ARCH ;;
+esac
+
+have_kernel=$(ls "$ROOT"/boot/vmlinuz-* "$ROOT"/boot/Image "$ROOT"/boot/vmlinux-* \
+                 2>/dev/null | head -1)
+
+if [ "$KERNEL" != no ] && [ -z "$have_kernel" ] && [ -n "$kernel_pkg" ]; then
+    echo "    installing $kernel_pkg"
+    if run_bounded "${MSL_KERNEL_TIMEOUT:-900}" \
+            env -i TERM="${TERM:-xterm}" HOME=/root \
+            PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+            DEBIAN_FRONTEND=noninteractive MSL_ROOT=1 \
+            "$NABI" -m "$ROOT" /bin/bash -lc \
+            "apt-get install -y --no-install-recommends $kernel_pkg"; then
+        have_kernel=$(ls "$ROOT"/boot/vmlinuz-* 2>/dev/null | head -1)
+    else
+        tail -3 "$work/step.log" | sed 's/^/    /'
+        echo "    could not install $kernel_pkg - /boot gets a config only"
+    fi
+fi
+
+# What the menu entry names. A kernel that is actually there is named exactly;
+# with none, the conventional /vmlinuz and /initrd.img are used, which is what
+# a Debian system symlinks and what fakegrub itself defaults to.
+if [ -n "$have_kernel" ]; then
+    kimage=/boot/$(basename "$have_kernel")
+    krelease=$(basename "$have_kernel" | sed 's/^[^-]*-//')
+    initrd=/boot/initrd.img-$krelease
+    [ -e "$ROOT$initrd" ] || initrd=$(ls "$ROOT"/boot/initramfs-* 2>/dev/null | head -1)
+    if [ -n "$initrd" ]; then initrd=/boot/$(basename "$initrd"); else initrd=/initrd.img; fi
+else
+    kimage=/vmlinuz
+    initrd=/initrd.img
+fi
+
+# Named after the distro rather than "Linux", because the one thing a grub.cfg
+# is read for is to find out what is installed here.
+pretty=$(sed -n 's/^PRETTY_NAME="\{0,1\}\([^"]*\)"\{0,1\}$/\1/p' \
+             "$ROOT/etc/os-release" 2>/dev/null | head -1)
+[ -n "$pretty" ] || pretty="$DISTRO"
+
+cat > "$ROOT/boot/grub/grub.cfg" <<CFG
+# Generated by msl-mkrootfs. Do not expect this to boot anything.
+#
+# This root filesystem runs under mSL/NABI, which supplies the Linux system call
+# interface directly on macOS - there is no kernel here to load and no
+# bootloader to load it. The entry below is here so that software which reads
+# /boot/grub/grub.cfg to find out what is installed gets an answer.
+#
+# Same shape as fakegrub (github.com/MOZGIII/fakegrub) produces.
+
+menuentry '$pretty' {
+  linux $kimage root=/dev/sda1 ro quiet
+  initrd $initrd
+}
+CFG
+
+if [ -n "$have_kernel" ]; then
+    echo "    $kimage, and a grub.cfg naming it"
+else
+    echo "    grub.cfg only - no kernel package for this family yet"
+fi
 
 echo "==> done: $ROOT"
 # How many packages, asked the way this distro counts them. dpkg reads its own

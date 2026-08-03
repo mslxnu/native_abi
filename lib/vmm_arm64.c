@@ -108,8 +108,17 @@ vmm_arm64_map_stage2(gaddr_t ipa, size_t size, int prot, void *haddr)
   assert((size & (STAGE2_GRANULE - 1)) == 0);
 
   hv_vm_unmap(ipa, size);
-  if (hv_vm_map(haddr, ipa, size, prot) != HV_SUCCESS) {
-    panic("hv_vm_map failed\n");
+  hv_return_t err = hv_vm_map(haddr, ipa, size, prot);
+  if (err != HV_SUCCESS) {
+    /* "hv_vm_map failed" on its own says nothing about which of the four
+     * arguments the framework objected to, and the answer is usually the IPA:
+     * it is handed out by a bump allocator, so a guest that maps and unmaps for
+     * long enough walks off the end of the address space the VM was created
+     * with. Print what was asked for, and how far up the IPA space it was. */
+    panic("hv_vm_map failed: err %#x mapping ipa [%#llx, %#llx) "
+          "to host %p prot %d (ipa space is %d bits)\n",
+          err, (unsigned long long) ipa, (unsigned long long) (ipa + size),
+          haddr, prot, vmm_arm64_ipa_bits());
   }
   s2_record(ipa, size, prot, haddr);
 }
@@ -231,6 +240,59 @@ vmm_arm64_replay_stage2(void)
 
 /* ------------------------------------------------------- VM lifecycle */
 
+/*
+ * How many bits of guest-physical address the VM was created with.
+ *
+ * hv_vm_create(NULL) takes the platform default, which is 36 bits - 64GiB - and
+ * the framework will map as much as 40. NABI hands IPAs out with a bump
+ * allocator and only reclaims what a guest explicitly unmaps, so the address
+ * space is consumed faster than a real machine's would be and running out of it
+ * is a real failure rather than a theoretical one. Asking for the maximum costs
+ * nothing: an IPA range is not memory, only room to put memory in.
+ *
+ * Recorded because the panic that reports a failed mapping is much easier to
+ * read when it can say how close to the ceiling the request was.
+ */
+static uint32_t ipa_bits;
+
+uint32_t
+vmm_arm64_ipa_bits(void)
+{
+  return ipa_bits;
+}
+
+/*
+ * Create the VM with as much guest-physical space as this host allows, falling
+ * back to the default if the config API refuses - the fallback is what every
+ * build did before, so it can only be as bad as it already was.
+ */
+static hv_return_t
+create_vm_with_max_ipa(void)
+{
+  uint32_t max = 0;
+  hv_vm_config_t cfg = hv_vm_config_create();
+  hv_return_t ret = HV_ERROR;
+
+  if (cfg != NULL && hv_vm_config_get_max_ipa_size(&max) == HV_SUCCESS &&
+      hv_vm_config_set_ipa_size(cfg, max) == HV_SUCCESS) {
+    ret = hv_vm_create(cfg);
+    if (ret == HV_SUCCESS)
+      ipa_bits = max;
+  }
+  /* Released either way. arm64's fork is fork-plus-exec and each side rebuilds
+   * the VM, so a config held here would be leaked once per guest fork rather
+   * than once per run. */
+  if (cfg != NULL)
+    os_release(cfg);
+  if (ret == HV_SUCCESS)
+    return ret;
+
+  ipa_bits = 0;
+  if (hv_vm_config_get_default_ipa_size(&ipa_bits) != HV_SUCCESS)
+    ipa_bits = 36;
+  return hv_vm_create(NULL);
+}
+
 void
 vmm_create(void)
 {
@@ -241,7 +303,7 @@ vmm_create(void)
   nr_vcpus = 0;
   s2_map = kh_init(s2);
 
-  ret = hv_vm_create(NULL);
+  ret = create_vm_with_max_ipa();
   if (ret != HV_SUCCESS) {
     /* HV_DENIED here is almost always the entitlement, not a policy decision:
      * hv_vm_create needs com.apple.security.hypervisor and a valid signature
@@ -524,7 +586,7 @@ vmm_arm64_init_vcpu(void)
   vmm_arm64_write_sysreg(HV_SYS_REG_SCTLR_EL1, SCTLR_EL1_RES1);
   vmm_arm64_write_sysreg(HV_SYS_REG_CPACR_EL1, CPACR_EL1_FPEN_NOTRAP);
   vmm_arm64_write_sysreg(HV_SYS_REG_MAIR_EL1, MAIR_EL1_VALUE);
-  vmm_arm64_write_sysreg(HV_SYS_REG_TCR_EL1, TCR_EL1_VALUE);
+  vmm_arm64_write_sysreg(HV_SYS_REG_TCR_EL1, TCR_EL1_FOR(ipa_bits));
 }
 
 /*
@@ -627,7 +689,7 @@ vmm_reentry(struct vmm_snapshot *snapshot)
   hv_return_t ret;
   bool retried = false;
 retry:
-  ret = hv_vm_create(NULL);
+  ret = create_vm_with_max_ipa();
   if (ret != HV_SUCCESS) {
     /* HVF hands the just-destroyed VM's resources back asynchronously; a single
      * yield-and-retry is enough to let that settle, matching the x86 path. */
