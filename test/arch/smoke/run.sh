@@ -417,6 +417,17 @@ else
     fail=1
 fi
 
+# eventfdtest: eventfd's counter and pollability, the descriptor number it is
+# handed out as, and openat with an absolute path against a bogus dirfd.
+cp "$here/eventfdtest" "$root/"; chmod +x "$root/eventfdtest"
+out=$("$NABI" -m "$root" /eventfdtest); rc=$?
+if [ "$rc" -eq 0 ] && [ "$out" = "eventfd ok" ]; then
+    echo "  ok  eventfdtest -> \"$out\", exit 0"
+else
+    echo "  FAIL eventfdtest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 if [ "$fail" -eq 0 ]; then
     echo "smoke: PASS"
 else

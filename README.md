@@ -216,7 +216,7 @@ signature verification, and installs and runs a C toolchain.
 | Sibling modules (`/proc`, `/sys`) | **Detected**, optional; NABI runs without them |
 | Debian, Ubuntu | **Working** — resolved from the archive, apt works inside |
 | Arch | **Working** — from the published tarball; pacman installs, signatures and all |
-| Fedora | **Rootfs works**, from the published container image; dnf does not run yet |
+| Fedora | **Mostly working** — from the published container image; dnf installs, but glibc's rpm triggers fail |
 | x86-64 | **Builds, unverified** — see below |
 
 The x86-64 backend is the original Noah VT-x code. It compiles, and is kept as the

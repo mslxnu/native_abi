@@ -2007,6 +2007,75 @@ symlinks built to be read. Two details each cost a run:
 `pacman -S git` with the distribution's own `SigLevel` now resolves seven
 packages, verifies them and installs them in **6 seconds**.
 
+### 3.5.36 dnf's librepo assertion was self-inflicted — **fixed**
+
+```
+lr_download: Assertion `(dtarget->fd > 0 && !dtarget->fn) || (dtarget->fd < 0 && dtarget->fn)' failed
+```
+
+librepo insists a download target's descriptor is strictly positive, and it had
+been given **zero**. Tracing showed why: `eventfd2` was returning `register_fd`'s
+*status* rather than the descriptor, and register_fd returns 0 for success. So
+every eventfd this repository had just implemented came back as fd 0.
+
+Nothing complained at the time, which is the interesting part. A guest holding
+fd 0 and treating it as an eventfd writes to it, reads from it and polls it, and
+all three appear to work, because what it is really holding is stdin. The bug
+surfaced two layers away and in a different process: dnf closed the eventfd it
+had been given, thereby closing the guest's real stdin, and the next `open` took
+the free slot. librepo then asserted about a destination file that had
+legitimately been given descriptor zero.
+
+`dnf makecache` went from aborting to fetching 60MB of metadata in 8 seconds.
+The smoke test that guards it checks the *number* as much as the behaviour.
+
+### 3.5.37 An absolute path makes the dirfd irrelevant — **fixed**
+
+With the index built, rpm could not unpack:
+
+```
+failed to open dir usr of /usr/bin/: cpio: open failed - Bad file descriptor
+```
+
+about a directory that was plainly there. rpm opens the transaction root with
+`openat(-1, "/", ...)`, which on Linux succeeds: **when the path is absolute the
+directory descriptor is ignored, and not even checked for validity.** NABI
+validated it first and returned EBADF, so the descriptor rpm used for every
+component afterwards was -1 and the whole unpack cascaded from one refused call.
+
+`dnf install` now unpacks and configures. `dnf -y install tree` exits 0 and the
+package runs.
+
+### 3.5.38 What still fails on Fedora
+
+Two things, and both predate this work - checked against the previous commit
+rather than assumed.
+
+**ldconfig segfaults when it is a forked child.** Run top-level it completes and
+writes the cache; run as `bash -c ldconfig` it dies on SIGSEGV every time. That
+fails glibc-common's `%transfiletriggerin`, whose lua calls `rpm.spawn
+{"ldconfig"}`, gets nil, and hits `assert(nil)` on line 20 - so any transaction
+touching glibc's file triggers is reported as failed even though the packages
+unpacked. Ordinary installs are unaffected.
+
+The faulting address is `0x6e756f46206572a7`, which is ASCII text rather than an
+address - a pointer overwritten with string data. So this is memory corruption
+in the resumed child, not a missing mapping, and the child had `execve`d after
+being resumed. That is the narrowest description available and it is where the
+next investigation starts.
+
+Two things made it findable and are worth keeping in mind: the fault took the
+`addr_ok` branch, which reports through **printk** rather than stderr, so with
+no `-p` sink it is completely silent; and a resumed child writes its sinks to
+`<path>.<pid>`, which is what the environment variables are for.
+
+**A setuid binary cannot be executed.** Fedora's sudo is mode `---s--x--x`, and
+NABI has to *read* an ELF to load it while the host account has no read
+permission - so `sudo` installs correctly and then cannot run. This is §3.5.27
+again, arriving at runtime rather than at build time, and the answer is the same
+one that is still not done: record the guest's mode beside its owner so the host
+mode can stay permissive.
+
 ---
 
 ## 4. Phased implementation

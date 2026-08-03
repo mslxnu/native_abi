@@ -424,11 +424,21 @@ DEFINE_SYSCALL(eventfd2, unsigned int, initval, int, flags)
   if ((flags & LINUX_O_CLOEXEC) && fcntl(sv[0], F_SETFD, FD_CLOEXEC) < 0)
     goto fail;
 
+  /* register_fd reports success or -errno; the descriptor the guest gets is the
+   * host one it was handed, because nabi does not renumber. Returning what
+   * register_fd returned instead handed every eventfd out as fd 0 - so dnf
+   * created one, was told 0, later closed it, and thereby closed the guest's
+   * real stdin. The next open took the free slot, librepo asserted
+   * `dtarget->fd > 0` on a destination file that had legitimately been given
+   * descriptor zero, and aborted. */
   pthread_rwlock_wrlock(&proc.fileinfo.fdtable_lock);
-  int guest_fd = register_fd(sv[0], (flags & LINUX_O_CLOEXEC) != 0);
+  int err = register_fd(sv[0], (flags & LINUX_O_CLOEXEC) != 0);
   pthread_rwlock_unlock(&proc.fileinfo.fdtable_lock);
-  if (guest_fd < 0)
-    goto fail;
+  if (err < 0) {
+    close(sv[0]);
+    close(sv[1]);
+    return err;
+  }
 
   if (eventfds == NULL)
     eventfds = kh_init(evfd);
@@ -442,7 +452,7 @@ DEFINE_SYSCALL(eventfd2, unsigned int, initval, int, flags)
   if (initval > 0)
     eventfd_poke(&kh_value(eventfds, k));
 
-  return guest_fd;
+  return sv[0];
 
 fail:;
   int e = errno;
@@ -2308,7 +2318,19 @@ vfs_grab_dir(int dirfd, const char *name, int flags, struct path *path)
     return -LINUX_ENOENT;
   }
 
-  if (dirfd == LINUX_AT_FDCWD) {
+  /*
+   * An absolute path makes the directory descriptor irrelevant, and Linux does
+   * not look at it at all - not even to check that it is open. Checking it here
+   * first is what made `openat(-1, "/", ...)` EBADF, and rpm opens the root
+   * exactly that way before unpacking anything: the descriptor it then used for
+   * every component came back -1, so `dnf install` reported "failed to open dir
+   * usr of /usr/bin/: cpio: open failed - Bad file descriptor" about a
+   * directory that was there all along.
+   *
+   * resolve_path replaces the directory with the rootfs for an absolute name
+   * regardless, so nothing downstream depends on what is put here.
+   */
+  if (dirfd == LINUX_AT_FDCWD || *name == '/') {
     dir.fd = AT_FDCWD;
   } else {
     dir.fd = dirfd;
