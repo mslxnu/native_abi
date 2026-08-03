@@ -1114,6 +1114,10 @@ darwinfs_fsync(struct file *file)
  * the ordinary path costs one failed lookup and no storage.
  * ------------------------------------------------------------------------ */
 
+/* Defined with the passthrough table further down; needed here to tell a host
+ * object, which cannot carry an attribute, from one in the rootfs, which can. */
+static bool is_host_passthrough(const char *name);
+
 #define GUEST_OWNER_XATTR "msl.nabi.owner"
 
 struct guest_owner {
@@ -1217,7 +1221,32 @@ guest_owner_record(int dirfd, const char *path, bool nofollow,
     removexattr(abs, GUEST_OWNER_XATTR, nofollow ? XATTR_NOFOLLOW : 0);
     return 0;
   }
-  return syswrap(guest_owner_write(abs, nofollow, &o));
+  if (guest_owner_write(abs, nofollow, &o) == 0)
+    return 0;
+
+  /*
+   * Nowhere to record it, on something that was never ours to record.
+   *
+   * A passthrough path is a host object - devfs, procfs, the host's /tmp - and
+   * carries no extended attributes at all: setxattr on a pty slave is EPERM,
+   * and so is chown, because nabi is not root on the host and devfs would not
+   * store either if it were. Reporting that back says "you may not do this" to
+   * a guest that on Linux plainly may.
+   *
+   * grantpt() is the case that matters. It chowns the slave to the caller and
+   * to group tty, which on Linux devpts the kernel has already done and which
+   * nothing afterwards reads. sudo takes the failure as fatal, so `sudo id`
+   * from a terminal answered "unable to allocate pty: Operation not permitted"
+   * - about a pty it had successfully opened a line earlier.
+   *
+   * So a passthrough is told yes. Inside the rootfs a failure here is real and
+   * is still returned: that is where ownership means something.
+   */
+  if (abs[0] == '/' && is_host_passthrough(abs) &&
+      (errno == EPERM || errno == ENOTSUP))
+    return 0;
+
+  return -darwin_to_linux_errno(errno);
 }
 
 /* ---------------------------------------------------------------------------

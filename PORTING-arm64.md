@@ -2274,6 +2274,83 @@ Worth keeping: the failing ioctl is logged with its number in decimal, and
 decoding it - direction, size, type, sequence - is what named it. An unhandled
 ioctl reports EPERM, which reads as a permission problem rather than a gap.
 
+### 3.5.44 `sudo` could not allocate a pty it had already opened — **fixed**
+
+```
+sudo: unable to allocate pty: Operation not permitted
+```
+
+The trace shows it getting all the way there and failing on the last step:
+
+```
+openat("/dev/ptmx", O_RDWR)          -> 16
+ioctl(16, TIOCGPTN)                  -> 0
+ioctl(16, TIOCSPTLCK)                -> 0
+ioctl(16, 0x5441 = TIOCGPTPEER)      -> EPERM     (glibc falls back)
+openat("/dev/pts/2", O_RDWR|O_NOCTTY) -> 17       (the fallback works)
+fchownat("/dev/pts/2", 0, 5)         -> EPERM     <- fatal
+```
+
+The fatal one is `grantpt()`, chowning the slave to the caller and to group
+`tty`. `/dev` is a host passthrough, so the guest's chown becomes an attempt to
+record ownership in an extended attribute on **devfs**, which carries none:
+measured on the host, both `setxattr` and `chown` on a pty slave are EPERM, and
+would be even for root. Reporting that back says "you may not do this" to a
+guest that on Linux plainly may - and on Linux devpts, `grantpt` is a no-op the
+kernel has already performed.
+
+So a chown that cannot be recorded *on a passthrough* now succeeds. Those are
+host objects whose ownership was never ours to state; inside the rootfs a
+failure here is real and is still returned, because that is where the attribute
+means something.
+
+`TIOCGPTPEER` remains unimplemented. glibc falls back to `TIOCGPTN` plus an open
+of `/dev/pts/<n>`, which works, so it costs one refused ioctl and nothing else.
+Implementing it would mean an ioctl that returns a *descriptor*, which the ioctl
+path is not built to register - worth doing, not worth doing here.
+
+### 3.5.45 `/proc` is unreadable to an unprivileged guest — **not NABI's**
+
+`cat /proc/version` as an ordinary guest user is "Permission denied", and as
+root it is fine. That is correct enforcement of what the host presents:
+
+```
+-r-xr-x--- 1 sunneva staff 0 /proc/version
+```
+
+Everything mSL/ProcFS exposes is mode **0550** owned by the account that mounted
+it - 417 directories and 40 files, not one of them readable by `other`. NABI
+maps that owner to guest root, which is right, and then an unprivileged guest
+has no bits at all.
+
+Linux presents `/proc/version`, `/proc/cmdline`, `/proc/uptime` and their
+neighbours as `-r--r--r--`, and `/proc/<pid>` as `dr-xr-xr-x`. A macOS
+filesystem defaulting to 0550 is reasonable on its own terms; it is only wrong
+once a Linux guest with its own uids is reading it.
+
+**It needs no code anywhere.** mSL/ProcFS already has the switch
+(`kext/procfs_vnops.c:1152`):
+
+```c
+mode_t modemask = (pmp->pmnt_flags & PROCFS_MOPT_NOPROCPERMS)
+                  ? RWX_OWNER_RX_ALL : ALL_ACCESS_OWNER_GROUP_ONLY;
+```
+
+with `READ_EXECUTE_ALL` 0555, `ALL_ACCESS_OWNER_GROUP_ONLY` 0770 and
+`RWX_OWNER_RX_ALL` 0755 - so the default masks to **0550** and `noprocperms`
+masks to **0555**, which is what Linux gives `/proc/<pid>`. Mounting with
+
+    mount -t procfs -o noprocperms procfs /proc
+
+is the whole fix. What it costs is stated plainly in that repository's README:
+it lets every account on the *Mac* see every process, not just its own. Under
+NABI that is what Linux does anyway - `hidepid=0` is the default there - but the
+tradeoff is a macOS one and is the reason it is not the default.
+
+NABI is left alone. Enforcing the modes it is given is the correct behaviour,
+and having one module quietly override another's metadata would make the next
+disagreement of this kind much harder to see.
+
 ---
 
 ## 4. Phased implementation
