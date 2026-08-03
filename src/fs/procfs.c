@@ -32,6 +32,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/syslimits.h>
+#include <dirent.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "common.h"
@@ -152,7 +154,7 @@ build_maps(size_t *len_out)
  * is another guest, its state lives in a different nabi.
  */
 enum procfs_file { PROCFS_NONE, PROCFS_MAPS, PROCFS_CMDLINE, PROCFS_COMM,
-                   PROCFS_EXE, PROCFS_FD };
+                   PROCFS_EXE, PROCFS_FD, PROCFS_MOUNTS, PROCFS_FDDIR };
 
 /* For PROCFS_FD, the number after /fd/. Meaningless for the others. */
 static enum procfs_file
@@ -161,6 +163,12 @@ own_procfs_file_n(const char *path, int *fd_out)
   if (strncmp(path, "/proc/", 6) != 0)
     return PROCFS_NONE;
   const char *rest = path + 6;
+
+  /* /proc/mounts, with no pid component. The usual spelling of it - /etc/mtab
+   * is a symlink to /proc/self/mounts on every distribution now, but plenty of
+   * software still opens the short name directly. */
+  if (strcmp(rest, "mounts") == 0)
+    return PROCFS_MOUNTS;
 
   const char *slash = strchr(rest, '/');
   if (!slash)
@@ -177,6 +185,7 @@ own_procfs_file_n(const char *path, int *fd_out)
   if (!mine)
     return PROCFS_NONE;
 
+  if (strcmp(slash, "/mounts") == 0)  return PROCFS_MOUNTS;
   if (strcmp(slash, "/maps") == 0)    return PROCFS_MAPS;
   if (strcmp(slash, "/cmdline") == 0) return PROCFS_CMDLINE;
   if (strcmp(slash, "/comm") == 0)    return PROCFS_COMM;
@@ -189,6 +198,17 @@ own_procfs_file_n(const char *path, int *fd_out)
    * fsync_directory_of_file, which finds a file's directory by reading
    * /proc/self/fd/<n>, reported "Failed to flush /etc/.#group...: Invalid
    * argument" and stopped systemd, udev and cron from configuring. */
+  /* The directory itself, which is what anything closing its inherited
+   * descriptors reads. Handled before the /fd/<n> form below, which needs a
+   * number and would decline this.
+   *
+   * A trailing slash is the same directory. Spelling it "/proc/self/fd/" is
+   * what libassuan does, and missing that sent the open to the host's /proc -
+   * where it found nabi's descriptors and never finished reading them. */
+  if (strcmp(slash, "/fd") == 0 || strcmp(slash, "/fd/") == 0 ||
+      strcmp(slash, "/fd/.") == 0)
+    return PROCFS_FDDIR;
+
   if (strncmp(slash, "/fd/", 4) == 0) {
     const char *p = slash + 4;
     if (*p < '0' || *p > '9')
@@ -208,6 +228,46 @@ own_procfs_file_n(const char *path, int *fd_out)
   return PROCFS_NONE;
 }
 
+
+/*
+ * The guest's mount table, in Linux's /proc/mounts format.
+ *
+ * There is no mount table to report. The guest's filesystem is one host
+ * directory that nabi resolves paths against, and the host's own mounts are
+ * neither what the guest sees nor expressible in this format. What software
+ * reads this file for, though, is rarely the mounts themselves: it is which
+ * filesystem a path belongs to, so it can ask how much room is left.
+ *
+ * pacman does exactly that, and until this existed it stopped before unpacking
+ * anything with "could not open file: /etc/mtab: No such file or directory"
+ * followed by "could not determine filesystem mount points" - /etc/mtab being a
+ * symlink to /proc/self/mounts, which nabi did not serve. A single root entry
+ * answers the question truthfully: everything the guest can reach really is on
+ * one filesystem as far as it can tell.
+ *
+ * The passthrough prefixes are listed too, because those genuinely are a
+ * different filesystem from the guest's point of view - a write to /dev or /tmp
+ * lands somewhere the rootfs does not - and something sizing a download into
+ * /tmp should not be told it shares the root's free space.
+ */
+static char *
+build_mounts(size_t *len_out)
+{
+  static const char text[] =
+    "rootfs / rootfs rw 0 0\n"
+    "devtmpfs /dev devtmpfs rw,nosuid 0 0\n"
+    "tmpfs /tmp tmpfs rw,nosuid,nodev 0 0\n"
+    "proc /proc proc rw,nosuid,nodev,noexec,relatime 0 0\n"
+    "sysfs /sys sysfs rw,nosuid,nodev,noexec,relatime 0 0\n";
+
+  size_t len = sizeof text - 1;
+  char *out = malloc(len);
+  if (!out)
+    return NULL;
+  memcpy(out, text, len);
+  *len_out = len;
+  return out;
+}
 
 /* comm is the executable's basename and a newline - Linux truncates it to 15
  * characters, and something reading it to compare against a process name will
@@ -236,6 +296,115 @@ build_comm(size_t *len_out)
  * the caller falls back to the host's own answer, which is wrong in the way
  * described at the top of this file but no worse than it was.
  */
+/*
+ * Staging directories handed out for /proc/self/fd, by the descriptor that
+ * names one. Small and short-lived: a program reads its own fd list once,
+ * closes it, and the directory goes with it.
+ */
+KHASH_MAP_INIT_INT(fddir, char *)
+static khash_t(fddir) *fddir_tmp;
+
+/* Remove a directory of symlinks and the directory itself. */
+static void
+procfs_rmtree(const char *dir)
+{
+  DIR *d = opendir(dir);
+  if (d != NULL) {
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+      if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0)
+        continue;
+      char p[PATH_MAX];
+      snprintf(p, sizeof p, "%s/%s", dir, e->d_name);
+      unlink(p);
+    }
+    closedir(d);
+  }
+  rmdir(dir);
+}
+
+/*
+ * Fill a staging directory with one symlink per open guest descriptor,
+ * replacing whatever was there.
+ *
+ * Rebuilt rather than written once because /proc/self/fd is *live*: a program
+ * closing its inherited descriptors reads the directory, closes what it found,
+ * and reads again to see what is left. Against a snapshot that never changes,
+ * that second read returns the same list as the first and the program never
+ * finishes - which is exactly where `pacman -S` stopped, rewinding one
+ * descriptor forever while libassuan waited for the list to shrink.
+ */
+static void
+procfs_fill_fddir(const char *dir)
+{
+  DIR *d = opendir(dir);
+  if (d != NULL) {
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+      if (e->d_name[0] == '.')
+        continue;
+      char p[PATH_MAX];
+      snprintf(p, sizeof p, "%s/%s", dir, e->d_name);
+      unlink(p);
+    }
+    closedir(d);
+  }
+
+  int nfds = fdtable_open_fds(NULL, 0);
+  int *fds = nfds > 0 ? malloc((size_t) nfds * sizeof *fds) : NULL;
+  if (fds == NULL)
+    return;
+  nfds = fdtable_open_fds(fds, nfds);
+
+  for (int i = 0; i < nfds; i++) {
+    char name[PATH_MAX], target[64];
+    snprintf(name, sizeof name, "%s/%d", dir, fds[i]);
+    snprintf(target, sizeof target, "/proc/self/fd/%d", fds[i]);
+    (void) symlink(target, name);
+  }
+  free(fds);
+}
+
+/* Refresh the listing behind a descriptor, if it is one of ours. Returns
+ * whether it was. */
+bool
+procfs_refresh_fddir(int fd)
+{
+  if (fddir_tmp == NULL)
+    return false;
+  khiter_t k = kh_get(fddir, fddir_tmp, fd);
+  if (k == kh_end(fddir_tmp))
+    return false;
+  procfs_fill_fddir(kh_value(fddir_tmp, k));
+  return true;
+}
+
+static void
+procfs_remember_tmpdir(int fd, const char *dir)
+{
+  int ret;
+  if (fddir_tmp == NULL)
+    fddir_tmp = kh_init(fddir);
+  khiter_t k = kh_put(fddir, fddir_tmp, fd, &ret);
+  kh_value(fddir_tmp, k) = strdup(dir);
+}
+
+/* Called when a descriptor is closed; a no-op for anything that is not one of
+ * these. */
+void
+procfs_close_fd(int fd)
+{
+  if (fddir_tmp == NULL)
+    return;
+  khiter_t k = kh_get(fddir, fddir_tmp, fd);
+  if (k == kh_end(fddir_tmp))
+    return;
+  char *dir = kh_value(fddir_tmp, k);
+  procfs_rmtree(dir);
+  free(dir);
+  kh_del(fddir, fddir_tmp, k);
+}
+
 int
 procfs_open(const char *path, int *out_fd)
 {
@@ -244,6 +413,49 @@ procfs_open(const char *path, int *out_fd)
   int fdno = -1;
 
   switch (own_procfs_file_n(path, &fdno)) {
+  case PROCFS_FDDIR: {
+    /*
+     * /proc/self/fd as a directory, which is how a program finds out what it
+     * has open so it can close the rest. libassuan does it before starting
+     * gpg-agent, and pacman's "checking keyring" step is where that happens.
+     *
+     * The host cannot answer this, for the same reason it cannot answer
+     * /proc/self/fd/<n> below and rather more sharply. Its /proc/<pid>/fd lists
+     * *nabi's* descriptors - the arena, the checkpoint files, the rootfs handle
+     * - which are not the guest's and whose numbers mean nothing to it. Worse,
+     * the set changes while it is being read, because serving the read itself
+     * opens descriptors: the guest never saw a stable listing and never
+     * finished, which is what left `pacman -S` spinning in getdents64 forever
+     * on a machine where mSL/ProcFS is mounted and /proc is passed through.
+     *
+     * A directory of symlinks is built to answer with, because that is what the
+     * caller is about to readdir. The names are what matter and the names are
+     * exact - one per open guest descriptor. The targets are the guest's own
+     * /proc/self/fd/<n>, which resolves properly through the case below.
+     */
+    char dirtpl[PATH_MAX];
+    const char *tmpd = getenv("TMPDIR");
+    snprintf(dirtpl, sizeof dirtpl, "%s/nabi-fddir-XXXXXX",
+             tmpd && *tmpd ? tmpd : "/tmp");
+    if (mkdtemp(dirtpl) == NULL)
+      return -1;
+
+    procfs_fill_fddir(dirtpl);
+
+    int dfd = open(dirtpl, O_RDONLY | O_DIRECTORY);
+    if (dfd < 0) {
+      procfs_rmtree(dirtpl);
+      return -1;
+    }
+    /* Unlike the temp *files* below, this cannot be unlinked the moment it is
+     * open: removing a directory removes what readdir would have found in it.
+     * So it is remembered against the descriptor and swept when the guest
+     * closes that - and if the guest never does, the process exiting takes the
+     * whole of TMPDIR's business with it either way. */
+    procfs_remember_tmpdir(dfd, dirtpl);
+    *out_fd = dfd;
+    return 0;
+  }
   case PROCFS_FD: {
     /*
      * Opening /proc/self/fd/<n> reaches the *file*, not the name - which is
@@ -297,6 +509,9 @@ procfs_open(const char *path, int *out_fd)
     break;
   case PROCFS_COMM:
     content = build_comm(&len);
+    break;
+  case PROCFS_MOUNTS:
+    content = build_mounts(&len);
     break;
   default:
     return -1;      /* not ours; the caller does the ordinary lookup */

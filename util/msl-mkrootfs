@@ -834,7 +834,13 @@ fi
 # nabi processes, and killing only the one this script started leaves the rest
 # reparented to init with nothing to report to - so they are swept while their
 # parent is still there to name them.
-run_bounded() {
+# The work, with the caller's stderr detached. A guest that dies on a signal -
+# dnf aborts on a failed assertion - is announced by the shell's job monitor as
+# a bare "Abort trap: 6" naming a line in this script, in the middle of an
+# install, as though the installer itself had crashed. It cannot be turned off
+# portably, so the shell that would print it is the one whose stderr goes away;
+# what the step actually said is in the log and is printed by the caller.
+run_bounded_inner() {
     limit=$1; shift
     "$@" < /dev/null > "$work/step.log" 2>&1 &
     bpid=$!
@@ -849,7 +855,11 @@ run_bounded() {
         sleep 2
         waited=$((waited + 2))
     done
-    wait "$bpid" 2>/dev/null || return $?
+    { wait "$bpid"; } 2>/dev/null || return $?
+}
+
+run_bounded() {
+    run_bounded_inner "$@" 2>/dev/null
 }
 
 # ---------------------------------------------------------------------------
@@ -863,6 +873,29 @@ run_bounded() {
 #
 # Best-effort: a machine that is offline, or behind a proxy this does not know
 # about, should still get a rootfs. `apt update` is one command away.
+# pacman verifies every package against a keyring, and the image ships the keys
+# without the GnuPG database built from them - `pacman-key --init` is a step the
+# Arch installer runs and a tarball cannot. Without it every install stops at
+# "checking keyring", so it is done here rather than left as a first surprise.
+#
+# --populate names the keyring this distribution actually ships; on Arch Linux
+# ARM that is archlinuxarm rather than archlinux, and asking for the wrong one
+# imports nothing.
+if [ "$FAMILY" = tar ]; then
+    echo "==> building the package keyring"
+    if run_bounded "${MSL_KEYRING_TIMEOUT:-600}" \
+            env -i TERM="${TERM:-xterm}" HOME=/root \
+            PATH=/usr/sbin:/usr/bin:/sbin:/bin MSL_ROOT=1 \
+            "$NABI" -m "$ROOT" /bin/bash -lc \
+            'pacman-key --init && pacman-key --populate archlinuxarm'; then
+        echo "    ok"
+    else
+        tail -2 "$work/step.log" | sed 's/^/    /'
+        echo "    no keyring - pacman will refuse to install until"
+        echo "    'pacman-key --init && pacman-key --populate archlinuxarm' succeeds"
+    fi
+fi
+
 echo "==> fetching package lists"
 case $FAMILY in
     apt) refresh='apt-get update' ;;

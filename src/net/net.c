@@ -61,7 +61,20 @@ linux_to_darwin_sockaddr(struct sockaddr **sockaddr, const struct l_sockaddr *l_
     return -1;
   }
 
-  *sockaddr = malloc(l_sockaddr_len);
+  /* Enough for what comes out, not for what went in. A guest sends exactly as
+   * many bytes as its path needs, but an AF_UNIX path is rewritten below into
+   * one inside the rootfs, which is longer - so the allocation has to be the
+   * full sockaddr_un rather than the guest's length, or the translation writes
+   * off the end of it. It did: the overflow corrupted the malloc heap, and the
+   * failure surfaced as connect() spinning at 100% CPU inside free(). */
+  size_t alloc_len = l_sockaddr_len;
+  if (linux_to_darwin_sa_family(l_sockaddr->sa_family) == AF_UNIX &&
+      alloc_len < sizeof(struct sockaddr_un))
+    alloc_len = sizeof(struct sockaddr_un);
+
+  *sockaddr = calloc(1, alloc_len);
+  if (*sockaddr == NULL)
+    return -1;
 
   memcpy(*sockaddr, l_sockaddr, l_sockaddr_len);
   assert(offsetof(struct sockaddr, sa_data) == offsetof(struct l_sockaddr, sa_data));
@@ -78,13 +91,32 @@ linux_to_darwin_sockaddr(struct sockaddr **sockaddr, const struct l_sockaddr *l_
       printk("Abstract namespace: %20s\n", &sockaddr_un->sun_path[1]);
       slen = strnlen(&sockaddr_un->sun_path[1], l_sockaddr_len - offsetof(struct sockaddr_un, sun_path) - 1);
     } else {
-      slen = strnlen(sockaddr_un->sun_path, l_sockaddr_len - offsetof(struct sockaddr_un, sun_path));
+      /* A filesystem socket names a path, and a guest path means nothing to the
+       * host: /etc/pacman.d/gnupg/S.gpg-agent is inside the rootfs, not at the
+       * host's /etc. Untranslated, gpg-agent's bind came back ENOENT and gpg
+       * never got an agent to talk to, so pacman could not verify a signature
+       * and stopped dead with the keyring half-built. */
+      char host_path[sizeof sockaddr_un->sun_path];
+      if (guest_to_host_path(sockaddr_un->sun_path, host_path,
+                             sizeof host_path) == 0) {
+        /* strlcpy, so a path that does not fit is refused rather than
+         * truncated into one that names something else. */
+        if (strlcpy(sockaddr_un->sun_path, host_path,
+                    sizeof sockaddr_un->sun_path) >=
+            sizeof sockaddr_un->sun_path)
+          goto err;
+      }
+      slen = strnlen(sockaddr_un->sun_path, sizeof sockaddr_un->sun_path);
     }
-    (*sockaddr)->sa_len = sizeof(struct sockaddr_un);
-    if ((*sockaddr)->sa_len < offsetof(struct sockaddr_un, sun_path) + slen) {
+    if (offsetof(struct sockaddr_un, sun_path) + slen >
+        sizeof(struct sockaddr_un)) {
       // Name too long
       goto err;
     }
+    /* The length the kernel is given must cover the path this call will
+     * actually use, which after translation is not the one the guest sent. */
+    (*sockaddr)->sa_len =
+        (unsigned char) (offsetof(struct sockaddr_un, sun_path) + slen + 1);
     break;
   }
 
@@ -618,7 +650,7 @@ DEFINE_SYSCALL(bind, int, sockfd, gaddr_t, addr_ptr, int, addrlen)
   if (linux_to_darwin_sockaddr(&sockaddr, (struct l_sockaddr *) addr, addrlen) < 0) {
     return -LINUX_EINVAL;
   }
-  int ret = syswrap(bind(sockfd, sockaddr, addrlen));
+  int ret = syswrap(bind(sockfd, sockaddr, sockaddr->sa_len));
 
   free(sockaddr);
   free(addr);

@@ -48,6 +48,7 @@
 #include "arm64/vm.h"
 #include "linux/mman.h"
 #include "checkpoint.h"
+#include "util/khash.h"
 
 /*
  * A 16KiB stage-2 chunk: one host allocation, one hv_vm_map, four 4KiB guest
@@ -81,9 +82,19 @@ static struct s2_chunk cur_chunk;
  * (a descriptor holds an IPA; writing the next level needs the host address),
  * so keep it here.
  *
- * A flat array is deliberate. Lookups happen only while building tables, never
- * on a fault path, and the count is small; a tree would be more code for no
- * measurable gain.
+ * A flat array plus a hash index on the chunk's base IPA.
+ *
+ * The array was once the whole thing, on the reasoning that lookups happen only
+ * while building tables, never on a fault path, and the count is small. Two of
+ * those three stopped being true. Building tables *is* a hot path - every 4KiB
+ * page of a mapping walks to its level-3 descriptor, and each walk calls
+ * ipa_to_host twice - and the count is now whatever the guest needs rather than
+ * a fixed 4096, so the scan got longer exactly as the guest allocated more.
+ *
+ * That made every mmap cost O(pages x chunks). Profiling `pacman -Sy` put 387
+ * of the 436 samples in the page-mapping loop on the two ipa_to_host calls
+ * inside walk_to_l3, which is very nearly all of it. The array stays because
+ * snapshot and restore want a stable order to walk; the hash answers lookups.
  */
 /*
  * Grown rather than capped, for the same reason the arena's span table is: a
@@ -100,9 +111,31 @@ static struct s2_chunk *chunks;
 static size_t nr_chunks;
 static size_t chunks_cap;
 
+/* Base IPA of a chunk -> where this process sees it. */
+KHASH_MAP_INIT_INT64(chunk, void *)
+static khash_t(chunk) *chunk_index;
+
+static void
+chunk_index_put(gaddr_t ipa, void *hva)
+{
+  int ret;
+  if (chunk_index == NULL)
+    chunk_index = kh_init(chunk);
+  khiter_t k = kh_put(chunk, chunk_index, ipa, &ret);
+  kh_value(chunk_index, k) = hva;
+}
+
+static void
+chunk_index_clear(void)
+{
+  if (chunk_index != NULL)
+    kh_clear(chunk, chunk_index);
+}
+
 static void
 chunk_record(struct s2_chunk c)
 {
+  chunk_index_put(c.ipa, c.hva);
   if (nr_chunks == chunks_cap) {
     size_t want = chunks_cap ? chunks_cap * 2 : INIT_CHUNKS;
     struct s2_chunk *bigger = realloc(chunks, want * sizeof *bigger);
@@ -117,9 +150,11 @@ chunk_record(struct s2_chunk c)
 static void *
 ipa_to_host(gaddr_t ipa)
 {
-  for (size_t i = 0; i < nr_chunks; i++) {
-    if (ipa >= chunks[i].ipa && ipa < chunks[i].ipa + STAGE2_GRANULE)
-      return (char *) chunks[i].hva + (ipa - chunks[i].ipa);
+  gaddr_t base = ipa & ~(gaddr_t)(STAGE2_GRANULE - 1);
+  if (chunk_index != NULL) {
+    khiter_t k = kh_get(chunk, chunk_index, base);
+    if (k != kh_end(chunk_index))
+      return (char *) kh_value(chunk_index, k) + (ipa - base);
   }
   panic("no stage-2 chunk backs IPA 0x%llx", (unsigned long long) ipa);
   return NULL;
@@ -331,6 +366,7 @@ pt_init(void)
 {
   ipa_brk = IPA_BASE;
   nr_chunks = 0;
+  chunk_index_clear();
   memset(&cur_chunk, 0, sizeof cur_chunk);
 
   l1_table = alloc_table();
@@ -586,6 +622,7 @@ pt_restore(uint64_t saved_ipa_brk, uint64_t l1_ipa,
            const struct checkpoint_pt_chunk *saved, size_t n)
 {
   nr_chunks = 0;
+  chunk_index_clear();
   memset(&cur_chunk, 0, sizeof cur_chunk);
 
   for (size_t i = 0; i < n; i++) {

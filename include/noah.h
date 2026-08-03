@@ -218,6 +218,10 @@ const l_gid_t *guest_groups_ptr(void);
 void guest_groups_set(const l_gid_t *g, int n);
 void elevate_privilege(uid_t owner_uid, gid_t owner_gid, mode_t mode);
 int procfs_open(const char *path, int *out_fd);
+void procfs_close_fd(int fd);
+bool procfs_refresh_fddir(int fd);
+int fdtable_open_fds(int *out, int max);
+int guest_to_host_path(const char *name, char *out, size_t outsz);
 int procfs_readlink(const char *path, char *buf, size_t bufsize);
 void proc_set_ident(const char *exe, int argc, char *argv[]);
 

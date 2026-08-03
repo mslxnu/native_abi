@@ -1899,6 +1899,114 @@ here. It is there to be read, by an initramfs hook globbing `/boot/vmlinuz-*`,
 by a postinst calling `update-grub`, by os-prober, and an empty `/boot` answers
 those wrongly rather than not at all.
 
+### 3.5.33 pacman was never slow — **fixed**
+
+§3.5.28 recorded that what stopped `pacman -Sy` was time: mappings being
+re-established one block at a time, `do_mmap` on top of the stack after fifteen
+minutes. That was wrong, and the way it was wrong is worth keeping.
+
+Stage 2 was already batched. `vmm_arm64_map_stage2` takes a whole region and
+makes one `hv_vm_map` call for it; the profile that looked like slow mapping was
+read at too shallow a depth. Sampling properly put **387 of the 436 samples** in
+the page-mapping loop on two lines - the `ipa_to_host` calls inside
+`walk_to_l3`, which was a linear scan over every stage-2 chunk ever allocated,
+run twice per 4KiB page. Since §3.5.28 removed the cap on that table, it grew
+without bound, so every mapping got slower as the guest allocated more. It is a
+hash now.
+
+But that was not the problem either. **pacman was not slow. It was blocked**,
+spinning in libcurl's retry loop with the download of every database producing
+zero bytes:
+
+```
+curl: (27) Out of memory
+```
+
+on a machine with 32GiB free. `eventfd2` - syscall 19 - was not implemented at
+all. libcurl's multi interface creates one for `curl_multi_wakeup` and treats
+the failure as fatal, so `curl_multi_init` returned NULL and the tool reported
+the only error it has for that. pacman 7 and dnf both drive libcurl that way,
+which is why neither could fetch anything and why dnf's separate complaint about
+a resolver thread was a red herring.
+
+Darwin has no eventfd. It is emulated with a socketpair - the guest gets one
+end, NABI keeps the other, and one byte is held in flight whenever the counter
+is nonzero, which is what makes poll, select and epoll answer correctly without
+knowing anything is emulated. The counter lives in NABI, because a socketpair
+queues bytes where an eventfd accumulates a total: a guest that writes 1 five
+times must read back 5, not 1 with four bytes still pending.
+
+`pacman -Sy` went from never finishing to **5.4 seconds**.
+
+### 3.5.34 Four more things between there and an installed package
+
+Each was found by the next one appearing, and none is about performance.
+
+**`/proc/mounts` was not served.** pacman reads `/etc/mtab` to find out which
+filesystem it is unpacking into and stopped at "could not determine filesystem
+mount points". There is no mount table to report - the guest's filesystem is one
+host directory - but what software wants from that file is which filesystem a
+path is on, and a root entry answers that truthfully.
+
+**A symlink into `/proc` was not followed there.** `/etc/mtab` *is* a symlink to
+`/proc/self/mounts` on every distribution, and the check for NABI's own /proc
+files is made on the name the guest passed. So the name that arrived was
+/etc/mtab, the check declined it, and resolution followed the link inside the
+rootfs where the target is not a file. One hop is now retried against procfs -
+distributions ship exactly one link here, and following a chain would be
+re-implementing resolution rather than finishing it.
+
+**AF_UNIX paths went to the host untranslated.** A guest binding
+`/etc/pacman.d/gnupg/S.gpg-agent` asked the *host* for that path and got ENOENT,
+so gpg-agent never started, `pacman-key --init` could not generate a key, and
+signature checking had nothing to work with. Every other file operation is an
+`*at()` call against a resolved directory, but `bind` takes a path inside a
+sockaddr and there is no `bindat`, so this is the one place a guest path has to
+be turned back into a host one. `F_GETPATH` on the resolved directory does it.
+
+Fixing that introduced a heap overflow immediately: the sockaddr is allocated
+with the length the *guest* sent, and a translated path is longer. It presented
+as `connect` spinning at 100% CPU inside `free()`. AF_UNIX now gets a full
+`sockaddr_un` and `sa_len` describes the path the call will actually use.
+
+**getdents lost entries.** Every call opened a fresh `DIR` over a dup of the
+descriptor and closed it again, keeping its place with telldir/seekdir. Neither
+half works: a telldir cookie belongs to one DIR instance and does not outlive
+it, and what seekdir leaves on the descriptor is the start of the block it
+re-read rather than the entry asked for. Reading a 4000-entry directory returned
+**3792 of them, with no error anywhere** - a guest simply did not see some of
+its own files. `d_seekoff` is no way out either; APFS reports it as zero, and
+seeking there restarts the directory from the top forever. The stream stays open
+between calls now, so the position lives in the stream instead of having to be
+reconstructed.
+
+### 3.5.35 `/proc/self/fd` has to be the guest's, and has to be live
+
+The last thing between `checking keyring...` and an installed package, and it
+took two goes.
+
+libassuan reads `/proc/self/fd` before starting gpg-agent, to close what it
+inherited. `/proc` is a host passthrough when mSL/ProcFS is mounted, so the
+guest got **nabi's** descriptors - the arena, the checkpoint files, the rootfs
+handle - whose numbers mean nothing to it. Worse, the set changed while it was
+being read, because serving the read opens descriptors. The listing never
+stabilised and `pacman -S` sat in `getdents64` forever.
+
+So NABI answers it, from the guest's own descriptor table, with a directory of
+symlinks built to be read. Two details each cost a run:
+
+- `/proc/self/fd/` with a trailing slash is the same directory, and missing that
+  sent the open back to the host's /proc.
+- The listing has to be **rebuilt on rewind**. Real /proc/self/fd is live: the
+  caller reads it, closes what it found, and reads again to see what is left.
+  Against a snapshot that never changes the second read returns the first
+  answer, and the program waits forever for a list that cannot shrink. A probe
+  printing one line per rewind is what made that obvious - the same descriptor,
+  thousands of times.
+
+`pacman -S git` with the distribution's own `SigLevel` now resolves seven
+packages, verifies them and installs them in **6 seconds**.
+
 ---
 
 ## 4. Phased implementation

@@ -293,7 +293,7 @@
   SYSCALL(287, unimplemented)                   \
   SYSCALL(288, unimplemented)                   \
   SYSCALL(289, unimplemented)                   \
-  SYSCALL(290, unimplemented)                   \
+  SYSCALL(290, eventfd2)                        \
   SYSCALL(291, epoll_create1)                   \
   SYSCALL(292, dup3)                            \
   SYSCALL(293, pipe2)                           \

@@ -225,11 +225,8 @@ cmd_help() {
     printf '\n'
     section "Distros"
     item "$C""debian$Z, $C""ubuntu$Z  $D- resolved from the archive; apt works$Z"
+    item "$C""arch$Z            $D- published rootfs tarball; pacman works$Z"
     item "$C""fedora$Z          $D- published container image; dnf does not work yet$Z"
-    item "$C""arch$Z            $D- published rootfs tarball; pacman does not work yet$Z"
-    printf '\n'
-    note "All four build a tree you can log into. On the last two the package"
-    note "manager still fails inside NABI, so you get what the image shipped."
     printf '\n'
     section "Where things are"
     item "$D""Trees      $MOUNT/<name>$Z"

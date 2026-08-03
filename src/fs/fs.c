@@ -68,6 +68,9 @@
 struct file {
   struct file_operations *ops;
   int fd;
+  /* Live directory stream, opened on the first getdents and kept until close.
+   * NULL for anything that is not being read as a directory. */
+  DIR *dirp;
 };
 
 struct file_operations {
@@ -257,21 +260,224 @@ vkern_fd_floor(void)
   return proc.fileinfo.vkern_fdtable.start + vkern_fdtable_maxsize;
 }
 
+
+/* ------------------------------------------------------------- eventfd */
+
+/*
+ * eventfd, on a system that has none.
+ *
+ * An eventfd is a counter you can poll: write adds to it, read returns the
+ * total and zeroes it, and it is readable exactly while the total is nonzero.
+ * Darwin has no equivalent, and nothing here had implemented syscall 19 at all,
+ * so it returned ENOSYS - which is what stopped every download in the guest.
+ * libcurl's multi interface creates one for curl_multi_wakeup and treats the
+ * failure as fatal, so curl_multi_init returned NULL and the tool reported
+ * "curl: (27) Out of memory" - about a machine with 32GiB free. pacman 7 and
+ * dnf both drive libcurl that way, which is why neither could fetch anything.
+ *
+ * The pollable part is what needs a real descriptor, so it is a socketpair: the
+ * guest is given one end, NABI keeps the other, and a single byte is held in
+ * flight whenever the counter is nonzero. That byte is what makes poll, select
+ * and epoll answer correctly without any of them knowing this is emulated. The
+ * counter itself lives here, because a socketpair queues bytes where an eventfd
+ * accumulates a total, and a guest that writes 1 five times must read back 5
+ * rather than 1 with four bytes still pending.
+ *
+ * What does not survive: arm64's fork is fork-plus-exec, and this table is
+ * process memory rather than checkpoint state, so a forked child inherits the
+ * descriptor without the counter behind it. libcurl creates its eventfd after
+ * forking, so no guest yet has needed it to travel; a guest that did would see
+ * a socketpair with eventfd's arithmetic missing rather than a broken fd.
+ */
+struct eventfd_state {
+  int      notify_fd;   /* the end NABI keeps; the guest never sees it */
+  uint64_t count;
+  bool     semaphore;
+};
+
+KHASH_MAP_INIT_INT(evfd, struct eventfd_state)
+static khash_t(evfd) *eventfds;
+
+/* NULL unless `fd` is one of ours, which is also the "is this an eventfd" test
+ * every hook below uses. */
+static struct eventfd_state *
+eventfd_lookup(int fd)
+{
+  if (eventfds == NULL)
+    return NULL;
+  khiter_t k = kh_get(evfd, eventfds, fd);
+  return k == kh_end(eventfds) ? NULL : &kh_value(eventfds, k);
+}
+
+/* Exactly one byte is outstanding whenever the counter is nonzero, so the
+ * descriptor's readability and the counter never disagree. */
+static void
+eventfd_poke(struct eventfd_state *ev)
+{
+  char one = 1;
+  (void) write(ev->notify_fd, &one, 1);
+}
+
+static void
+eventfd_drain(int fd)
+{
+  char one;
+  (void) recv(fd, &one, 1, MSG_DONTWAIT);
+}
+
+static int
+eventfd_do_read(struct file *file, struct eventfd_state *ev,
+                struct iovec *iov, size_t iovcnt)
+{
+  if (iovcnt < 1 || iov[0].iov_len < sizeof(uint64_t))
+    return -LINUX_EINVAL;
+
+  while (ev->count == 0) {
+    int fl = fcntl(file->fd, F_GETFL);
+    if (fl >= 0 && (fl & O_NONBLOCK))
+      return -LINUX_EAGAIN;
+    /* Block where the guest asked to block: the byte arrives when somebody
+     * writes, and the counter it belongs to is then nonzero. */
+    char one;
+    ssize_t r = read(file->fd, &one, 1);
+    if (r < 0)
+      return -darwin_to_linux_errno(errno);
+    if (r == 0)
+      return -LINUX_EBADF;
+    if (ev->count == 0)
+      continue;              /* somebody else drained it first */
+    goto have_it;
+  }
+  eventfd_drain(file->fd);
+
+have_it:;
+  uint64_t out;
+  if (ev->semaphore) {
+    out = 1;
+    ev->count--;
+  } else {
+    out = ev->count;
+    ev->count = 0;
+  }
+  /* Still owed something, so it must stay readable. */
+  if (ev->count > 0)
+    eventfd_poke(ev);
+
+  memcpy(iov[0].iov_base, &out, sizeof out);
+  return (int) sizeof out;
+}
+
+static int
+eventfd_do_write(struct eventfd_state *ev, const struct iovec *iov, size_t iovcnt)
+{
+  if (iovcnt < 1 || iov[0].iov_len < sizeof(uint64_t))
+    return -LINUX_EINVAL;
+
+  uint64_t add;
+  memcpy(&add, iov[0].iov_base, sizeof add);
+  /* UINT64_MAX is reserved: it is the value that could never be read back,
+   * since the counter saturates one below it. */
+  if (add == UINT64_MAX)
+    return -LINUX_EINVAL;
+  if (add == 0)
+    return (int) sizeof add;
+  if (ev->count > UINT64_MAX - 1 - add)
+    return -LINUX_EAGAIN;    /* a blocking writer would wait for a reader */
+
+  bool was_empty = ev->count == 0;
+  ev->count += add;
+  if (was_empty)
+    eventfd_poke(ev);
+
+  return (int) sizeof add;
+}
+
+static void
+eventfd_forget(int fd)
+{
+  if (eventfds == NULL)
+    return;
+  khiter_t k = kh_get(evfd, eventfds, fd);
+  if (k == kh_end(eventfds))
+    return;
+  close(kh_value(eventfds, k).notify_fd);
+  kh_del(evfd, eventfds, k);
+}
+
+#define LINUX_EFD_SEMAPHORE 1
+
+DEFINE_SYSCALL(eventfd2, unsigned int, initval, int, flags)
+{
+  if (flags & ~(LINUX_EFD_SEMAPHORE | LINUX_O_NONBLOCK | LINUX_O_CLOEXEC))
+    return -LINUX_EINVAL;
+
+  int sv[2];
+  if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) < 0)
+    return -darwin_to_linux_errno(errno);
+
+  /* Only the guest's end takes the guest's flags. The end NABI keeps must stay
+   * blocking and must not leak across exec... except that on arm64 exec is how
+   * fork works, so it is deliberately left inheritable and simply closed with
+   * the descriptor it belongs to. */
+  if ((flags & LINUX_O_NONBLOCK) && fcntl(sv[0], F_SETFL, O_NONBLOCK) < 0)
+    goto fail;
+  if ((flags & LINUX_O_CLOEXEC) && fcntl(sv[0], F_SETFD, FD_CLOEXEC) < 0)
+    goto fail;
+
+  pthread_rwlock_wrlock(&proc.fileinfo.fdtable_lock);
+  int guest_fd = register_fd(sv[0], (flags & LINUX_O_CLOEXEC) != 0);
+  pthread_rwlock_unlock(&proc.fileinfo.fdtable_lock);
+  if (guest_fd < 0)
+    goto fail;
+
+  if (eventfds == NULL)
+    eventfds = kh_init(evfd);
+  int ret;
+  khiter_t k = kh_put(evfd, eventfds, sv[0], &ret);
+  kh_value(eventfds, k) = (struct eventfd_state){
+    .notify_fd = sv[1],
+    .count = initval,
+    .semaphore = (flags & LINUX_EFD_SEMAPHORE) != 0,
+  };
+  if (initval > 0)
+    eventfd_poke(&kh_value(eventfds, k));
+
+  return guest_fd;
+
+fail:;
+  int e = errno;
+  close(sv[0]);
+  close(sv[1]);
+  return -darwin_to_linux_errno(e);
+}
+
 int
 darwinfs_writev(struct file *file, const struct iovec *iov, size_t iovcnt)
 {
+  struct eventfd_state *ev = eventfd_lookup(file->fd);
+  if (ev != NULL)
+    return eventfd_do_write(ev, iov, iovcnt);
   return syswrap(writev(file->fd, iov, iovcnt));
 }
 
 int
 darwinfs_readv(struct file *file, struct iovec *iov, size_t iovcnt)
 {
+  struct eventfd_state *ev = eventfd_lookup(file->fd);
+  if (ev != NULL)
+    return eventfd_do_read(file, ev, iov, iovcnt);
   return syswrap(readv(file->fd, iov, iovcnt));
 }
 
 int
 darwinfs_close(struct file *file)
 {
+  eventfd_forget(file->fd);
+  procfs_close_fd(file->fd);
+  if (file->dirp != NULL) {
+    closedir(file->dirp);       /* takes the dup with it */
+    file->dirp = NULL;
+  }
   return syswrap(close(file->fd));
 }
 
@@ -559,6 +765,19 @@ darwinfs_ioctl(struct file *file, int cmd, uint64_t val0)
 int
 darwinfs_lseek(struct file *file, l_off_t offset, int whence)
 {
+  /* A directory being read has its position in the stream rather than on the
+   * descriptor, so a seek has to move the stream or it moves nothing that
+   * getdents will notice. rewinddir is the case that occurs - it is what
+   * glibc's rewinddir(3) compiles to, and what anything re-reading a directory
+   * after changing it does. */
+  if (file->dirp != NULL && offset == 0 && whence == SEEK_SET) {
+    /* If this is /proc/self/fd, the answer has to be recomputed rather than
+     * replayed - the guest is rewinding precisely because it expects the list
+     * to have changed since it last looked. */
+    procfs_refresh_fddir(file->fd);
+    rewinddir(file->dirp);
+    return 0;
+  }
   return syswrap(lseek(file->fd, offset, whence));
 }
 
@@ -602,33 +821,67 @@ darwin_to_linux_dent(struct dirent *d_dent, void *l_dent, size_t buflen, int is6
   return reclen;
 }
 
+/*
+ * getdents, over a directory stream that stays open between calls.
+ *
+ * A guest reads a directory in whatever size buffer it chose, so any directory
+ * too big for one call has to continue exactly where the last one stopped.
+ *
+ * This used to open a fresh DIR over a dup of the descriptor every call and
+ * close it again, keeping its place with telldir/seekdir. Neither half of that
+ * works. A telldir cookie belongs to one DIR instance and does not outlive it,
+ * and what seekdir leaves on the descriptor is the start of the block it
+ * re-read rather than the entry that was asked for - so a directory that did
+ * not fit resumed in the wrong place. Reading a 4000-entry directory returned
+ * 3792 of them, with no error anywhere: a guest simply did not see some of its
+ * own files. d_seekoff is no way out either; APFS reports it as zero, and
+ * seeking there restarts the directory from the top forever.
+ *
+ * Keeping the stream open makes the question go away, because the position
+ * lives in the stream rather than having to be reconstructed. seekdir is then
+ * used only within one instance, where its cookies do mean something, to push
+ * back the entry that did not fit.
+ */
 int
 darwinfs_getdents(struct file *file, char *direntp, unsigned count, bool is64)
 {
-  int fd = dup(file->fd);
-  DIR *dir = fdopendir(fd);
-  
-  if (dir == NULL) {
-    return -darwin_to_linux_errno(errno);
+  if (file->dirp == NULL) {
+    int fd = dup(file->fd);
+    if (fd < 0)
+      return -darwin_to_linux_errno(errno);
+    if ((file->dirp = fdopendir(fd)) == NULL) {
+      int e = errno;
+      close(fd);
+      return -darwin_to_linux_errno(e);
+    }
   }
+
+  DIR *dir = file->dirp;
   struct dirent *dent;
   size_t pos = 0;
+  bool full = false;
   long loc = telldir(dir);
+
   errno = 0;
   while ((dent = readdir(dir)) != NULL) {
     ssize_t reclen = darwin_to_linux_dent(dent, direntp + pos, count - pos, is64);
     if (reclen < 0) {
-      seekdir(dir, loc);
-      goto end;
+      seekdir(dir, loc);        /* this one goes to the next call */
+      full = true;
+      break;
     }
     pos += reclen;
     loc = telldir(dir);
   }
-  if (errno) {
+  if (dent == NULL && !full && errno)
     return -darwin_to_linux_errno(errno);
-  }
- end:
-  closedir(dir);
+
+  /* Not one entry fitted. Linux calls that EINVAL rather than end-of-directory,
+   * and the difference matters: a guest told 0 stops reading and concludes the
+   * directory is empty. */
+  if (pos == 0 && full)
+    return -LINUX_EINVAL;
+
   return pos;
 }
 
@@ -1034,6 +1287,8 @@ alloc_file(struct fdtable *table, int fd)
   struct file *file = &table->files[offset / fdtable_alloc_unit][offset % fdtable_alloc_unit];
   file->ops = &ops;
   file->fd = fd;
+  /* A recycled slot must not inherit the previous descriptor's stream. */
+  file->dirp = NULL;
 }
 
 /*
@@ -2116,6 +2371,140 @@ vkern_open(const char *path, int l_flags, int mode)
   return vkern_openat(LINUX_AT_FDCWD, path, l_flags, mode);
 }
 
+/*
+ * A guest path that turns out to be a symlink into /proc.
+ *
+ * The files under /proc that describe the guest are NABI's to answer, and the
+ * check for them is made on the name the guest passed. But /etc/mtab is a
+ * symlink to /proc/self/mounts on every distribution now, so the name that
+ * arrives is /etc/mtab, the check declines it, and resolution then follows the
+ * link inside the rootfs - where /proc/self/mounts is not a file - and the open
+ * fails with ENOENT. pacman reads /etc/mtab to find out which filesystem it is
+ * unpacking into, and stopped at "could not determine filesystem mount points"
+ * having downloaded everything it needed.
+ *
+ * One hop, deliberately. Distributions ship exactly one link here, and
+ * following a chain would be re-implementing resolution rather than finishing
+ * it - resolve_path already does that, in the guest's namespace, which is
+ * exactly why it cannot see /proc.
+ *
+ * Writes the target as an absolute guest path with . and .. folded out, or
+ * returns false if `name` is not a link or the target does not land in /proc.
+ */
+static bool
+symlink_into_procfs(int dirfd, const char *name, char *out, size_t outsz)
+{
+  struct path path;
+  if (vfs_grab_dir(dirfd, name, LOOKUP_NOFOLLOW, &path) < 0)
+    return false;
+
+  char target[LINUX_PATH_MAX];
+  int n = path.fs->ops->readlinkat(path.fs, path.dir, path.subpath,
+                                   target, sizeof target - 1);
+  vfs_ungrab_dir(&path);
+  if (n <= 0)
+    return false;
+  target[n] = '\0';
+
+  /* Relative targets are relative to the link's own directory, so that is what
+   * they are joined onto. */
+  char joined[LINUX_PATH_MAX * 2];
+  if (target[0] == '/') {
+    snprintf(joined, sizeof joined, "%s", target);
+  } else {
+    const char *slash = strrchr(name, '/');
+    int dirlen = slash ? (int)(slash - name) : 0;
+    snprintf(joined, sizeof joined, "%.*s/%s", dirlen, name, target);
+  }
+
+  /* Fold . and .. textually. Every component here came from the guest's own
+   * namespace, so there is no host path to leak by doing it this way. */
+  char norm[LINUX_PATH_MAX];
+  size_t len = 0;
+  norm[0] = '\0';
+  for (char *p = joined; *p; ) {
+    while (*p == '/') p++;
+    if (!*p) break;
+    char *e = p;
+    while (*e && *e != '/') e++;
+    size_t clen = (size_t)(e - p);
+    if (clen == 1 && p[0] == '.') {
+      /* nothing */
+    } else if (clen == 2 && p[0] == '.' && p[1] == '.') {
+      while (len > 0 && norm[--len] != '/')
+        ;
+      norm[len] = '\0';
+    } else {
+      if (len + clen + 2 > sizeof norm)
+        return false;
+      norm[len++] = '/';
+      memcpy(norm + len, p, clen);
+      len += clen;
+      norm[len] = '\0';
+    }
+    p = e;
+  }
+  if (len == 0)
+    return false;
+
+  if (strncmp(norm, "/proc/", 6) != 0)
+    return false;
+  if (strlcpy(out, norm, outsz) >= outsz)
+    return false;
+  return true;
+}
+
+/*
+ * Where a guest path lives on the host.
+ *
+ * Almost nothing needs this: every ordinary file operation is done with an
+ * *at() call against the resolved directory, which is both faster and free of
+ * the races a rebuilt absolute path invites. AF_UNIX is the exception, because
+ * bind(2) and connect(2) take a path inside a sockaddr and there is no
+ * bindat(). Passing the guest's path through untranslated is what NABI did, so
+ * a guest binding /etc/pacman.d/gnupg/S.gpg-agent asked the *host* for that
+ * path, got ENOENT, and gpg-agent reported "error binding socket" - which is
+ * why gpg could not start and pacman could not check a signature.
+ *
+ * F_GETPATH names the directory the resolver landed on, which is what turns a
+ * dirfd back into something a sockaddr can carry. A passthrough path is already
+ * a host path and is returned as it stands.
+ */
+int
+guest_to_host_path(const char *name, char *out, size_t outsz)
+{
+  if (name[0] == '/' && is_host_passthrough(name)) {
+    if (strlcpy(out, name, outsz) >= outsz)
+      return -LINUX_ENAMETOOLONG;
+    return 0;
+  }
+
+  struct path path;
+  int r = vfs_grab_dir(LINUX_AT_FDCWD, name, LOOKUP_NOFOLLOW, &path);
+  if (r < 0)
+    return r;
+
+  char dirpath[PATH_MAX];
+  if (fcntl(path.dir->fd, F_GETPATH, dirpath) < 0) {
+    vfs_ungrab_dir(&path);
+    return -LINUX_ENOENT;
+  }
+
+  int n;
+  if (strcmp(path.subpath, ".") == 0)
+    n = snprintf(out, outsz, "%s", dirpath);
+  else
+    n = snprintf(out, outsz, "%s/%s", dirpath, path.subpath);
+  vfs_ungrab_dir(&path);
+
+  /* sun_path is 104 bytes on Darwin against Linux's 108, and the rootfs prefix
+   * eats into that, so this is a limit a guest can genuinely reach. Saying so
+   * beats a truncated path that binds somewhere unintended. */
+  if (n < 0 || (size_t) n >= outsz)
+    return -LINUX_ENAMETOOLONG;
+  return 0;
+}
+
 int
 user_openat(int atdirfd, const char *name, int flags, int mode)
 {
@@ -2123,8 +2512,14 @@ user_openat(int atdirfd, const char *name, int flags, int mode)
   pthread_rwlock_wrlock(&proc.fileinfo.fdtable_lock);
   /* A few /proc files describe the guest rather than the nabi running it, and
    * only NABI can answer those. Anything else falls through to the host's. */
-  if (procfs_open(name, &fd) < 0)
+  if (procfs_open(name, &fd) < 0) {
     fd = do_openat(atdirfd, name, flags, mode);
+    if (fd < 0) {
+      char target[LINUX_PATH_MAX];
+      if (symlink_into_procfs(atdirfd, name, target, sizeof target))
+        procfs_open(target, &fd);
+    }
+  }
   if (fd < 0) {
     goto out;
   }
@@ -3317,6 +3712,33 @@ DEFINE_SYSCALL(syncfs, int, fd)
  *
  * Returns the number of open descriptors, which may exceed `max`.
  */
+/*
+ * The guest's open descriptor numbers, for /proc/self/fd.
+ *
+ * Only the user table: the vkern table is NABI's own bookkeeping and a guest
+ * has no business seeing it, which is the whole reason the host's /proc cannot
+ * answer this question. Writes up to `max` of them and returns how many there
+ * are, so a caller can size a buffer by asking with max 0.
+ */
+int
+fdtable_open_fds(int *out, int max)
+{
+  struct fdtable *t = &proc.fileinfo.fdtable;
+  int n = 0;
+
+  pthread_rwlock_rdlock(&proc.fileinfo.fdtable_lock);
+  for (int fd = t->start; fd < t->start + t->size; fd++) {
+    int i = (fd - t->start) / 64, b = (fd - t->start) - i * 64;
+    if (!(t->open_fds[i] & (1ULL << b)))
+      continue;
+    if (out != NULL && n < max)
+      out[n] = fd;
+    n++;
+  }
+  pthread_rwlock_unlock(&proc.fileinfo.fdtable_lock);
+  return n;
+}
+
 static size_t
 fdtable_snapshot_one(struct fdtable *t, int32_t which,
                      struct checkpoint_fd *out, size_t max, size_t n)

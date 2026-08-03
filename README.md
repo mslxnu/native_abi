@@ -212,10 +212,11 @@ signature verification, and installs and runs a C toolchain.
 | Filesystem | **Working** — host-backed, with passthrough prefixes |
 | `/proc/self/{maps,cmdline,comm,exe,fd}` | **Working** — served by NABI |
 | Credentials, `su`, `sudo` | **Working** — emulated in software |
-| apt, dpkg, gcc | **Working** |
+| apt, dpkg, pacman, gcc | **Working** |
 | Sibling modules (`/proc`, `/sys`) | **Detected**, optional; NABI runs without them |
 | Debian, Ubuntu | **Working** — resolved from the archive, apt works inside |
-| Fedora, Arch | **Rootfs works**, from the published image; dnf and pacman do not run yet |
+| Arch | **Working** — from the published tarball; pacman installs, signatures and all |
+| Fedora | **Rootfs works**, from the published container image; dnf does not run yet |
 | x86-64 | **Builds, unverified** — see below |
 
 The x86-64 backend is the original Noah VT-x code. It compiles, and is kept as the
