@@ -37,6 +37,15 @@ static long sys6(long n,long a,long b,long c,long d,long e,long f){
 #define TIOCSPTLCK 0x40045431
 #define TCGETS     0x5401
 #define TCSETSF    0x5404
+/* The termios2 family, which is what a current glibc actually sends:
+ * _IOR('T', 0x2a, struct termios2) and the three setters after it. glibc 2.42
+ * moved to these so a baud rate could be given by number, and a nabi that knows
+ * only TCGETS answers EPERM to every terminal query a modern distribution
+ * makes - so isatty() reports that nothing is a terminal, bash starts
+ * non-interactive with an empty PS1, and a login shows a blank screen. */
+#define TCGETS2    0x802c542a
+#define TCSETS2    0x402c542b
+#define TCSETSF2   0x402c542d
 #define TIOCSWINSZ 0x5414
 #define TIOCGWINSZ 0x5413
 
@@ -95,6 +104,17 @@ void _start(void)
     fail("TCGETS on a fresh master", r);
   if ((r = sys6(SYS_ioctl, m, TCSETSF, (long) tio, 0, 0, 0)) < 0)
     fail("TCSETSF on a fresh master", r);
+
+  /* termios2, the form a current glibc uses for the very same question. Two
+   * baud-rate fields longer than the struct above, and under an _IOC-encoded
+   * number rather than a bare one. */
+  char tio2[64];
+  if ((r = sys6(SYS_ioctl, m, TCGETS2, (long) tio2, 0, 0, 0)) < 0)
+    fail("TCGETS2 on a fresh master", r);
+  if ((r = sys6(SYS_ioctl, m, TCSETS2, (long) tio2, 0, 0, 0)) < 0)
+    fail("TCSETS2 on a fresh master", r);
+  if ((r = sys6(SYS_ioctl, m, TCSETSF2, (long) tio2, 0, 0, 0)) < 0)
+    fail("TCSETSF2 on a fresh master", r);
 
   /* The path the guest builds from that number has to reach the slave the
    * master is actually paired with, which is the half that lives in path

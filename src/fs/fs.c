@@ -589,6 +589,60 @@ darwinfs_ioctl(struct file *file, int cmd, uint64_t val0)
     linux_to_darwin_termios(&lios, &dios);
     return syswrap(tcsetattr(fd, TCSAFLUSH, &dios));
   }
+  /*
+   * The termios2 family. A guest running glibc 2.42 or newer sends these and
+   * never the four above - tcgetattr(3) compiles to TCGETS2 now - so without
+   * them every terminal query from a current distribution came back EPERM from
+   * the default arm. isatty() concluded nothing was a terminal, bash started
+   * non-interactive with an empty PS1, and `msl login fedora` showed a blank
+   * screen: alive, echoing, answering commands, and with no prompt, which is
+   * indistinguishable from a hang.
+   *
+   * The extra content over the older form is the pair of baud rates, which
+   * Darwin's termios carries too, so nothing has to be invented. The
+   * conversion of everything else is shared - a termios2 *is* a termios with
+   * two fields appended, and treating it as a separate thing would be two
+   * copies of the flag mapping to keep in step.
+   */
+  case LINUX_TCGETS2: {
+    struct termios dios;
+    struct linux_termios2 lios2;
+    struct linux_termios lios;
+
+    if ((r = syswrap(tcgetattr(fd, &dios))) < 0) {
+      return r;
+    }
+    darwin_to_linux_termios(&dios, &lios);
+    memcpy(&lios2, &lios, sizeof lios);
+    lios2.c_ispeed = (unsigned int) cfgetispeed(&dios);
+    lios2.c_ospeed = (unsigned int) cfgetospeed(&dios);
+    if (copy_to_user(val0, &lios2, sizeof lios2)) {
+      return -LINUX_EFAULT;
+    }
+    return r;
+  }
+  case LINUX_TCSETS2:
+  case LINUX_TCSETSW2:
+  case LINUX_TCSETSF2: {
+    struct termios dios;
+    struct linux_termios2 lios2;
+    struct linux_termios lios;
+    if (copy_from_user(&lios2, val0, sizeof lios2)) {
+      return -LINUX_EFAULT;
+    }
+    memcpy(&lios, &lios2, sizeof lios);
+    linux_to_darwin_termios(&lios, &dios);
+    /* Only if the guest asked for something. A zero here means "leave it", and
+     * cfsetspeed(0) would be B0 - which hangs up the line. */
+    if (lios2.c_ispeed)
+      cfsetispeed(&dios, (speed_t) lios2.c_ispeed);
+    if (lios2.c_ospeed)
+      cfsetospeed(&dios, (speed_t) lios2.c_ospeed);
+    int when = cmd == LINUX_TCSETS2  ? TCSANOW
+             : cmd == LINUX_TCSETSW2 ? TCSADRAIN
+             :                         TCSAFLUSH;
+    return syswrap(tcsetattr(fd, when, &dios));
+  }
   case LINUX_TIOCGPGRP: {
     l_pid_t pgrp;
     if ((r = syswrap(ioctl(fd, TIOCGPGRP, &pgrp))) < 0) {

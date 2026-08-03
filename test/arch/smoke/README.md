@@ -92,7 +92,10 @@ guest-code cache sync.
   a flag read as one NABI ignores is granted rather than rejected.
 - `ptytest` — `/dev/ptmx`, `TIOCSPTLCK`, `TIOCGPTN` and the `/dev/pts/<n>`
   path, which Darwin spells differently at every step. apt runs dpkg under a
-  pty, so all four have to work or nothing installs.
+  pty, so all four have to work or nothing installs. Also the `termios2` forms
+  (`TCGETS2` and its setters), which are what glibc 2.42 sends instead of
+  `TCGETS`: without them `isatty()` says nothing is a terminal, so bash starts
+  non-interactive with an empty prompt and a login looks like a hang.
 - `growtest` — a large `PROT_NONE` reservation with a piece `mprotect`ed
   writable, and large regions grown by `mremap`, reached from the parent and
   from a child. Stage 2 has to be re-permissioned, not merely reflushed.

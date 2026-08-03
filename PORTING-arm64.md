@@ -2233,6 +2233,47 @@ installs `sudo` and `util-linux` for the oci and tar families after the index
 exists, which is the same thing the apt families get by seeding. The closing
 message no longer promises `su` to a tree that has not got it.
 
+### 3.5.43 `msl login fedora` looked like a hang — **fixed**
+
+It was not hung. The shell was running, echoing, and answering commands the
+whole time; what it never printed was a **prompt**, and a blank screen that
+takes input and shows nothing is indistinguishable from a hang. Driving it
+through a pty and asking it questions is what separated the two:
+
+```
+FLAGS=hBs          <- no `i`: bash is not interactive
+PS1=[]             <- so no prompt was ever going to appear
+tty -> not a tty   <- and here is why
+```
+
+`isatty()` was failing, and it failed on one unhandled ioctl:
+
+```
+ioctl(fd: 0, cmd: 2150388778) -> EPERM      = _IOR('T', 0x2a, 44)
+```
+
+which is **TCGETS2**. Linux has two termios interfaces: the original four bare
+`0x54xx` numbers, and the `termios2` family, `_IOC`-encoded and carrying the two
+baud rates as plain numbers rather than `Bxxx` constants. glibc moved to the
+second in 2.42, so `tcgetattr(3)` now compiles to `TCGETS2` and nothing else.
+NABI knew only `TCGETS`, so every terminal query from a current distribution
+came back EPERM from the default arm.
+
+Fedora 43 ships glibc 2.42 and Debian trixie ships 2.41, which is the whole of
+why this appeared on one and not the other - and why it appeared *now*: Fedora's
+login only started going through a shell that cares once §3.5.42 gave the image
+a `su` to log in with. Before that it fell back to a root shell, which had the
+same empty prompt and was equally silent about it.
+
+A `termios2` is a `termios` with two fields appended, so the flag conversion is
+shared rather than copied - two mappings to keep in step would be a bug waiting
+for the next person. `ptytest` covers the new numbers, and fails on the old
+build with `TCGETS2 on a fresh master`.
+
+Worth keeping: the failing ioctl is logged with its number in decimal, and
+decoding it - direction, size, type, sequence - is what named it. An unhandled
+ioctl reports EPERM, which reads as a permission problem rather than a gap.
+
 ---
 
 ## 4. Phased implementation

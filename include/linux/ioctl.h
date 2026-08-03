@@ -332,6 +332,20 @@
 #define	LINUX_TCSETS		0x5402
 #define	LINUX_TCSETSW		0x5403
 #define	LINUX_TCSETSF		0x5404
+
+/*
+ * The termios2 family: _IOC-encoded, unlike the four above.
+ *
+ * A guest running glibc 2.42 or newer asks for these and nothing else - it is
+ * what tcgetattr(3) compiles to now - so a NABI that knows only TCGETS answers
+ * EPERM to every terminal query a modern distribution makes. isatty() then
+ * reports that nothing is a terminal, bash starts non-interactive with an empty
+ * PS1, and `msl login fedora` shows a blank screen that reads as a hang.
+ */
+#define	LINUX_TCGETS2		0x802c542a
+#define	LINUX_TCSETS2		0x402c542b
+#define	LINUX_TCSETSW2		0x402c542c
+#define	LINUX_TCSETSF2		0x402c542d
 #define	LINUX_TCGETA		0x5405
 #define	LINUX_TCSETA		0x5406
 #define	LINUX_TCSETAW		0x5407
