@@ -791,6 +791,27 @@ chmod 0440 /etc/sudoers.d/"\$u"
 # PAM_PERM_DENIED, about a nice value.
 #
 # The module is left where the distribution put it.
+
+# The XDG base directories.
+#
+# Neither distribution's /etc/skel has them, so a home made by useradd has no
+# .local at all - and a program wanting one of them generally creates only its
+# own leaf. nano does a single mkdir of \$XDG_DATA_HOME/nano and reports
+# "Unable to create directory /home/<user>/.local/share/nano/: No such file or
+# directory" the first time it runs, which reads as a fault and is really an
+# empty home.
+#
+# Created here rather than left to whatever asks first, because on a real
+# system these arrive with a desktop session or a login manager, and this guest
+# has neither.
+h=\$(getent passwd "\$u" | cut -d: -f6)
+if [ -n "\$h" ] && [ -d "\$h" ]; then
+    for d in .local/share .local/state .config .cache; do
+        mkdir -p "\$h/\$d"
+    done
+    chown -R "\$u:\$u" "\$h/.local" "\$h/.config" "\$h/.cache" 2>/dev/null || true
+fi
+
 id "\$u"
 EOS
     chmod 755 "$ROOT/var/tmp/msl-adduser.sh"

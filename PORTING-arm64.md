@@ -2491,6 +2491,46 @@ waiting on SIGALRM to end a read still gets its EINTR.
 `sudo dnf install gcc` now waits at its prompt, takes the answer, and reports
 Complete.
 
+### 3.5.52 Two reports that were not bugs, and one small thing that was
+
+**`./hello.c` is not `./hello`.** A guest reported needing sudo to run something
+it had just compiled:
+
+```
+$ gcc hello.c -o hello
+$ ./hello.c            -> Permission denied
+$ sudo hello           -> command not found
+$ sudo ~/hello         -> hello
+```
+
+Nothing here is NABI's. `./hello.c` is the *source*, mode 0644, and refusing to
+execute it is what Linux does too - checked, and `./hello` beside it runs
+unprivileged and exits 0. `sudo hello` then fails because there is no `./`, so
+it is a PATH lookup, and Fedora's sudoers sets
+
+    Defaults secure_path = /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:...
+
+which does not include a home directory. `sudo ~/hello` worked, but so would
+plain `./hello`; sudo was never the thing that made the difference.
+
+Worth confirming rather than assuming, because §3.5.40 had recently changed how
+modes are recorded, and "a freshly compiled binary will not run" is exactly the
+shape a bug there would have taken.
+
+**nano's complaint was an empty home** - and that one is worth smoothing:
+
+```
+Unable to create directory /home/sunneva/.local/share/nano/: No such file
+or directory
+```
+
+Neither distribution's `/etc/skel` contains `.local`, so a home made by
+`useradd -m` has none, and nano creates only its own leaf with a single
+`mkdir`. `mkdir -p` of the same path succeeds, so nothing is broken - it is an
+empty home and a program that does not create parents. On a real system those
+directories arrive with a desktop session or a login manager, and this guest has
+neither, so the builder now creates the XDG base directories with the account.
+
 ---
 
 ## 4. Phased implementation
