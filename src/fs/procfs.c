@@ -405,6 +405,23 @@ procfs_close_fd(int fd)
   kh_del(fddir, fddir_tmp, k);
 }
 
+/*
+ * The descriptor number in "/proc/self/fd/<n>", or -1 for anything else.
+ *
+ * Opening that path is answered elsewhere; this is for every *other* operation
+ * on it. systemd changes the mode of an O_PATH descriptor by chmod'ing
+ * /proc/self/fd/<n>, because fchmod on an O_PATH handle is not allowed - and
+ * that arrived here as an ordinary path, went to the host's /proc, and came
+ * back EACCES. So `dnf install` reported a failed transaction, from
+ * "Failed to copy permissions from /etc/group to /etc/.#group...".
+ */
+int
+procfs_fd_number(const char *path)
+{
+  int fd = -1;
+  return own_procfs_file_n(path, &fd) == PROCFS_FD ? fd : -1;
+}
+
 int
 procfs_open(const char *path, int *out_fd)
 {

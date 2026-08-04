@@ -143,6 +143,12 @@ guest-code cache sync.
   20, and putting it back was then a privileged operation - so sudo stopped at
   "pam_open_session: Permission denied" over a nice value.
 
+- `roottest` — `/..` is `/`, by path and through a descriptor the guest opened
+  itself, and `getcwd` answers in the guest's namespace. The host resolved `..`
+  at the rootfs boundary, so every host file was one `..` away; and systemd,
+  which decides whether a descriptor is the root by asking where `..` leads,
+  concluded `/` was not the root and failed every rpm `%sysusers` scriptlet.
+
 The ELF binaries are committed prebuilt (as the x86 guest tests under
 `test/*/build/` are), so the check needs no cross-toolchain. The `.s` sources
 are here for reference; rebuild with an aarch64-linux clang + ld.lld:

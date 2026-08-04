@@ -461,6 +461,17 @@ else
     fail=1
 fi
 
+# roottest: the guest's root has no parent, by path and through a descriptor,
+# and the working directory is named the way the guest names things.
+cp "$here/roottest" "$root/"; chmod +x "$root/roottest"
+out=$("$NABI" -m "$root" /roottest); rc=$?
+if [ "$rc" -eq 0 ] && [ "$out" = "root ok" ]; then
+    echo "  ok  roottest -> \"$out\", exit 0"
+else
+    echo "  FAIL roottest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 if [ "$fail" -eq 0 ]; then
     echo "smoke: PASS"
 else

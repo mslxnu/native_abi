@@ -221,6 +221,7 @@ void guest_view_of_fd(int fd, uint32_t *uid, uint32_t *gid, uint32_t *mode);
 int vkern_open_exec(const char *path);
 int procfs_open(const char *path, int *out_fd);
 void procfs_close_fd(int fd);
+int procfs_fd_number(const char *path);
 bool procfs_refresh_fddir(int fd);
 int fdtable_open_fds(int *out, int max);
 int guest_to_host_path(const char *name, char *out, size_t outsz);

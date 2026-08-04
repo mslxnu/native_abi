@@ -2505,6 +2505,45 @@ is_host_passthrough(const char *name)
   return false;
 }
 
+/*
+ * Whether a descriptor names the guest's root directory.
+ *
+ * By what it points at, not by its number. A guest that opens "/" for itself
+ * gets an ordinary descriptor, and comparing that against the one nabi keeps
+ * would say no about the very same directory - which is how systemd, holding
+ * its own handle on the root, still walked ".." straight out of the rootfs.
+ *
+ * The root's identity cannot change while a guest runs, so it is looked up
+ * once. Lazily, because a resumed child rebuilds its descriptor table from a
+ * checkpoint and this file's statics start empty again.
+ */
+static bool
+dir_is_rootfs(int fd)
+{
+  static dev_t root_dev;
+  static ino_t root_ino;
+  static bool known;
+
+  if (fd == proc.fileinfo.rootfd)
+    return true;
+  if (fd == AT_FDCWD)
+    return false;
+
+  if (!known) {
+    struct stat rst;
+    if (fstat(proc.fileinfo.rootfd, &rst) < 0)
+      return false;
+    root_dev = rst.st_dev;
+    root_ino = rst.st_ino;
+    known = true;
+  }
+
+  struct stat st;
+  if (fstat(fd, &st) < 0)
+    return false;
+  return st.st_dev == root_dev && st.st_ino == root_ino;
+}
+
 int
 resolve_path(const struct dir *parent, const char *name, int flags, struct path *path, int loop)
 {
@@ -2531,8 +2570,10 @@ resolve_path(const struct dir *parent, const char *name, int flags, struct path 
     return -LINUX_ELOOP;
 
   struct dir dir = *parent;
-  /* Outlives the branch below, since `name` may be made to point at it. */
+  /* Both outlive the branch below, since `name` may be made to point at one. */
   char ptsname[32];
+  char procpath[PATH_MAX];
+  int procfd;
 
   /* resolve mountpoints */
   if (*name == '/') {
@@ -2544,6 +2585,14 @@ resolve_path(const struct dir *parent, const char *name, int flags, struct path 
     if (!is_host_passthrough(name)) {
       dir.fd = proc.fileinfo.rootfd;
       name++;
+    } else if ((procfd = procfs_fd_number(name)) >= 0 &&
+               in_userfd(procfd) &&
+               fcntl(procfd, F_GETPATH, procpath) == 0) {
+      /* /proc/self/fd/<n> naming a file the guest has open. Every operation
+       * other than opening it - chmod, chown, stat, rename - has to reach the
+       * file itself, and the host's /proc knows nothing of the guest's
+       * descriptors. F_GETPATH turns the one into the other. */
+      name = procpath;
     } else if (devpts_to_host(name, ptsname, sizeof ptsname)) {
       /* /dev is a passthrough, so a guest that asks for the slave it was just
        * told about would reach the host's /dev/pts/<n>, which does not exist:
@@ -2555,16 +2604,76 @@ resolve_path(const struct dir *parent, const char *name, int flags, struct path 
     }
   }
 
+  /*
+   * Whether ".." may be followed out of the top of this walk.
+   *
+   * It may not, when the walk starts at the guest's root: on Linux "/.." is
+   * "/", the kernel pins it, and a guest cannot climb out of its own
+   * filesystem. Here the host resolves the component, so it climbed straight
+   * out of the rootfs - `stat /..` gave a different inode from `stat /`, and
+   * `ls /../..` reached the host's /Volumes.
+   *
+   * That is a containment hole on its own, and it also broke software that
+   * checks the invariant. systemd's chaseat() returns an absolute path when the
+   * descriptor it walked from is the root, and decides that by asking whether
+   * ".." leads back to the same directory. Told no, it returned a relative path
+   * with root "/", which chaseat_prefix_root refuses as impossible - so every
+   * rpm %sysusers scriptlet failed with "Failed to prefix '...' with root '/':
+   * Invalid argument", and dnf reported a failed transaction for packages that
+   * had installed perfectly.
+   *
+   * Only for a walk rooted at the rootfs. A walk from a descriptor the guest
+   * passed to openat starts somewhere below, and how far below is not known
+   * here, so those are left to the host as before.
+   */
+  /* A passthrough path keeps its leading slash, because it is a host path and
+   * is meant to stay one; everything else is being built relative to a
+   * descriptor and must not acquire one. */
+  bool leading_slash = *name == '/';
+
   /* resolve symlinks */
   char *sp = path->subpath;
   *sp = 0;
   const char *c = name;
   assert(*c);
   while (*c) {
+    char *component = sp;
     while (*c && *c != '/') {
       *sp++ = *c++;
     }
     *sp = 0;
+
+    /*
+     * "." and ".." are folded here rather than before the walk, because on
+     * Linux they apply to what the path has resolved to so far - and a symlink
+     * earlier in it has already been expanded by the time we arrive. Folding
+     * the whole string up front would take "link/.." to nothing instead of to
+     * the parent of the link's target.
+     */
+    if (sp - component == 1 && component[0] == '.') {
+      sp = component;                       /* "." is nothing at all */
+      *sp = 0;
+    } else if (sp - component == 2 &&
+               component[0] == '.' && component[1] == '.') {
+      if (component == path->subpath) {
+        /* At the top. Linux stays put; the host would leave the rootfs. Asked
+         * here rather than once up front because it costs a stat, and a path
+         * with ".." on its front is rare. */
+        if (dir_is_rootfs(dir.fd)) {
+          sp = component;
+          *sp = 0;
+        }
+      } else {
+        sp = component;
+        if (sp > path->subpath && sp[-1] == '/')
+          sp--;                             /* the separator before ".." */
+        while (sp > path->subpath && sp[-1] != '/')
+          sp--;                             /* and the component before it */
+        if (sp > path->subpath && sp[-1] == '/')
+          sp--;
+        *sp = 0;
+      }
+    }
     if ((flags & LOOKUP_NOFOLLOW) == 0) {
       char buf[LINUX_PATH_MAX];
       int n;
@@ -2605,10 +2714,27 @@ resolve_path(const struct dir *parent, const char *name, int flags, struct path 
         return r;
     }
     if (*c) {
-      *sp++ = *c++;
+      /*
+       * Only between components, and only for a path being built relative to
+       * the rootfs descriptor. Folding may have emptied that - "/.." is the
+       * whole of it - and a separator on the front would turn it back into an
+       * absolute path.
+       *
+       * A passthrough path is the opposite case: it keeps its leading slash,
+       * because it is a host path and is meant to be. Suppressing that turned
+       * /dev/null into dev/null and the guest lost its /dev.
+       */
+      if (sp > path->subpath || leading_slash)
+        *sp++ = *c;
+      c++;
     }
     *sp = 0;
   }
+
+  /* Everything folded away, which is the root itself. openat has no name for
+   * that; "." is how it is spelled. */
+  if (path->subpath[0] == '\0')
+    strcpy(path->subpath, ".");
 
  out:
   path->fs = fs;
@@ -3080,7 +3206,24 @@ DEFINE_SYSCALL(statx, int, dirfd, gstr_t, path_ptr, int, flags, unsigned int, ma
 
   struct l_statx stx;
   memset(&stx, 0, sizeof stx);
-  stx.stx_mask       = LINUX_STATX_BASIC_STATS;
+  /*
+   * The mount is reported as well as the basic set, because the alternative is
+   * worse than not answering.
+   *
+   * Software that wants to know whether two paths are on the same mount asks
+   * statx for STATX_MNT_ID first and falls back to name_to_handle_at when the
+   * answer is missing - which Darwin has nothing to implement, so it is
+   * ENOSYS, which is fatal where EOPNOTSUPP would not have been. systemd's
+   * sysusers stopped there with "Failed to load user database: Function not
+   * implemented", and every rpm %sysusers scriptlet failed with it.
+   *
+   * st_dev is the identifier to give. It is exactly what a mount id means here
+   * - one number per filesystem, equal for two files on the same one - and it
+   * agrees with the stx_dev_major/minor pair reported beside it, which is the
+   * fallback comparison anything doing this uses anyway.
+   */
+  stx.stx_mask       = LINUX_STATX_BASIC_STATS | LINUX_STATX_MNT_ID;
+  stx.stx_mnt_id     = (uint64_t) st.st_dev;
   stx.stx_blksize    = st.st_blksize;
   stx.stx_nlink      = st.st_nlink;
   stx.stx_uid        = host_uid_to_guest(st.st_uid);
@@ -3410,14 +3553,55 @@ DEFINE_SYSCALL(mkdir, gstr_t, path_ptr, int, mode)
   return sys_mkdirat(LINUX_AT_FDCWD, path_ptr, mode);
 }
 
+/*
+ * The working directory, named the way the guest names things.
+ *
+ * The host's answer is a host path, and handing that over says
+ * "/Volumes/msltest/fedora/etc" to a guest whose own name for it is "/etc" -
+ * or, before the process has chdir'd anywhere, a directory outside the rootfs
+ * entirely. bash hides it by tracking PWD itself, so this went unnoticed until
+ * something did arithmetic on the real answer: systemd's chaseat_prefix_root
+ * calls path_make_absolute_cwd, and every rpm %sysusers scriptlet failed with
+ * "Failed to prefix '...' with root '/': Invalid argument".
+ *
+ * A passthrough directory keeps its name, because that name is the same on both
+ * sides - that is what makes it a passthrough.
+ */
 int
 vfs_getcwd(char *buf, size_t size)
 {
+  char host[PATH_MAX];
+
   errno = 0;
-  char *ptr = getcwd(buf, size); /* FIXME: path translation */
-  if (! ptr) {
+  if (getcwd(host, sizeof host) == NULL)
     return -darwin_to_linux_errno(errno);
+
+  char root[PATH_MAX];
+  const char *guest = NULL;
+
+  if (fcntl(proc.fileinfo.rootfd, F_GETPATH, root) == 0) {
+    size_t rlen = strlen(root);
+    /* Careful with the boundary: "/a/rootfs-old" starts with "/a/rootfs" and
+     * is not inside it. */
+    if (strncmp(host, root, rlen) == 0) {
+      if (host[rlen] == '\0')
+        guest = "/";
+      else if (host[rlen] == '/')
+        guest = host + rlen;
+    }
   }
+
+  if (guest == NULL && host[0] == '/' && is_host_passthrough(host))
+    guest = host;
+
+  /* Outside both, so the guest has no name for it. It cannot happen once the
+   * process has been started in the rootfs, and answering with the root beats
+   * handing over a path that resolves to something else entirely. */
+  if (guest == NULL)
+    guest = "/";
+
+  if (strlcpy(buf, guest, size) >= size)
+    return -LINUX_ERANGE;
   return 0;
 }
 

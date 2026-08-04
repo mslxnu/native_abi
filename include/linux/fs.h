@@ -315,6 +315,8 @@ struct l_statx {
 #define LINUX_STATX_SIZE	0x00000200U
 #define LINUX_STATX_BLOCKS	0x00000400U
 #define LINUX_STATX_BASIC_STATS	0x000007ffU
+#define LINUX_STATX_BTIME	0x00000800U
+#define LINUX_STATX_MNT_ID	0x00001000U
 
 /*
  * epoll. Implemented over kqueue (src/fs/epoll.c), so these are only the guest's

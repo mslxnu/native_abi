@@ -2351,6 +2351,83 @@ NABI is left alone. Enforcing the modes it is given is the correct behaviour,
 and having one module quietly override another's metadata would make the next
 disagreement of this kind much harder to see.
 
+### 3.5.46 `..` walked out of the rootfs — **fixed**
+
+Chasing why every rpm `%sysusers` scriptlet failed found something larger than
+the scriptlet. In the guest:
+
+```
+stat /       1048605:16
+stat /..     1048605:2       <- a different inode: the host volume's root
+stat /../..  1048593:18481   <- a different device: the host's /Volumes
+ls /..    ->  fedora
+```
+
+On Linux `/..` is `/`; the kernel pins it and a process cannot climb out of its
+own filesystem. Here the *host* resolved the component, so every host file was
+one `..` away from a guest. That is a containment hole on its own terms.
+
+It is also what broke sysusers, by a route worth recording. systemd's `chaseat()`
+returns an absolute path when the descriptor it walked from is the root, and
+decides that by asking where `..` leads. Told somewhere else, it returned a
+relative path, and `chaseat_prefix_root` rejects "relative path with root /" as
+impossible - the case its own comment says cannot arise. Hence "Failed to prefix
+'usr/lib/sysusers.d/setup.conf' with root '/': Invalid argument", which names
+neither `..` nor the rootfs.
+
+`.` and `..` are now folded during the component walk, clamped at the root. The
+walk rather than a pass over the whole string beforehand, because on Linux `..`
+applies to what the path has resolved to *so far*: folding `link/..` textually
+gives nothing, where the answer is the parent of the link's target.
+
+Two things that cost a build each. Suppressing the separator on an empty path
+also suppressed the leading slash of a passthrough, and the guest lost `/dev`.
+And identifying the root by descriptor *number* is not enough: a guest that
+opens `/` for itself gets an ordinary descriptor, and systemd holds one, so it
+went on escaping until the check compared what the descriptor points at.
+
+### 3.5.47 `getcwd` answered with host paths — **fixed**
+
+A guest's first `getcwd` returned `/Users/sunneva/Development/mSL-XNU/mSL-NABI`
+- the directory nabi happened to be launched from, which has no name in the
+guest's namespace at all. After a `chdir` it returned
+`/Volumes/msltest/fedora/etc` for what the guest calls `/etc`.
+
+bash hides this by tracking `PWD` itself, which is why it went unnoticed: `pwd`
+looked right. It surfaced when something did arithmetic on the real answer.
+
+The guest now starts inside its own filesystem, and `getcwd` translates: under
+the rootfs the prefix is stripped, a passthrough keeps its name because that
+name is the same on both sides, and anything else - which the startup `chdir`
+makes unreachable - answers `/`.
+
+### 3.5.48 `statx` did not report a mount, so systemd asked a syscall we lack
+
+With the root pinned, sysusers got further and stopped on "Failed to load user
+database: Function not implemented". The unimplemented call was **264**,
+`name_to_handle_at`, called as `(fd, "", handle, &mnt_id, AT_EMPTY_PATH)` - the
+fallback for finding out which mount a file is on when `statx` does not say.
+
+NABI's `statx` filled the basic set and left `stx_mnt_id` out of the mask, so
+systemd fell through to the syscall Darwin has nothing to implement, and ENOSYS
+is fatal where EOPNOTSUPP would not have been. `st_dev` is the identifier to
+give: one number per filesystem, equal for two files on the same one, and it
+agrees with the `stx_dev_major`/`minor` pair reported beside it, which is the
+fallback comparison anything doing this uses anyway.
+
+### 3.5.49 `/proc/self/fd/<n>` was only a name you could open — **fixed**
+
+The last one. systemd changes the mode of an `O_PATH` descriptor by chmod'ing
+`/proc/self/fd/<n>`, because `fchmod` on an `O_PATH` handle is not allowed.
+NABI answered that path for `open` and for `readlink` and for nothing else, so
+the chmod went to the host's `/proc` and came back EACCES - "Failed to copy
+permissions from /etc/group to /etc/.#group…".
+
+Path resolution now rewrites it to the file the descriptor holds, so every
+operation reaches the file rather than the name. `dnf` installs `tpm2-tss` and
+`systemd-resolved` and reports **Complete**, with the sysusers scriptlet
+returning 0.
+
 ---
 
 ## 4. Phased implementation

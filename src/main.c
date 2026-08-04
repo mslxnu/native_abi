@@ -552,6 +552,23 @@ main(int argc, char *argv[], char **envp)
 
   open_debug_sinks(debug_paths);
 
+  /*
+   * Start the guest inside its own filesystem.
+   *
+   * Until now the process kept whatever directory nabi was launched from, and
+   * that is a host directory with no name in the guest's namespace at all - a
+   * guest's very first getcwd answered
+   * "/Users/sunneva/Development/mSL-XNU/mSL-NABI". Nothing good follows from a
+   * process whose working directory is outside its own root: relative paths
+   * resolve somewhere the guest cannot see, and anything building an absolute
+   * path from the cwd builds nonsense.
+   *
+   * After the debug sinks, because a relative -o/-w/-s is relative to where the
+   * user typed it.
+   */
+  if (fchdir(proc.fileinfo.rootfd) < 0)
+    warnk("could not start in the rootfs: %s\n", strerror(errno));
+
   /* Now that the sinks exist, say which sibling modules this run picked up. */
   report_host_passthrough();
   report_rootfs_case();
