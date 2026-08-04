@@ -461,13 +461,37 @@ fail:;
   return -darwin_to_linux_errno(e);
 }
 
+/*
+ * Retry a blocking transfer the host gave up on because a signal arrived.
+ *
+ * Linux restarts a call interrupted by a handler carrying SA_RESTART; the guest
+ * is never told. NABI's host handler only records the signal for delivery
+ * later, so an EINTR arriving here is an artefact of how it was noticed rather
+ * than something the guest asked to hear about - and sigrestart_wanted() is
+ * what distinguishes that from a signal whose handler is entitled to break the
+ * call.
+ *
+ * Reads and writes only. They are the two that block with nothing else to
+ * report, and they are where it was found: dnf's children exit while it waits
+ * at "Is this ok [y/N]:", and it takes the failed read as a refusal.
+ */
+#define RETRY_ON_RESTARTABLE_EINTR(expr) ({                                   \
+      int _r;                                                                 \
+      for (;;) {                                                              \
+        _r = syswrap(expr);                                                   \
+        if (_r != -LINUX_EINTR || !sigrestart_wanted())                       \
+          break;                                                              \
+      }                                                                       \
+      _r;                                                                     \
+    })
+
 int
 darwinfs_writev(struct file *file, const struct iovec *iov, size_t iovcnt)
 {
   struct eventfd_state *ev = eventfd_lookup(file->fd);
   if (ev != NULL)
     return eventfd_do_write(ev, iov, iovcnt);
-  return syswrap(writev(file->fd, iov, iovcnt));
+  return RETRY_ON_RESTARTABLE_EINTR(writev(file->fd, iov, iovcnt));
 }
 
 int
@@ -476,7 +500,7 @@ darwinfs_readv(struct file *file, struct iovec *iov, size_t iovcnt)
   struct eventfd_state *ev = eventfd_lookup(file->fd);
   if (ev != NULL)
     return eventfd_do_read(file, ev, iov, iovcnt);
-  return syswrap(readv(file->fd, iov, iovcnt));
+  return RETRY_ON_RESTARTABLE_EINTR(readv(file->fd, iov, iovcnt));
 }
 
 int

@@ -33,6 +33,49 @@ send_signal(pid_t pid, int signum)
   return syswrap(kill(pid, dsignum));
 }
 
+/*
+ * Whether an EINTR from the host should be hidden and the call tried again.
+ *
+ * EINTR is the guest's answer to "a signal you handle arrived while you were
+ * waiting". If nabi has no such signal to deliver, the guest is being told
+ * about something that did not happen to it: the host process is not the guest,
+ * and it takes signals of its own - from the frameworks it links, from its own
+ * threads - that have no meaning one level up. Passing those on invents an
+ * interruption Linux would never have reported.
+ *
+ * That is the case this was found in, and it is worth being precise about
+ * because the first guess was wrong. `sudo dnf install` answered "Operation
+ * aborted by the user" the instant it printed "Is this ok [y/N]:", because the
+ * read of the terminal came back EINTR and dnf takes a failed read as a
+ * refusal. It looked like SIGCHLD from dnf's own children - it handles SIGCHLD
+ * with SA_RESTART, and Linux would have restarted the read. But at the moment
+ * of the EINTR nabi had *nothing* pending and the guest's SIGCHLD was still
+ * SIG_DFL: the signal belonged to the host process alone.
+ *
+ * So: retry when there is nothing to deliver, and retry when everything to
+ * deliver was installed with SA_RESTART, which is what Linux does with it.
+ * A handler without SA_RESTART is entitled to break a blocking call, and
+ * something waiting on SIGALRM to end a read must still get its EINTR.
+ */
+bool
+sigrestart_wanted(void)
+{
+  uint64_t pending = task.sigpending & ~LINUX_SIGSET_TO_UI64(&task.sigmask);
+  if (pending == 0)
+    return true;              /* no signal for the guest; nothing interrupted it */
+
+  for (int sig = 1; sig <= LINUX_NSIG; sig++) {
+    if (!(pending & (1ULL << (sig - 1))))
+      continue;
+    const l_sigaction_t *sa = &proc.sigaction[sig - 1];
+    if (sa->lsa_handler == LINUX_SIG_DFL || sa->lsa_handler == LINUX_SIG_IGN)
+      continue;                 /* no handler runs, so nothing to restart for */
+    if (!(sa->lsa_flags & LINUX_SA_RESTART))
+      return false;
+  }
+  return true;
+}
+
 bool
 has_sigpending()
 {

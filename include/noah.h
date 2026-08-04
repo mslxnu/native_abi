@@ -70,6 +70,7 @@ typedef atomic_uint_least64_t atomic_sigbits_t;
 #define INIT_SIGBIT(sigbit) (*(sigbit) = ATOMIC_VAR_INIT(0))
 void handle_signal(void);
 bool has_sigpending(void);
+bool sigrestart_wanted(void);
 int send_signal(pid_t pid, int sig);
 
 /* The architecture-specific half of signal delivery, in signal_x86.c /

@@ -2449,7 +2449,7 @@ under /dev); everything else keeps the old answer.
 
 `apt-get install gcc` now completes on Debian and gcc runs.
 
-### 3.5.51 `sudo dnf install` aborts at its prompt — **not fixed**
+### 3.5.51 `sudo dnf install` aborted at its prompt — **fixed**
 
 ```
 Is this ok [y/N]: Operation aborted by the user.
@@ -2468,17 +2468,28 @@ check, since stdin and stdout are both ttys inside sudo; not dnf, which run
 directly as root reads `y\n` from fd 0 and completes; and not the process
 groups, since `setpgid` and `TIOCSPGRP` both succeed.
 
-The remaining suspicion is a signal Linux would not have raised, or one raised
-without the restart Linux would have performed. dnf installs handlers for 21 and
-22 - SIGTTIN and SIGTTOU - which is what a process gets for touching a terminal
-it does not have the foreground of. NABI translates SA_RESTART into the host
-sigaction it installs, so a host syscall interrupted by a guest handler should
-be restarted by the host kernel rather than surfacing; that it did not is where
-the next investigation starts. There is no restart logic of NABI's own, which
-may or may not turn out to be the gap.
+The first guess was SIGCHLD from dnf's own children: dnf installs a SIGCHLD
+handler with SA_RESTART, and Linux would restart the read rather than fail it.
+Probing showed that guess was wrong, and the way it was wrong is the answer. At
+the moment of the EINTR nabi had **nothing pending** and the guest's SIGCHLD was
+still SIG_DFL. The `[SIG 17]` deliveries that pointed at SIGCHLD were in *other*
+processes - bash and sudo - not in dnf.
 
-`sudo dnf -y install` avoids the prompt entirely and works, as does dnf run as
-root through `su`.
+So the signal belonged to the **host process alone**. NABI's process is not the
+guest: it links frameworks, it runs threads of its own, and it takes signals for
+their reasons. Darwin was asked whether it honours SA_RESTART and it does -
+`read` and `readv` on both a pipe and a pty were confirmed to restart rather
+than fail - so the interruption came from something with no guest meaning at
+all, and passing the EINTR on invented an event Linux would never have reported.
+
+EINTR is the guest's answer to "a signal *you* handle arrived while you were
+waiting". A read or write is therefore retried when nabi has nothing to deliver,
+and when everything it has to deliver carries SA_RESTART, which is what Linux
+does with that flag. A handler without it still breaks the call, so something
+waiting on SIGALRM to end a read still gets its EINTR.
+
+`sudo dnf install gcc` now waits at its prompt, takes the answer, and reports
+Complete.
 
 ---
 
