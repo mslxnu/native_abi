@@ -172,8 +172,36 @@ stat_darwin_to_linux(struct stat *stat, struct l_newstat *lstat)
 void
 statfs_darwin_to_linux(struct statfs *statfs, struct l_statfs *l_statfs)
 {
-#define HFS_SUPER_MAGIC 0x4244
-  l_statfs->f_type = HFS_SUPER_MAGIC;
+  /*
+   * The filesystem's identity, from what Darwin says it is rather than a
+   * constant.
+   *
+   * Every statfs used to answer HFS_SUPER_MAGIC, including for /proc - and
+   * "is /proc mounted?" is asked by comparing exactly this against
+   * PROC_SUPER_MAGIC. systemd-tmpfiles therefore refused to run at all,
+   * printing "/proc/ is not mounted, but required for successful operation of
+   * systemd-tmpfiles" on a machine where it was mounted, which stopped every
+   * apt install that triggers it.
+   *
+   * f_fstypename is the name Darwin gives the mount, so the mapping needs no
+   * knowledge of which path is which - a passthrough is recognised by what it
+   * is. Linux reports devtmpfs and Darwin's devfs as the same magic, which is
+   * what a guest expects to find under /dev.
+   */
+#define LINUX_PROC_SUPER_MAGIC  0x9fa0
+#define LINUX_SYSFS_MAGIC       0x62656572
+#define LINUX_TMPFS_MAGIC       0x01021994
+#define LINUX_HFS_SUPER_MAGIC   0x4244
+
+  if (strcmp(statfs->f_fstypename, "procfs") == 0)
+    l_statfs->f_type = LINUX_PROC_SUPER_MAGIC;
+  else if (strcmp(statfs->f_fstypename, "sysfs") == 0)
+    l_statfs->f_type = LINUX_SYSFS_MAGIC;
+  else if (strcmp(statfs->f_fstypename, "devfs") == 0 ||
+           strcmp(statfs->f_fstypename, "tmpfs") == 0)
+    l_statfs->f_type = LINUX_TMPFS_MAGIC;
+  else
+    l_statfs->f_type = LINUX_HFS_SUPER_MAGIC;
   l_statfs->f_bsize = statfs->f_bsize;
   l_statfs->f_blocks = statfs->f_blocks;
   l_statfs->f_bfree = statfs->f_bfree;

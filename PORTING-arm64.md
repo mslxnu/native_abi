@@ -2428,6 +2428,58 @@ operation reaches the file rather than the name. `dnf` installs `tpm2-tss` and
 `systemd-resolved` and reports **Complete**, with the sysusers scriptlet
 returning 0.
 
+### 3.5.50 Every filesystem claimed to be HFS — **fixed**
+
+```
+/proc/ is not mounted, but required for successful operation of
+systemd-tmpfiles. Please mount /proc/.
+```
+
+on a machine where it plainly was. "Is /proc mounted?" is not asked by looking
+at the mount table - it is asked by calling `statfs` and comparing `f_type`
+against `PROC_SUPER_MAGIC`. NABI answered `HFS_SUPER_MAGIC` for every
+filesystem there is, so the answer was always no, and `apt install` stopped
+wherever it triggers systemd-tmpfiles.
+
+Darwin's `statfs` carries `f_fstypename`, which is the mount's own name for
+itself, so the mapping needs no knowledge of which path is which - a passthrough
+is recognised by what it *is*. procfs, sysfs and devfs get the magic Linux uses
+(devtmpfs and Darwin's devfs report the same one, which is what a guest expects
+under /dev); everything else keeps the old answer.
+
+`apt-get install gcc` now completes on Debian and gcc runs.
+
+### 3.5.51 `sudo dnf install` aborts at its prompt — **not fixed**
+
+```
+Is this ok [y/N]: Operation aborted by the user.
+```
+
+immediately, without waiting. The trace says exactly what happens and no more:
+
+```
+write(fd: 2, "Is this ok [y/N]: ")  -> 18
+read(fd: 0, ..., 0x2000)            -> EINTR
+```
+
+dnf treats the interrupted read as a refusal. What has been ruled out: it is not
+the pty, which `sudo cat` relays correctly in both directions; not the terminal
+check, since stdin and stdout are both ttys inside sudo; not dnf, which run
+directly as root reads `y\n` from fd 0 and completes; and not the process
+groups, since `setpgid` and `TIOCSPGRP` both succeed.
+
+The remaining suspicion is a signal Linux would not have raised, or one raised
+without the restart Linux would have performed. dnf installs handlers for 21 and
+22 - SIGTTIN and SIGTTOU - which is what a process gets for touching a terminal
+it does not have the foreground of. NABI translates SA_RESTART into the host
+sigaction it installs, so a host syscall interrupted by a guest handler should
+be restarted by the host kernel rather than surfacing; that it did not is where
+the next investigation starts. There is no restart logic of NABI's own, which
+may or may not turn out to be the gap.
+
+`sudo dnf -y install` avoids the prompt entirely and works, as does dnf run as
+root through `su`.
+
 ---
 
 ## 4. Phased implementation
