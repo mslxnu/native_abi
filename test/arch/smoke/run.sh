@@ -483,6 +483,17 @@ else
     fail=1
 fi
 
+# schedtest: the sched_* family, and that its answers agree with each other -
+# what getscheduler reports must be what setscheduler accepted.
+cp "$here/schedtest" "$root/"; chmod +x "$root/schedtest"
+out=$("$NABI" -m "$root" /schedtest); rc=$?
+if [ "$rc" -eq 0 ] && [ "$out" = "sched ok" ]; then
+    echo "  ok  schedtest -> \"$out\", exit 0"
+else
+    echo "  FAIL schedtest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 if [ "$fail" -eq 0 ]; then
     echo "smoke: PASS"
 else

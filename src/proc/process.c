@@ -18,6 +18,7 @@
 
 #include "linux/common.h"
 #include "linux/misc.h"
+#include "linux/time.h"
 #include "linux/errno.h"
 #include "linux/futex.h"
 
@@ -949,6 +950,197 @@ DEFINE_SYSCALL(getpriority, int, which, int, who)
 DEFINE_SYSCALL(setpriority, int, which, int, who, int, niceval)
 {
   return syswrap(setpriority(which, who, niceval));
+}
+
+/* ------------------------------------------------------------- scheduling
+ *
+ * A guest thread is an ordinary host thread, and it stays one.
+ *
+ * Darwin has real-time scheduling, but not through POSIX: it is Mach's
+ * thread_policy_set with a time-constraint policy, which needs a port and a
+ * privilege nabi has not got. There is no honest way to put a guest thread on
+ * SCHED_FIFO, so the guest is SCHED_OTHER and these say so consistently -
+ * getscheduler agrees with what setscheduler accepted, and getparam agrees with
+ * both.
+ *
+ * The refusal is the one Linux already gives. An unprivileged process asking
+ * for SCHED_FIFO gets EPERM there too, so every caller that asks for real-time
+ * scheduling already has a path for being told no; that is a far better answer
+ * than accepting the request and not honouring it, which nothing can detect.
+ *
+ * The priority *ranges*, though, are reported as Linux reports them. Asking
+ * what a policy's range is is a question about the interface rather than a
+ * request to be scheduled under it, and a guest comparing a number against the
+ * maximum should get the number it would get anywhere else.
+ */
+
+/* The task exists, or ESRCH. pid 0 is the caller, which always does. Guest pids
+ * are host pids, so this is a real question with a real answer. */
+static int
+sched_check_pid(l_pid_t pid)
+{
+  if (pid < 0)
+    return -LINUX_EINVAL;
+  if (pid == 0)
+    return 0;
+  return syswrap(kill(pid, 0)) < 0 ? -LINUX_ESRCH : 0;
+}
+
+/* Whether a policy exists at all, with the flag bit already stripped. */
+static bool
+sched_policy_known(int policy)
+{
+  switch (policy) {
+  case LINUX_SCHED_OTHER: case LINUX_SCHED_FIFO: case LINUX_SCHED_RR:
+  case LINUX_SCHED_BATCH: case LINUX_SCHED_IDLE:
+    return true;
+  default:
+    return false;
+  }
+}
+
+static bool
+sched_policy_is_realtime(int policy)
+{
+  return policy == LINUX_SCHED_FIFO || policy == LINUX_SCHED_RR;
+}
+
+DEFINE_SYSCALL(sched_getscheduler, l_pid_t, pid)
+{
+  int r;
+  if ((r = sched_check_pid(pid)) < 0)
+    return r;
+  return LINUX_SCHED_OTHER;
+}
+
+DEFINE_SYSCALL(sched_getparam, l_pid_t, pid, gaddr_t, param_ptr)
+{
+  int r;
+  if ((r = sched_check_pid(pid)) < 0)
+    return r;
+  if (param_ptr == 0)
+    return -LINUX_EINVAL;
+
+  /* Zero, which is the only priority SCHED_OTHER has. */
+  struct l_sched_param param = { .sched_priority = 0 };
+  if (copy_to_user(param_ptr, &param, sizeof param))
+    return -LINUX_EFAULT;
+  return 0;
+}
+
+DEFINE_SYSCALL(sched_setparam, l_pid_t, pid, gaddr_t, param_ptr)
+{
+  int r;
+  if ((r = sched_check_pid(pid)) < 0)
+    return r;
+  if (param_ptr == 0)
+    return -LINUX_EINVAL;
+
+  struct l_sched_param param;
+  if (copy_from_user(&param, param_ptr, sizeof param))
+    return -LINUX_EFAULT;
+
+  /* The task is SCHED_OTHER, whose only valid priority is 0 - Linux answers
+   * EINVAL for anything else rather than pretending to set it. */
+  if (param.sched_priority != 0)
+    return -LINUX_EINVAL;
+  return 0;
+}
+
+DEFINE_SYSCALL(sched_setscheduler, l_pid_t, pid, int, policy, gaddr_t, param_ptr)
+{
+  int r;
+  if ((r = sched_check_pid(pid)) < 0)
+    return r;
+
+  int base = policy & ~LINUX_SCHED_RESET_ON_FORK;
+  if (!sched_policy_known(base))
+    return -LINUX_EINVAL;
+  if (param_ptr == 0)
+    return -LINUX_EINVAL;
+
+  struct l_sched_param param;
+  if (copy_from_user(&param, param_ptr, sizeof param))
+    return -LINUX_EFAULT;
+
+  if (sched_policy_is_realtime(base)) {
+    /* The priority has to be in range before privilege is considered, because
+     * that is the order Linux checks in and a caller probing the range should
+     * not have EPERM hide an EINVAL. */
+    if (param.sched_priority < LINUX_SCHED_RT_PRIO_MIN ||
+        param.sched_priority > LINUX_SCHED_RT_PRIO_MAX)
+      return -LINUX_EINVAL;
+    return -LINUX_EPERM;        /* no real-time scheduling to hand out */
+  }
+
+  if (param.sched_priority != 0)
+    return -LINUX_EINVAL;
+  return 0;                     /* already SCHED_OTHER, and staying there */
+}
+
+DEFINE_SYSCALL(sched_get_priority_max, int, policy)
+{
+  if (!sched_policy_known(policy))
+    return -LINUX_EINVAL;
+  return sched_policy_is_realtime(policy) ? LINUX_SCHED_RT_PRIO_MAX : 0;
+}
+
+DEFINE_SYSCALL(sched_get_priority_min, int, policy)
+{
+  if (!sched_policy_known(policy))
+    return -LINUX_EINVAL;
+  return sched_policy_is_realtime(policy) ? LINUX_SCHED_RT_PRIO_MIN : 0;
+}
+
+DEFINE_SYSCALL(sched_rr_get_interval, l_pid_t, pid, gaddr_t, interval_ptr)
+{
+  int r;
+  if ((r = sched_check_pid(pid)) < 0)
+    return r;
+  if (interval_ptr == 0)
+    return -LINUX_EINVAL;
+
+  /* Zero, which is what Linux reports for a task that is not on SCHED_RR - and
+   * none of them are. */
+  struct l_timespec ts = { 0, 0 };
+  if (copy_to_user(interval_ptr, &ts, sizeof ts))
+    return -LINUX_EFAULT;
+  return 0;
+}
+
+/*
+ * Accepted and not enforced, which is worth being explicit about.
+ *
+ * Darwin has no CPU pinning to offer - thread_policy_set's affinity policy is a
+ * hint about sharing caches, not a restriction, and it is not exposed for
+ * another process at all. Refusing would be the more honest answer in the
+ * abstract, but affinity is overwhelmingly set as an optimisation by runtimes
+ * that treat failure as fatal, and Linux itself makes no promise that a mask is
+ * honoured beyond the CPUs that exist.
+ *
+ * What is checked is the part a caller can be wrong about: a mask naming no
+ * usable CPU is EINVAL, exactly as it is on Linux. sched_getaffinity goes on
+ * reporting the one CPU this guest has, so the two do not contradict each
+ * other - a round trip returns the mask the guest was always going to get.
+ */
+DEFINE_SYSCALL(sched_setaffinity, l_pid_t, pid, unsigned int, len, gaddr_t, user_mask_ptr)
+{
+  int r;
+  if ((r = sched_check_pid(pid)) < 0)
+    return r;
+  if (len == 0 || user_mask_ptr == 0)
+    return -LINUX_EINVAL;
+
+  unsigned char buf[128];
+  unsigned int n = len < sizeof buf ? len : (unsigned int) sizeof buf;
+  if (copy_from_user(buf, user_mask_ptr, n))
+    return -LINUX_EFAULT;
+
+  /* CPU 0 is the only one sched_getaffinity offers, so a mask without it names
+   * nothing this guest can run on. */
+  if (!(buf[0] & 0x1))
+    return -LINUX_EINVAL;
+  return 0;
 }
 
 DEFINE_SYSCALL(sched_getaffinity, l_pid_t, pid, unsigned int, len, gaddr_t, user_mask_ptr)

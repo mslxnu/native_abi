@@ -2569,6 +2569,55 @@ before looking further. If it recurs, the way in is `NABI_STRACE_PATH`, which a
 resumed child writes to `<path>.<pid>`, and sampling the busiest of the several
 nabi processes rather than the first.
 
+### 3.5.55 The rest of the `sched_*` family — **implemented**
+
+Only `sched_yield` and `sched_getaffinity` existed; the other eight were ENOSYS
+on both architectures. All are implemented now: `setparam`, `getparam`,
+`setscheduler`, `getscheduler`, `setaffinity`, `get_priority_max`,
+`get_priority_min`, `rr_get_interval`.
+
+**A guest thread is an ordinary host thread and stays one.** Darwin does have
+real-time scheduling, but not through POSIX - it is Mach's `thread_policy_set`
+with a time-constraint policy, needing a port and a privilege NABI has not got.
+There is no honest way to put a guest thread on `SCHED_FIFO`, so it is refused,
+and refused with **EPERM** because that is what Linux already tells an
+unprivileged caller. Every program that asks for real-time scheduling therefore
+already has a path for being told no - which is a far better answer than
+accepting the request and not honouring it, since nothing can detect that.
+
+What the tests are really for is **agreement between the calls**, which is
+easier to get wrong than any single answer:
+
+- `getscheduler` reports what `setscheduler` accepted, and `getparam` agrees
+  with both.
+- `setaffinity` accepts the mask `getaffinity` just handed out. A round trip
+  returns what the guest was always going to get.
+- An out-of-range real-time priority is EINVAL *before* privilege is
+  considered, matching Linux's order, so a caller probing the range is not
+  told EPERM when the real answer is EINVAL.
+
+The priority *ranges* are the deliberate exception and report Linux's real
+numbers - 99/1 for FIFO and RR, 0/0 for the rest. Asking what a policy's range
+is is a question about the interface rather than a request to be scheduled under
+it, and a guest comparing a number against the maximum should get the number it
+would get anywhere else.
+
+Two things are accepted without being enforced, and both are marked as such in
+the code. `sched_setaffinity` cannot pin anything: Darwin's affinity policy is a
+hint about cache sharing, not a restriction, and is not exposed for another
+process at all - but affinity is overwhelmingly set as an optimisation by
+runtimes that treat failure as fatal, and a mask naming no usable CPU is still
+EINVAL. `sched_rr_get_interval` reports zero, which is what Linux reports for a
+task that is not on `SCHED_RR`, and none are.
+
+Verified against glibc rather than only at the syscall boundary - a Debian guest
+compiling and running the obvious program reports `SCHED_OTHER`, `99/1`,
+`Operation not permitted` for FIFO, and a zero quantum.
+
+Worth noting for later: `sched_getaffinity` reports **one** CPU. That predates
+this work and is left alone, but it is why a guest will not parallelise, and it
+is the thing to revisit if that starts to matter.
+
 ---
 
 ## 4. Phased implementation

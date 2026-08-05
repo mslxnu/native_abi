@@ -124,16 +124,16 @@
   SYSCALL(115, clock_nanosleep) \
   SYSCALL(116, unimplemented) \
   SYSCALL(117, ptrace) \
-  SYSCALL(118, unimplemented) \
-  SYSCALL(119, unimplemented) \
-  SYSCALL(120, unimplemented) \
-  SYSCALL(121, unimplemented) \
-  SYSCALL(122, unimplemented) \
+  SYSCALL(118, sched_setparam) \
+  SYSCALL(119, sched_setscheduler) \
+  SYSCALL(120, sched_getscheduler) \
+  SYSCALL(121, sched_getparam) \
+  SYSCALL(122, sched_setaffinity) \
   SYSCALL(123, sched_getaffinity) \
   SYSCALL(124, sched_yield) \
-  SYSCALL(125, unimplemented) \
-  SYSCALL(126, unimplemented) \
-  SYSCALL(127, unimplemented) \
+  SYSCALL(125, sched_get_priority_max) \
+  SYSCALL(126, sched_get_priority_min) \
+  SYSCALL(127, sched_rr_get_interval) \
   SYSCALL(128, unimplemented) \
   SYSCALL(129, kill) \
   SYSCALL(130, tkill) \

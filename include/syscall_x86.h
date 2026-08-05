@@ -145,13 +145,13 @@
   SYSCALL(139, unimplemented)                   \
   SYSCALL(140, getpriority)                     \
   SYSCALL(141, setpriority)                     \
-  SYSCALL(142, unimplemented)                   \
-  SYSCALL(143, unimplemented)                   \
-  SYSCALL(144, unimplemented)                   \
-  SYSCALL(145, unimplemented)                   \
-  SYSCALL(146, unimplemented)                   \
-  SYSCALL(147, unimplemented)                   \
-  SYSCALL(148, unimplemented)                   \
+  SYSCALL(142, sched_setparam)                   \
+  SYSCALL(143, sched_getparam)                   \
+  SYSCALL(144, sched_setscheduler)                   \
+  SYSCALL(145, sched_getscheduler)                   \
+  SYSCALL(146, sched_get_priority_max)                   \
+  SYSCALL(147, sched_get_priority_min)                   \
+  SYSCALL(148, sched_rr_get_interval)                   \
   SYSCALL(149, mlock)                           \
   SYSCALL(150, munlock)                         \
   SYSCALL(151, unimplemented)                   \
@@ -206,7 +206,7 @@
   SYSCALL(200, tkill)                           \
   SYSCALL(201, time)                            \
   SYSCALL(202, futex)                           \
-  SYSCALL(203, unimplemented)                   \
+  SYSCALL(203, sched_setaffinity)                   \
   SYSCALL(204, sched_getaffinity)               \
   SYSCALL(205, set_thread_area)                 \
   SYSCALL(206, unimplemented)                   \

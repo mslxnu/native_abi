@@ -155,6 +155,15 @@ guest-code cache sync.
   tree under `/proc/sys`, so `random/` is empty there and Arch's shell startup
   opened a login with three "No such file or directory" complaints.
 
+- `schedtest` — the `sched_*` family. A guest thread is an ordinary host thread
+  and stays one: Darwin's real-time scheduling is Mach's, needing a privilege
+  NABI has not got, so `SCHED_FIFO` is refused with EPERM exactly as Linux
+  refuses it to an unprivileged caller. What the test is really for is
+  agreement - `getscheduler` reporting what `setscheduler` accepted, `getparam`
+  agreeing with both, and `setaffinity` accepting the mask `getaffinity` just
+  handed out. A setter that quietly succeeded while the getter said otherwise
+  would be worse than either answer alone.
+
 The ELF binaries are committed prebuilt (as the x86 guest tests under
 `test/*/build/` are), so the check needs no cross-toolchain. The `.s` sources
 are here for reference; rebuild with an aarch64-linux clang + ld.lld:

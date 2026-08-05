@@ -65,6 +65,26 @@ struct l___sysctl_args
 #define	LINUX_SCHED_OTHER	0
 #define	LINUX_SCHED_FIFO	1
 #define	LINUX_SCHED_RR		2
+#define	LINUX_SCHED_BATCH	3
+#define	LINUX_SCHED_IDLE	5
+#define	LINUX_SCHED_DEADLINE	6
+
+/* OR'd into the policy by sched_setscheduler; not a policy of its own. */
+#define	LINUX_SCHED_RESET_ON_FORK	0x40000000
+
+/*
+ * The priority ranges Linux reports for each policy. These describe the
+ * interface rather than what this host can deliver: asking what a policy's
+ * range *is* is a different question from asking to be scheduled under it, and
+ * a guest comparing its priority against the maximum should get the numbers it
+ * would get anywhere else.
+ */
+#define	LINUX_SCHED_RT_PRIO_MIN	1
+#define	LINUX_SCHED_RT_PRIO_MAX	99
+
+struct l_sched_param {
+	int	sched_priority;
+};
 
 /* Resource limits */
 #define	LINUX_RLIMIT_CPU	0
