@@ -34,6 +34,13 @@
 #include <sys/syslimits.h>
 #include <dirent.h>
 #include <sys/stat.h>
+#include <uuid/uuid.h>
+#include <ctype.h>
+
+/* Declared rather than included: <sys/sysctl.h> drags in a roundup() macro that
+ * collides with the inline of the same name in util/misc.h. One prototype is
+ * cheaper than an include-order rule nobody will remember. */
+int sysctlbyname(const char *, void *, size_t *, void *, size_t);
 #include <unistd.h>
 
 #include "common.h"
@@ -154,7 +161,8 @@ build_maps(size_t *len_out)
  * is another guest, its state lives in a different nabi.
  */
 enum procfs_file { PROCFS_NONE, PROCFS_MAPS, PROCFS_CMDLINE, PROCFS_COMM,
-                   PROCFS_EXE, PROCFS_FD, PROCFS_MOUNTS, PROCFS_FDDIR };
+                   PROCFS_EXE, PROCFS_FD, PROCFS_MOUNTS, PROCFS_FDDIR,
+                   PROCFS_RANDOM_UUID, PROCFS_RANDOM_BOOT_ID };
 
 /* For PROCFS_FD, the number after /fd/. Meaningless for the others. */
 static enum procfs_file
@@ -169,6 +177,21 @@ own_procfs_file_n(const char *path, int *fd_out)
    * software still opens the short name directly. */
   if (strcmp(rest, "mounts") == 0)
     return PROCFS_MOUNTS;
+
+  /*
+   * The two files under /proc/sys/kernel/random that are read rather than
+   * tuned. mSL/FHS mirrors Darwin's sysctl tree under /proc/sys, so
+   * /proc/sys/kernel is the kern.* namespace and random/ comes out empty -
+   * these are Linux's own and have no Darwin sysctl behind them.
+   *
+   * Arch's shell startup reads both, so a login began with
+   * "-bash: /proc/sys/kernel/random/uuid: No such file or directory" three
+   * times over.
+   */
+  if (strcmp(rest, "sys/kernel/random/uuid") == 0)
+    return PROCFS_RANDOM_UUID;
+  if (strcmp(rest, "sys/kernel/random/boot_id") == 0)
+    return PROCFS_RANDOM_BOOT_ID;
 
   const char *slash = strchr(rest, '/');
   if (!slash)
@@ -266,6 +289,60 @@ build_mounts(size_t *len_out)
     return NULL;
   memcpy(out, text, len);
   *len_out = len;
+  return out;
+}
+
+/*
+ * /proc/sys/kernel/random/uuid: a fresh random UUID, every time it is read.
+ *
+ * That is the whole of its behaviour on Linux - it is a UUID generator with a
+ * filename, not a value that is stored anywhere - so two reads must not agree.
+ */
+static char *
+build_random_uuid(size_t *len_out)
+{
+  uuid_t u;
+  uuid_string_t text;
+
+  uuid_generate_random(u);
+  uuid_unparse_lower(u, text);
+
+  size_t n = strlen(text);
+  char *out = malloc(n + 2);
+  if (!out)
+    return NULL;
+  memcpy(out, text, n);
+  out[n] = '\n';
+  *len_out = n + 1;
+  return out;
+}
+
+/*
+ * /proc/sys/kernel/random/boot_id: one value for as long as the machine has
+ * been up, which is what anything reading it depends on.
+ *
+ * Darwin has exactly that in kern.bootsessionuuid, so this is a translation
+ * rather than an invention - and it keeps the guest's answer agreeing with the
+ * host's across every guest on the machine, which a per-process random value
+ * would not. Uppercase there, lowercase here, as Linux writes it.
+ */
+static char *
+build_boot_id(size_t *len_out)
+{
+  char sys[64];
+  size_t syslen = sizeof sys;
+
+  if (sysctlbyname("kern.bootsessionuuid", sys, &syslen, NULL, 0) < 0)
+    return NULL;
+
+  size_t n = strnlen(sys, sizeof sys - 1);
+  char *out = malloc(n + 2);
+  if (!out)
+    return NULL;
+  for (size_t i = 0; i < n; i++)
+    out[i] = (char) tolower((unsigned char) sys[i]);
+  out[n] = '\n';
+  *len_out = n + 1;
   return out;
 }
 
@@ -529,6 +606,12 @@ procfs_open(const char *path, int *out_fd)
     break;
   case PROCFS_MOUNTS:
     content = build_mounts(&len);
+    break;
+  case PROCFS_RANDOM_UUID:
+    content = build_random_uuid(&len);
+    break;
+  case PROCFS_RANDOM_BOOT_ID:
+    content = build_boot_id(&len);
     break;
   default:
     return -1;      /* not ours; the caller does the ordinary lookup */

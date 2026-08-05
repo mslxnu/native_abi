@@ -2531,6 +2531,44 @@ empty home and a program that does not create parents. On a real system those
 directories arrive with a desktop session or a login manager, and this guest has
 neither, so the builder now creates the XDG base directories with the account.
 
+### 3.5.53 `/proc/sys/kernel/random` — **fixed**
+
+An Arch login opened with three of these:
+
+```
+-bash: /proc/sys/kernel/random/uuid: No such file or directory
+-bash: /proc/sys/kernel/random/boot_id: No such file or directory
+```
+
+mSL/FHS mirrors **Darwin's sysctl tree** under `/proc/sys`, so `/proc/sys/kernel`
+is the `kern.*` namespace - `argmax`, `aiomax`, `apfsprebootuuid` - and
+`random/` exists but is empty, because Darwin has no `kern.random.*`. These two
+files are Linux's own and nothing on the host answers them, which is the same
+case `/proc/mounts` is already served for, so NABI answers them too.
+
+They are opposites, and that is what makes them worth a test. `uuid` is a
+generator with a filename: every read gives a different value, and caching one
+would be a defect nothing would report. `boot_id` must not change while the
+machine is up - Darwin has exactly that in `kern.bootsessionuuid`, so this is a
+translation rather than an invention, and every guest on the host agrees on it.
+Lowercase, as Linux writes it. bash's OSC 3008 now carries the real
+`bootid=d80c4ba9-…`.
+
+### 3.5.54 pacman hanging at "checking keys in keyring" — **not reproduced**
+
+Reported as a hang installing gcc under `sudo`. It did not reproduce on a tree
+built from the current source, across: `pacman -S gcc` as root (22s), the same
+under `sudo` through a real pty as an unprivileged user, and twice more in a
+row. A deliberately wiped keyring does not hang either - it fails cleanly with
+"required key missing from keyring".
+
+The likeliest explanation is that the report predates §3.5.51, which is exactly
+the shape that would hang a gpg-driven step under sudo: a host-only signal
+turning a blocking call into EINTR. Worth re-checking against a current build
+before looking further. If it recurs, the way in is `NABI_STRACE_PATH`, which a
+resumed child writes to `<path>.<pid>`, and sampling the busiest of the several
+nabi processes rather than the first.
+
 ---
 
 ## 4. Phased implementation

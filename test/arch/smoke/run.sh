@@ -472,6 +472,17 @@ else
     fail=1
 fi
 
+# randtest: /proc/sys/kernel/random/uuid is a generator (never twice the same)
+# and boot_id is not (never different).
+cp "$here/randtest" "$root/"; chmod +x "$root/randtest"
+out=$("$NABI" -m "$root" /randtest); rc=$?
+if [ "$rc" -eq 0 ] && [ "$out" = "rand ok" ]; then
+    echo "  ok  randtest -> \"$out\", exit 0"
+else
+    echo "  FAIL randtest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 if [ "$fail" -eq 0 ]; then
     echo "smoke: PASS"
 else

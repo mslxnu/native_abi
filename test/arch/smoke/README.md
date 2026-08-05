@@ -149,6 +149,12 @@ guest-code cache sync.
   which decides whether a descriptor is the root by asking where `..` leads,
   concluded `/` was not the root and failed every rpm `%sysusers` scriptlet.
 
+- `randtest` — `/proc/sys/kernel/random/uuid` and `boot_id`, which are
+  opposites: the first must give a different value on every read, the second the
+  same one for as long as the host has been up. mSL/FHS mirrors Darwin's sysctl
+  tree under `/proc/sys`, so `random/` is empty there and Arch's shell startup
+  opened a login with three "No such file or directory" complaints.
+
 The ELF binaries are committed prebuilt (as the x86 guest tests under
 `test/*/build/` are), so the check needs no cross-toolchain. The `.s` sources
 are here for reference; rebuild with an aarch64-linux clang + ld.lld:
