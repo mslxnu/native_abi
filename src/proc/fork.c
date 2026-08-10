@@ -394,10 +394,19 @@ DEFINE_SYSCALL(clone, unsigned long, clone_flags, unsigned long, newsp, gaddr_t,
    * clone asking for a namespace that cannot be provided fails outright rather
    * than producing a child in the wrong one.
    */
+  /*
+   * CLONE_NEWTIME is not available here, and that is Linux's rule rather than a
+   * limitation of ours: the flag is 0x80, which lands inside the exit-signal
+   * byte that clone's low bits carry, so the two cannot be told apart. It is
+   * reachable through unshare, which has no such byte.
+   */
+  if (clone_flags & LINUX_CLONE_NEWTIME)
+    return -LINUX_EINVAL;
+
   if (clone_flags & (LINUX_CLONE_NEWNS | LINUX_CLONE_NEWUTS |
                      LINUX_CLONE_NEWIPC | LINUX_CLONE_NEWPID |
                      LINUX_CLONE_NEWNET | LINUX_CLONE_NEWUSER |
-                     LINUX_CLONE_NEWCGROUP | LINUX_CLONE_NEWTIME)) {
+                     LINUX_CLONE_NEWCGROUP)) {
     int nsr = nsproxy_clone(clone_flags);
     if (nsr < 0)
       return nsr;

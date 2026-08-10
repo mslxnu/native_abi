@@ -164,6 +164,18 @@ guest-code cache sync.
   handed out. A setter that quietly succeeded while the getter said otherwise
   would be worse than either answer alone.
 
+- `nstest` — namespaces. All ten links Linux has under `/proc/<pid>/ns` exist;
+  a type that cannot be isolated here is refused with EINVAL rather than
+  accepted and ignored, and a refused flag alongside a workable one moves
+  nothing; `unshare(CLONE_NEWUTS)` changes the identity and the hostname set
+  inside it survives a fork, which on arm64 means surviving a rebuild from a
+  checkpoint. The time namespace is checked for what makes it unlike the
+  others: `unshare(CLONE_NEWTIME)` must *not* move the caller, only
+  `time_for_children`; `clone(CLONE_NEWTIME)` is EINVAL; and a child of a
+  namespace with offsets written through `/proc/self/timens_offsets` sees
+  `CLOCK_MONOTONIC` and `CLOCK_BOOTTIME` shifted by exactly them while
+  `CLOCK_REALTIME` is untouched.
+
 - `ipctest` — System V IPC: a segment created, attached, shared across a fork,
   detached and removed; keys resolving to ids; semaphore values through
   `SETVAL`/`GETALL`/`semop`; and `unshare(CLONE_NEWIPC)` making the same key

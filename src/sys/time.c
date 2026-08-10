@@ -1,5 +1,6 @@
 #include "common.h"
 #include "noah.h"
+#include "namespace.h"
 
 #include "linux/common.h"
 #include "linux/misc.h"
@@ -240,13 +241,51 @@ linux_to_darwin_clockid(l_clockid_t id)
   }
 }
 
+/*
+ * Which of a time namespace's two offsets a clock is subject to, if either.
+ *
+ * The realtime clocks are deliberately absent. Linux does not virtualise them
+ * and could not usefully: a guest that disagreed with the host about the wall
+ * clock would disagree with every file timestamp and every peer it spoke to.
+ * What a time namespace exists for is the monotonic family, so that a process
+ * restored from a checkpoint does not observe its own CLOCK_MONOTONIC jump.
+ */
+static bool
+clock_is_virtualised(l_clockid_t id, bool *boottime)
+{
+  switch (id) {
+  case LINUX_CLOCK_MONOTONIC:
+  case LINUX_CLOCK_MONOTONIC_COARSE:
+  case LINUX_CLOCK_MONOTONIC_RAW:
+    *boottime = false;
+    return true;
+  case LINUX_CLOCK_BOOTTIME:
+    *boottime = true;
+    return true;
+  default:
+    return false;
+  }
+}
+
+/* The host clock as this process's namespace sees it. */
+static int
+clock_gettime_ns(l_clockid_t id, clockid_t cid, struct timespec *ts)
+{
+  if (clock_gettime(cid, ts) < 0)
+    return -darwin_to_linux_errno(errno);
+  bool boot;
+  if (clock_is_virtualised(id, &boot))
+    timens_shift(ts, boot, +1);
+  return 0;
+}
+
 DEFINE_SYSCALL(clock_gettime, l_clockid_t, id, gaddr_t, spec_ptr)
 {
   struct timespec ts;
   clockid_t cid = linux_to_darwin_clockid(id);
   if (cid == (clockid_t) -1)
     return -LINUX_EINVAL;
-  int r = syswrap(clock_gettime(cid, &ts));
+  int r = clock_gettime_ns(id, cid, &ts);
   if (r < 0) {
     return r;
   }
@@ -311,9 +350,16 @@ DEFINE_SYSCALL(clock_nanosleep, l_clockid_t, id, int, flags, gaddr_t, rqtp_ptr,
   rq.tv_nsec = lreq.tv_nsec;
 
   if (flags & LINUX_TIMER_ABSTIME) {
+    /*
+     * The deadline the guest gave is in its own namespace's time, so `now` has
+     * to be read the same way or the interval comes out wrong by exactly the
+     * offset - a sleep until an absolute monotonic deadline would overshoot or
+     * return at once, depending on the sign.
+     */
     struct timespec now;
-    if (clock_gettime(cid, &now) < 0)
-      return -darwin_to_linux_errno(errno);
+    int nr = clock_gettime_ns(id, cid, &now);
+    if (nr < 0)
+      return nr;
     rq.tv_sec -= now.tv_sec;
     rq.tv_nsec -= now.tv_nsec;
     if (rq.tv_nsec < 0) {

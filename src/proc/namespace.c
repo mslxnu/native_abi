@@ -39,7 +39,7 @@ static const struct {
   [NS_NET]    = { NS_NET,    "net",    LINUX_CLONE_NEWNET,    false },
   [NS_USER]   = { NS_USER,   "user",   LINUX_CLONE_NEWUSER,   false },
   [NS_CGROUP] = { NS_CGROUP, "cgroup", LINUX_CLONE_NEWCGROUP, false },
-  [NS_TIME]   = { NS_TIME,   "time",   LINUX_CLONE_NEWTIME,   false },
+  [NS_TIME]   = { NS_TIME,   "time",   LINUX_CLONE_NEWTIME,   true  },
 };
 
 /* Every CLONE_NEW* bit, for telling "asked for a namespace" from other flags. */
@@ -91,12 +91,52 @@ nabi_boot_tag(void)
 }
 
 static void
-uts_path(uint64_t ino, char *out, size_t n)
+ns_state_path(const char *kind, uint64_t ino, char *out, size_t n)
 {
   const char *tmp = getenv("TMPDIR");
-  snprintf(out, n, "%s/nabi-uts-%s-%llu",
-           tmp && *tmp ? tmp : "/tmp", nabi_boot_tag(),
+  snprintf(out, n, "%s/nabi-%s-%s-%llu",
+           tmp && *tmp ? tmp : "/tmp", kind, nabi_boot_tag(),
            (unsigned long long) ino);
+}
+
+static void
+uts_path(uint64_t ino, char *out, size_t n)
+{
+  ns_state_path("uts", ino, out, n);
+}
+
+/* The offsets are shared state for the same reason a hostname is: every
+ * process in the namespace has to agree, and they are separate host
+ * processes. */
+static bool
+timens_load(uint64_t ino, struct time_namespace *out)
+{
+  char path[PATH_MAX];
+  ns_state_path("timens", ino, path, sizeof path);
+  int fd = open(path, O_RDONLY);
+  if (fd < 0)
+    return false;
+  bool ok = read(fd, out, sizeof *out) == (ssize_t) sizeof *out;
+  close(fd);
+  return ok;
+}
+
+static void
+timens_store(uint64_t ino, const struct time_namespace *t)
+{
+  char path[PATH_MAX], tmppath[PATH_MAX];
+  ns_state_path("timens", ino, path, sizeof path);
+  snprintf(tmppath, sizeof tmppath, "%s.new", path);
+
+  int fd = open(tmppath, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+  if (fd < 0)
+    return;
+  bool ok = write(fd, t, sizeof *t) == (ssize_t) sizeof *t;
+  close(fd);
+  if (ok)
+    rename(tmppath, path);
+  else
+    unlink(tmppath);
 }
 
 static bool
@@ -170,6 +210,7 @@ nsproxy_init(void)
     };
     current_nsproxy.ns[i] = &initial_ns[i];
   }
+  current_nsproxy.time_for_children = &initial_ns[NS_TIME];
 
   /*
    * The initial uts namespace starts from the host's idea of the machine, so a
@@ -198,9 +239,20 @@ ns_new(enum ns_type type, const struct namespace *from)
    * Linux does for uts - unshare does not blank the hostname. */
   if (from != NULL) {
     ns->uts = from->uts;
+    ns->time = from->time;
     if (type == NS_UTS) {
       uts_load(from->ino, &ns->uts);      /* whatever it is *now* */
       uts_store(ns->ino, &ns->uts);
+    }
+    if (type == NS_TIME) {
+      /*
+       * The offsets carry over and the freeze does not. A namespace nobody is
+       * in yet is exactly the one whose offsets may still be set, which is the
+       * whole reason unshare leaves the caller where it was.
+       */
+      timens_load(from->ino, &ns->time);
+      ns->time.frozen = 0;
+      timens_store(ns->ino, &ns->time);
     }
   }
   return ns;
@@ -250,11 +302,22 @@ nsproxy_unshare(unsigned long flags)
      * later sweep can tell an abandoned namespace from the initial one, which
      * nothing should ever collect.
      */
-    if (i == NS_IPC && ns)
-      sysv_ns_claim(ns->ino);
     if (ns == NULL) {
       pthread_mutex_unlock(&ns_lock);
       return -LINUX_ENOMEM;
+    }
+    if (i == NS_IPC)
+      sysv_ns_claim(ns->ino);
+
+    /*
+     * Time is the exception, and the only one: the caller stays where it is and
+     * the new namespace waits for its children. Moving the caller would move
+     * its CLOCK_MONOTONIC, and a monotonic clock that jumps is not one.
+     */
+    if (i == NS_TIME) {
+      ns_put(current_nsproxy.time_for_children);
+      current_nsproxy.time_for_children = ns;
+      continue;
     }
     ns_put(current_nsproxy.ns[i]);
     current_nsproxy.ns[i] = ns;
@@ -302,6 +365,15 @@ nsproxy_snapshot(uint64_t inos[NS_COUNT], struct uts_namespace *uts)
 {
   for (int i = 0; i < NS_COUNT; i++)
     inos[i] = current_nsproxy.ns[i]->ino;
+
+  /*
+   * Except time, where the child goes where the parent said children go rather
+   * than where the parent is. This is the whole of unshare(CLONE_NEWTIME)'s
+   * effect - the parent kept its own clocks and set these aside - and the
+   * checkpoint is written by a parent for one child, so substituting it here is
+   * exactly the handover. Nothing else consults this snapshot.
+   */
+  inos[NS_TIME] = current_nsproxy.time_for_children->ino;
   *uts = current_nsproxy.ns[NS_UTS]->uts;
 }
 
@@ -344,7 +416,24 @@ nsproxy_restore(const uint64_t inos[NS_COUNT], const struct uts_namespace *uts)
     ns->refcount = 1;
     ns_put(current_nsproxy.ns[i]);
     current_nsproxy.ns[i] = ns;
+    if (i == NS_TIME)
+      current_nsproxy.time_for_children = ns;
   }
+
+  /*
+   * Now that somebody is actually in the time namespace, its offsets are fixed.
+   * Freezing here rather than at unshare is what makes the window right: the
+   * parent may go on adjusting them until the moment a child arrives, and after
+   * that a change would move a running process's CLOCK_MONOTONIC.
+   */
+  {
+    struct namespace *tns = current_nsproxy.ns[NS_TIME];
+    if (timens_load(tns->ino, &tns->time) && !tns->time.frozen) {
+      tns->time.frozen = 1;
+      timens_store(tns->ino, &tns->time);
+    }
+  }
+
   /* The contents come from the file rather than the checkpoint when the file
    * exists, because the parent may have changed them after forking. The
    * checkpoint's copy is the fallback for a namespace whose file is gone. */
@@ -409,8 +498,39 @@ DEFINE_SYSCALL(setns, int, fd, int, nstype)
   if (!ns_kinds[type].supported)
     return -LINUX_EINVAL;
 
-  if (ns_ino_of(type) == ino)
+  if (ns_ino_of(type) == ino) {
+    /*
+     * setns is the call that *does* move a process into a time namespace, so
+     * joining the one already occupied has to bring time_for_children along -
+     * otherwise a process that unshared and then set itself back would go on
+     * handing children the namespace it had abandoned.
+     */
+    if (type == NS_TIME && current_nsproxy.time_for_children != current_nsproxy.ns[NS_TIME]) {
+      ns_put(current_nsproxy.time_for_children);
+      current_nsproxy.time_for_children = current_nsproxy.ns[NS_TIME];
+      current_nsproxy.time_for_children->refcount++;
+    }
     return 0;                   /* already there */
+  }
+
+  /*
+   * The namespace an unshare set aside for children is reachable, and it is the
+   * one case that matters: unshare(CLONE_NEWTIME) does not move the caller, so
+   * setns on the time_for_children descriptor is how a process joins what it
+   * just made. Doing so freezes the offsets, since from here on a process is in
+   * it.
+   */
+  if (type == NS_TIME && current_nsproxy.time_for_children->ino == ino) {
+    struct namespace *ns = current_nsproxy.time_for_children;
+    if (!timens_load(ns->ino, &ns->time))
+      ;
+    ns->time.frozen = 1;
+    timens_store(ns->ino, &ns->time);
+    ns_put(current_nsproxy.ns[NS_TIME]);
+    ns->refcount++;
+    current_nsproxy.ns[NS_TIME] = ns;
+    return 0;
+  }
 
   /* A namespace this process is not in belongs to another guest, and there is
    * no way to reach it until namespaces outlive the process that made them. */
@@ -432,4 +552,139 @@ nsproxy_release(void)
 {
   if (ns_kinds[NS_IPC].supported)
     sysv_ns_release_owned(ns_ino_of(NS_IPC));
+}
+
+uint64_t
+ns_ino_time_for_children(void)
+{
+  return current_nsproxy.time_for_children->ino;
+}
+
+/*
+ * The offsets in force for this process, read fresh.
+ *
+ * From the file rather than from memory, because a parent that unshared and
+ * then set them did so in another process - the same reason a hostname is not
+ * kept here either.
+ */
+static void
+timens_current(struct time_namespace *out)
+{
+  struct namespace *tns = current_nsproxy.ns[NS_TIME];
+  if (!timens_load(tns->ino, out))
+    *out = tns->time;
+}
+
+void
+timens_shift(struct timespec *ts, bool boottime, int sign)
+{
+  struct time_namespace t;
+  timens_current(&t);
+
+  int64_t sec  = boottime ? t.boot_sec  : t.mono_sec;
+  int64_t nsec = boottime ? t.boot_nsec : t.mono_nsec;
+  if (sec == 0 && nsec == 0)
+    return;
+
+  ts->tv_sec  += sign * sec;
+  ts->tv_nsec += sign * nsec;
+  if (ts->tv_nsec >= 1000000000L) {
+    ts->tv_nsec -= 1000000000L;
+    ts->tv_sec++;
+  } else if (ts->tv_nsec < 0) {
+    ts->tv_nsec += 1000000000L;
+    ts->tv_sec--;
+  }
+  /*
+   * A namespace may not push a clock below zero. Linux refuses an offset that
+   * would, when it is set; refusing it here as well costs nothing and means no
+   * arithmetic downstream has to cope with a negative timespec.
+   */
+  if (ts->tv_sec < 0) {
+    ts->tv_sec = 0;
+    ts->tv_nsec = 0;
+  }
+}
+
+int
+timens_offsets_read(char *out, size_t n)
+{
+  struct time_namespace t;
+  struct namespace *tns = current_nsproxy.time_for_children;
+  if (!timens_load(tns->ino, &t))
+    t = tns->time;
+  return snprintf(out, n,
+                  "monotonic %11lld %9lld\n"
+                  "boottime  %11lld %9lld\n",
+                  (long long) t.mono_sec, (long long) t.mono_nsec,
+                  (long long) t.boot_sec, (long long) t.boot_nsec);
+}
+
+/*
+ * Writing offsets, which is the only way a guest sets them.
+ *
+ * They belong to the namespace this process's *children* will be in, never to
+ * the one it is in itself - so in the initial namespace, where those are the
+ * same, there is nothing to write and Linux says so too. `unshare -T` and
+ * anything like it does exactly this: unshare, write, fork.
+ */
+int
+timens_offsets_write(const char *text)
+{
+  struct namespace *tns = current_nsproxy.time_for_children;
+
+  if (tns == current_nsproxy.ns[NS_TIME])
+    return -LINUX_EPERM;        /* the one we are in; not ours to move */
+
+  struct time_namespace t;
+  if (!timens_load(tns->ino, &t))
+    t = tns->time;
+  if (t.frozen)
+    return -LINUX_EACCES;       /* somebody is in it now */
+
+  /*
+   * Nothing to parse is not a failure. A shell splits `echo x > file` into more
+   * than one write and the trailing newline can arrive on its own, so rejecting
+   * an all-whitespace write made a redirect that had already taken effect
+   * report an I/O error afterwards.
+   */
+  const char *p = text;
+  while (*p == ' ' || *p == '\t' || *p == '\n')
+    p++;
+  if (*p == '\0')
+    return 0;
+
+  while (*p) {
+    while (*p == ' ' || *p == '\t' || *p == '\n')
+      p++;
+    if (*p == '\0')
+      break;
+
+    /* Linux takes either the clock's name or its number. */
+    bool boot;
+    if (strncmp(p, "monotonic", 9) == 0) { boot = false; p += 9; }
+    else if (strncmp(p, "boottime", 8) == 0) { boot = true; p += 8; }
+    else if (*p == '1') { boot = false; p += 1; }
+    else if (*p == '7') { boot = true; p += 1; }
+    else return -LINUX_EINVAL;
+
+    char *end;
+    long long sec = strtoll(p, &end, 10);
+    if (end == p)
+      return -LINUX_EINVAL;
+    p = end;
+    long long nsec = strtoll(p, &end, 10);
+    if (end == p)
+      nsec = 0;
+    else
+      p = end;
+    if (nsec < 0 || nsec >= 1000000000LL)
+      return -LINUX_EINVAL;
+
+    if (boot) { t.boot_sec = sec; t.boot_nsec = nsec; }
+    else      { t.mono_sec = sec; t.mono_nsec = nsec; }
+  }
+  tns->time = t;
+  timens_store(tns->ino, &t);
+  return 0;
 }

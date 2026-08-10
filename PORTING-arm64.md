@@ -3091,3 +3091,81 @@ answer.
 The test covers a `semtimedop` that need not wait, one that must wait its whole
 timeout and then return EAGAIN (checked against the clock, so a version that
 returned immediately would fail), the atomicity case above, and a null timeout.
+
+### 3.5.60 The time namespace — **implemented**
+
+`CLONE_NEWTIME` was refused with EINVAL. It is supported now: offsets on
+`CLOCK_MONOTONIC` and `CLOCK_BOOTTIME`, set through `/proc/<pid>/timens_offsets`
+and inherited by children, which is what a time namespace is and all it is.
+
+**It behaves unlike every other namespace, and that is the whole of the
+difficulty.** `unshare(CLONE_NEWTIME)` does **not** move the caller into the new
+namespace. Every other `CLONE_NEW*` takes effect on the process that asked; this
+one cannot, because shifting a running process's `CLOCK_MONOTONIC` is a
+monotonic clock jumping, which is the one thing it promises never to do. So the
+new namespace is held aside for children and `/proc/self/ns/time` goes on naming
+the old one. That is why Linux has a `time_for_children` link at all, and an
+implementation that assumed unshare moves the caller would read the same inode
+from both and never notice it was wrong.
+
+`nsproxy` therefore gained `time_for_children`, and `/proc/<pid>/ns` gained both
+`time_for_children` and `pid_for_children` — the second because Linux lists it
+and software walking the directory expects the full set; with no pid namespaces
+to be in, it names the one everybody is in. The directory now has all ten links
+Linux has.
+
+**`clone(CLONE_NEWTIME)` is EINVAL**, which is Linux's rule and not a limitation
+here: the flag is `0x80`, which lands inside the exit-signal byte that clone's
+low bits carry, so the two cannot be told apart. It is reachable through
+`unshare`, which has no such byte.
+
+`CLOCK_REALTIME` is deliberately untouched, as on Linux. A guest that disagreed
+with the host about the wall clock would disagree with every file timestamp and
+every peer it spoke to; what the namespace exists for is the monotonic family.
+`clock_nanosleep` with `TIMER_ABSTIME` reads "now" through the same offset, or
+the interval would come out wrong by exactly the offset and the sleep would
+overshoot or return at once depending on the sign.
+
+Offsets freeze once a process is actually in the namespace — at the fork, not at
+the unshare — which is the widest correct window: the parent may keep adjusting
+them until a child arrives, and after that a change would move a running
+process's clock.
+
+**Two bugs found, both in the write path, and both silent.**
+`/proc/<pid>/timens_offsets` is the only way to set offsets, and it is served
+here as a temporary file holding the current text, so a write had to be diverted
+to the namespace itself. The note saying "this descriptor is really the
+namespace" is keyed by descriptor number:
+
+- **A dup left the note behind.** `echo x > /proc/self/timens_offsets` opens the
+  file, `dup2`s it onto stdout and closes the original, so the write arrived on
+  a descriptor with no note and landed in the stand-in file. The shell reported
+  success and nothing had happened.
+- **Then it leaked the other way.** With `dup` carrying the note across, a shell
+  redirect *ends* by dup2ing the saved stdout back over descriptor 1 — and the
+  note stayed there, so every later `echo` in that shell was diverted into the
+  offset parser and failed. The first write worked and the session broke
+  afterwards. A dup has to clear the destination's note before copying, because
+  whatever the destination used to be, it is not that any more.
+
+A third, smaller one: a shell splits `echo x > file` into more than one write and
+the trailing newline can arrive alone, so an all-whitespace write must be a
+no-op rather than EINVAL — otherwise a redirect that had already taken effect
+reported an I/O error afterwards.
+
+Under Debian:
+
+```
+initial namespace:  echo ... > /proc/self/timens_offsets
+                    bash: echo: write error: Operation not permitted
+after unshare -T:   write ok
+                    monotonic        1234         5
+                    boottime            0         0
+```
+
+and in the smoke test, a child of a namespace with `monotonic 3600` /
+`boottime 7200` reports both shifted by exactly that, with `CLOCK_REALTIME`
+unmoved.
+
+What is not offset: `/proc/uptime` and `sysinfo`, which come from mSL/ProcFS and
+the host's `kern.boottime` respectively. Linux does virtualise both.

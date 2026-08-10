@@ -165,7 +165,8 @@ build_maps(size_t *len_out)
 enum procfs_file { PROCFS_NONE, PROCFS_MAPS, PROCFS_CMDLINE, PROCFS_COMM,
                    PROCFS_EXE, PROCFS_FD, PROCFS_MOUNTS, PROCFS_FDDIR,
                    PROCFS_RANDOM_UUID, PROCFS_RANDOM_BOOT_ID, PROCFS_NS, PROCFS_NSDIR,
-                   PROCFS_SYSVIPC_SHM, PROCFS_SYSVIPC_SEM, PROCFS_SYSVIPC_MSG };
+                   PROCFS_SYSVIPC_SHM, PROCFS_SYSVIPC_SEM, PROCFS_SYSVIPC_MSG,
+                   PROCFS_NS_FORCHILDREN, PROCFS_TIMENS_OFFSETS };
 
 /* For PROCFS_FD, the number after /fd/. Meaningless for the others. */
 static enum procfs_file
@@ -259,6 +260,33 @@ own_procfs_file_n(const char *path, int *fd_out)
   if (strcmp(slash, "/ns") == 0 || strcmp(slash, "/ns/") == 0)
     return PROCFS_NSDIR;
 
+  /*
+   * /proc/<pid>/timens_offsets: what a time namespace's offsets are, and the
+   * only way to set them. It describes the namespace this process's *children*
+   * will be in, never the one it is in - which is why writing it is useful only
+   * between an unshare and the fork that follows.
+   */
+  if (strcmp(slash, "/timens_offsets") == 0)
+    return PROCFS_TIMENS_OFFSETS;
+
+  /*
+   * The _for_children links. Linux has both, and only time's can ever differ
+   * from the plain one here: unshare(CLONE_NEWTIME) leaves the caller where it
+   * is and points these at the new namespace. pid's is listed because Linux
+   * lists it and anything walking the directory expects it; with no pid
+   * namespaces to be in, it names the one everybody is in.
+   */
+  if (strcmp(slash, "/ns/time_for_children") == 0) {
+    if (fd_out)
+      *fd_out = NS_TIME;
+    return PROCFS_NS_FORCHILDREN;
+  }
+  if (strcmp(slash, "/ns/pid_for_children") == 0) {
+    if (fd_out)
+      *fd_out = NS_PID;
+    return PROCFS_NS_FORCHILDREN;
+  }
+
   /* /proc/<pid>/ns/<type>. A symlink on Linux, reading "uts:[4026531838]", and
    * the thing setns is handed. */
   if (strncmp(slash, "/ns/", 4) == 0) {
@@ -327,6 +355,34 @@ build_mounts(size_t *len_out)
     return NULL;
   memcpy(out, text, len);
   *len_out = len;
+  return out;
+}
+
+/*
+ * Which namespace a link names: the one this process is in, or - for the
+ * _for_children forms - the one its children will be. Only time can differ,
+ * and only between an unshare(CLONE_NEWTIME) and the fork that follows it.
+ */
+static uint64_t
+ns_link_ino(enum procfs_file kind, enum ns_type t)
+{
+  if (kind == PROCFS_NS_FORCHILDREN && t == NS_TIME)
+    return ns_ino_time_for_children();
+  return ns_ino_of(t);
+}
+
+static char *
+build_timens_offsets(size_t *len_out)
+{
+  char buf[128];
+  int n = timens_offsets_read(buf, sizeof buf);
+  if (n < 0)
+    return NULL;
+  char *out = malloc((size_t) n + 1);
+  if (!out)
+    return NULL;
+  memcpy(out, buf, (size_t) n);
+  *len_out = (size_t) n;
   return out;
 }
 
@@ -608,6 +664,89 @@ procfs_ns_of_fd(int fd, enum ns_type *type, uint64_t *ino)
   return true;
 }
 
+/*
+ * Descriptors on /proc/<pid>/timens_offsets, which is the one file here a guest
+ * writes rather than reads.
+ *
+ * The file it was handed is a temporary stand-in holding the current text, so a
+ * write that landed in it would be recorded nowhere and reported as a success -
+ * the guest would set an offset, read it back from its own copy, and find the
+ * clocks unmoved. The descriptor is noted instead and write(2) is diverted to
+ * the namespace itself.
+ */
+KHASH_SET_INIT_INT(timensfd)
+static khash_t(timensfd) *timens_fds;
+
+static void
+procfs_remember_timens(int fd)
+{
+  int ret;
+  if (timens_fds == NULL)
+    timens_fds = kh_init(timensfd);
+  kh_put(timensfd, timens_fds, fd, &ret);
+}
+
+/* Whether a write to this descriptor is really a write to a time namespace,
+ * and if so what came of it. */
+bool
+procfs_write_timens(int fd, const char *buf, size_t size, int *out)
+{
+  if (timens_fds == NULL)
+    return false;
+  if (kh_get(timensfd, timens_fds, fd) == kh_end(timens_fds))
+    return false;
+
+  char text[256];
+  size_t n = size < sizeof text - 1 ? size : sizeof text - 1;
+  memcpy(text, buf, n);
+  text[n] = '\0';
+
+  int r = timens_offsets_write(text);
+  *out = r < 0 ? r : (int) size;
+  return true;
+}
+
+/*
+ * Carry these notes across a dup.
+ *
+ * They are keyed by descriptor number, and a descriptor number is exactly what
+ * dup changes. `echo > /proc/self/timens_offsets` opens the file, dup2s it onto
+ * stdout and closes the original, so the write arrived on a descriptor with no
+ * note against it and went to the stand-in file instead of the namespace - the
+ * shell reported success and nothing had happened, which is the worst of the
+ * available outcomes. The same applies to a namespace descriptor handed to
+ * setns after being dup'd.
+ */
+void
+procfs_dup_fd(int oldfd, int newfd)
+{
+  int ret;
+
+  if (oldfd == newfd)
+    return;                     /* dup2(fd, fd) changes nothing */
+
+  /*
+   * The destination is overwritten, so whatever it used to be it is not that
+   * any more. Clearing first is not tidiness: a shell redirect ends by dup2ing
+   * the saved stdout back over descriptor 1, and without this the note stayed
+   * on 1 and every subsequent `echo` in that shell was diverted into the
+   * namespace parser - the first write worked and the whole session broke
+   * afterwards.
+   */
+  procfs_close_fd(newfd);
+
+  if (nsfd_notes != NULL) {
+    khiter_t k = kh_get(nsfd, nsfd_notes, oldfd);
+    if (k != kh_end(nsfd_notes)) {
+      struct ns_note note = kh_value(nsfd_notes, k);
+      khiter_t n = kh_put(nsfd, nsfd_notes, newfd, &ret);
+      kh_value(nsfd_notes, n) = note;
+    }
+  }
+  if (timens_fds != NULL && kh_get(timensfd, timens_fds, oldfd) != kh_end(timens_fds))
+    kh_put(timensfd, timens_fds, newfd, &ret);
+}
+
 static void
 procfs_remember_tmpdir(int fd, const char *dir)
 {
@@ -623,6 +762,11 @@ procfs_remember_tmpdir(int fd, const char *dir)
 void
 procfs_close_fd(int fd)
 {
+  if (timens_fds != NULL) {
+    khiter_t tk = kh_get(timensfd, timens_fds, fd);
+    if (tk != kh_end(timens_fds))
+      kh_del(timensfd, timens_fds, tk);
+  }
   if (nsfd_notes != NULL) {
     khiter_t nk = kh_get(nsfd, nsfd_notes, fd);
     if (nk != kh_end(nsfd_notes))
@@ -678,18 +822,27 @@ procfs_stat(const char *path, uint32_t *mode, uint64_t *size, uint64_t *ino)
     *size = 0;
     *ino  = 1;
     return true;
+  case PROCFS_NS_FORCHILDREN:
   case PROCFS_NS:
     /* A symlink, and the length is the text it resolves to - which is what
      * anything sizing a readlink buffer will ask for. */
     {
+      uint64_t nsino = ns_link_ino(kind, (enum ns_type) which);
       char text[64];
       int n = snprintf(text, sizeof text, "%s:[%llu]",
                        ns_type_name((enum ns_type) which),
-                       (unsigned long long) ns_ino_of((enum ns_type) which));
+                       (unsigned long long) nsino);
       *mode = 0777 | 0120000;               /* lrwxrwxrwx */
       *size = n < 0 ? 0 : (uint64_t) n;
-      *ino  = ns_ino_of((enum ns_type) which);
+      *ino  = nsino;
     }
+    return true;
+  case PROCFS_TIMENS_OFFSETS:
+    /* Writable, and that is not decoration: writing it is the only way to set
+     * a time namespace's offsets. */
+    *mode = 0644 | 0100000;
+    *size = 0;
+    *ino  = 2;
     return true;
   default:
     return false;
@@ -766,6 +919,16 @@ procfs_open(const char *path, int *out_fd)
                (unsigned long long) ns_ino_of((enum ns_type) t));
       (void) symlink(target, name);
     }
+    /* Linux lists these beside the plain ones, and software walking the
+     * directory expects to find them. */
+    for (int k = 0; k < 2; k++) {
+      enum ns_type t = k == 0 ? NS_PID : NS_TIME;
+      char name[PATH_MAX], target[64];
+      snprintf(name, sizeof name, "%s/%s_for_children", dirtpl, ns_type_name(t));
+      snprintf(target, sizeof target, "%s:[%llu]", ns_type_name(t),
+               (unsigned long long) ns_link_ino(PROCFS_NS_FORCHILDREN, t));
+      (void) symlink(target, name);
+    }
 
     int dfd = open(dirtpl, O_RDONLY | O_DIRECTORY);
     if (dfd < 0) { procfs_rmtree(dirtpl); return -1; }
@@ -773,6 +936,7 @@ procfs_open(const char *path, int *out_fd)
     *out_fd = dfd;
     return 0;
   }
+  case PROCFS_NS_FORCHILDREN:
   case PROCFS_NS: {
     /*
      * Opening a namespace link.
@@ -783,10 +947,12 @@ procfs_open(const char *path, int *out_fd)
      * asks for that note rather than reading the file, because the file is
      * only a stand-in.
      */
+    uint64_t ino = ns_link_ino(own_procfs_file_n(path, &fdno),
+                               (enum ns_type) fdno);
     char text[64];
     int n = snprintf(text, sizeof text, "%s:[%llu]\n",
                      ns_type_name((enum ns_type) fdno),
-                     (unsigned long long) ns_ino_of((enum ns_type) fdno));
+                     (unsigned long long) ino);
     if (n < 0)
       return -1;
     len = (size_t) n;
@@ -806,8 +972,7 @@ procfs_open(const char *path, int *out_fd)
     free(content);
     if (!ok2 || lseek(nsfd, 0, SEEK_SET) < 0) { close(nsfd); return -1; }
 
-    procfs_remember_ns(nsfd, (enum ns_type) fdno,
-                       ns_ino_of((enum ns_type) fdno));
+    procfs_remember_ns(nsfd, (enum ns_type) fdno, ino);
     *out_fd = nsfd;
     return 0;
   }
@@ -874,6 +1039,9 @@ procfs_open(const char *path, int *out_fd)
   case PROCFS_RANDOM_BOOT_ID:
     content = build_boot_id(&len);
     break;
+  case PROCFS_TIMENS_OFFSETS:
+    content = build_timens_offsets(&len);
+    break;
   case PROCFS_SYSVIPC_SHM:
   case PROCFS_SYSVIPC_SEM:
   case PROCFS_SYSVIPC_MSG:
@@ -902,6 +1070,9 @@ procfs_open(const char *path, int *out_fd)
     return -1;
   }
 
+  if (own_procfs_file_n(path, &fdno) == PROCFS_TIMENS_OFFSETS)
+    procfs_remember_timens(fd);
+
   *out_fd = fd;
   return 0;
 }
@@ -921,11 +1092,13 @@ procfs_readlink(const char *path, char *buf, size_t bufsize)
   const char *link;
   char fdpath[PATH_MAX];
 
-  switch (own_procfs_file_n(path, &fd)) {
+  enum procfs_file kind = own_procfs_file_n(path, &fd);
+  switch (kind) {
+  case PROCFS_NS_FORCHILDREN:
   case PROCFS_NS: {
     int n = snprintf(fdpath, sizeof fdpath, "%s:[%llu]",
                      ns_type_name((enum ns_type) fd),
-                     (unsigned long long) ns_ino_of((enum ns_type) fd));
+                     (unsigned long long) ns_link_ino(kind, (enum ns_type) fd));
     if (n < 0 || (size_t) n > bufsize)
       return -1;
     memcpy(buf, fdpath, (size_t) n);

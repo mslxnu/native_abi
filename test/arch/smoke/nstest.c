@@ -33,9 +33,11 @@ static long sys6(long n,long a,long b,long c,long d,long e,long f){
 #define SYS_unshare 97
 #define SYS_setns 268
 #define SYS_clone 220
+#define SYS_clock_gettime 113
 #define SYS_wait4 260
 #define AT_FDCWD -100
 #define O_RDONLY 0
+#define O_WRONLY 1
 #define SIGCHLD 17
 
 #define CLONE_NEWNS     0x00020000
@@ -44,9 +46,16 @@ static long sys6(long n,long a,long b,long c,long d,long e,long f){
 #define CLONE_NEWUSER   0x10000000
 #define CLONE_NEWPID    0x20000000
 #define CLONE_NEWNET    0x40000000
+#define CLONE_NEWTIME   0x00000080
 #define EINVAL 22
 
 struct utsname { char sys[65], node[65], rel[65], ver[65], mach[65], dom[65]; };
+struct tspec { long tv_sec, tv_nsec; };
+
+#define CLOCK_REALTIME  0
+#define CLOCK_MONOTONIC 1
+#define CLOCK_BOOTTIME  7
+#define TIMENS_OFFSET   3600
 
 static void put(const char*m){int i=0;while(m[i])i++;sys6(SYS_write,1,(long)m,i,0,0,0);}
 static void putd(long v){char b[24];int i=23;b[i--]=0;int g=v<0;if(g)v=-v;
@@ -88,7 +97,8 @@ void _start(void)
   static const char *const all[] = {
     "/proc/self/ns/mnt", "/proc/self/ns/uts", "/proc/self/ns/ipc",
     "/proc/self/ns/pid", "/proc/self/ns/net", "/proc/self/ns/user",
-    "/proc/self/ns/cgroup", "/proc/self/ns/time", 0
+    "/proc/self/ns/cgroup", "/proc/self/ns/time",
+    "/proc/self/ns/time_for_children", "/proc/self/ns/pid_for_children", 0
   };
   for (int i = 0; all[i]; i++)
     if ((r = ns_link(all[i], a, sizeof a)) < 0)
@@ -152,6 +162,7 @@ void _start(void)
   if ((r = ns_link("/proc/self/ns/uts", a, sizeof a)) < 0)
     fail("uts link before forking", r, 0);
 
+  int status;
   long pid = sys6(SYS_clone, SIGCHLD, 0, 0, 0, 0, 0);
   if (pid < 0)
     fail("clone", pid, 0);
@@ -167,7 +178,7 @@ void _start(void)
     sys6(SYS_exit, 0, 0,0,0,0,0);
   }
 
-  int status = 0;
+  status = 0;
   if ((r = sys6(SYS_wait4, pid, (long) &status, 0, 0,0,0)) < 0)
     fail("wait4", r, 0);
   if ((status & 0x7f) != 0)
@@ -178,6 +189,97 @@ void _start(void)
   case 3: fails("the child could not read its uts link", "");
   case 4: fails("the child's uts namespace identity did not survive the fork", "");
   default: fail("the child exited with", (status >> 8) & 0xff, 0);
+  }
+
+  /*
+   * The time namespace, which behaves unlike every other one: unshare does not
+   * move the caller into it.
+   *
+   * A process's CLOCK_MONOTONIC cannot be shifted underneath it - that is a
+   * clock jumping, which is the one thing monotonic means it will not do - so
+   * the new namespace is set aside for children and /proc/self/ns/time goes on
+   * naming the old one. Anything that assumed unshare moves the caller would
+   * read the same inode from both links and never notice.
+   */
+  char tbefore[80], tafter[80], cbefore[80], cafter[80];
+  if (ns_link("/proc/self/ns/time", tbefore, sizeof tbefore) < 0)
+    fail("reading the time link", -1, 0);
+  if (ns_link("/proc/self/ns/time_for_children", cbefore, sizeof cbefore) < 0)
+    fail("reading the time_for_children link", -1, 0);
+  if (!eq(tbefore, cbefore))
+    fails("time and time_for_children disagreed before any unshare", cbefore);
+
+  /* clone cannot ask for one: the flag is 0x80, which lands in the exit-signal
+   * byte clone's low bits carry, so Linux offers it only through unshare. */
+  if ((r = sys6(SYS_clone, CLONE_NEWTIME | SIGCHLD, 0, 0, 0, 0, 0)) != -EINVAL)
+    fail("clone(CLONE_NEWTIME)", r, -EINVAL);
+
+  if ((r = sys6(SYS_unshare, CLONE_NEWTIME, 0,0,0,0,0)) != 0)
+    fail("unshare(CLONE_NEWTIME)", r, 0);
+  if (ns_link("/proc/self/ns/time", tafter, sizeof tafter) < 0)
+    fail("re-reading the time link", -1, 0);
+  if (ns_link("/proc/self/ns/time_for_children", cafter, sizeof cafter) < 0)
+    fail("re-reading the time_for_children link", -1, 0);
+  if (!eq(tbefore, tafter))
+    fails("unshare(CLONE_NEWTIME) moved the caller, which it must not", tafter);
+  if (eq(cbefore, cafter))
+    fails("unshare(CLONE_NEWTIME) left time_for_children unchanged", cafter);
+
+  /* The offsets, which are writable only while nobody is in the namespace. */
+  long ofd = sys6(SYS_openat, AT_FDCWD, (long) "/proc/self/timens_offsets",
+                  O_WRONLY, 0,0,0);
+  if (ofd < 0)
+    fail("opening /proc/self/timens_offsets", ofd, 0);
+  static const char offsets[] = "monotonic 3600 0\nboottime 7200 0\n";
+  int olen = 0; while (offsets[olen]) olen++;
+  if ((r = sys6(SYS_write, ofd, (long) offsets, olen, 0,0,0)) != olen)
+    fail("writing the offsets", r, olen);
+  sys6(SYS_close, ofd, 0,0,0,0,0);
+
+  /* This process is not in that namespace, so its own clocks have not moved. */
+  struct tspec pm, pb, pr;
+  sys6(SYS_clock_gettime, CLOCK_MONOTONIC, (long) &pm, 0,0,0,0);
+  sys6(SYS_clock_gettime, CLOCK_BOOTTIME, (long) &pb, 0,0,0,0);
+  sys6(SYS_clock_gettime, CLOCK_REALTIME, (long) &pr, 0,0,0,0);
+
+  long tpid = sys6(SYS_clone, SIGCHLD, 0, 0, 0, 0, 0);
+  if (tpid < 0)
+    fail("clone into the time namespace", tpid, 0);
+  if (tpid == 0) {
+    /* The child is in it, so its monotonic and boottime are shifted and its
+     * realtime is not - a time namespace does not touch the wall clock. */
+    struct tspec cm, cb, cr;
+    char cl[80];
+    sys6(SYS_clock_gettime, CLOCK_MONOTONIC, (long) &cm, 0,0,0,0);
+    sys6(SYS_clock_gettime, CLOCK_BOOTTIME, (long) &cb, 0,0,0,0);
+    sys6(SYS_clock_gettime, CLOCK_REALTIME, (long) &cr, 0,0,0,0);
+
+    long dm = cm.tv_sec - pm.tv_sec;
+    long db = cb.tv_sec - pb.tv_sec;
+    long dr = cr.tv_sec - pr.tv_sec;
+    if (dm < TIMENS_OFFSET - 5 || dm > TIMENS_OFFSET + 5)
+      sys6(SYS_exit, 5, 0,0,0,0,0);       /* monotonic did not shift */
+    if (db < 2 * TIMENS_OFFSET - 5 || db > 2 * TIMENS_OFFSET + 5)
+      sys6(SYS_exit, 6, 0,0,0,0,0);       /* boottime did not shift */
+    if (dr < -5 || dr > 5)
+      sys6(SYS_exit, 7, 0,0,0,0,0);       /* realtime moved, and must not */
+    if (ns_link("/proc/self/ns/time", cl, sizeof cl) < 0)
+      sys6(SYS_exit, 8, 0,0,0,0,0);
+    if (!eq(cl, cafter))
+      sys6(SYS_exit, 9, 0,0,0,0,0);       /* not in the one set aside for it */
+    sys6(SYS_exit, 0, 0,0,0,0,0);
+  }
+  status = 0;
+  if ((r = sys6(SYS_wait4, tpid, (long) &status, 0, 0,0,0)) < 0)
+    fail("wait4 for the time child", r, 0);
+  switch ((status >> 8) & 0xff) {
+  case 0: break;
+  case 5: fails("the child's CLOCK_MONOTONIC was not shifted", "");
+  case 6: fails("the child's CLOCK_BOOTTIME was not shifted", "");
+  case 7: fails("the child's CLOCK_REALTIME was shifted, and must not be", "");
+  case 8: fails("the child could not read its time link", "");
+  case 9: fails("the child is not in the namespace set aside for it", "");
+  default: fail("the time child exited with", (status >> 8) & 0xff, 0);
   }
 
   put("ns ok\n");

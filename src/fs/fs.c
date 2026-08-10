@@ -989,6 +989,7 @@ darwinfs_fcntl(struct file *file, unsigned int cmd, unsigned long arg)
     pthread_rwlock_wrlock(&proc.fileinfo.fdtable_lock);
     r = syswrap(fcntl(file->fd, F_DUPFD, arg)); /* FIXME */
     if (r >= 0) {
+      procfs_dup_fd(file->fd, r);
       int err = register_fd(r, false);
       if (err < 0) {
         close(r);
@@ -1001,6 +1002,7 @@ darwinfs_fcntl(struct file *file, unsigned int cmd, unsigned long arg)
     pthread_rwlock_wrlock(&proc.fileinfo.fdtable_lock);
     r = syswrap(fcntl(file->fd, F_DUPFD_CLOEXEC, arg));
     if (r >= 0) {
+      procfs_dup_fd(file->fd, r);
       int err = register_fd(r, true);
       if (err < 0) {
         close(r);
@@ -1838,6 +1840,15 @@ DEFINE_SYSCALL(write, int, fd, gaddr_t, buf_ptr, size_t, size)
     r = -LINUX_EFAULT;
     goto out;
   }
+  /*
+   * /proc/<pid>/timens_offsets is served as a temporary file holding the
+   * current text, so a write would land in that copy and be reported as a
+   * success while the namespace went unchanged. It is diverted before the
+   * descriptor is looked up at all.
+   */
+  if (procfs_write_timens(fd, buf, size, &r))
+    goto out;
+
   struct file *file = get_file(fd);
   if (file == NULL) {
     r = -LINUX_EBADF;
@@ -3857,6 +3868,7 @@ DEFINE_SYSCALL(dup, unsigned int, fd)
   pthread_rwlock_wrlock(&proc.fileinfo.fdtable_lock);
   int ret = sys_fcntl(fd, LINUX_F_DUPFD, 0);
   if (ret >= 0) {
+    procfs_dup_fd(fd, ret);
     int err = register_fd(ret, false);
     if (err < 0) {
       close(ret);
@@ -3875,6 +3887,7 @@ DEFINE_SYSCALL(dup2, unsigned int, fd1, unsigned int, fd2)
   pthread_rwlock_wrlock(&proc.fileinfo.fdtable_lock);
   int ret = syswrap(dup2(fd1, fd2));
   if (ret >= 0) {
+    procfs_dup_fd(fd1, ret);
     int err = register_fd(ret, false);
     if (err < 0) {
       close(ret);
@@ -3899,6 +3912,7 @@ DEFINE_SYSCALL(dup3, unsigned int, oldfd, unsigned int, newfd, int, flags)
   if (ret < 0) {
     goto out;
   }
+  procfs_dup_fd(oldfd, ret);
   if (flags & LINUX_O_CLOEXEC) {
     int fcntl_err = syswrap(fcntl(newfd, F_SETFD, FD_CLOEXEC));
     if (fcntl_err < 0) {
