@@ -56,6 +56,15 @@ struct mm_region {
   int prot;            /* Access permission that consists of LINUX_PROT_* */
   int mm_flags;        /* mm flags in the form of LINUX_MAP_* */
   int mm_fd;
+  /*
+   * The shared-memory segment this region is an attachment to, or -1.
+   *
+   * Kept on the region rather than in a table beside it because the region *is*
+   * the attachment - there is exactly one per shmat - so the two cannot drift
+   * apart, and because regions travel in the checkpoint, which is what lets a
+   * forked child detach a segment it inherited.
+   */
+  int shm_id;
   int pgoff;           /* offset within mm_fd in page size */
   bool is_global;      /* global page flag. Preserved during exec if global */
   struct list_head list;

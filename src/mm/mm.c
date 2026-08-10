@@ -122,6 +122,7 @@ split_region(struct mm *mm, struct mm_region *region, gaddr_t gaddr)
   tail->mm_flags = region->mm_flags;
   tail->mm_fd = region->mm_fd;
   tail->pgoff = region->pgoff;
+  tail->shm_id = region->shm_id;
 
   region->size = offset;
   list_add(&tail->list, &region->list);
@@ -137,6 +138,7 @@ record_region(struct mm *mm, void *haddr, gaddr_t gaddr, size_t size, int prot, 
   *region = (struct mm_region) {
     .haddr = haddr,
     .arena_off = -1,      /* callers that allocate from the arena set this */
+    .shm_id = -1,         /* shmat sets this; nothing else is an attachment */
     .gaddr = gaddr,
     .size = size,
     .prot = prot,

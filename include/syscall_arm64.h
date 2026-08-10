@@ -203,7 +203,7 @@
   SYSCALL(194, shmget) \
   SYSCALL(195, shmctl) \
   SYSCALL(196, shmat) \
-  SYSCALL(197, unimplemented) \
+  SYSCALL(197, shmdt) \
   SYSCALL(198, socket) \
   SYSCALL(199, socketpair) \
   SYSCALL(200, bind) \

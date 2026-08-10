@@ -650,6 +650,7 @@ DEFINE_SYSCALL(exit, int, reason)
   vmm_destroy_vcpu();
   pthread_rwlock_wrlock(&proc.lock);
   if (proc.nr_tasks == 1) {
+    nsproxy_release();
     _exit(reason);
   } else {
     proc.nr_tasks--;
@@ -667,6 +668,7 @@ DEFINE_SYSCALL(exit_group, int, reason)
       return -LINUX_EFAULT;
     do_futex_wake(task.clear_child_tid, 1);
   }
+  nsproxy_release();
   _exit(reason);
 }
 

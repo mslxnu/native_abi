@@ -26,7 +26,7 @@
 #include "linux/signal.h"
 
 #define CHECKPOINT_MAGIC   0x4E414249434B5031ULL  /* "NABICKP1" */
-#define CHECKPOINT_VERSION 4
+#define CHECKPOINT_VERSION 5
 
 /* One guest memory region, as src/mm/mmap.c tracks it, with the host address
  * replaced by the arena offset that names the same bytes elsewhere. */
@@ -38,6 +38,16 @@ struct checkpoint_region {
   int32_t  mm_flags;
   int32_t  mm_fd;
   int32_t  pgoff;
+  /*
+   * As of version 5: the shared-memory segment this region attaches, or -1.
+   *
+   * An attachment is process state and has to travel, or a child that inherited
+   * one cannot detach it - and Linux lets it. There is no separate list of
+   * attachments because there is no need for one: a shmat produces exactly one
+   * region, so the region list already is that list.
+   */
+  int32_t  shm_id;
+  int32_t  _pad5;
 };
 
 /* One stage-2 mapping: which guest-physical range is backed by which arena

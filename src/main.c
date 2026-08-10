@@ -15,6 +15,7 @@
 #include "mm.h"
 #include "noah.h"
 #include "namespace.h"
+#include "sysv.h"
 #include "syscall.h"
 #if defined(__arm64__)
 #include "checkpoint.h"
@@ -225,6 +226,12 @@ init_first_proc(const char *root)
   /* The initial namespace set, seeded from the host's hostname so a guest that
    * never unshares reports what it always did. */
   nsproxy_init();
+  /*
+   * Anything left in an IPC namespace by a run that is over, or by a boot that
+   * is, collected before this guest starts. A namespace whose processes are all
+   * gone has no members and by Linux's rule no objects either.
+   */
+  sysv_sweep();
 
   /*
    * Clamp RLIMIT_NOFILE to what the OS can actually give a process.

@@ -70,7 +70,7 @@
   SYSCALL(64, semget)                           \
   SYSCALL(65, semop)                            \
   SYSCALL(66, semctl)                           \
-  SYSCALL(67, unimplemented)                    \
+  SYSCALL(67, shmdt)                            \
   SYSCALL(68, unimplemented)                    \
   SYSCALL(69, unimplemented)                    \
   SYSCALL(70, unimplemented)                    \

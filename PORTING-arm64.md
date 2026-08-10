@@ -2889,3 +2889,98 @@ fresh start:    redstar
   inside:       inside-box
 outside after:  redstar
 ```
+
+### 3.5.57 The IPC namespace, and the tables it needed underneath — **implemented**
+
+`unshare(CLONE_NEWIPC)` now works, and `ipcs` inside one shows an empty list
+next to a populated one outside. Getting there meant implementing System V IPC,
+because what was here could not be namespaced and, as it turned out, did not
+work either.
+
+**What was actually there.** `shmget` mapped `IPC_CREAT` and `IPC_EXCL` into
+Darwin's flags and dropped the permission bits on the floor, so every segment
+was created mode 0 and every `shmat` on it returned **EACCES**. `semctl`
+returned ENOSYS for *every* command, including the `SETVAL` that initialises an
+array and the `IPC_RMID` that removes it. `shmdt` did not exist. `semop` read
+the guest's operations with `copy_from_user(&l_tsops, ...)` — the address of the
+pointer rather than the array — so it overwrote its own pointer with guest data
+and then freed that. None of this can have been exercised.
+
+**Why the objects could not stay Darwin's.** Four reasons, the first of which is
+the namespace and any one of which is sufficient:
+
+- They are the *host Mac's* tables, shared with macOS itself and every other
+  guest. There is no key space to scope, so there is no isolation to be had.
+- Darwin allows **32 shared segments for the whole machine**
+  (`kern.sysv.shmmni`), 8 attachments per process, and 4MB each. Linux's
+  defaults are 4096 and effectively unbounded.
+- Anything a guest left behind stayed in those 32 slots until the Mac rebooted.
+  A guest leak was a host problem.
+- **A Darwin attachment could not survive nabi's fork — it panicked.** Verified,
+  not inferred: with the mode-bits bug patched so that `shmat` could succeed at
+  all, attaching a segment and then forking gives
+
+  ```
+  !!PANIC!!  region 0xc0000000 is neither arena-backed nor file-backed
+      panic → checkpoint_restore → resume_main
+  ```
+
+  A resumed child rebuilds its address space from the checkpoint: arena-backed
+  regions are copied, file-backed ones re-mapped from their descriptor, and a
+  `shmat` region is neither. So the ordinary way to use shared memory — attach,
+  then fork — killed the child.
+
+**So a segment is a file and a namespace is a directory of them.** That one
+change settles isolation (different directory, no shared key space), capacity
+(the filesystem's limits, not Darwin's 32), fork (a file-backed mapping is
+precisely what the checkpoint already knows how to rebuild), and destruction:
+`IPC_RMID` unlinks, and an unlinked file's existing mappings stay valid, which
+*is* Linux's rule that a removed segment lives until the last attachment goes.
+The rule came for free rather than being implemented.
+
+Ids are allocated by `O_EXCL` on the meta file — whoever creates it owns that
+id, and a race cannot have two winners. Keys are symlinks into the same
+directory, so a key lookup is a `readlink`.
+
+**Semaphores keep Darwin's arrays underneath**, and the asymmetry is deliberate:
+`semmni` is 87381 rather than 32, and Darwin's `semop` already has the two hard
+parts right — blocking until a whole set of operations can be applied at once,
+and undoing a dead process's `SEM_UNDO` adjustments. Reimplementing a
+cross-process wait queue to arrive back at the same behaviour would be the worse
+trade. What they take from the namespace is scoping: the Darwin key is *derived*
+from the namespace and the id rather than agreed on, so every process computes
+the same number and there is nothing to coordinate.
+
+**Attachments travel on the region, not beside it.** `struct mm_region` gained
+`shm_id`, and the checkpoint carries it (version 4 → 5). A `shmat` produces
+exactly one region, so the region list already *is* the list of attachments —
+there is no second table to drift out of step, and a forked child can detach
+what it inherited, which Linux allows.
+
+**`/proc/sysvipc` had to move too.** mSL/ProcFS provides those files, filled
+from the host Mac's tables — which is where these objects used to live and no
+longer do. So `ipcs` opened `/proc/sysvipc/shm`, parsed it, found nothing, and
+never fell back to `shmctl(SHM_STAT)`: an empty listing beside a segment the
+guest had just made, with nothing appearing to be wrong. nabi answers those
+three files now, from the namespace the caller is in.
+
+Message queues are still absent — `msgget` is unimplemented and in neither
+syscall table — so they need no isolating yet. Worth stating rather than leaving
+to be noticed: the guarantee holds only while they stay absent.
+
+End to end under Debian, with its own tooling:
+
+```
+=== initial namespace ===
+key        shmid  owner  perms  bytes  nattch
+0xbb5b6322 0      root   644    65536  0
+=== inside unshare -i ===
+(nothing)      … then after ipcmk -M 4096 here:
+0xdd8f50d9 0      root   644    4096   0
+=== back outside ===
+0xbb5b6322 0      root   644    65536  0
+```
+
+and the host's own tables come back to where they started — a guest's
+`ipcrm` releases the Darwin array behind a semaphore, and a namespace that ends
+releases every one it held.

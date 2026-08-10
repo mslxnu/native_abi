@@ -123,6 +123,7 @@ checkpoint_restore(int ckpt_fd, int arena_fd)
                                         regions[i].mm_flags, regions[i].mm_fd,
                                         regions[i].pgoff);
     r->arena_off = regions[i].arena_off;
+    r->shm_id = regions[i].shm_id;
   }
   free(region_hva);
 

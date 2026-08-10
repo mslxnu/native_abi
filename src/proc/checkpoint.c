@@ -153,6 +153,7 @@ checkpoint_write(int fd)
       .mm_flags  = r->mm_flags,
       .mm_fd     = r->mm_fd,
       .pgoff     = r->pgoff,
+      .shm_id    = r->shm_id,
     };
   }
 

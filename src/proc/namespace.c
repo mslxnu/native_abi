@@ -14,6 +14,7 @@
 #include "common.h"
 #include "noah.h"
 #include "namespace.h"
+#include "sysv.h"
 
 #include "linux/common.h"
 #include "linux/errno.h"
@@ -33,7 +34,7 @@ static const struct {
 } ns_kinds[NS_COUNT] = {
   [NS_MNT]    = { NS_MNT,    "mnt",    LINUX_CLONE_NEWNS,     false },
   [NS_UTS]    = { NS_UTS,    "uts",    LINUX_CLONE_NEWUTS,    true  },
-  [NS_IPC]    = { NS_IPC,    "ipc",    LINUX_CLONE_NEWIPC,    false },
+  [NS_IPC]    = { NS_IPC,    "ipc",    LINUX_CLONE_NEWIPC,    true  },
   [NS_PID]    = { NS_PID,    "pid",    LINUX_CLONE_NEWPID,    false },
   [NS_NET]    = { NS_NET,    "net",    LINUX_CLONE_NEWNET,    false },
   [NS_USER]   = { NS_USER,   "user",   LINUX_CLONE_NEWUSER,   false },
@@ -74,8 +75,8 @@ static const struct {
  */
 int sysctlbyname(const char *, void *, size_t *, void *, size_t);
 
-static void
-uts_path(uint64_t ino, char *out, size_t n)
+const char *
+nabi_boot_tag(void)
 {
   static char boot[48];
   if (boot[0] == '\0') {
@@ -86,9 +87,16 @@ uts_path(uint64_t ino, char *out, size_t n)
       if (*p == '-')
         *p = '\0';              /* the first field is plenty, and short */
   }
+  return boot;
+}
+
+static void
+uts_path(uint64_t ino, char *out, size_t n)
+{
   const char *tmp = getenv("TMPDIR");
   snprintf(out, n, "%s/nabi-uts-%s-%llu",
-           tmp && *tmp ? tmp : "/tmp", boot, (unsigned long long) ino);
+           tmp && *tmp ? tmp : "/tmp", nabi_boot_tag(),
+           (unsigned long long) ino);
 }
 
 static bool
@@ -236,6 +244,14 @@ nsproxy_unshare(unsigned long flags)
     if (!(wanted & ns_kinds[i].flag))
       continue;
     struct namespace *ns = ns_new((enum ns_type) i, current_nsproxy.ns[i]);
+    /*
+     * A new IPC namespace starts empty, as Linux's does - unshare does not
+     * carry the objects across - and it is claimed for this process so that a
+     * later sweep can tell an abandoned namespace from the initial one, which
+     * nothing should ever collect.
+     */
+    if (i == NS_IPC && ns)
+      sysv_ns_claim(ns->ino);
     if (ns == NULL) {
       pthread_mutex_unlock(&ns_lock);
       return -LINUX_ENOMEM;
@@ -399,4 +415,21 @@ DEFINE_SYSCALL(setns, int, fd, int, nstype)
   /* A namespace this process is not in belongs to another guest, and there is
    * no way to reach it until namespaces outlive the process that made them. */
   return -LINUX_EINVAL;
+}
+
+/*
+ * The namespaces this process brought into being, released.
+ *
+ * Only the ones it created: a process that merely joined one must not take it
+ * away from everyone else, and every forked child is in its parent's. The
+ * ownership recorded when the namespace was made is what tells them apart.
+ *
+ * This is the prompt path, not the guarantee. A process killed outright never
+ * runs it, so sysv_sweep at startup does the same job for anything left behind.
+ */
+void
+nsproxy_release(void)
+{
+  if (ns_kinds[NS_IPC].supported)
+    sysv_ns_release_owned(ns_ino_of(NS_IPC));
 }

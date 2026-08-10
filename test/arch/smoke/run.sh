@@ -505,6 +505,19 @@ else
     fail=1
 fi
 
+# ipctest: System V IPC on its own tables, and the namespace that scopes them.
+# The segment attached across a fork is the case that used to panic the child
+# in checkpoint_restore, a Darwin attachment being neither arena- nor
+# file-backed.
+cp "$here/ipctest" "$root/"; chmod +x "$root/ipctest"
+out=$("$NABI" -m "$root" /ipctest); rc=$?
+if [ "$rc" -eq 0 ] && [ "$out" = "ipc ok" ]; then
+    echo "  ok  ipctest -> \"$out\", exit 0"
+else
+    echo "  FAIL ipctest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 if [ "$fail" -eq 0 ]; then
     echo "smoke: PASS"
 else

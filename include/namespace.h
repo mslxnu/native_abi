@@ -85,6 +85,10 @@ struct nsproxy {
   struct namespace *ns[NS_COUNT];
 };
 
+/* The current boot session, short and filename-safe. Namespace state is kept in
+ * files, and none of it should outlive the machine. */
+const char *nabi_boot_tag(void);
+
 const char *ns_type_name(enum ns_type type);
 bool ns_type_from_name(const char *name, enum ns_type *out);
 
@@ -104,6 +108,9 @@ void current_uts_commit(void);
 
 /* For /proc/<pid>/ns/<name>: the inode of the namespace this process is in. */
 uint64_t ns_ino_of(enum ns_type type);
+
+/* Called on the way out: give up namespaces this process created. */
+void nsproxy_release(void);
 
 /* Checkpoint support: arm64's fork is fork plus exec, so a child rebuilds these
  * from the parent's rather than inheriting them in memory. */

@@ -47,6 +47,7 @@ int sysctlbyname(const char *, void *, size_t *, void *, size_t);
 #include "noah.h"
 #include "mm.h"
 #include "namespace.h"
+#include "sysv.h"
 #include <sys/stat.h>
 
 #include "page.h"
@@ -163,7 +164,8 @@ build_maps(size_t *len_out)
  */
 enum procfs_file { PROCFS_NONE, PROCFS_MAPS, PROCFS_CMDLINE, PROCFS_COMM,
                    PROCFS_EXE, PROCFS_FD, PROCFS_MOUNTS, PROCFS_FDDIR,
-                   PROCFS_RANDOM_UUID, PROCFS_RANDOM_BOOT_ID, PROCFS_NS, PROCFS_NSDIR };
+                   PROCFS_RANDOM_UUID, PROCFS_RANDOM_BOOT_ID, PROCFS_NS, PROCFS_NSDIR,
+                   PROCFS_SYSVIPC_SHM, PROCFS_SYSVIPC_SEM, PROCFS_SYSVIPC_MSG };
 
 /* For PROCFS_FD, the number after /fd/. Meaningless for the others. */
 static enum procfs_file
@@ -189,6 +191,25 @@ own_procfs_file_n(const char *path, int *fd_out)
    * "-bash: /proc/sys/kernel/random/uuid: No such file or directory" three
    * times over.
    */
+  /*
+   * /proc/sysvipc, which is how ipcs and everything like it lists these
+   * objects - it reads the files first and only falls back to shmctl(SHM_STAT)
+   * if they are missing.
+   *
+   * mSL/ProcFS does provide them, and that is exactly the problem: it fills
+   * them from the *host Mac's* System V tables, which is where these objects
+   * used to live and no longer do. So the files existed, parsed, and reported
+   * nothing, and ipcs showed an empty list next to a segment the guest had just
+   * created - the one failure mode a fallback cannot rescue, because nothing
+   * looks broken. They are answered here now, from the namespace the caller is
+   * actually in.
+   */
+  if (strcmp(rest, "sysvipc/shm") == 0)
+    return PROCFS_SYSVIPC_SHM;
+  if (strcmp(rest, "sysvipc/sem") == 0)
+    return PROCFS_SYSVIPC_SEM;
+  if (strcmp(rest, "sysvipc/msg") == 0)
+    return PROCFS_SYSVIPC_MSG;
   if (strcmp(rest, "sys/kernel/random/uuid") == 0)
     return PROCFS_RANDOM_UUID;
   if (strcmp(rest, "sys/kernel/random/boot_id") == 0)
@@ -305,6 +326,81 @@ build_mounts(size_t *len_out)
   if (!out)
     return NULL;
   memcpy(out, text, len);
+  *len_out = len;
+  return out;
+}
+
+/*
+ * /proc/sysvipc/{shm,sem,msg}, in the kernel's own column layout because that
+ * is what util-linux parses. The ids are the guest's, and the objects are those
+ * of the IPC namespace this process is in - which is the whole point of
+ * answering it here rather than letting the host's empty tables answer.
+ */
+static char *
+build_sysvipc(enum procfs_file which, size_t *len_out)
+{
+  static const char shm_hdr[] =
+    "       key      shmid perms       size  cpid  lpid nattch   uid   gid  cuid  cgid      atime      dtime      ctime        rss       swap\n";
+  static const char sem_hdr[] =
+    "       key      semid perms      nsems   uid   gid  cuid  cgid      otime      ctime\n";
+  static const char msg_hdr[] =
+    "       key      msqid perms      cbytes       qnum lspid lrpid   uid   gid  cuid  cgid      stime      rtime      ctime\n";
+
+  const char *hdr = which == PROCFS_SYSVIPC_SHM ? shm_hdr
+                  : which == PROCFS_SYSVIPC_SEM ? sem_hdr : msg_hdr;
+
+  size_t cap = 4096, len = strlen(hdr);
+  char *out = malloc(cap);
+  if (!out)
+    return NULL;
+  memcpy(out, hdr, len);
+
+  /* Message queues do not exist here, so the file is its header and nothing
+   * else - which is also what Linux shows when there are none. */
+  if (which != PROCFS_SYSVIPC_MSG) {
+    enum sysv_kind kind =
+        which == PROCFS_SYSVIPC_SHM ? SYSV_SHM : SYSV_SEM;
+    struct sysv_meta *all = calloc(SYSV_MAX_ID, sizeof *all);
+    if (all) {
+      int n = sysv_list(kind, all, SYSV_MAX_ID);
+      if (n > SYSV_MAX_ID)
+        n = SYSV_MAX_ID;
+      for (int i = 0; i < n; i++) {
+        char row[512];
+        int rn;
+        if (kind == SYSV_SHM)
+          rn = snprintf(row, sizeof row,
+                        "%10d %10d  %4o %21llu %5u %5u  %5lu %5u %5u %5u %5u %10lld %10lld %10lld %21llu %21llu\n",
+                        all[i].key, all[i].host_id, all[i].mode,
+                        (unsigned long long) all[i].size,
+                        (unsigned) all[i].cpid, (unsigned) all[i].lpid,
+                        (unsigned long) (all[i].nattch < 0 ? 0 : all[i].nattch),
+                        all[i].uid, all[i].gid, all[i].cuid, all[i].cgid,
+                        (long long) all[i].atime, (long long) all[i].dtime,
+                        (long long) all[i].ctime,
+                        (unsigned long long) all[i].size, 0ULL);
+        else
+          rn = snprintf(row, sizeof row,
+                        "%10d %10d  %4o %10llu %5u %5u %5u %5u %10lld %10lld\n",
+                        all[i].key, all[i].host_id, all[i].mode,
+                        (unsigned long long) all[i].size,
+                        all[i].uid, all[i].gid, all[i].cuid, all[i].cgid,
+                        (long long) all[i].otime, (long long) all[i].ctime);
+        if (rn < 0)
+          continue;
+        if (len + (size_t) rn + 1 > cap) {
+          cap = (len + (size_t) rn + 1) * 2;
+          char *bigger = realloc(out, cap);
+          if (!bigger)
+            break;
+          out = bigger;
+        }
+        memcpy(out + len, row, (size_t) rn);
+        len += (size_t) rn;
+      }
+      free(all);
+    }
+  }
   *len_out = len;
   return out;
 }
@@ -767,6 +863,11 @@ procfs_open(const char *path, int *out_fd)
     break;
   case PROCFS_RANDOM_BOOT_ID:
     content = build_boot_id(&len);
+    break;
+  case PROCFS_SYSVIPC_SHM:
+  case PROCFS_SYSVIPC_SEM:
+  case PROCFS_SYSVIPC_MSG:
+    content = build_sysvipc(own_procfs_file_n(path, &fdno), &len);
     break;
   default:
     return -1;      /* not ours; the caller does the ordinary lookup */

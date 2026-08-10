@@ -357,6 +357,7 @@ DEFINE_SYSCALL(mremap, gaddr_t, old_addr, size_t, old_size, size_t, new_size, in
   /* Map new one */
   ret = alloc_region(new_size);
   struct mm_region *new = record_region(proc.mm, moved_to, ret, new_size, region->prot, region->mm_flags, region->mm_fd, region->pgoff);
+  new->shm_id = region->shm_id;
   new->arena_off = moved_off;
   vmm_mmap(new->gaddr, new->size, new->prot, new->haddr);
 

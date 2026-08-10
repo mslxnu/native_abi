@@ -164,6 +164,13 @@ guest-code cache sync.
   handed out. A setter that quietly succeeded while the getter said otherwise
   would be worse than either answer alone.
 
+- `ipctest` — System V IPC: a segment created, attached, shared across a fork,
+  detached and removed; keys resolving to ids; semaphore values through
+  `SETVAL`/`GETALL`/`semop`; and `unshare(CLONE_NEWIPC)` making the same key
+  name a different object. The fork case is the one that mattered: a Darwin
+  `shmat` region is neither arena-backed nor file-backed, so the child panicked
+  in `checkpoint_restore` rather than inheriting the segment.
+
 The ELF binaries are committed prebuilt (as the x86 guest tests under
 `test/*/build/` are), so the check needs no cross-toolchain. The `.s` sources
 are here for reference; rebuild with an aarch64-linux clang + ld.lld:

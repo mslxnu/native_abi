@@ -98,6 +98,70 @@ union l_semun {
   l_uintptr_t	__pad;
 };
 
+/*
+ * The 64-bit ipc structures, which are what a modern glibc passes for every
+ * command (it sets IPC_64 unconditionally). Identical on x86-64 and arm64 -
+ * both use the asm-generic layout - so one definition serves both.
+ */
+struct l_ipc64_perm {
+  l_key_t   key;
+  l_uid_t   uid;
+  l_gid_t   gid;
+  l_uid_t   cuid;
+  l_gid_t   cgid;
+  l_uint    mode;
+  l_ushort  seq;
+  l_ushort  __pad2;
+  uint64_t  __unused1;
+  uint64_t  __unused2;
+};
+
+struct l_shmid64_ds {
+  struct l_ipc64_perm shm_perm;
+  uint64_t  shm_segsz;
+  int64_t   shm_atime;
+  int64_t   shm_dtime;
+  int64_t   shm_ctime;
+  l_int     shm_cpid;
+  l_int     shm_lpid;
+  uint64_t  shm_nattch;
+  uint64_t  __unused4;
+  uint64_t  __unused5;
+};
+
+struct l_semid64_ds {
+  struct l_ipc64_perm sem_perm;
+  int64_t   sem_otime;
+  int64_t   sem_ctime;
+  uint64_t  sem_nsems;
+  uint64_t  __unused3;
+  uint64_t  __unused4;
+};
+
+struct l_shminfo64 {
+  uint64_t  shmmax, shmmin, shmmni, shmseg, shmall;
+  uint64_t  __unused1, __unused2, __unused3, __unused4;
+};
+
+struct l_shm_info {
+  l_int     used_ids;
+  uint64_t  shm_tot, shm_rss, shm_swp;
+  uint64_t  swap_attempts, swap_successes;
+};
+
+struct l_seminfo {
+  l_int semmap, semmni, semmns, semmnu, semmsl;
+  l_int semopm, semume, semusz, semvmx, semaem;
+};
+
+/* shm_perm.mode carries this once the segment has been IPC_RMID'd. */
+#define LINUX_SHM_DEST      01000
+#define LINUX_SHM_LOCKED    02000
+
+/* The *_STAT_ANY forms skip the read check; ipcs uses them when it can. */
+#define LINUX_SHM_STAT_ANY  15
+#define LINUX_SEM_STAT_ANY  20
+
 struct l_ipc_perm {
   l_key_t	key;
   l_uid_t	uid;
