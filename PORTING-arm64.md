@@ -2984,3 +2984,69 @@ key        shmid  owner  perms  bytes  nattch
 and the host's own tables come back to where they started — a guest's
 `ipcrm` releases the Darwin array behind a semaphore, and a namespace that ends
 releases every one it held.
+
+### 3.5.58 System V message queues — **implemented**
+
+`msgget`, `msgsnd`, `msgrcv` and `msgctl` did not exist and were in neither
+syscall table. This closes the hole §3.5.57 left open and was explicit about:
+message queues needed no isolating while they did not exist, and that guarantee
+held only for as long as they did not.
+
+**A queue is a file, like a segment and unlike a semaphore.** Darwin does have
+message queues, and they were never a candidate: **40 queues for the whole
+machine, 40 messages in the system at once, and 2048 bytes per queue**, in
+tables shared with the host and every other guest. Linux's defaults are 32000
+queues of 16KiB. That is the shared-memory situation again, not the semaphore
+one — semaphores could stay Darwin's because `semmni` is 87381 and its `semop`
+already blocks correctly.
+
+The queue's bytes are held under **`flock`** while they change, rather than
+behind a semaphore. Two reasons, and the second is the one that decided it: a
+lock needs no initialising, so there is no window in which one process has
+published a queue whose lock another cannot yet take; and the kernel drops an
+`flock` when the holder dies. A lock that must be released by the process
+holding it wedges the queue for everyone the first time a guest is killed at the
+wrong moment.
+
+**A receiver with nothing to receive polls, on a backoff to a few
+milliseconds.** This is the one deliberate approximation and it is worth being
+plain about. There is no cross-process wait primitive here that survives a
+participant dying: macOS has no futex, and a counting semaphore used as a wakeup
+loses its token if the sender dies between appending the message and posting
+it — which strands the receiver forever. A short delay is the better failure,
+and much the easier one to see. Polling also makes the two conditions Linux
+specifies fall out for free, since both are things the next look notices: a
+signal is EINTR, and the queue being removed underneath is EIDRM.
+
+The record layout compacts from the front and resets the file whenever the last
+message leaves, so a queue that drains does not grow however long it runs. A
+message taken from the middle by a type-selective receive is marked dead and
+skipped.
+
+`/proc/sysvipc/msg` is answered from these tables, as `shm` and `sem` already
+were.
+
+The smoke test covers the ordering rules — a type asked for by number, a
+negative type meaning the lowest at or below it, otherwise first in first out —
+`E2BIG` and `MSG_NOERROR`, and a receive that **blocks on a message the forked
+child has not sent yet**. That last one is the point: the parent waits before
+reaping rather than after, so the wait path is genuinely taken. A version that
+only ever returned what was already queued would pass every ordering test above
+it and hang there.
+
+Under Debian, with its own tooling:
+
+```
+=== initial namespace ===
+key        msqid  owner  perms  used-bytes  messages
+0x211e9dbb 0      root   644    0           0
+0xf12e3aea 1      root   644    0           0
+=== inside unshare -i ===
+(nothing)
+=== back outside ===
+0x211e9dbb 0      root   644    0           0
+0xf12e3aea 1      root   644    0           0
+```
+
+With this the System V family is complete apart from `semtimedop`, which wants a
+timed wait Darwin's `semop` has no equivalent of.

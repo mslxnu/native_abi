@@ -192,10 +192,10 @@
   SYSCALL(183, unimplemented) \
   SYSCALL(184, unimplemented) \
   SYSCALL(185, unimplemented) \
-  SYSCALL(186, unimplemented) \
-  SYSCALL(187, unimplemented) \
-  SYSCALL(188, unimplemented) \
-  SYSCALL(189, unimplemented) \
+  SYSCALL(186, msgget) \
+  SYSCALL(187, msgctl) \
+  SYSCALL(188, msgrcv) \
+  SYSCALL(189, msgsnd) \
   SYSCALL(190, semget) \
   SYSCALL(191, semctl) \
   SYSCALL(192, unimplemented) \

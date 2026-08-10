@@ -71,10 +71,10 @@
   SYSCALL(65, semop)                            \
   SYSCALL(66, semctl)                           \
   SYSCALL(67, shmdt)                            \
-  SYSCALL(68, unimplemented)                    \
-  SYSCALL(69, unimplemented)                    \
-  SYSCALL(70, unimplemented)                    \
-  SYSCALL(71, unimplemented)                    \
+  SYSCALL(68, msgget)                  \
+  SYSCALL(69, msgsnd)                  \
+  SYSCALL(70, msgrcv)                  \
+  SYSCALL(71, msgctl)                  \
   SYSCALL(72, fcntl)                            \
   SYSCALL(73, flock)                            \
   SYSCALL(74, fsync)                            \

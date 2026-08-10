@@ -40,11 +40,10 @@
  * and the Darwin key behind it is private to nabi, so two namespaces asking for
  * key 5 get two different semaphore arrays and neither one is the host's.
  *
- * Message queues are absent - msgget is not implemented and is not wired into
- * either syscall table - so they need no isolating yet. That is worth stating
- * rather than leaving to be noticed: the guarantee holds only while they stay
- * absent, and whoever adds them has to bring them in here rather than pass them
- * to Darwin.
+ * Message queues are files too, and for the same reasons as shared memory
+ * rather than the semaphores' - Darwin allows 40 queues for the whole machine,
+ * 40 messages in it at once and 2048 bytes per queue, against Linux's 32000
+ * queues of 16KiB. src/ipc/msg.c has the rest.
  */
 #ifndef NABI_SYSV_H
 #define NABI_SYSV_H
@@ -52,7 +51,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-enum sysv_kind { SYSV_SHM, SYSV_SEM, SYSV_KINDS };
+enum sysv_kind { SYSV_SHM, SYSV_SEM, SYSV_MSG, SYSV_KINDS };
 
 #define SYSV_MAGIC   0x76737973u        /* "sysv" */
 #define SYSV_MAX_ID  4096               /* Linux's SHMMNI/SEMMNI default */
@@ -68,7 +67,7 @@ struct sysv_meta {
   int32_t  key;                 /* the guest's key, or IPC_PRIVATE */
   uint32_t mode;                /* permission bits only */
   uint32_t uid, gid, cuid, cgid;
-  uint64_t size;                /* shm: bytes. sem: nsems. */
+  uint64_t size;                /* shm: bytes. sem: nsems. msg: qbytes. */
   int32_t  host_id;             /* sem: the Darwin semid. shm: -1 */
   int32_t  nattch;              /* shm only */
   int32_t  cpid, lpid;
@@ -121,6 +120,9 @@ int32_t sysv_host_key(uint64_t ino, int id);
  * has to show. Returns how many exist, which may exceed `max`.
  */
 int sysv_list(enum sysv_kind kind, struct sysv_meta *out, int max);
+
+/* What a message queue currently holds (src/ipc/msg.c owns the layout). */
+void sysv_msg_stats(int id, uint64_t *qnum, uint64_t *cbytes);
 
 /* How many objects of a kind exist, and the highest id in use; for IPC_INFO. */
 void sysv_count(enum sysv_kind kind, int *used, int *high, uint64_t *total);

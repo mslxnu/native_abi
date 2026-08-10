@@ -119,6 +119,7 @@ COMMON_SRCS := src/main.c \
                src/ipc/signal.c \
                src/ipc/sem.c \
                src/ipc/sysv.c \
+               src/ipc/msg.c \
                src/fs/fs.c \
                src/fs/epoll.c \
                src/fs/procfs.c \

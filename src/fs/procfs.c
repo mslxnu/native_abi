@@ -355,11 +355,9 @@ build_sysvipc(enum procfs_file which, size_t *len_out)
     return NULL;
   memcpy(out, hdr, len);
 
-  /* Message queues do not exist here, so the file is its header and nothing
-   * else - which is also what Linux shows when there are none. */
-  if (which != PROCFS_SYSVIPC_MSG) {
-    enum sysv_kind kind =
-        which == PROCFS_SYSVIPC_SHM ? SYSV_SHM : SYSV_SEM;
+  {
+    enum sysv_kind kind = which == PROCFS_SYSVIPC_SHM ? SYSV_SHM
+                        : which == PROCFS_SYSVIPC_SEM ? SYSV_SEM : SYSV_MSG;
     struct sysv_meta *all = calloc(SYSV_MAX_ID, sizeof *all);
     if (all) {
       int n = sysv_list(kind, all, SYSV_MAX_ID);
@@ -368,7 +366,19 @@ build_sysvipc(enum procfs_file which, size_t *len_out)
       for (int i = 0; i < n; i++) {
         char row[512];
         int rn;
-        if (kind == SYSV_SHM)
+        if (kind == SYSV_MSG) {
+          uint64_t qnum, cbytes;
+          sysv_msg_stats(all[i].host_id, &qnum, &cbytes);
+          rn = snprintf(row, sizeof row,
+                        "%10d %10d  %4o %10llu %10llu %5u %5u %5u %5u %5u %5u %10lld %10lld %10lld\n",
+                        all[i].key, all[i].host_id, all[i].mode,
+                        (unsigned long long) cbytes,
+                        (unsigned long long) qnum,
+                        (unsigned) all[i].lpid, (unsigned) all[i].lpid,
+                        all[i].uid, all[i].gid, all[i].cuid, all[i].cgid,
+                        (long long) all[i].atime, (long long) all[i].dtime,
+                        (long long) all[i].ctime);
+        } else if (kind == SYSV_SHM)
           rn = snprintf(row, sizeof row,
                         "%10d %10d  %4o %21llu %5u %5u  %5lu %5u %5u %5u %5u %10lld %10lld %10lld %21llu %21llu\n",
                         all[i].key, all[i].host_id, all[i].mode,

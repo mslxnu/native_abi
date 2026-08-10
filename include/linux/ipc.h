@@ -138,6 +138,26 @@ struct l_semid64_ds {
   uint64_t  __unused4;
 };
 
+struct l_msqid64_ds {
+  struct l_ipc64_perm msg_perm;
+  int64_t   msg_stime;
+  int64_t   msg_rtime;
+  int64_t   msg_ctime;
+  uint64_t  msg_cbytes;
+  uint64_t  msg_qnum;
+  uint64_t  msg_qbytes;
+  l_int     msg_lspid;
+  l_int     msg_lrpid;
+  uint64_t  __unused4;
+  uint64_t  __unused5;
+};
+
+struct l_msginfo {
+  l_int msgpool, msgmap, msgmax, msgmnb, msgmni;
+  l_int msgssz, msgtql;
+  l_ushort msgseg;
+};
+
 struct l_shminfo64 {
   uint64_t  shmmax, shmmin, shmmni, shmseg, shmall;
   uint64_t  __unused1, __unused2, __unused3, __unused4;
@@ -157,6 +177,14 @@ struct l_seminfo {
 /* shm_perm.mode carries this once the segment has been IPC_RMID'd. */
 #define LINUX_SHM_DEST      01000
 #define LINUX_SHM_LOCKED    02000
+
+/* msgrcv's own flags. */
+#define LINUX_MSG_NOERROR   010000        /* trim rather than refuse */
+#define LINUX_MSG_EXCEPT    020000        /* any type but this one */
+#define LINUX_MSG_COPY      040000
+
+#define LINUX_MSG_STAT      11
+#define LINUX_MSG_STAT_ANY  13
 
 /* The *_STAT_ANY forms skip the read check; ipcs uses them when it can. */
 #define LINUX_SHM_STAT_ANY  15

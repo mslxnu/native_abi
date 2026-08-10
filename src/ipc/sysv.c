@@ -29,6 +29,7 @@
 static const char *const kind_name[SYSV_KINDS] = {
   [SYSV_SHM] = "shm",
   [SYSV_SEM] = "sem",
+  [SYSV_MSG] = "msg",
 };
 
 static void
@@ -284,10 +285,12 @@ sysv_get(enum sysv_kind kind, int32_t key, uint64_t size, int l_flags,
   if (id < 0)
     return id;
 
-  if (kind == SYSV_SHM) {
+  /* Both of the kinds whose contents are nabi's get a file for them. A
+   * segment is sized up front; a queue starts empty and grows. */
+  if (kind != SYSV_SEM) {
     obj_path(dir, kind, id, 'd', path, sizeof path);
     int dfd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0600);
-    if (dfd < 0 || ftruncate(dfd, (off_t) size) < 0) {
+    if (dfd < 0 || ftruncate(dfd, kind == SYSV_SHM ? (off_t) size : 0) < 0) {
       int e = errno;
       if (dfd >= 0) close(dfd);
       close(meta_fd);

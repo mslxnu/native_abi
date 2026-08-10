@@ -25,6 +25,10 @@ static long sys6(long n,long a,long b,long c,long d,long e,long f){
 #define SYS_exit    93
 #define SYS_readlinkat 78
 #define SYS_unshare 97
+#define SYS_msgget  186
+#define SYS_msgctl  187
+#define SYS_msgrcv  188
+#define SYS_msgsnd  189
 #define SYS_semget  190
 #define SYS_semctl  191
 #define SYS_semop   193
@@ -45,6 +49,8 @@ static long sys6(long n,long a,long b,long c,long d,long e,long f){
 #define IPC_RMID    0
 #define IPC_STAT    2
 #define IPC_64      0x0100
+#define MSG_NOERROR 010000
+#define MSG_EXCEPT  020000
 #define GETVAL      12
 #define GETALL      13
 #define SETVAL      16
@@ -53,6 +59,8 @@ static long sys6(long n,long a,long b,long c,long d,long e,long f){
 #define EINVAL 22
 #define ENOENT 2
 #define EEXIST 17
+#define E2BIG  7
+#define ENOMSG 42
 
 #define SEGSZ 4096
 
@@ -62,6 +70,10 @@ struct shmid_ds { struct ipc64_perm perm; unsigned long segsz;
                   long atime, dtime, ctime; int cpid, lpid;
                   unsigned long nattch, u4, u5; };
 struct sembuf { unsigned short num; short op; short flg; };
+struct msqid_ds { struct ipc64_perm perm; long stime, rtime, ctime;
+                  unsigned long cbytes, qnum, qbytes; int lspid, lrpid;
+                  unsigned long u4, u5; };
+struct msgbuf { long mtype; char mtext[32]; };
 
 static void put(const char*m){int i=0;while(m[i])i++;sys6(SYS_write,1,(long)m,i,0,0,0);}
 static void putd(long v){char b[24];int i=23;b[i--]=0;int g=v<0;if(g)v=-v;
@@ -177,6 +189,90 @@ void _start(void)
   want("the value after semop", sys6(SYS_semctl, sid, 0, GETVAL, 0, 0,0), 1);
 
   /*
+   * Message queues. The ordering rules are the whole of the interface: a type
+   * asked for by number, a negative type meaning "the lowest at or below this",
+   * and otherwise first in, first out. Getting those wrong is not a crash, it
+   * is a program that receives the wrong message and carries on.
+   */
+  long qid = sys6(SYS_msgget, IPC_PRIVATE, IPC_CREAT | 0600, 0,0,0,0);
+  if (qid < 0) fail("msgget", qid, 0);
+
+  struct msgbuf m;
+  m.mtype = 1; m.mtext[0] = 'a';
+  want("msgsnd(type 1)", sys6(SYS_msgsnd, qid, (long) &m, 1, 0, 0,0), 0);
+  m.mtype = 2; m.mtext[0] = 'b';
+  want("msgsnd(type 2)", sys6(SYS_msgsnd, qid, (long) &m, 1, 0, 0,0), 0);
+  m.mtype = 5; m.mtext[0] = 'c';
+  want("msgsnd(type 5)", sys6(SYS_msgsnd, qid, (long) &m, 1, 0, 0,0), 0);
+
+  if ((r = sys6(SYS_msgctl, qid, IPC_STAT | IPC_64, (long) &ds, 0,0,0)) < 0)
+    fail("msgctl(IPC_STAT)", r, 0);
+  want("msg_qnum after three sends",
+       (long) ((struct msqid_ds *) &ds)->qnum, 3);
+
+  /* A type asked for by number jumps the queue. */
+  m.mtype = 0; m.mtext[0] = 0;
+  want("msgrcv(type 2)", sys6(SYS_msgrcv, qid, (long) &m, 32, 2, 0, 0), 1);
+  want("the type that came back", m.mtype, 2);
+  want("the text that came back", m.mtext[0], 'b');
+
+  /* A negative type takes the lowest at or below its magnitude - 1, not 5. */
+  want("msgrcv(type -4)", sys6(SYS_msgrcv, qid, (long) &m, 32, -4, 0, 0), 1);
+  want("the type a negative msgtyp chose", m.mtype, 1);
+
+  /* Then what is left, oldest first. */
+  want("msgrcv(any)", sys6(SYS_msgrcv, qid, (long) &m, 32, 0, 0, 0), 1);
+  want("the last type", m.mtype, 5);
+
+  /* An empty queue is ENOMSG rather than a wait, when asked not to wait. */
+  want("msgrcv on an empty queue with IPC_NOWAIT",
+       sys6(SYS_msgrcv, qid, (long) &m, 32, 0, 04000, 0), -ENOMSG);
+
+  /* Too long for the buffer is refused, or trimmed if the caller says so. */
+  m.mtype = 9;
+  for (int i = 0; i < 10; i++) m.mtext[i] = 'x';
+  want("msgsnd(10 bytes)", sys6(SYS_msgsnd, qid, (long) &m, 10, 0, 0,0), 0);
+  want("msgrcv into a buffer too small",
+       sys6(SYS_msgrcv, qid, (long) &m, 4, 0, 0, 0), -E2BIG);
+  want("msgrcv with MSG_NOERROR",
+       sys6(SYS_msgrcv, qid, (long) &m, 4, 0, MSG_NOERROR, 0), 4);
+
+  /*
+   * And across a fork, which is what a queue is for. The child sends and the
+   * parent receives, so the bytes have to cross between two host processes -
+   * a queue kept in this one would pass every test above and fail this.
+   *
+   * The parent blocks *before* reaping the child rather than after, so the
+   * receive genuinely has to wait for a message that is not there yet. Waiting
+   * is the part with no host primitive behind it - nabi looks again on a
+   * backoff - so a version of it that only ever returned what was already
+   * queued would pass the ordering tests above and hang here.
+   */
+  long qpid = sys6(SYS_clone, SIGCHLD, 0, 0, 0, 0, 0);
+  if (qpid < 0) fail("clone for the queue test", qpid, 0);
+  if (qpid == 0) {
+    struct msgbuf c;
+    c.mtype = 42; c.mtext[0] = 'z';
+    sys6(SYS_exit, sys6(SYS_msgsnd, qid, (long) &c, 1, 0, 0,0) == 0 ? 0 : 4,
+         0,0,0,0,0);
+  }
+  m.mtype = 0; m.mtext[0] = 0;
+  want("a blocking msgrcv waiting on the child",
+       sys6(SYS_msgrcv, qid, (long) &m, 32, 42, 0, 0), 1);
+  want("the type the child sent", m.mtype, 42);
+  want("the text the child sent", m.mtext[0], 'z');
+
+  status = 0;
+  if ((r = sys6(SYS_wait4, qpid, (long) &status, 0, 0,0,0)) < 0)
+    fail("wait4 for the queue child", r, 0);
+  if (((status >> 8) & 0xff) != 0)
+    fail("the child could not send to the queue", (status >> 8) & 0xff, 0);
+
+  want("msgctl(IPC_RMID)", sys6(SYS_msgctl, qid, IPC_RMID, 0, 0,0,0), 0);
+  want("msgsnd to a removed queue",
+       sys6(SYS_msgsnd, qid, (long) &m, 1, 0, 0,0), -EINVAL);
+
+  /*
    * Removed before the namespace changes, because after that they are out of
    * reach. The initial IPC namespace outlives any one guest - a machine's own
    * objects do - so a test that leaves things in it fails the next time it
@@ -203,6 +299,8 @@ void _start(void)
 
   want("the old key in a new namespace",
        sys6(SYS_shmget, key, SEGSZ, 0600, 0,0,0), -ENOENT);
+  want("a message queue key in a new namespace",
+       sys6(SYS_msgget, key, 0600, 0,0,0,0), -ENOENT);
 
   /* And the new namespace works, rather than merely being empty. */
   long c = sys6(SYS_shmget, key, SEGSZ, IPC_CREAT | 0600, 0,0,0);
