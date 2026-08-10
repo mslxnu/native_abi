@@ -174,7 +174,11 @@ guest-code cache sync.
   `time_for_children`; `clone(CLONE_NEWTIME)` is EINVAL; and a child of a
   namespace with offsets written through `/proc/self/timens_offsets` sees
   `CLOCK_MONOTONIC` and `CLOCK_BOOTTIME` shifted by exactly them while
-  `CLOCK_REALTIME` is untouched.
+  `CLOCK_REALTIME` is untouched. The user namespace covers the map being the
+  only thing that gives an id meaning: before one is written every id reads as
+  nobody, after `100 <self> 1` the process is 100 and a file it owns reads as
+  100 while one owned by an unmapped id still reads as nobody, chowning to an
+  unmapped id is EINVAL, and a second write to `uid_map` is EPERM.
 
 - `ipctest` — System V IPC: a segment created, attached, shared across a fork,
   detached and removed; keys resolving to ids; semaphore values through

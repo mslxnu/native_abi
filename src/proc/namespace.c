@@ -37,7 +37,7 @@ static const struct {
   [NS_IPC]    = { NS_IPC,    "ipc",    LINUX_CLONE_NEWIPC,    true  },
   [NS_PID]    = { NS_PID,    "pid",    LINUX_CLONE_NEWPID,    false },
   [NS_NET]    = { NS_NET,    "net",    LINUX_CLONE_NEWNET,    false },
-  [NS_USER]   = { NS_USER,   "user",   LINUX_CLONE_NEWUSER,   false },
+  [NS_USER]   = { NS_USER,   "user",   LINUX_CLONE_NEWUSER,   true  },
   [NS_CGROUP] = { NS_CGROUP, "cgroup", LINUX_CLONE_NEWCGROUP, false },
   [NS_TIME]   = { NS_TIME,   "time",   LINUX_CLONE_NEWTIME,   true  },
 };
@@ -108,6 +108,37 @@ uts_path(uint64_t ino, char *out, size_t n)
 /* The offsets are shared state for the same reason a hostname is: every
  * process in the namespace has to agree, and they are separate host
  * processes. */
+static bool
+userns_load(uint64_t ino, struct user_namespace *out)
+{
+  char path[PATH_MAX];
+  ns_state_path("userns", ino, path, sizeof path);
+  int fd = open(path, O_RDONLY);
+  if (fd < 0)
+    return false;
+  bool ok = read(fd, out, sizeof *out) == (ssize_t) sizeof *out;
+  close(fd);
+  return ok;
+}
+
+static void
+userns_store(uint64_t ino, const struct user_namespace *u)
+{
+  char path[PATH_MAX], tmppath[PATH_MAX];
+  ns_state_path("userns", ino, path, sizeof path);
+  snprintf(tmppath, sizeof tmppath, "%s.new", path);
+
+  int fd = open(tmppath, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+  if (fd < 0)
+    return;
+  bool ok = write(fd, u, sizeof *u) == (ssize_t) sizeof *u;
+  close(fd);
+  if (ok)
+    rename(tmppath, path);
+  else
+    unlink(tmppath);
+}
+
 static bool
 timens_load(uint64_t ino, struct time_namespace *out)
 {
@@ -243,6 +274,20 @@ ns_new(enum ns_type type, const struct namespace *from)
     if (type == NS_UTS) {
       uts_load(from->ino, &ns->uts);      /* whatever it is *now* */
       uts_store(ns->ino, &ns->uts);
+    }
+    if (type == NS_USER) {
+      /*
+       * Deliberately *not* a copy. A new user namespace starts with no map at
+       * all, so every id in it reads as nobody until one is written - which is
+       * Linux's behaviour and the only safe default: inheriting the parent's
+       * map would silently make the new namespace a synonym for the old one.
+       */
+      memset(&ns->user, 0, sizeof ns->user);
+      ns->user.setgroups_allowed = 1;
+      pthread_rwlock_rdlock(&proc.cred.lock);
+      ns->user.creator = proc.cred.euid;
+      pthread_rwlock_unlock(&proc.cred.lock);
+      userns_store(ns->ino, &ns->user);
     }
     if (type == NS_TIME) {
       /*
@@ -686,5 +731,236 @@ timens_offsets_write(const char *text)
   }
   tns->time = t;
   timens_store(tns->ino, &t);
+  return 0;
+}
+
+/* ------------------------------------------------------------------ user */
+
+static void
+userns_current(struct user_namespace *out)
+{
+  struct namespace *uns = current_nsproxy.ns[NS_USER];
+  if (!userns_load(uns->ino, out))
+    *out = uns->user;
+}
+
+bool
+userns_active(void)
+{
+  return current_nsproxy.ns[NS_USER] != &initial_ns[NS_USER];
+}
+
+static uint32_t
+map_inward(const struct id_range *r, uint32_t n, uint32_t outside)
+{
+  for (uint32_t i = 0; i < n; i++)
+    if (outside >= r[i].outside && outside - r[i].outside < r[i].count)
+      return r[i].inside + (outside - r[i].outside);
+  return USERNS_OVERFLOW;
+}
+
+static bool
+map_outward(const struct id_range *r, uint32_t n, uint32_t inside, uint32_t *out)
+{
+  for (uint32_t i = 0; i < n; i++)
+    if (inside >= r[i].inside && inside - r[i].inside < r[i].count) {
+      *out = r[i].outside + (inside - r[i].inside);
+      return true;
+    }
+  return false;
+}
+
+uint32_t
+userns_uid_inward(uint32_t outside)
+{
+  if (!userns_active())
+    return outside;
+  struct user_namespace u;
+  userns_current(&u);
+  return map_inward(u.uid, u.n_uid, outside);
+}
+
+uint32_t
+userns_gid_inward(uint32_t outside)
+{
+  if (!userns_active())
+    return outside;
+  struct user_namespace u;
+  userns_current(&u);
+  return map_inward(u.gid, u.n_gid, outside);
+}
+
+bool
+userns_uid_outward(uint32_t inside, uint32_t *out)
+{
+  if (!userns_active()) {
+    *out = inside;
+    return true;
+  }
+  struct user_namespace u;
+  userns_current(&u);
+  return map_outward(u.uid, u.n_uid, inside, out);
+}
+
+bool
+userns_gid_outward(uint32_t inside, uint32_t *out)
+{
+  if (!userns_active()) {
+    *out = inside;
+    return true;
+  }
+  struct user_namespace u;
+  userns_current(&u);
+  return map_outward(u.gid, u.n_gid, inside, out);
+}
+
+int
+userns_map_read(bool gid, char *out, size_t n)
+{
+  struct user_namespace u;
+  userns_current(&u);
+  const struct id_range *r = gid ? u.gid : u.uid;
+  uint32_t count = gid ? u.n_gid : u.n_uid;
+
+  /*
+   * The initial namespace reports the whole range as itself, which is what
+   * Linux shows and what anything reading the file to decide "am I in a user
+   * namespace" is looking for.
+   */
+  if (!userns_active())
+    return snprintf(out, n, "%10u %10u %10u\n", 0u, 0u, 4294967295u);
+
+  int len = 0;
+  for (uint32_t i = 0; i < count && (size_t) len < n; i++)
+    len += snprintf(out + len, n - (size_t) len, "%10u %10u %10u\n",
+                    r[i].inside, r[i].outside, r[i].count);
+  return len;
+}
+
+int
+userns_setgroups_read(char *out, size_t n)
+{
+  struct user_namespace u;
+  userns_current(&u);
+  return snprintf(out, n, "%s\n",
+                  !userns_active() || u.setgroups_allowed ? "allow" : "deny");
+}
+
+int
+userns_setgroups_write(const char *text)
+{
+  if (!userns_active())
+    return -LINUX_EPERM;
+
+  struct namespace *uns = current_nsproxy.ns[NS_USER];
+  struct user_namespace u;
+  userns_current(&u);
+
+  /* Once gid_map is set the answer is fixed, since it is what decided whether
+   * that map was allowed to be written in the first place. */
+  if (u.gid_written)
+    return -LINUX_EPERM;
+
+  while (*text == ' ' || *text == '\t' || *text == '\n')
+    text++;
+  if (strncmp(text, "deny", 4) == 0)
+    u.setgroups_allowed = 0;
+  else if (strncmp(text, "allow", 5) == 0)
+    u.setgroups_allowed = 1;
+  else
+    return -LINUX_EINVAL;
+
+  uns->user = u;
+  userns_store(uns->ino, &u);
+  return 0;
+}
+
+/*
+ * Writing a map, which happens exactly once per namespace.
+ *
+ * The rule for who may write what is Linux's, and it is the whole of the
+ * safety here: a process that is not root outside may map only the single id
+ * it already has. Anything else would let an unprivileged guest claim to be an
+ * id it is not - and since file ownership is translated through this map, that
+ * is the difference between "root inside my own namespace" and "able to
+ * rename myself into somebody else's files".
+ */
+int
+userns_map_write(bool gid, const char *text)
+{
+  if (!userns_active())
+    return -LINUX_EPERM;
+
+  struct namespace *uns = current_nsproxy.ns[NS_USER];
+  struct user_namespace u;
+  userns_current(&u);
+
+  if (gid ? u.gid_written : u.uid_written)
+    return -LINUX_EPERM;        /* write-once, as Linux has it */
+
+  /* An unprivileged writer must deny setgroups before mapping gids, because a
+   * gid map plus a retained supplementary group is a way to drop a group that
+   * was restricting access rather than granting it. */
+  pthread_rwlock_rdlock(&proc.cred.lock);
+  l_uid_t euid = proc.cred.euid;
+  l_gid_t egid = proc.cred.egid;
+  pthread_rwlock_unlock(&proc.cred.lock);
+  bool privileged = euid == 0;
+
+  if (gid && !privileged && u.setgroups_allowed)
+    return -LINUX_EPERM;
+
+  struct id_range r[USERNS_MAX_RANGES];
+  uint32_t n = 0;
+  const char *p = text;
+
+  while (*p) {
+    while (*p == ' ' || *p == '\t' || *p == '\n')
+      p++;
+    if (*p == '\0')
+      break;
+    if (n == USERNS_MAX_RANGES)
+      return -LINUX_EINVAL;
+
+    char *end;
+    unsigned long long inside = strtoull(p, &end, 10);
+    if (end == p) return -LINUX_EINVAL;
+    p = end;
+    unsigned long long outside = strtoull(p, &end, 10);
+    if (end == p) return -LINUX_EINVAL;
+    p = end;
+    unsigned long long count = strtoull(p, &end, 10);
+    if (end == p) return -LINUX_EINVAL;
+    p = end;
+
+    if (count == 0 || inside > 0xffffffffULL || outside > 0xffffffffULL ||
+        count > 0xffffffffULL)
+      return -LINUX_EINVAL;
+
+    r[n++] = (struct id_range){ (uint32_t) inside, (uint32_t) outside,
+                                (uint32_t) count };
+  }
+  if (n == 0)
+    return 0;                   /* nothing asked for; not a failure */
+
+  if (!privileged) {
+    /* One line, one id, and it has to be the id the writer already is. */
+    if (n != 1 || r[0].count != 1)
+      return -LINUX_EPERM;
+    if (r[0].outside != (uint32_t) (gid ? egid : euid))
+      return -LINUX_EPERM;
+  }
+
+  if (gid) {
+    memcpy(u.gid, r, sizeof r[0] * n);
+    u.n_gid = n;
+    u.gid_written = 1;
+  } else {
+    memcpy(u.uid, r, sizeof r[0] * n);
+    u.n_uid = n;
+    u.uid_written = 1;
+  }
+  uns->user = u;
+  userns_store(uns->ino, &u);
   return 0;
 }

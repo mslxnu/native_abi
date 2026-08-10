@@ -166,7 +166,8 @@ enum procfs_file { PROCFS_NONE, PROCFS_MAPS, PROCFS_CMDLINE, PROCFS_COMM,
                    PROCFS_EXE, PROCFS_FD, PROCFS_MOUNTS, PROCFS_FDDIR,
                    PROCFS_RANDOM_UUID, PROCFS_RANDOM_BOOT_ID, PROCFS_NS, PROCFS_NSDIR,
                    PROCFS_SYSVIPC_SHM, PROCFS_SYSVIPC_SEM, PROCFS_SYSVIPC_MSG,
-                   PROCFS_NS_FORCHILDREN, PROCFS_TIMENS_OFFSETS };
+                   PROCFS_NS_FORCHILDREN, PROCFS_TIMENS_OFFSETS,
+                   PROCFS_UID_MAP, PROCFS_GID_MAP, PROCFS_SETGROUPS };
 
 /* For PROCFS_FD, the number after /fd/. Meaningless for the others. */
 static enum procfs_file
@@ -270,6 +271,15 @@ own_procfs_file_n(const char *path, int *fd_out)
     return PROCFS_TIMENS_OFFSETS;
 
   /*
+   * The user namespace's maps. Writing uid_map is how a process in a new user
+   * namespace stops being nobody and becomes an id - there is no syscall for
+   * it, so these files are the whole interface.
+   */
+  if (strcmp(slash, "/uid_map") == 0)   return PROCFS_UID_MAP;
+  if (strcmp(slash, "/gid_map") == 0)   return PROCFS_GID_MAP;
+  if (strcmp(slash, "/setgroups") == 0) return PROCFS_SETGROUPS;
+
+  /*
    * The _for_children links. Linux has both, and only time's can ever differ
    * from the plain one here: unshare(CLONE_NEWTIME) leaves the caller where it
    * is and points these at the new namespace. pid's is listed because Linux
@@ -369,6 +379,25 @@ ns_link_ino(enum procfs_file kind, enum ns_type t)
   if (kind == PROCFS_NS_FORCHILDREN && t == NS_TIME)
     return ns_ino_time_for_children();
   return ns_ino_of(t);
+}
+
+static char *
+build_userns(enum procfs_file which, size_t *len_out)
+{
+  char buf[256];
+  int n = which == PROCFS_SETGROUPS ? userns_setgroups_read(buf, sizeof buf)
+                                    : userns_map_read(which == PROCFS_GID_MAP,
+                                                      buf, sizeof buf);
+  if (n < 0)
+    return NULL;
+  if ((size_t) n > sizeof buf)
+    n = (int) sizeof buf;
+  char *out = malloc((size_t) n + 1);
+  if (!out)
+    return NULL;
+  memcpy(out, buf, (size_t) n);
+  *len_out = (size_t) n;
+  return out;
 }
 
 static char *
@@ -674,16 +703,17 @@ procfs_ns_of_fd(int fd, enum ns_type *type, uint64_t *ino)
  * clocks unmoved. The descriptor is noted instead and write(2) is diverted to
  * the namespace itself.
  */
-KHASH_SET_INIT_INT(timensfd)
+KHASH_MAP_INIT_INT(timensfd, int)
 static khash_t(timensfd) *timens_fds;
 
 static void
-procfs_remember_timens(int fd)
+procfs_remember_writable(int fd, enum procfs_file which)
 {
   int ret;
   if (timens_fds == NULL)
     timens_fds = kh_init(timensfd);
-  kh_put(timensfd, timens_fds, fd, &ret);
+  khiter_t k = kh_put(timensfd, timens_fds, fd, &ret);
+  kh_value(timens_fds, k) = (int) which;
 }
 
 /* Whether a write to this descriptor is really a write to a time namespace,
@@ -693,15 +723,22 @@ procfs_write_timens(int fd, const char *buf, size_t size, int *out)
 {
   if (timens_fds == NULL)
     return false;
-  if (kh_get(timensfd, timens_fds, fd) == kh_end(timens_fds))
+  khiter_t k = kh_get(timensfd, timens_fds, fd);
+  if (k == kh_end(timens_fds))
     return false;
 
-  char text[256];
+  char text[512];
   size_t n = size < sizeof text - 1 ? size : sizeof text - 1;
   memcpy(text, buf, n);
   text[n] = '\0';
 
-  int r = timens_offsets_write(text);
+  int r;
+  switch ((enum procfs_file) kh_value(timens_fds, k)) {
+  case PROCFS_UID_MAP:    r = userns_map_write(false, text); break;
+  case PROCFS_GID_MAP:    r = userns_map_write(true, text);  break;
+  case PROCFS_SETGROUPS:  r = userns_setgroups_write(text);  break;
+  default:                r = timens_offsets_write(text);    break;
+  }
   *out = r < 0 ? r : (int) size;
   return true;
 }
@@ -743,8 +780,17 @@ procfs_dup_fd(int oldfd, int newfd)
       kh_value(nsfd_notes, n) = note;
     }
   }
-  if (timens_fds != NULL && kh_get(timensfd, timens_fds, oldfd) != kh_end(timens_fds))
-    kh_put(timensfd, timens_fds, newfd, &ret);
+  if (timens_fds != NULL) {
+    khiter_t k = kh_get(timensfd, timens_fds, oldfd);
+    if (k != kh_end(timens_fds)) {
+      /* The value as well as the key: it says *which* file this is, and a copy
+       * that carried only the key had every map write arriving at the time
+       * namespace's parser instead, which refused it. */
+      int which = kh_value(timens_fds, k);
+      khiter_t n = kh_put(timensfd, timens_fds, newfd, &ret);
+      kh_value(timens_fds, n) = which;
+    }
+  }
 }
 
 static void
@@ -838,8 +884,11 @@ procfs_stat(const char *path, uint32_t *mode, uint64_t *size, uint64_t *ino)
     }
     return true;
   case PROCFS_TIMENS_OFFSETS:
-    /* Writable, and that is not decoration: writing it is the only way to set
-     * a time namespace's offsets. */
+  case PROCFS_UID_MAP:
+  case PROCFS_GID_MAP:
+  case PROCFS_SETGROUPS:
+    /* Writable, and that is not decoration: writing these is the only way to
+     * set a time namespace's offsets or a user namespace's maps. */
     *mode = 0644 | 0100000;
     *size = 0;
     *ino  = 2;
@@ -1042,6 +1091,11 @@ procfs_open(const char *path, int *out_fd)
   case PROCFS_TIMENS_OFFSETS:
     content = build_timens_offsets(&len);
     break;
+  case PROCFS_UID_MAP:
+  case PROCFS_GID_MAP:
+  case PROCFS_SETGROUPS:
+    content = build_userns(own_procfs_file_n(path, &fdno), &len);
+    break;
   case PROCFS_SYSVIPC_SHM:
   case PROCFS_SYSVIPC_SEM:
   case PROCFS_SYSVIPC_MSG:
@@ -1070,8 +1124,12 @@ procfs_open(const char *path, int *out_fd)
     return -1;
   }
 
-  if (own_procfs_file_n(path, &fdno) == PROCFS_TIMENS_OFFSETS)
-    procfs_remember_timens(fd);
+  {
+    enum procfs_file w = own_procfs_file_n(path, &fdno);
+    if (w == PROCFS_TIMENS_OFFSETS || w == PROCFS_UID_MAP ||
+        w == PROCFS_GID_MAP || w == PROCFS_SETGROUPS)
+      procfs_remember_writable(fd, w);
+  }
 
   *out_fd = fd;
   return 0;

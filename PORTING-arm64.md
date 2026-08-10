@@ -3169,3 +3169,68 @@ unmoved.
 
 What is not offset: `/proc/uptime` and `sysinfo`, which come from mSL/ProcFS and
 the host's `kern.boottime` respectively. Linux does virtualise both.
+
+### 3.5.61 The user namespace — **implemented as an identity, not an authority**
+
+`CLONE_NEWUSER` was refused. It works now: `uid_map`, `gid_map` and `setgroups`
+under `/proc/<pid>/`, translating at the syscall boundary, so `unshare -Ur`
+gives a guest root inside its own namespace and files owned by ids the map does
+not cover read back as nobody — which is what a rootless container looks like.
+
+**The design decision is where the translation lives, and it is the whole of the
+safety argument.** `struct cred` is *not* rewritten. It goes on holding the ids
+the process really has, and only what crosses to the guest is mapped. So a
+process that maps itself to uid 0 inside is still, to every check NABI makes,
+the unprivileged process it started as. It gains the appearance of root and none
+of the reach.
+
+That matters because NABI has no capability model, and the obvious
+implementation — rewrite the credentials so the process *is* uid 0 — would have
+handed it every `euid == 0` fast path in the tree: the SysV ownership checks, the
+guest-mode xattr overlay, setuid exec. An unprivileged guest could have unshared
+a user namespace and become real root over everything the host account can
+reach, which is far more than Linux would ever grant. Translating at the
+boundary gives Linux's containment without anything having to enforce it.
+
+**The cost is real and worth stating plainly.** On Linux, root in a user
+namespace genuinely may act on ids mapped into it. Here it may not, because the
+check that would allow it looks at credentials that never changed. Programs that
+ask "am I root" and proceed will work; programs that then rely on the authority
+are refused as the unprivileged process they actually are. That is a smaller
+lie than the alternative, and it fails closed.
+
+The map rules are Linux's: written once, and an unprivileged writer may map only
+the single id it already has — anything else would let a guest rename itself
+into somebody else's files, since file ownership is translated through the same
+map. `setgroups` must be denied before an unprivileged `gid_map`.
+
+**Two bugs, both found by the feature rather than by the tests.**
+
+- **A dup carried a note's key but not its value.** The writable-`/proc`-file
+  mechanism from §3.5.60 became a map when a second kind of file needed it, and
+  `procfs_dup_fd` still copied only the key. Every `echo ... > /proc/self/uid_map`
+  therefore arrived at the *time* namespace's parser, which refused it — a shell
+  redirect dup2s, so this was every write anyone would actually make.
+
+- **`statx` translated an id that had already been translated.** `st` there is an
+  `l_newstat` the filesystem path has already put through `host_uid_to_guest`,
+  the ownership overlay and now the user namespace, and `statx` converted it a
+  second time. This was invisible for as long as the conversion was its own
+  inverse for everything but one account; with a map in the way it stopped
+  being, and every file inside a user namespace read back as nobody. The fix is
+  to make `st` uniformly guest-side — the `procfs_stat` branch that fed it a raw
+  host euid now converts on the way in — and take it as it is.
+
+Under Debian, with a file owned outside by root and another by an unmapped id:
+
+```
+outside: fresh=0 other=1000
+inside:  uid=100 fresh=100 other=65534      (map: 100 0 1)
+outside: fresh=0
+```
+
+and `unshare -U` before any map is written reports uid 65534, as Linux does.
+
+That leaves `mnt`, `pid` and `cgroup`. `mnt` waits on `mount(2)` — there is no
+mount table yet to isolate. `pid` remains the large one: guest pids are host
+pids throughout. `cgroup` has nothing to isolate.

@@ -112,10 +112,19 @@ DEFINE_SYSCALL(getpid)
   return syswrap(getpid());
 }
 
+/*
+ * The id the guest is told, which is not the id it has.
+ *
+ * A user namespace translates only here, at the boundary. struct cred keeps the
+ * ids the process really carries, so every permission check nabi makes goes on
+ * seeing the unprivileged user it started as - which is how "root inside the
+ * namespace" comes out meaning what it does on Linux without a capability model
+ * underneath it.
+ */
 DEFINE_SYSCALL(getuid)
 {
   pthread_rwlock_rdlock(&proc.cred.lock);
-  int ret = proc.cred.uid;
+  int ret = (int) userns_uid_inward(proc.cred.uid);
   pthread_rwlock_unlock(&proc.cred.lock);
   return ret;
 }
@@ -155,7 +164,7 @@ gid_t   guest_gid_to_host(l_gid_t g) { return g == 0 ? nabi_host_gid : (gid_t) g
 DEFINE_SYSCALL(getgid)
 {
   pthread_rwlock_rdlock(&proc.cred.lock);
-  int ret = proc.cred.gid;
+  int ret = (int) userns_gid_inward(proc.cred.gid);
   pthread_rwlock_unlock(&proc.cred.lock);
   return ret;
 }
@@ -277,7 +286,7 @@ DEFINE_SYSCALL(setgid, l_gid_t, gid)
 DEFINE_SYSCALL(geteuid)
 {
   pthread_rwlock_rdlock(&proc.cred.lock);
-  int ret = proc.cred.euid;
+  int ret = (int) userns_uid_inward(proc.cred.euid);
   pthread_rwlock_unlock(&proc.cred.lock);
   return ret;
 }
@@ -285,7 +294,7 @@ DEFINE_SYSCALL(geteuid)
 DEFINE_SYSCALL(getegid)
 {
   pthread_rwlock_rdlock(&proc.cred.lock);
-  int ret = proc.cred.egid;
+  int ret = (int) userns_gid_inward(proc.cred.egid);
   pthread_rwlock_unlock(&proc.cred.lock);
   return ret;
 }
@@ -302,17 +311,17 @@ DEFINE_SYSCALL(getresgid, gaddr_t, rgid, gaddr_t, egid, gaddr_t, sgid)
 {
   int n;
   pthread_rwlock_rdlock(&proc.cred.lock);
-  n = proc.cred.gid;
+  n = (int) userns_gid_inward(proc.cred.gid);
   if (copy_to_user(rgid, &n, sizeof n)) {
     pthread_rwlock_unlock(&proc.cred.lock);
     return -LINUX_EFAULT;
   }
-  n = proc.cred.egid;
+  n = (int) userns_gid_inward(proc.cred.egid);
   if (copy_to_user(egid, &n, sizeof n)) {
     pthread_rwlock_unlock(&proc.cred.lock);
     return -LINUX_EFAULT;
   }
-  n = proc.cred.sgid;
+  n = (int) userns_gid_inward(proc.cred.sgid);
   if (copy_to_user(sgid, &n, sizeof n)) {
     pthread_rwlock_unlock(&proc.cred.lock);
     return -LINUX_EFAULT;

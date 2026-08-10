@@ -29,6 +29,7 @@
 
 #include "common.h"
 #include "noah.h"
+#include "namespace.h"
 #include "checkpoint.h"
 
 #include "linux/common.h"
@@ -1210,8 +1211,8 @@ guest_owner_overlay(int dirfd, const char *path, bool nofollow,
   if (!abs_path_at(dirfd, path, abs, sizeof abs))
     return;
   if (guest_owner_read(abs, nofollow, &o)) {
-    l_st->st_uid = o.uid;
-    l_st->st_gid = o.gid;
+    l_st->st_uid = userns_uid_inward(o.uid);
+    l_st->st_gid = userns_gid_inward(o.gid);
   }
 }
 
@@ -1220,8 +1221,8 @@ guest_owner_overlay_fd(int fd, struct l_newstat *l_st)
 {
   struct guest_owner o;
   if (fgetxattr(fd, GUEST_OWNER_XATTR, &o, sizeof o, 0, 0) == (ssize_t) sizeof o) {
-    l_st->st_uid = o.uid;
-    l_st->st_gid = o.gid;
+    l_st->st_uid = userns_uid_inward(o.uid);
+    l_st->st_gid = userns_gid_inward(o.gid);
   }
 }
 
@@ -1969,6 +1970,17 @@ DEFINE_SYSCALL(fstat, int, fd, gaddr_t, st_ptr)
 
 DEFINE_SYSCALL(fchown, int, fd, l_uid_t, uid, l_gid_t, gid)
 {
+  uint32_t o;
+  if (uid != (l_uid_t) -1) {
+    if (!userns_uid_outward(uid, &o))
+      return -LINUX_EINVAL;
+    uid = (l_uid_t) o;
+  }
+  if (gid != (l_gid_t) -1) {
+    if (!userns_gid_outward(gid, &o))
+      return -LINUX_EINVAL;
+    gid = (l_gid_t) o;
+  }
   struct file *file = get_file(fd);
   if (file == NULL)
     return -LINUX_EBADF;
@@ -3249,8 +3261,10 @@ DEFINE_SYSCALL(statx, int, dirfd, gstr_t, path_ptr, int, flags, unsigned int, ma
       st.st_ino = pino;
       st.st_nlink = 1;
       st.st_blksize = 4096;
-      st.st_uid = geteuid();       /* converted below like any other stat */
-      st.st_gid = getegid();
+      /* Guest-side already, like everything the filesystem path produces -
+       * see the assignment of stx_uid below, which no longer converts. */
+      st.st_uid = host_uid_to_guest(geteuid());
+      st.st_gid = host_gid_to_guest(getegid());
       served = true;
       r = 0;
     }
@@ -3298,8 +3312,16 @@ DEFINE_SYSCALL(statx, int, dirfd, gstr_t, path_ptr, int, flags, unsigned int, ma
   stx.stx_mnt_id     = (uint64_t) st.st_dev;
   stx.stx_blksize    = st.st_blksize;
   stx.stx_nlink      = st.st_nlink;
-  stx.stx_uid        = host_uid_to_guest(st.st_uid);
-  stx.stx_gid        = host_gid_to_guest(st.st_gid);
+  /*
+   * Taken as they are. `st` is an l_newstat that the filesystem path has
+   * already put through host_uid_to_guest, the ownership overlay and the user
+   * namespace, so converting again here would be a second translation of an
+   * id that had been translated once. That was harmless while the conversion
+   * was its own inverse for everything but one account; with a user namespace
+   * in the way it stopped being, and every file read back as nobody inside one.
+   */
+  stx.stx_uid        = st.st_uid;
+  stx.stx_gid        = st.st_gid;
   stx.stx_mode       = st.st_mode;
   stx.stx_ino        = st.st_ino;
   stx.stx_size       = st.st_size;
@@ -3332,6 +3354,25 @@ DEFINE_SYSCALL(fchownat, int, dirfd, gstr_t, path_ptr, l_uid_t, user, l_gid_t, g
   if (flags & ~(LINUX_AT_SYMLINK_NOFOLLOW)) {
     return -LINUX_EINVAL;
   }
+  /*
+   * The ids the guest names are its namespace's, so they come back out to the
+   * ones the rest of nabi works in. An id the map does not cover has no outside
+   * equivalent at all, and Linux answers that with EINVAL rather than picking
+   * something - which is the only safe answer, since the alternative is
+   * chowning a file to an id the caller cannot name.
+   */
+  uint32_t out_uid = (uint32_t) -1, out_gid = (uint32_t) -1;
+  if (user != (l_uid_t) -1) {
+    if (!userns_uid_outward(user, &out_uid))
+      return -LINUX_EINVAL;
+    user = (l_uid_t) out_uid;
+  }
+  if (group != (l_gid_t) -1) {
+    if (!userns_gid_outward(group, &out_gid))
+      return -LINUX_EINVAL;
+    group = (l_gid_t) out_gid;
+  }
+
   int grab_flags = flags & LINUX_AT_SYMLINK_NOFOLLOW ? LOOKUP_NOFOLLOW : 0;
   struct path path;
   int r = vfs_grab_dir(dirfd, pathname, grab_flags, &path);

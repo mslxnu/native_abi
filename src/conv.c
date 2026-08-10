@@ -1,5 +1,6 @@
 #include "common.h"
 #include "noah.h"
+#include "namespace.h"
 
 #include "linux/common.h"
 #include "linux/time.h"
@@ -155,8 +156,11 @@ stat_darwin_to_linux(struct stat *stat, struct l_newstat *lstat)
   /* The account NABI runs as is the guest's root - see struct cred. Without
    * this the guest is root but everything it owns reads back as uid 501, and
    * anything that checks the two agree (sudo most loudly) refuses to run. */
-  lstat->st_uid = host_uid_to_guest(stat->st_uid);
-  lstat->st_gid = host_gid_to_guest(stat->st_gid);
+  /* And then through the user namespace, so a file owned by an id it does not
+   * map reads back as nobody - which is what Linux shows and what tells a
+   * program inside one that the file is not really its own. */
+  lstat->st_uid = userns_uid_inward(host_uid_to_guest(stat->st_uid));
+  lstat->st_gid = userns_gid_inward(host_gid_to_guest(stat->st_gid));
   lstat->st_rdev = stat->st_rdev;
   lstat->st_size = stat->st_size;
   lstat->st_atim.tv_sec = stat->st_atimespec.tv_sec;

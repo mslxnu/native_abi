@@ -28,12 +28,16 @@ static long sys6(long n,long a,long b,long c,long d,long e,long f){
 #define SYS_exit 93
 #define SYS_readlinkat 78
 #define SYS_uname 160
+#define SYS_getuid 174
+#define SYS_getgid 176
 #define SYS_sethostname 161
 #define SYS_setdomainname 162
 #define SYS_unshare 97
 #define SYS_setns 268
 #define SYS_clone 220
 #define SYS_clock_gettime 113
+#define SYS_newfstatat 79
+#define SYS_fchownat 54
 #define SYS_wait4 260
 #define AT_FDCWD -100
 #define O_RDONLY 0
@@ -47,10 +51,16 @@ static long sys6(long n,long a,long b,long c,long d,long e,long f){
 #define CLONE_NEWPID    0x20000000
 #define CLONE_NEWNET    0x40000000
 #define CLONE_NEWTIME   0x00000080
+#define NOBODY          65534
 #define EINVAL 22
+#define EPERM  1
 
 struct utsname { char sys[65], node[65], rel[65], ver[65], mach[65], dom[65]; };
 struct tspec { long tv_sec, tv_nsec; };
+
+/* aarch64's struct stat, as far as the owner. */
+struct lstat { unsigned long dev, ino; unsigned mode, nlink, uid, gid;
+               unsigned long rdev, pad1; long size; char rest[64]; };
 
 #define CLOCK_REALTIME  0
 #define CLOCK_MONOTONIC 1
@@ -111,8 +121,8 @@ void _start(void)
     fail("unshare(CLONE_NEWNET)", r, -EINVAL);
   if ((r = sys6(SYS_unshare, CLONE_NEWPID, 0,0,0,0,0)) != -EINVAL)
     fail("unshare(CLONE_NEWPID)", r, -EINVAL);
-  if ((r = sys6(SYS_unshare, CLONE_NEWUSER, 0,0,0,0,0)) != -EINVAL)
-    fail("unshare(CLONE_NEWUSER)", r, -EINVAL);
+  if ((r = sys6(SYS_unshare, CLONE_NEWNS, 0,0,0,0,0)) != -EINVAL)
+    fail("unshare(CLONE_NEWNS)", r, -EINVAL);
   if ((r = ns_link("/proc/self/ns/net", b, sizeof b)) < 0)
     fail("re-reading the net link", r, 0);
   if (!eq(a, b))
@@ -280,6 +290,90 @@ void _start(void)
   case 8: fails("the child could not read its time link", "");
   case 9: fails("the child is not in the namespace set aside for it", "");
   default: fail("the time child exited with", (status >> 8) & 0xff, 0);
+  }
+
+  /*
+   * The user namespace. It is an identity here rather than an authority:
+   * credentials are translated at the boundary and never rewritten, so a
+   * process that maps itself to root is still, to every check nabi makes, the
+   * unprivileged process it was. That is the part of Linux's behaviour worth
+   * having, and it falls out of *not* implementing capabilities rather than
+   * being enforced by them.
+   *
+   * Last, because unlike the others it changes what every subsequent id-related
+   * answer means.
+   */
+  struct lstat sb;
+  if ((r = sys6(SYS_newfstatat, AT_FDCWD, (long) "/nstest", (long) &sb, 0, 0,0)) < 0)
+    fail("stat of the test binary", r, 0);
+  long owner_outside = sb.uid;
+
+  char ubefore[80], uafter[80];
+  if (ns_link("/proc/self/ns/user", ubefore, sizeof ubefore) < 0)
+    fail("reading the user link", -1, 0);
+  if ((r = sys6(SYS_unshare, CLONE_NEWUSER, 0,0,0,0,0)) != 0)
+    fail("unshare(CLONE_NEWUSER)", r, 0);
+  if (ns_link("/proc/self/ns/user", uafter, sizeof uafter) < 0)
+    fail("re-reading the user link", -1, 0);
+  if (eq(ubefore, uafter))
+    fails("unshare(CLONE_NEWUSER) left the identity unchanged", uafter);
+
+  /* Before a map exists there is no id to report, and Linux says nobody. */
+  if ((r = sys6(SYS_getuid, 0,0,0,0,0,0)) != NOBODY)
+    fail("getuid in a namespace with no map", r, NOBODY);
+  if ((r = sys6(SYS_getgid, 0,0,0,0,0,0)) != NOBODY)
+    fail("getgid in a namespace with no map", r, NOBODY);
+  if ((r = sys6(SYS_newfstatat, AT_FDCWD, (long) "/nstest", (long) &sb, 0, 0,0)) < 0)
+    fail("stat before a map", r, 0);
+  if (sb.uid != NOBODY)
+    fail("a file's owner before a map", sb.uid, NOBODY);
+
+  /* Map the id this process actually has onto 100. */
+  {
+    long fd2 = sys6(SYS_openat, AT_FDCWD, (long) "/proc/self/uid_map",
+                    O_WRONLY, 0,0,0);
+    if (fd2 < 0)
+      fail("opening /proc/self/uid_map", fd2, 0);
+    char line[64];
+    int li = 0;
+    const char *pfx = "100 ";
+    for (int i = 0; pfx[i]; i++) line[li++] = pfx[i];
+    long v = owner_outside;
+    if (v == 0) line[li++] = '0';
+    else { char t[16]; int ti = 0;
+           while (v > 0) { t[ti++] = (char) ('0' + v % 10); v /= 10; }
+           while (ti > 0) line[li++] = t[--ti]; }
+    line[li++] = ' '; line[li++] = '1'; line[li++] = '\n';
+    if ((r = sys6(SYS_write, fd2, (long) line, li, 0,0,0)) != li)
+      fail("writing uid_map", r, li);
+    sys6(SYS_close, fd2, 0,0,0,0,0);
+  }
+
+  if ((r = sys6(SYS_getuid, 0,0,0,0,0,0)) != 100)
+    fail("getuid after mapping it to 100", r, 100);
+
+  /* And the same map decides what a file's owner reads as. */
+  if ((r = sys6(SYS_newfstatat, AT_FDCWD, (long) "/nstest", (long) &sb, 0, 0,0)) < 0)
+    fail("stat after a map", r, 0);
+  if (sb.uid != 100)
+    fail("a mapped owner", sb.uid, 100);
+
+  /* An id the map does not cover has no outside equivalent, so chowning to it
+   * is EINVAL rather than a guess. */
+  if ((r = sys6(SYS_fchownat, AT_FDCWD, (long) "/nstest", 55, -1, 0, 0)) != -EINVAL)
+    fail("chown to an unmapped id", r, -EINVAL);
+
+  /* The map is written once; a second attempt cannot reinterpret every id the
+   * process has already been told. */
+  {
+    long fd3 = sys6(SYS_openat, AT_FDCWD, (long) "/proc/self/uid_map",
+                    O_WRONLY, 0,0,0);
+    if (fd3 >= 0) {
+      r = sys6(SYS_write, fd3, (long) "7 0 1\n", 6, 0,0,0);
+      sys6(SYS_close, fd3, 0,0,0,0,0);
+      if (r != -EPERM)
+        fail("a second write to uid_map", r, -EPERM);
+    }
   }
 
   put("ns ok\n");

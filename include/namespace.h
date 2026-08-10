@@ -20,9 +20,13 @@
  *           deliberately does not touch CLOCK_REALTIME - neither does Linux's.
  *           Implemented.
  *
- *   user    Reachable, and the largest of the reachable ones: credentials are
- *           already software, so what is missing is uid_map/gid_map and a
- *           capability model to go with them.
+ *   user    Implemented as an identity, not as an authority. The maps are real
+ *           - uid_map, gid_map and setgroups, translating at the syscall
+ *           boundary - so a process can be uid 0 inside while remaining its own
+ *           unprivileged self outside, and files owned by unmapped ids read
+ *           back as nobody, exactly as on Linux. What is *not* modelled is
+ *           capabilities: being root in a namespace here confers no permission
+ *           that the guest credentials did not already carry. See below.
  *
  *   pid     Large. Guest pids *are* host pids today - getpid, kill, wait4,
  *           signals, /proc and the fork checkpoint all use them directly - so a
@@ -96,6 +100,30 @@ struct time_namespace {
   int32_t _pad;
 };
 
+/*
+ * A user namespace: what the ids inside it mean outside it.
+ *
+ * Held as ranges, as Linux holds them, and written once - a map that could
+ * change under a running process would silently reinterpret every id it had
+ * already been told.
+ */
+#define USERNS_MAX_RANGES 5
+#define USERNS_OVERFLOW   65534         /* Linux's overflowuid: "nobody" */
+
+struct id_range {
+  uint32_t inside, outside, count;
+};
+
+struct user_namespace {
+  struct id_range uid[USERNS_MAX_RANGES];
+  struct id_range gid[USERNS_MAX_RANGES];
+  uint32_t n_uid, n_gid;
+  int32_t  setgroups_allowed;   /* until "deny" is written, which gid_map wants */
+  int32_t  uid_written, gid_written;
+  uint32_t creator;             /* the outside uid that made it */
+  uint32_t _pad;
+};
+
 struct namespace {
   enum ns_type type;
   uint64_t     ino;          /* what /proc/<pid>/ns/<name> reports */
@@ -103,6 +131,7 @@ struct namespace {
   /* Only uts and time carry anything; the rest exist to have an identity. */
   struct uts_namespace  uts;
   struct time_namespace time;
+  struct user_namespace user;
 };
 
 /*
@@ -148,6 +177,35 @@ uint64_t ns_ino_time_for_children(void);
  * and -1 going back in, which is what an absolute deadline needs.
  */
 void timens_shift(struct timespec *ts, bool boottime, int sign);
+
+/*
+ * The user namespace, as a translation at the syscall boundary.
+ *
+ * Credentials are *not* rewritten. struct cred goes on holding the ids the
+ * process really has, and only what crosses to the guest is mapped - which is
+ * what makes the containment come out right without a capability model to
+ * enforce it. A process that maps itself to uid 0 inside is still its own
+ * unprivileged self to every check nabi makes, so it gains the appearance of
+ * root and none of the reach: exactly the part of Linux's behaviour that
+ * matters, arrived at by not implementing the part that does not.
+ *
+ * The cost of that shortcut is real and worth stating. On Linux, root in a user
+ * namespace genuinely may act on ids mapped into it - chown a file it owns to
+ * another mapped id, for instance - and here it may not, because the check that
+ * would allow it looks at credentials that never changed. Programs that ask
+ * "am I root" and proceed will work; programs that then rely on the authority
+ * will be refused as the unprivileged process they actually are.
+ */
+bool     userns_active(void);
+uint32_t userns_uid_inward(uint32_t outside);   /* nobody, if unmapped */
+uint32_t userns_gid_inward(uint32_t outside);
+bool     userns_uid_outward(uint32_t inside, uint32_t *out);  /* false if unmapped */
+bool     userns_gid_outward(uint32_t inside, uint32_t *out);
+
+int userns_map_read(bool gid, char *out, size_t n);
+int userns_map_write(bool gid, const char *text);
+int userns_setgroups_read(char *out, size_t n);
+int userns_setgroups_write(const char *text);
 
 /* /proc/<pid>/timens_offsets, which is the only way to set them. */
 int timens_offsets_read(char *out, size_t n);
