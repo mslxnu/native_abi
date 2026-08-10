@@ -62,6 +62,15 @@ struct mount_entry {
   char     hostdir[MOUNT_PATH_MAX];  /* what backs it, or "" */
   uint32_t flags;
   uint32_t id;
+  /*
+   * Propagation. `peer` is the group a shared mount belongs to and `master` the
+   * group a slave listens to; either is 0 when it does not apply. A private
+   * mount has neither, which is what makes private the absence of a
+   * relationship rather than a kind of one.
+   */
+  uint32_t propagation;              /* LINUX_MS_SHARED, _PRIVATE, _SLAVE, _UNBINDABLE */
+  uint32_t peer;
+  uint32_t master;
 };
 
 struct mount_table {
@@ -69,6 +78,29 @@ struct mount_table {
   uint32_t n;
   uint32_t next_id;
 };
+
+/*
+ * Propagation, which is the part of mounting that is about other namespaces.
+ *
+ * A shared mount and the copy of it a new namespace receives are *peers*: a
+ * mount made under one appears under the other, and that is what propagation
+ * is for. Here a namespace's mounts are a table in a file, so peers are entries
+ * in different files carrying the same group number, and propagating an event
+ * means writing it into every table that has one.
+ *
+ * The four types are Linux's and are honoured rather than recorded:
+ *
+ *   shared      events travel both ways with every peer.
+ *   private     no relationship in either direction. The default, as on Linux.
+ *   slave       receives from its master's group, sends to nobody. `unshare`
+ *               makes one when a shared mount is copied with --make-rslave,
+ *               which is how a container watches the host's mounts without
+ *               being able to disturb them.
+ *   unbindable  private, and refuses to be the source of a bind. This one is
+ *               enforced rather than noted: it exists to stop a recursive bind
+ *               from copying a subtree into itself forever.
+ */
+void mount_ns_clone(uint64_t from_ino, uint64_t to_ino);
 
 /*
  * Whether an absolute guest path falls inside a mount, and where it really is.
@@ -86,8 +118,5 @@ bool mount_is_rdonly(const char *guest_path);
  * string that could only ever describe the day it was written. */
 int  mount_build_mounts(char *out, size_t n);
 int  mount_build_mountinfo(char *out, size_t n);
-
-/* Give a new mount namespace its own copy of this one's table. */
-void mount_ns_clone(uint64_t from_ino, uint64_t to_ino);
 
 #endif

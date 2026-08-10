@@ -3556,3 +3556,64 @@ a nested mount at /a/sub: deep
     /src     /c     none rw 0 0
     /src/sub /c/sub none rw 0 0
 ```
+
+### 3.5.68 Mount propagation — **implemented**
+
+§3.5.62 accepted `MS_SHARED`, `MS_PRIVATE`, `MS_SLAVE` and `MS_UNBINDABLE` and
+did nothing with them, on the argument that a namespace's table is a copy taken
+at unshare, so there was no propagation to configure. That argument was true of
+the implementation and wrong about the feature: propagation is precisely the
+thing that makes a namespace's mounts *not* a private copy, and a mount reported
+as shared that does not propagate is the silent lie this port keeps refusing.
+
+**Peers are entries in different tables carrying the same group number.** A
+namespace's mounts are a table in a file, so propagating an event means writing
+it into every table that has a member of the parent mount's group. The group
+counter is shared across namespaces — two namespaces handing out group 1 for
+unrelated mounts would make them propagate to each other.
+
+**The inheritance rule at unshare is where propagation is actually decided.** A
+shared mount keeps its group, so the copy and the original are peers and events
+travel between them; that is the part `unshare -m` does *not* isolate, and why
+every container recipe begins by making things private. A slave keeps listening
+to its master. A private or unbindable mount has no relationship to keep.
+
+All four types are honoured rather than recorded:
+
+| | |
+|---|---|
+| **shared** | events travel both ways with every peer |
+| **private** | no relationship in either direction; the default, as on Linux |
+| **slave** | receives from its master's group, sends to nobody |
+| **unbindable** | private, and **enforced**: refused as the source of a bind, which is what it exists for |
+
+`/proc/self/mountinfo` reports it in the optional fields — `shared:N`,
+`master:N`, `unbindable` — because that is the only place anything can read
+propagation back. A private mount is written as their absence rather than as a
+word, as Linux writes it.
+
+The rootfs may now have an entry of its own even with nothing mounted on it,
+because `mount --make-rshared /` is how a machine declares that its mounts
+should reach the namespaces made from it — and with no entry for `/` there would
+be nothing to record that on, and nothing under it would ever propagate.
+
+Verified across namespaces, which is the only place it can be:
+
+```
+=== a child namespace mounts under the SHARED one ===
+  parent sees /shared/x/f: payload
+=== and under the PRIVATE one ===
+  parent sees /priv/x/f:   No such file or directory
+=== unmounting in a child propagates too ===
+  parent sees /shared/x/f: No such file or directory
+
+  child: 30 1 0:30 / /shared rw master:1 - none none rw   (a slave)
+  parent sees /shared/y/f: No such file or directory      (it sent nothing back)
+  31 1 0:31 / /nb rw unbindable - none /s1 rw
+  mount: /dest: … bad option …                            (refused as a bind source)
+```
+
+The smoke test makes the child `unshare` before it mounts, which is the whole
+point: a plain fork shares this namespace's table, so without the unshare the
+mount arriving in the parent would prove nothing was isolated rather than that
+propagation happened.

@@ -58,6 +58,8 @@ static long sys6(long n,long a,long b,long c,long d,long e,long f){
 #define MS_REMOUNT 0x20
 #define MS_BIND 0x1000
 #define MS_MOVE 0x2000
+#define MS_PRIVATE 0x40000
+#define MS_SHARED 0x100000
 #define EROFS 30
 #define ENOENT 2
 #define SIGCHLD 17
@@ -424,6 +426,81 @@ void _start(void)
     fail("the target after unmounting", r, -ENOENT);
   if ((r = sys6(SYS_umount2, (long) "/mnt-dst", 0, 0,0,0,0)) != -EINVAL)
     fail("umount2 of something that is not a mount", r, -EINVAL);
+
+  /*
+   * Propagation, which is the part of mounting that is about other namespaces
+   * and cannot be tested inside one. A plain fork shares this namespace's
+   * table, so the child has to unshare before its mount means anything: only
+   * then are the two mounts peers rather than the same entry, and only then
+   * does the mount arriving here say that propagation happened rather than
+   * that nothing was isolated.
+   */
+  sys6(SYS_mkdirat, AT_FDCWD, (long) "/prop-src", 0755, 0,0,0);
+  sys6(SYS_mkdirat, AT_FDCWD, (long) "/prop-at", 0755, 0,0,0);
+  sys6(SYS_mkdirat, AT_FDCWD, (long) "/prop-at/x", 0755, 0,0,0);
+  {
+    long f = sys6(SYS_openat, AT_FDCWD, (long) "/prop-src/f",
+                  O_WRONLY | O_CREAT, 0644, 0,0);
+    if (f < 0)
+      fail("creating the propagation source's file", f, 0);
+    sys6(SYS_write, f, (long) "prop\n", 5, 0,0,0);
+    sys6(SYS_close, f, 0,0,0,0,0);
+  }
+
+  /* Shared: what a child mounts under it arrives here. */
+  if ((r = sys6(SYS_mount, 0, (long) "/prop-at", 0, MS_SHARED, 0, 0)) != 0)
+    fail("mount(MS_SHARED)", r, 0);
+
+  long mpid = sys6(SYS_clone, SIGCHLD, 0, 0, 0, 0, 0);
+  if (mpid < 0)
+    fail("clone for the propagation test", mpid, 0);
+  if (mpid == 0) {
+    if (sys6(SYS_unshare, CLONE_NEWNS, 0,0,0,0,0) != 0)
+      sys6(SYS_exit, 5, 0,0,0,0,0);
+    if (sys6(SYS_mount, (long) "/prop-src", (long) "/prop-at/x", 0,
+             MS_BIND, 0, 0) != 0)
+      sys6(SYS_exit, 6, 0,0,0,0,0);
+    sys6(SYS_exit, 0, 0,0,0,0,0);
+  }
+  status = 0;
+  if ((r = sys6(SYS_wait4, mpid, (long) &status, 0, 0,0,0)) < 0)
+    fail("wait4 for the propagation child", r, 0);
+  switch ((status >> 8) & 0xff) {
+  case 0: break;
+  case 5: fails("the propagation child could not unshare", "");
+  case 6: fails("the propagation child could not mount", "");
+  default: fail("the propagation child exited with", (status >> 8) & 0xff, 0);
+  }
+  {
+    long f = sys6(SYS_openat, AT_FDCWD, (long) "/prop-at/x/f", O_RDONLY, 0,0,0);
+    if (f < 0)
+      fail("a mount made under a shared mount did not propagate", f, 0);
+    sys6(SYS_close, f, 0,0,0,0,0);
+  }
+
+  /* Private: it does not. This is the half that a recorded-but-ignored
+   * propagation type would pass by accident, so it is the one that matters. */
+  sys6(SYS_umount2, (long) "/prop-at/x", 0, 0,0,0,0);
+  if ((r = sys6(SYS_mount, 0, (long) "/prop-at", 0, MS_PRIVATE, 0, 0)) != 0)
+    fail("mount(MS_PRIVATE)", r, 0);
+
+  mpid = sys6(SYS_clone, SIGCHLD, 0, 0, 0, 0, 0);
+  if (mpid < 0)
+    fail("clone for the private propagation test", mpid, 0);
+  if (mpid == 0) {
+    if (sys6(SYS_unshare, CLONE_NEWNS, 0,0,0,0,0) != 0)
+      sys6(SYS_exit, 5, 0,0,0,0,0);
+    if (sys6(SYS_mount, (long) "/prop-src", (long) "/prop-at/x", 0,
+             MS_BIND, 0, 0) != 0)
+      sys6(SYS_exit, 6, 0,0,0,0,0);
+    sys6(SYS_exit, 0, 0,0,0,0,0);
+  }
+  status = 0;
+  sys6(SYS_wait4, mpid, (long) &status, 0, 0,0,0);
+  if (((status >> 8) & 0xff) != 0)
+    fail("the private-propagation child failed", (status >> 8) & 0xff, 0);
+  if ((r = sys6(SYS_openat, AT_FDCWD, (long) "/prop-at/x/f", O_RDONLY, 0,0,0)) != -ENOENT)
+    fail("a mount under a private mount propagated anyway", r, -ENOENT);
 
   /*
    * The pid namespace, which unshare treats as it treats time: the caller stays

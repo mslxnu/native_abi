@@ -89,6 +89,45 @@ current_table(struct mount_table *t)
   return false;
 }
 
+static size_t under(const char *path, const char *mnt);
+
+/*
+ * Peer group numbers are shared between namespaces, so the counter has to be
+ * too - two namespaces handing out group 1 for unrelated mounts would make
+ * them propagate to each other.
+ */
+static uint32_t
+peer_group_new(void)
+{
+  char path[PATH_MAX];
+  const char *tmp = getenv("TMPDIR");
+  snprintf(path, sizeof path, "%s/nabi-mntpeer-%s",
+           tmp && *tmp ? tmp : "/tmp", nabi_boot_tag());
+
+  int fd = open(path, O_RDWR | O_CREAT, 0600);
+  if (fd < 0)
+    return 0;
+  flock(fd, LOCK_EX);
+  uint32_t next = 0;
+  if (pread(fd, &next, sizeof next, 0) != (ssize_t) sizeof next || next == 0)
+    next = 1;
+  uint32_t mine = next++;
+  (void) !pwrite(fd, &next, sizeof next, 0);
+  flock(fd, LOCK_UN);
+  close(fd);
+  return mine;
+}
+
+/*
+ * What a namespace's copy of a mount inherits, which is where propagation is
+ * actually decided.
+ *
+ * A shared mount stays shared and stays in its group, so the copy and the
+ * original are peers and events travel between them - that is the whole of
+ * what `unshare -m` does *not* isolate, and why a container recipe starts by
+ * making things private. A slave keeps listening to its master. A private
+ * mount, or an unbindable one, has no relationship to keep.
+ */
 void
 mount_ns_clone(uint64_t from_ino, uint64_t to_ino)
 {
@@ -97,9 +136,113 @@ mount_ns_clone(uint64_t from_ino, uint64_t to_ino)
     memset(&t, 0, sizeof t);
     t.next_id = 30;
   }
-  /* A copy, which is what unshare(CLONE_NEWNS) makes: the new namespace starts
-   * with everything the old one had and diverges from there. */
+  for (uint32_t i = 0; i < t.n; i++) {
+    if (t.m[i].propagation == LINUX_MS_SHARED)
+      continue;                 /* same group: the copy is a peer */
+    if (t.m[i].propagation == LINUX_MS_SLAVE)
+      continue;                 /* still listening to the same master */
+    t.m[i].peer = 0;
+    t.m[i].master = 0;
+  }
   table_store(to_ino, &t);
+}
+
+/* Every mount table of this boot, so an event can be given to peers. */
+static int
+each_table(uint64_t skip_ino, uint64_t *inos, int max)
+{
+  const char *tmp = getenv("TMPDIR");
+  char base[PATH_MAX], prefix[64];
+  snprintf(base, sizeof base, "%s", tmp && *tmp ? tmp : "/tmp");
+  snprintf(prefix, sizeof prefix, "nabi-mnt-%s-", nabi_boot_tag());
+
+  DIR *d = opendir(base);
+  if (!d)
+    return 0;
+  int n = 0;
+  struct dirent *e;
+  while ((e = readdir(d)) != NULL && n < max) {
+    size_t pl = strlen(prefix);
+    if (strncmp(e->d_name, prefix, pl) != 0)
+      continue;
+    if (strchr(e->d_name + pl, '.'))
+      continue;                 /* the .new written during a store */
+    uint64_t ino = strtoull(e->d_name + pl, NULL, 10);
+    if (ino == 0 || ino == skip_ino)
+      continue;
+    inos[n++] = ino;
+  }
+  closedir(d);
+  return n;
+}
+
+/*
+ * Give an event to the peers of the mount it happened under.
+ *
+ * `parent_peer` is the group of the mount containing the target. A namespace
+ * whose table has a member of that group is watching this place, so the same
+ * entry is added there (or removed, when `add` is false). A slave receives but
+ * does not send, which falls out of only ever looking at the parent's peer
+ * group: a slave has a master rather than a group of its own.
+ */
+static void
+propagate(uint32_t parent_peer, const struct mount_entry *e, bool add)
+{
+  if (parent_peer == 0)
+    return;
+
+  uint64_t inos[64];
+  int n = each_table(ns_ino_of(NS_MNT), inos, 64);
+  for (int i = 0; i < n; i++) {
+    struct mount_table t;
+    if (!table_load(inos[i], &t))
+      continue;
+
+    bool watching = false;
+    for (uint32_t k = 0; k < t.n; k++)
+      if (t.m[k].peer == parent_peer || t.m[k].master == parent_peer)
+        watching = true;
+    if (!watching)
+      continue;
+
+    int at = -1;
+    for (uint32_t k = 0; k < t.n; k++)
+      if (strcmp(t.m[k].target, e->target) == 0)
+        at = (int) k;
+
+    if (add) {
+      if (at >= 0)
+        t.m[at] = *e;
+      else if (t.n < MOUNT_MAX)
+        t.m[t.n++] = *e;
+      else
+        continue;
+    } else {
+      if (at < 0)
+        continue;
+      memmove(&t.m[at], &t.m[at + 1], (t.n - (uint32_t) at - 1) * sizeof t.m[0]);
+      t.n--;
+    }
+    table_store(inos[i], &t);
+  }
+}
+
+/* The mount a new target falls under, which is the one that propagates it. */
+static uint32_t
+parent_peer_of(const struct mount_table *t, const char *target)
+{
+  int best = -1;
+  size_t best_len = 0;
+  for (uint32_t i = 0; i < t->n; i++) {
+    if (strcmp(t->m[i].target, target) == 0)
+      continue;                 /* itself is not its own parent */
+    size_t n = under(target, t->m[i].target);
+    if (n > best_len) {
+      best_len = n;
+      best = (int) i;
+    }
+  }
+  return best < 0 ? 0 : t->m[best].peer;
 }
 
 /*
@@ -224,9 +367,26 @@ mount_build_mountinfo(char *out, size_t n)
   if (current_table(&t))
     for (uint32_t i = 0; i < t.n && (size_t) len < n; i++) {
       const char *o = opts_of(t.m[i].flags);
+
+      /*
+       * The optional fields, which are where propagation is reported and the
+       * only place anything can read it back. A private mount has none, which
+       * is why it is written as their absence rather than as a word.
+       */
+      char prop[64] = "";
+      int pl = 0;
+      if (t.m[i].peer)
+        pl += snprintf(prop + pl, sizeof prop - (size_t) pl, " shared:%u",
+                       t.m[i].peer);
+      if (t.m[i].master)
+        pl += snprintf(prop + pl, sizeof prop - (size_t) pl, " master:%u",
+                       t.m[i].master);
+      if (t.m[i].propagation == LINUX_MS_UNBINDABLE)
+        pl += snprintf(prop + pl, sizeof prop - (size_t) pl, " unbindable");
+
       len += snprintf(out + len, n - (size_t) len,
-                      "%u 1 0:%u / %s %s - %s %s %s\n",
-                      t.m[i].id, t.m[i].id, t.m[i].target, o,
+                      "%u 1 0:%u / %s %s%s - %s %s %s\n",
+                      t.m[i].id, t.m[i].id, t.m[i].target, o, prop,
                       t.m[i].type, t.m[i].source, o);
     }
   return len;
@@ -276,22 +436,64 @@ DEFINE_SYSCALL(mount, gstr_t, source_ptr, gstr_t, target_ptr, gstr_t, type_ptr,
   struct mount_table t;
   current_table(&t);
 
-  /*
-   * Propagation on its own changes nothing that can be observed here. A
-   * namespace's table is a copy taken at unshare, so there is no propagation
-   * between namespaces to make private or shared; accepting the call is
-   * accurate rather than lenient, since the state it asks for is the state
-   * already in force.
-   */
-  if ((flags & (LINUX_MS_PRIVATE | LINUX_MS_SHARED | LINUX_MS_SLAVE |
-                LINUX_MS_UNBINDABLE)) && !(flags & LINUX_MS_BIND))
-    return 0;
-
   /* Find an existing mount on exactly this target. */
   int at = -1;
   for (uint32_t i = 0; i < t.n; i++)
     if (strcmp(t.m[i].target, target) == 0)
       at = (int) i;
+
+  /*
+   * Setting a propagation type, which changes a mount's relationship to other
+   * namespaces rather than what is mounted.
+   *
+   * The rootfs is allowed an entry of its own here even though nothing is
+   * mounted on it, because `mount --make-rshared /` is how a machine declares
+   * that its mounts should reach the namespaces made from it - and with no
+   * entry for "/" there would be nothing for that to be recorded on, and
+   * nothing under it would ever propagate.
+   */
+  unsigned long prop = flags & (LINUX_MS_PRIVATE | LINUX_MS_SHARED |
+                                LINUX_MS_SLAVE | LINUX_MS_UNBINDABLE);
+  if (prop && !(flags & LINUX_MS_BIND)) {
+    if (at < 0) {
+      if (t.n == MOUNT_MAX)
+        return -LINUX_ENOSPC;
+      at = (int) t.n++;
+      memset(&t.m[at], 0, sizeof t.m[at]);
+      snprintf(t.m[at].target, sizeof t.m[at].target, "%s", target);
+      snprintf(t.m[at].source, sizeof t.m[at].source, "%s",
+               strcmp(target, "/") == 0 ? "rootfs" : "none");
+      snprintf(t.m[at].type, sizeof t.m[at].type, "%s",
+               strcmp(target, "/") == 0 ? "rootfs" : "none");
+      t.m[at].id = t.next_id++;
+    }
+
+    switch (prop) {
+    case LINUX_MS_SHARED:
+      /* A group of its own if it has none; peers join it by being copies. */
+      if (t.m[at].peer == 0)
+        t.m[at].peer = peer_group_new();
+      t.m[at].master = 0;
+      break;
+    case LINUX_MS_SLAVE:
+      /* Stops sending and starts listening to what it used to be a peer of.
+       * A mount that was never shared has nothing to be a slave of, and Linux
+       * makes it private rather than failing. */
+      t.m[at].master = t.m[at].peer;
+      t.m[at].peer = 0;
+      break;
+    case LINUX_MS_PRIVATE:
+    case LINUX_MS_UNBINDABLE:
+      t.m[at].peer = 0;
+      t.m[at].master = 0;
+      break;
+    default:
+      return -LINUX_EINVAL;     /* more than one type at once is not a type */
+    }
+    t.m[at].propagation = (uint32_t) prop;
+    table_store(ns_ino_of(NS_MNT), &t);
+    return 0;
+  }
 
   if (flags & LINUX_MS_REMOUNT) {
     if (at < 0)
@@ -365,6 +567,15 @@ DEFINE_SYSCALL(mount, gstr_t, source_ptr, gstr_t, target_ptr, gstr_t, type_ptr,
     char host[PATH_MAX];
     if (source[0] != '/')
       return -LINUX_EINVAL;
+
+    /* Unbindable is the one propagation type that is enforced at the moment it
+     * matters: it exists so that a recursive bind cannot copy a subtree into
+     * itself, which would not terminate. */
+    for (uint32_t i = 0; i < t.n; i++)
+      if (t.m[i].propagation == LINUX_MS_UNBINDABLE &&
+          strcmp(t.m[i].target, source) == 0)
+        return -LINUX_EINVAL;
+
     int gr = guest_to_host_path(source, host, sizeof host);
     if (gr < 0)
       return gr;
@@ -414,11 +625,16 @@ DEFINE_SYSCALL(mount, gstr_t, source_ptr, gstr_t, target_ptr, gstr_t, type_ptr,
     return -LINUX_ENODEV;
   }
 
+  uint32_t pp = parent_peer_of(&t, target);
+
   if (at >= 0)
     t.m[at] = e;                /* mounting over a target replaces it */
   else
     t.m[t.n++] = e;
   table_store(ns_ino_of(NS_MNT), &t);
+
+  /* And to everyone watching the place it landed in. */
+  propagate(pp, &e, true);
   return 0;
 }
 
@@ -464,9 +680,15 @@ DEFINE_SYSCALL(umount2, gstr_t, target_ptr, int, flags)
      * anything that mounted one was relying on. */
     if (strcmp(t.m[i].type, "tmpfs") == 0 && t.m[i].hostdir[0])
       rmtree(t.m[i].hostdir);
+
+    struct mount_entry gone = t.m[i];
+    uint32_t pp = parent_peer_of(&t, gone.target);
+
     memmove(&t.m[i], &t.m[i + 1], (t.n - i - 1) * sizeof t.m[0]);
     t.n--;
     table_store(ns_ino_of(NS_MNT), &t);
+
+    propagate(pp, &gone, false);
     return 0;
   }
   return -LINUX_EINVAL;         /* not a mount point, as Linux says */

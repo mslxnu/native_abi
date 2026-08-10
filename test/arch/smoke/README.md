@@ -175,6 +175,11 @@ guest-code cache sync.
     `MS_MOVE` carries a mount to a new path and uncovers the old one, refusing a
     source that is not a mount point and a destination inside the mount's own
     subtree; `umount2` empties the target, and unmounting a non-mount is EINVAL.
+    Propagation is checked where it can only be checked - between namespaces: a
+    child that unshares and mounts under a **shared** mount has that mount
+    arrive in the parent, and under a **private** one it does not. A plain fork
+    shares the table, so the child must unshare first or the test would pass by
+    proving nothing was isolated.
   - **ipc** — covered by `ipctest` below.
   - **pid** — `unshare(CLONE_NEWPID)` must *not* renumber the caller, only
     `pid_for_children`; the first child is pid 1 with a reported parent of 0,
