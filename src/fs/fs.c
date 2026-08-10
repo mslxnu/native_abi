@@ -30,6 +30,7 @@
 #include "common.h"
 #include "noah.h"
 #include "namespace.h"
+#include "mount.h"
 #include "checkpoint.h"
 
 #include "linux/common.h"
@@ -2092,6 +2093,14 @@ struct path {
   struct fs *fs;
   struct dir *dir;
   char subpath[LINUX_PATH_MAX];
+  /*
+   * Whether the mount this path came through was mounted read-only. Carried
+   * here because resolution is the only place that knows which mount a name
+   * fell in, and the operations that write are the only ones that care - a
+   * read-only mount that quietly accepted writes would be worse than not
+   * having one, since the entire reason to ask for it is to be certain.
+   */
+  bool rdonly;
 };
 
 struct fs {
@@ -2616,6 +2625,7 @@ resolve_path(const struct dir *parent, const char *name, int flags, struct path 
   if (loop > LOOP_MAX)
     return -LINUX_ELOOP;
 
+  path->rdonly = false;
   struct dir dir = *parent;
   /* Both outlive the branch below, since `name` may be made to point at one. */
   char ptsname[32];
@@ -2623,13 +2633,23 @@ resolve_path(const struct dir *parent, const char *name, int flags, struct path 
   int procfd;
 
   /* resolve mountpoints */
+  char mntpath[PATH_MAX];
   if (*name == '/') {
     if (name[1] == '\0') {
       dir.fd = proc.fileinfo.rootfd;
       strcpy(path->subpath, ".");
       goto out;
     }
-    if (!is_host_passthrough(name)) {
+    /*
+     * A mount comes first, because that is what mounting means: whatever the
+     * path would otherwise have reached, the mount is now in front of it. The
+     * table gives a host path, so from here it is handled exactly like a
+     * passthrough - the machinery for "this absolute name is already a host
+     * name" is the same machinery a bind mount needs.
+     */
+    if (mount_resolve(name, mntpath, sizeof mntpath, &path->rdonly)) {
+      name = mntpath;
+    } else if (!is_host_passthrough(name)) {
       dir.fd = proc.fileinfo.rootfd;
       name++;
     } else if ((procfd = procfs_fd_number(name)) >= 0 &&
@@ -2826,6 +2846,28 @@ vfs_grab_dir(int dirfd, const char *name, int flags, struct path *path)
   return resolve_path(&dir, name, flags, path, 0);
 }
 
+void vfs_ungrab_dir(struct path *path);
+
+/*
+ * Resolve a name that is about to be written through.
+ *
+ * The read-only check is here rather than at each caller so that the policy is
+ * stated once: every operation that modifies a file or a directory goes through
+ * this, and one that forgot would be a read-only mount that was not.
+ */
+static int
+vfs_grab_dir_w(int dirfd, const char *name, int flags, struct path *path)
+{
+  int r = vfs_grab_dir(dirfd, name, flags, path);
+  if (r < 0)
+    return r;
+  if (path->rdonly) {
+    vfs_ungrab_dir(path);
+    return -LINUX_EROFS;
+  }
+  return 0;
+}
+
 void
 vfs_ungrab_dir(struct path *path)
 {
@@ -2843,8 +2885,14 @@ do_openat(int dirfd, const char *name, int flags, int mode)
     lkflag |= LOOKUP_DIRECTORY;
   }
 
+  /* Opening for write, creating, or truncating is a write; opening to read is
+   * not, and a read-only mount must still be readable. */
+  bool writes = (flags & LINUX_O_ACCMODE) != LINUX_O_RDONLY ||
+                (flags & (LINUX_O_CREAT | LINUX_O_TRUNC));
+
   struct path path;
-  int r = vfs_grab_dir(dirfd, name, lkflag, &path);
+  int r = writes ? vfs_grab_dir_w(dirfd, name, lkflag, &path)
+                 : vfs_grab_dir(dirfd, name, lkflag, &path);
   if (r < 0) {
     return r;
   }
@@ -3140,7 +3188,7 @@ DEFINE_SYSCALL(symlinkat, gstr_t, path1_ptr, int, dirfd, gstr_t, path2_ptr)
   strncpy_from_user(path2, path2_ptr, sizeof path2);
 
   struct path path;
-  int r = vfs_grab_dir(dirfd, path2, 0, &path);
+  int r = vfs_grab_dir_w(dirfd, path2, 0, &path);
   if (r < 0) {
     return r;
   }
@@ -3375,7 +3423,7 @@ DEFINE_SYSCALL(fchownat, int, dirfd, gstr_t, path_ptr, l_uid_t, user, l_gid_t, g
 
   int grab_flags = flags & LINUX_AT_SYMLINK_NOFOLLOW ? LOOKUP_NOFOLLOW : 0;
   struct path path;
-  int r = vfs_grab_dir(dirfd, pathname, grab_flags, &path);
+  int r = vfs_grab_dir_w(dirfd, pathname, grab_flags, &path);
   if (r < 0) {
     return r;
   }
@@ -3399,7 +3447,7 @@ DEFINE_SYSCALL(fchmodat, int, dirfd, gstr_t, path_ptr, l_mode_t, mode)
   char pathname[LINUX_PATH_MAX];
   strncpy_from_user(pathname, path_ptr, sizeof pathname);
   struct path path;
-  int r = vfs_grab_dir(dirfd, pathname, 0, &path);
+  int r = vfs_grab_dir_w(dirfd, pathname, 0, &path);
   if (r < 0) {
     return r;
   }
@@ -3503,10 +3551,10 @@ DEFINE_SYSCALL(renameat, int, oldfd, gstr_t, oldpath_ptr, int, newfd, gstr_t, ne
 
   struct path oldpath, newpath;
   int r;
-  if ((r = vfs_grab_dir(oldfd, oldname, LOOKUP_NOFOLLOW, &oldpath)) < 0) {
+  if ((r = vfs_grab_dir_w(oldfd, oldname, LOOKUP_NOFOLLOW, &oldpath)) < 0) {
     goto out1;
   }
-  if ((r = vfs_grab_dir(newfd, newname, LOOKUP_NOFOLLOW, &newpath)) < 0) {
+  if ((r = vfs_grab_dir_w(newfd, newname, LOOKUP_NOFOLLOW, &newpath)) < 0) {
     goto out2;
   }
   if (oldpath.fs != newpath.fs) {
@@ -3533,7 +3581,7 @@ DEFINE_SYSCALL(unlinkat, int, dirfd, gstr_t, path_ptr, int, flags)
 
   struct path path;
   int r;
-  if ((r = vfs_grab_dir(dirfd, name, LOOKUP_NOFOLLOW, &path)) < 0) {
+  if ((r = vfs_grab_dir_w(dirfd, name, LOOKUP_NOFOLLOW, &path)) < 0) {
     return r;
   }
   r = path.fs->ops->unlinkat(path.fs, path.dir, path.subpath, flags);
@@ -3573,10 +3621,10 @@ DEFINE_SYSCALL(linkat, int, oldfd, gstr_t, oldpath_ptr, int, newfd, gstr_t, newp
   int lkflag = flags & LINUX_AT_SYMLINK_FOLLOW ? 0 : LOOKUP_NOFOLLOW;
   struct path oldpath, newpath;
   int r;
-  if ((r = vfs_grab_dir(oldfd, oldname, lkflag, &oldpath)) < 0) {
+  if ((r = vfs_grab_dir_w(oldfd, oldname, lkflag, &oldpath)) < 0) {
     goto out1;
   }
-  if ((r = vfs_grab_dir(newfd, newname, 0, &newpath)) < 0) {
+  if ((r = vfs_grab_dir_w(newfd, newname, 0, &newpath)) < 0) {
     goto out2;
   }
   if (oldpath.fs != newpath.fs) {
@@ -3653,7 +3701,7 @@ DEFINE_SYSCALL(mkdirat, int, dirfd, gstr_t, path_ptr, int, mode)
 
   struct path path;
   int r;
-  if ((r = vfs_grab_dir(dirfd, name, 0, &path)) < 0) {
+  if ((r = vfs_grab_dir_w(dirfd, name, 0, &path)) < 0) {
     return r;
   }
   r = path.fs->ops->mkdirat(path.fs, path.dir, path.subpath, mode);
@@ -3795,7 +3843,7 @@ DEFINE_SYSCALL(mknodat, int, dirfd, gaddr_t, path_ptr, l_mode_t, mode, l_dev_t, 
   int r = 0;
   switch(mode & S_IFMT) {
   case S_IFIFO: {
-    if ((r = vfs_grab_dir(dirfd, name, 0, &path)) < 0) {
+    if ((r = vfs_grab_dir_w(dirfd, name, 0, &path)) < 0) {
       goto out;
     }
     r = syswrap(mkfifo(path.subpath, mode));

@@ -15,6 +15,7 @@
 #include "noah.h"
 #include "namespace.h"
 #include "sysv.h"
+#include "mount.h"
 
 #include "linux/common.h"
 #include "linux/errno.h"
@@ -32,7 +33,7 @@ static const struct {
   unsigned long flag;
   bool          supported;
 } ns_kinds[NS_COUNT] = {
-  [NS_MNT]    = { NS_MNT,    "mnt",    LINUX_CLONE_NEWNS,     false },
+  [NS_MNT]    = { NS_MNT,    "mnt",    LINUX_CLONE_NEWNS,     true  },
   [NS_UTS]    = { NS_UTS,    "uts",    LINUX_CLONE_NEWUTS,    true  },
   [NS_IPC]    = { NS_IPC,    "ipc",    LINUX_CLONE_NEWIPC,    true  },
   [NS_PID]    = { NS_PID,    "pid",    LINUX_CLONE_NEWPID,    false },
@@ -275,6 +276,8 @@ ns_new(enum ns_type type, const struct namespace *from)
       uts_load(from->ino, &ns->uts);      /* whatever it is *now* */
       uts_store(ns->ino, &ns->uts);
     }
+    if (type == NS_MNT)
+      mount_ns_clone(from->ino, ns->ino);
     if (type == NS_USER) {
       /*
        * Deliberately *not* a copy. A new user namespace starts with no map at

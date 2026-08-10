@@ -3234,3 +3234,71 @@ and `unshare -U` before any map is written reports uid 65534, as Linux does.
 That leaves `mnt`, `pid` and `cgroup`. `mnt` waits on `mount(2)` — there is no
 mount table yet to isolate. `pid` remains the large one: guest pids are host
 pids throughout. `cgroup` has nothing to isolate.
+
+### 3.5.62 The mount namespace, and the `mount(2)` it was waiting for — **implemented**
+
+`CLONE_NEWNS` was refused, and rightly: there was nothing to isolate. NABI had a
+rootfs and a **compile-time** list of host prefixes that are passed through —
+a policy, not a table. Nothing could be added to it or removed, and `mount(2)`
+and `umount2(2)` were unimplemented and in neither syscall table. So this
+namespace needed the thing it namespaces built first.
+
+**A bind mount is the one that matters, and it costs almost nothing.** It is a
+rewrite of one path prefix to another — which is exactly what `resolve_path`
+already does at its `/* resolve mountpoints */` step when it chooses between the
+rootfs and a passthrough. So a bind is a table entry consulted at that same
+point, and needs nothing from Darwin at all. `MS_REC` changes nothing, because a
+prefix rewrite is recursive by construction.
+
+What a mount can be is decided by what the host can provide:
+
+| | |
+|---|---|
+| **bind** | Fully, including read-only. The source is resolved once, at mount time, to the host object it names — a bind binds the object, not the name. |
+| **tmpfs** | A directory under TMPDIR, removed on unmount, which is the property anything mounting one relies on. |
+| **proc, sysfs, devtmpfs, devpts, cgroup…** | Accepted and recorded. NABI already serves these, so the mount asks for something already true — but recording it is not a formality: a container that mounts `/proc` and then cannot find it in `/proc/mounts` concludes the mount failed. |
+| **anything else** | ENODEV. There is no block device layer here to mount on. |
+
+**`MS_RDONLY` is honoured, not recorded.** A read-only mount that quietly
+accepted writes would be worse than one that refused to exist, since the only
+reason to ask for one is to be certain. The check is stated once, in a
+`vfs_grab_dir_w` used by every operation that modifies a file or directory, so
+an operation that forgot would be a read-only mount that was not — the failure
+mode worth designing against.
+
+`/proc/mounts` was a fixed five-line string; it and the new `/proc/self/mountinfo`
+are built from the table now. A fixed string could only ever describe the day it
+was written, never a mount the guest had made.
+
+**Mounting needs guest root, and a user namespace does not confer it.** That
+follows from what §3.5.61 made the user namespace — an identity, not an
+authority — and it fails closed: `unshare -Ur -m` gets its namespace and is then
+refused the mounts, rather than being handed authority over the host that
+nothing downstream would check.
+
+One bug, and an ordinary one: `guest_to_host_path` returns 0 on success and a
+negative errno on failure, and the first cut tested it as a boolean — so every
+bind mount failed with ENOENT precisely when the source resolved correctly.
+
+Under Debian:
+
+```
+outside before: 5 mounts, ns=mnt:[4026531835]
+  inside ns=mnt:[4026531843]
+  mounted inside            inside sees: hello
+  tmpfs mounted             tmpfs holds: tmpdata
+  inside mounts: 7
+outside after:  5 mounts
+outside sees /mnt/a/file: No such file or directory
+```
+
+and read-only, in the same session:
+
+```
+  write: /bin/bash: /mnt/ro/new: Read-only file system
+  mkdir: cannot create directory '/mnt/ro/d': Read-only file system
+```
+
+That leaves `pid` and `cgroup`. `pid` is the large one — guest pids are host
+pids throughout `getpid`, `kill`, `wait4`, signals, `/proc` and the fork
+checkpoint. `cgroup` has nothing to isolate.

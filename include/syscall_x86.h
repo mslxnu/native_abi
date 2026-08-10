@@ -168,8 +168,8 @@
   SYSCALL(162, sync)                            \
   SYSCALL(163, unimplemented)                   \
   SYSCALL(164, unimplemented)                   \
-  SYSCALL(165, unimplemented)                   \
-  SYSCALL(166, unimplemented)                   \
+  SYSCALL(165, mount)                           \
+  SYSCALL(166, umount2)                         \
   SYSCALL(167, unimplemented)                   \
   SYSCALL(168, unimplemented)                   \
   SYSCALL(169, unimplemented)                   \

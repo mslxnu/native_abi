@@ -206,6 +206,18 @@ struct l_dirent64 {
 #define	LINUX_MS_NODEV		0x0004
 #define	LINUX_MS_NOEXEC		0x0008
 #define	LINUX_MS_REMOUNT	0x0020
+#define	LINUX_MS_BIND		0x1000
+#define	LINUX_MS_MOVE		0x2000
+#define	LINUX_MS_REC		0x4000
+#define	LINUX_MS_SILENT		0x8000
+#define	LINUX_MS_UNBINDABLE	(1<<17)
+#define	LINUX_MS_PRIVATE	(1<<18)
+#define	LINUX_MS_SLAVE		(1<<19)
+#define	LINUX_MS_SHARED		(1<<20)
+#define	LINUX_MS_RELATIME	(1<<21)
+#define	LINUX_MS_STRICTATIME	(1<<24)
+#define	LINUX_MS_NOATIME	0x0400
+#define	LINUX_MS_NODIRATIME	0x0800
 
 /*
  * stat family of syscalls

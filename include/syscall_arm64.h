@@ -45,8 +45,8 @@
   SYSCALL(36, symlinkat) \
   SYSCALL(37, linkat) \
   SYSCALL(38, renameat) \
-  SYSCALL(39, unimplemented) \
-  SYSCALL(40, unimplemented) \
+  SYSCALL(39, umount2) \
+  SYSCALL(40, mount) \
   SYSCALL(41, unimplemented) \
   SYSCALL(42, nfsservctl) \
   SYSCALL(43, statfs) \

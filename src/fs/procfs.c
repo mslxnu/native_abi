@@ -48,6 +48,7 @@ int sysctlbyname(const char *, void *, size_t *, void *, size_t);
 #include "mm.h"
 #include "namespace.h"
 #include "sysv.h"
+#include "mount.h"
 #include <sys/stat.h>
 
 #include "page.h"
@@ -167,7 +168,8 @@ enum procfs_file { PROCFS_NONE, PROCFS_MAPS, PROCFS_CMDLINE, PROCFS_COMM,
                    PROCFS_RANDOM_UUID, PROCFS_RANDOM_BOOT_ID, PROCFS_NS, PROCFS_NSDIR,
                    PROCFS_SYSVIPC_SHM, PROCFS_SYSVIPC_SEM, PROCFS_SYSVIPC_MSG,
                    PROCFS_NS_FORCHILDREN, PROCFS_TIMENS_OFFSETS,
-                   PROCFS_UID_MAP, PROCFS_GID_MAP, PROCFS_SETGROUPS };
+                   PROCFS_UID_MAP, PROCFS_GID_MAP, PROCFS_SETGROUPS,
+                   PROCFS_MOUNTINFO };
 
 /* For PROCFS_FD, the number after /fd/. Meaningless for the others. */
 static enum procfs_file
@@ -233,6 +235,10 @@ own_procfs_file_n(const char *path, int *fd_out)
     return PROCFS_NONE;
 
   if (strcmp(slash, "/mounts") == 0)  return PROCFS_MOUNTS;
+  /* mountinfo is what systemd and every container runtime actually read; it
+   * carries the mount id and the propagation that /proc/mounts has no room
+   * for. */
+  if (strcmp(slash, "/mountinfo") == 0) return PROCFS_MOUNTINFO;
   if (strcmp(slash, "/maps") == 0)    return PROCFS_MAPS;
   if (strcmp(slash, "/cmdline") == 0) return PROCFS_CMDLINE;
   if (strcmp(slash, "/comm") == 0)    return PROCFS_COMM;
@@ -352,19 +358,32 @@ own_procfs_file_n(const char *path, int *fd_out)
 static char *
 build_mounts(size_t *len_out)
 {
-  static const char text[] =
-    "rootfs / rootfs rw 0 0\n"
-    "devtmpfs /dev devtmpfs rw,nosuid 0 0\n"
-    "tmpfs /tmp tmpfs rw,nosuid,nodev 0 0\n"
-    "proc /proc proc rw,nosuid,nodev,noexec,relatime 0 0\n"
-    "sysfs /sys sysfs rw,nosuid,nodev,noexec,relatime 0 0\n";
-
-  size_t len = sizeof text - 1;
-  char *out = malloc(len);
+  /* From the mount table now rather than a fixed string, which could only ever
+   * describe the day it was written and never a mount the guest had made. */
+  char buf[8192];
+  int n = mount_build_mounts(buf, sizeof buf);
+  if (n < 0)
+    return NULL;
+  char *out = malloc((size_t) n + 1);
   if (!out)
     return NULL;
-  memcpy(out, text, len);
-  *len_out = len;
+  memcpy(out, buf, (size_t) n);
+  *len_out = (size_t) n;
+  return out;
+}
+
+static char *
+build_mountinfo(size_t *len_out)
+{
+  char buf[8192];
+  int n = mount_build_mountinfo(buf, sizeof buf);
+  if (n < 0)
+    return NULL;
+  char *out = malloc((size_t) n + 1);
+  if (!out)
+    return NULL;
+  memcpy(out, buf, (size_t) n);
+  *len_out = (size_t) n;
   return out;
 }
 
@@ -1081,6 +1100,9 @@ procfs_open(const char *path, int *out_fd)
     break;
   case PROCFS_MOUNTS:
     content = build_mounts(&len);
+    break;
+  case PROCFS_MOUNTINFO:
+    content = build_mountinfo(&len);
     break;
   case PROCFS_RANDOM_UUID:
     content = build_random_uuid(&len);

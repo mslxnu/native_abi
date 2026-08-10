@@ -37,11 +37,20 @@ static long sys6(long n,long a,long b,long c,long d,long e,long f){
 #define SYS_clone 220
 #define SYS_clock_gettime 113
 #define SYS_newfstatat 79
+#define SYS_mkdirat 34
+#define SYS_mount 40
+#define SYS_umount2 39
 #define SYS_fchownat 54
 #define SYS_wait4 260
 #define AT_FDCWD -100
 #define O_RDONLY 0
 #define O_WRONLY 1
+#define O_CREAT  0100
+#define MS_RDONLY 1
+#define MS_REMOUNT 0x20
+#define MS_BIND 0x1000
+#define EROFS 30
+#define ENOENT 2
 #define SIGCHLD 17
 
 #define CLONE_NEWNS     0x00020000
@@ -121,8 +130,6 @@ void _start(void)
     fail("unshare(CLONE_NEWNET)", r, -EINVAL);
   if ((r = sys6(SYS_unshare, CLONE_NEWPID, 0,0,0,0,0)) != -EINVAL)
     fail("unshare(CLONE_NEWPID)", r, -EINVAL);
-  if ((r = sys6(SYS_unshare, CLONE_NEWNS, 0,0,0,0,0)) != -EINVAL)
-    fail("unshare(CLONE_NEWNS)", r, -EINVAL);
   if ((r = ns_link("/proc/self/ns/net", b, sizeof b)) < 0)
     fail("re-reading the net link", r, 0);
   if (!eq(a, b))
@@ -291,6 +298,83 @@ void _start(void)
   case 9: fails("the child is not in the namespace set aside for it", "");
   default: fail("the time child exited with", (status >> 8) & 0xff, 0);
   }
+
+  /*
+   * The mount namespace. There was no mount table at all before this - a rootfs
+   * and a fixed list of host prefixes - so there was nothing a namespace could
+   * have isolated, which is why this one waited on mount(2).
+   *
+   * A bind is the case worth testing because it is the one that carries the
+   * whole design: it is a rewrite of one path prefix to another, applied at the
+   * same point resolution already chooses between the rootfs and a passthrough.
+   */
+  sys6(SYS_mkdirat, AT_FDCWD, (long) "/mnt-src", 0755, 0,0,0);
+  sys6(SYS_mkdirat, AT_FDCWD, (long) "/mnt-dst", 0755, 0,0,0);
+  {
+    long f = sys6(SYS_openat, AT_FDCWD, (long) "/mnt-src/f",
+                  O_WRONLY | O_CREAT, 0644, 0,0);
+    if (f < 0)
+      fail("creating the bind source's file", f, 0);
+    sys6(SYS_write, f, (long) "bound\n", 6, 0,0,0);
+    sys6(SYS_close, f, 0,0,0,0,0);
+  }
+
+  char mbefore[80], mafter[80];
+  if (ns_link("/proc/self/ns/mnt", mbefore, sizeof mbefore) < 0)
+    fail("reading the mnt link", -1, 0);
+  if ((r = sys6(SYS_unshare, CLONE_NEWNS, 0,0,0,0,0)) != 0)
+    fail("unshare(CLONE_NEWNS)", r, 0);
+  if (ns_link("/proc/self/ns/mnt", mafter, sizeof mafter) < 0)
+    fail("re-reading the mnt link", -1, 0);
+  if (eq(mbefore, mafter))
+    fails("unshare(CLONE_NEWNS) left the identity unchanged", mafter);
+
+  /* Nothing is there until it is mounted. */
+  if ((r = sys6(SYS_openat, AT_FDCWD, (long) "/mnt-dst/f", O_RDONLY, 0,0,0)) != -ENOENT)
+    fail("the target before mounting", r, -ENOENT);
+
+  if ((r = sys6(SYS_mount, (long) "/mnt-src", (long) "/mnt-dst", 0,
+                MS_BIND, 0, 0)) != 0)
+    fail("mount(MS_BIND)", r, 0);
+
+  {
+    long f = sys6(SYS_openat, AT_FDCWD, (long) "/mnt-dst/f", O_RDONLY, 0,0,0);
+    if (f < 0)
+      fail("reading through the bind", f, 0);
+    char buf[8] = {0};
+    long n = sys6(63 /*read*/, f, (long) buf, 6, 0,0,0);
+    sys6(SYS_close, f, 0,0,0,0,0);
+    if (n != 6 || !eq(buf, "bound\n"))
+      fails("what came back through the bind", buf);
+  }
+
+  /*
+   * Read-only, and honoured rather than recorded. A mount that took the flag
+   * and then accepted writes would be worse than one that refused to exist,
+   * since the only reason to ask for it is to be certain.
+   */
+  if ((r = sys6(SYS_mount, 0, (long) "/mnt-dst", 0,
+                MS_REMOUNT | MS_BIND | MS_RDONLY, 0, 0)) != 0)
+    fail("mount(MS_REMOUNT|MS_RDONLY)", r, 0);
+  if ((r = sys6(SYS_openat, AT_FDCWD, (long) "/mnt-dst/new",
+                O_WRONLY | O_CREAT, 0644, 0,0)) != -EROFS)
+    fail("creating a file under a read-only mount", r, -EROFS);
+  if ((r = sys6(SYS_mkdirat, AT_FDCWD, (long) "/mnt-dst/d", 0755, 0,0,0)) != -EROFS)
+    fail("mkdir under a read-only mount", r, -EROFS);
+  /* Reading through it still works, which is the other half of read-only. */
+  {
+    long f = sys6(SYS_openat, AT_FDCWD, (long) "/mnt-dst/f", O_RDONLY, 0,0,0);
+    if (f < 0)
+      fail("reading through a read-only mount", f, 0);
+    sys6(SYS_close, f, 0,0,0,0,0);
+  }
+
+  if ((r = sys6(SYS_umount2, (long) "/mnt-dst", 0, 0,0,0,0)) != 0)
+    fail("umount2", r, 0);
+  if ((r = sys6(SYS_openat, AT_FDCWD, (long) "/mnt-dst/f", O_RDONLY, 0,0,0)) != -ENOENT)
+    fail("the target after unmounting", r, -ENOENT);
+  if ((r = sys6(SYS_umount2, (long) "/mnt-dst", 0, 0,0,0,0)) != -EINVAL)
+    fail("umount2 of something that is not a mount", r, -EINVAL);
 
   /*
    * The user namespace. It is an identity here rather than an authority:

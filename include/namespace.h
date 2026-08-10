@@ -35,8 +35,12 @@
  *           it is pid 1 while signals and waits use another number is a bug
  *           that surfaces far from here.
  *
- *   mnt     Little to isolate yet. There is no mount table - there is a rootfs
- *           and a list of passthrough prefixes - so this waits on mount(2).
+ *   mnt     Implemented, together with the mount(2) it was waiting on. A bind
+ *           mount is a rewrite of one path prefix to another, which is what
+ *           path resolution here already does for the rootfs and the
+ *           passthroughs, so it needs nothing from Darwin. tmpfs is a directory
+ *           under TMPDIR; proc, sysfs and the rest are recorded because nabi
+ *           already serves them. See include/mount.h.
  *
  *   cgroup  Nothing to isolate. There are no cgroups.
  *
