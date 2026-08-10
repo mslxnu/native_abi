@@ -28,12 +28,14 @@
  *           capabilities: being root in a namespace here confers no permission
  *           that the guest credentials did not already carry. See below.
  *
- *   pid     Large. Guest pids *are* host pids today - getpid, kill, wait4,
- *           signals, /proc and the fork checkpoint all use them directly - so a
- *           pid namespace means a translation layer through all of it. Doing
- *           half of it would be worse than none: a container init that is told
- *           it is pid 1 while signals and waits use another number is a bug
- *           that surfaces far from here.
+ *   pid     Renumbering, which is most of it, and not concealment, which is
+ *           not available from here. getpid, getppid, kill, wait4, clone's
+ *           return and /proc/<pid> all translate together, so the failure the
+ *           old note warned of - an init told it is pid 1 while signals and
+ *           waits use another number - cannot happen. What a pid namespace
+ *           cannot do here is hide: /proc is the host's, passed through by
+ *           mSL/ProcFS, so a guest sees every process on the Mac either way.
+ *           And there is no init to reparent orphans to. See src/proc/pidns.c.
  *
  *   mnt     Implemented, together with the mount(2) it was waiting on. A bind
  *           mount is a rewrite of one path prefix to another, which is what
@@ -152,6 +154,7 @@ struct namespace {
 struct nsproxy {
   struct namespace *ns[NS_COUNT];
   struct namespace *time_for_children;
+  struct namespace *pid_for_children;
 };
 
 /* The current boot session, short and filename-safe. Namespace state is kept in
@@ -174,6 +177,18 @@ int nsproxy_unshare(unsigned long flags);
 /* The time namespace this process's children will be in, which after an
  * unshare is not the one this process is in. */
 uint64_t ns_ino_time_for_children(void);
+
+/*
+ * The pid namespace, which unshare treats the same way as time: the caller
+ * stays where it is and the new namespace is for its children. A process
+ * cannot be renumbered underneath itself any more than its clock can be moved.
+ */
+uint64_t ns_ino_pid_for_children(void);
+bool     pidns_active(void);
+int32_t  pidns_to_ns(int32_t host);     /* 0 when it is not a member */
+int32_t  pidns_to_host(int32_t ns);     /* -1 when there is no such pid */
+int32_t  pidns_add_child(int32_t host); /* the parent registers; returns its own view */
+void     pidns_create(uint64_t ino, uint64_t parent_ino);
 
 /*
  * Move a timestamp between the host's clocks and this namespace's. `boottime`

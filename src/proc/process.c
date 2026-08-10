@@ -108,8 +108,11 @@ DEFINE_SYSCALL(getpid)
 {
   /* syscall(2) has been deprecated since macOS 10.12. getpid() is equivalent
    * here: Darwin's libc does not cache the pid across fork, so it is a real
-   * syscall every time (verified, not assumed). */
-  return syswrap(getpid());
+   * syscall every time (verified, not assumed).
+   *
+   * Then through the pid namespace, which for a process that never unshared is
+   * the identity and costs a comparison. */
+  return pidns_to_ns(getpid());
 }
 
 /*
@@ -332,32 +335,47 @@ DEFINE_SYSCALL(getresgid, gaddr_t, rgid, gaddr_t, egid, gaddr_t, sgid)
 
 DEFINE_SYSCALL(setsid)
 {
-  return syswrap(setsid());
+  int r = syswrap(setsid());
+  return r < 0 ? r : pidns_to_ns(r);
 }
 
 DEFINE_SYSCALL(setpgid, pid_t, pid, pid_t, pgid)
 {
-  return syswrap(setpgid(pid, pgid));
+  pid_t hpid = pid == 0 ? 0 : pidns_to_host(pid);
+  pid_t hpgid = pgid == 0 ? 0 : pidns_to_host(pgid);
+  if (hpid < 0 || hpgid < 0)
+    return -LINUX_ESRCH;
+  return syswrap(setpgid(hpid, hpgid));
 }
 
 DEFINE_SYSCALL(getppid)
 {
-  return syswrap(getppid());
+  /* A parent outside this namespace has no pid in it, and Linux reports 0 -
+   * which is also what pidns_to_ns says about a process it does not know. */
+  return pidns_to_ns(getppid());
 }
 
 DEFINE_SYSCALL(getpgrp)
 {
-  return syswrap(getpgrp());
+  return pidns_to_ns(getpgrp());
 }
 
 DEFINE_SYSCALL(getpgid, l_pid_t, pid)
 {
-  return syswrap(getpgid(pid));
+  pid_t hpid = pid == 0 ? 0 : pidns_to_host(pid);
+  if (hpid < 0)
+    return -LINUX_ESRCH;
+  int r = syswrap(getpgid(hpid));
+  return r < 0 ? r : pidns_to_ns(r);
 }
 
 DEFINE_SYSCALL(getsid, l_pid_t, pid)
 {
-  return syswrap(getsid(pid));
+  pid_t hpid = pid == 0 ? 0 : pidns_to_host(pid);
+  if (hpid < 0)
+    return -LINUX_ESRCH;
+  int r = syswrap(getsid(hpid));
+  return r < 0 ? r : pidns_to_ns(r);
 }
 
 /*
@@ -464,7 +482,10 @@ uint64_t do_gettid()
 
 DEFINE_SYSCALL(gettid)
 {
-  return do_gettid();
+  /* A guest thread is a host thread and nabi reports the process for it, so a
+   * tid translates exactly as a pid does. */
+  int r = do_gettid();
+  return r < 0 ? r : pidns_to_ns(r);
 }
 
 /*
@@ -705,7 +726,10 @@ DEFINE_SYSCALL(tgkill, l_pid_t, tgid, l_pid_t, tid, int, sig)
 {
   if (tgid <= 0 || tid <= 0)
     return -LINUX_EINVAL;
-  return send_signal(tgid, sig);
+  pid_t h = pidns_to_host(tgid);
+  if (h < 0)
+    return -LINUX_ESRCH;
+  return send_signal(h, sig);
 }
 
 /* The older form, without the thread-group check. Same delivery. */
@@ -713,7 +737,10 @@ DEFINE_SYSCALL(tkill, l_pid_t, tid, int, sig)
 {
   if (tid <= 0)
     return -LINUX_EINVAL;
-  return send_signal(tid, sig);
+  pid_t h = pidns_to_host(tid);
+  if (h < 0)
+    return -LINUX_ESRCH;
+  return send_signal(h, sig);
 }
 
 DEFINE_SYSCALL(capget, gaddr_t, header_ptr, gaddr_t, data_ptr)
@@ -912,10 +939,26 @@ DEFINE_SYSCALL(wait4, int, pid, gaddr_t, status_ptr, int, options, gaddr_t, rusa
   int status;
   struct rusage rusage;
 
-  int ret = syswrap(wait4(pid, &status, linux_to_darwin_waitopts(options), &rusage));
+  /*
+   * Both directions. A positive pid names a process in this namespace and has
+   * to be turned into the host's before waiting; the pid that comes back has to
+   * be turned into this namespace's before it is returned, or a caller that
+   * waits for the child clone told it about gets a different number back.
+   * -1 and the process-group forms pass through, since they name a set rather
+   * than a process.
+   */
+  pid_t hpid = pid;
+  if (pid > 0) {
+    hpid = pidns_to_host(pid);
+    if (hpid < 0)
+      return -LINUX_ECHILD;
+  }
+
+  int ret = syswrap(wait4(hpid, &status, linux_to_darwin_waitopts(options), &rusage));
   if (ret < 0) {
     return ret;
   }
+  ret = pidns_to_ns(ret);
 
   if (rusage_ptr != 0) {
     if (copy_to_user(rusage_ptr, &rusage, sizeof rusage)) {

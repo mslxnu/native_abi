@@ -2634,6 +2634,7 @@ resolve_path(const struct dir *parent, const char *name, int flags, struct path 
 
   /* resolve mountpoints */
   char mntpath[PATH_MAX];
+  char pidpath[PATH_MAX];       /* separate: mount_resolve reads what this wrote */
   if (*name == '/') {
     if (name[1] == '\0') {
       dir.fd = proc.fileinfo.rootfd;
@@ -2647,6 +2648,15 @@ resolve_path(const struct dir *parent, const char *name, int flags, struct path 
      * passthrough - the machinery for "this absolute name is already a host
      * name" is the same machinery a bind mount needs.
      */
+    /* A pid namespace renumbers /proc's per-process directories; a number that
+     * names nobody in it is refused rather than passed to the host. */
+    bool pid_denied = false;
+    if (procfs_pidns_path(name, pidpath, sizeof pidpath, &pid_denied)) {
+      if (pid_denied)
+        return -LINUX_ENOENT;
+      name = pidpath;
+    }
+
     if (mount_resolve(name, mntpath, sizeof mntpath, &path->rdonly)) {
       name = mntpath;
     } else if (!is_host_passthrough(name)) {

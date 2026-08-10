@@ -227,6 +227,7 @@ enum ns_type;
 bool procfs_ns_of_fd(int fd, enum ns_type *type, uint64_t *ino);
 bool procfs_write_timens(int fd, const char *buf, size_t size, int *out);
 void procfs_dup_fd(int oldfd, int newfd);
+bool procfs_pidns_path(const char *name, char *out, size_t outsz, bool *denied);
 bool procfs_stat(const char *path, uint32_t *mode, uint64_t *size, uint64_t *ino);
 bool procfs_refresh_fddir(int fd);
 int fdtable_open_fds(int *out, int max);

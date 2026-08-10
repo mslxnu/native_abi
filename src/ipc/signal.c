@@ -2,6 +2,7 @@
 #include "linux/signal.h"
 
 #include "noah.h"
+#include "namespace.h"
 #include "vmm.h"
 
 #include <stdio.h>
@@ -416,6 +417,19 @@ DEFINE_SYSCALL(sigaltstack, gaddr_t, uss, gaddr_t, uoss)
 
 DEFINE_SYSCALL(kill, l_pid_t, pid, int, sig)
 {
+  /*
+   * A pid this namespace does not contain does not exist as far as the caller
+   * is concerned, so it is ESRCH rather than a signal that leaves the
+   * namespace. This is the containment a pid namespace does provide here: the
+   * host's processes remain visible through /proc, which is not ours to hide,
+   * but they cannot be reached by number.
+   */
+  if (pid > 0) {
+    pid_t h = pidns_to_host(pid);
+    if (h < 0)
+      return -LINUX_ESRCH;
+    pid = h;
+  }
   return send_signal(pid, sig);
 }
 

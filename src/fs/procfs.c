@@ -169,7 +169,7 @@ enum procfs_file { PROCFS_NONE, PROCFS_MAPS, PROCFS_CMDLINE, PROCFS_COMM,
                    PROCFS_SYSVIPC_SHM, PROCFS_SYSVIPC_SEM, PROCFS_SYSVIPC_MSG,
                    PROCFS_NS_FORCHILDREN, PROCFS_TIMENS_OFFSETS,
                    PROCFS_UID_MAP, PROCFS_GID_MAP, PROCFS_SETGROUPS,
-                   PROCFS_MOUNTINFO };
+                   PROCFS_MOUNTINFO, PROCFS_STAT, PROCFS_STATUS };
 
 /* For PROCFS_FD, the number after /fd/. Meaningless for the others. */
 static enum procfs_file
@@ -230,9 +230,57 @@ own_procfs_file_n(const char *path, int *fd_out)
     char pid[16];
     int m = snprintf(pid, sizeof pid, "%d", getpid());
     mine = m > 0 && (size_t) m == n && strncmp(rest, pid, n) == 0;
+
+    /*
+     * And by the number this namespace uses. Inside a pid namespace a process
+     * asks about itself as /proc/1, which is not its host pid, so a comparison
+     * against getpid() alone would decide the guest was asking about somebody
+     * else and hand the question to the host's /proc - where pid 1 is launchd.
+     */
+    if (!mine && pidns_active()) {
+      int m2 = snprintf(pid, sizeof pid, "%d", (int) pidns_to_ns(getpid()));
+      mine = m2 > 0 && (size_t) m2 == n && strncmp(rest, pid, n) == 0;
+    }
   }
+  /*
+   * stat and status are answered for *any* member of the namespace, not only
+   * for the caller. /proc/1 is the process a container asks about most, and an
+   * init whose own /proc/self/stat says 1 while everyone else's view of it says
+   * its host pid would be consistent only from the inside.
+   */
+  if (!mine && pidns_active() && n > 0 && rest[0] >= '0' && rest[0] <= '9' &&
+      (strcmp(slash, "/stat") == 0 || strcmp(slash, "/status") == 0)) {
+    char numbuf[16];
+    if (n < sizeof numbuf) {
+      memcpy(numbuf, rest, n);
+      numbuf[n] = '\0';
+      int32_t host = pidns_to_host(atoi(numbuf));
+      if (host >= 0) {
+        if (fd_out)
+          *fd_out = (int) host;
+        return strcmp(slash, "/stat") == 0 ? PROCFS_STAT : PROCFS_STATUS;
+      }
+    }
+  }
+
   if (!mine)
     return PROCFS_NONE;
+
+  /*
+   * stat and status carry pids in their text, and inside a pid namespace the
+   * host's answer would contradict getpid() - the process would be told it is
+   * pid 1 by one interface and its host pid by another, which is exactly the
+   * inconsistency a renumbering has to avoid to be worth having. Outside a pid
+   * namespace these are not ours and the host answers them as before.
+   */
+  if (pidns_active() && strcmp(slash, "/stat") == 0) {
+    if (fd_out) *fd_out = (int) getpid();
+    return PROCFS_STAT;
+  }
+  if (pidns_active() && strcmp(slash, "/status") == 0) {
+    if (fd_out) *fd_out = (int) getpid();
+    return PROCFS_STATUS;
+  }
 
   if (strcmp(slash, "/mounts") == 0)  return PROCFS_MOUNTS;
   /* mountinfo is what systemd and every container runtime actually read; it
@@ -286,11 +334,11 @@ own_procfs_file_n(const char *path, int *fd_out)
   if (strcmp(slash, "/setgroups") == 0) return PROCFS_SETGROUPS;
 
   /*
-   * The _for_children links. Linux has both, and only time's can ever differ
-   * from the plain one here: unshare(CLONE_NEWTIME) leaves the caller where it
-   * is and points these at the new namespace. pid's is listed because Linux
-   * lists it and anything walking the directory expects it; with no pid
-   * namespaces to be in, it names the one everybody is in.
+   * The _for_children links, both of which can now differ from the plain one.
+   * unshare leaves the caller in its own time and pid namespaces - neither a
+   * clock nor a pid can be changed underneath a running process - and points
+   * these at the new one instead, so this is where the effect of that unshare
+   * is visible at all.
    */
   if (strcmp(slash, "/ns/time_for_children") == 0) {
     if (fd_out)
@@ -395,9 +443,170 @@ build_mountinfo(size_t *len_out)
 static uint64_t
 ns_link_ino(enum procfs_file kind, enum ns_type t)
 {
-  if (kind == PROCFS_NS_FORCHILDREN && t == NS_TIME)
-    return ns_ino_time_for_children();
+  if (kind == PROCFS_NS_FORCHILDREN) {
+    if (t == NS_TIME)
+      return ns_ino_time_for_children();
+    if (t == NS_PID)
+      return ns_ino_pid_for_children();
+  }
   return ns_ino_of(t);
+}
+
+/* Read a file of the host's /proc for this process. */
+static char *
+slurp_host_proc(int host_pid, const char *leaf, size_t *len_out)
+{
+  char path[PATH_MAX];
+  snprintf(path, sizeof path, "/proc/%d/%s", host_pid, leaf);
+  int fd = open(path, O_RDONLY);
+  if (fd < 0)
+    return NULL;
+  size_t cap = 8192, len = 0;
+  char *buf = malloc(cap);
+  if (!buf) {
+    close(fd);
+    return NULL;
+  }
+  ssize_t n;
+  while ((n = read(fd, buf + len, cap - len - 1)) > 0) {
+    len += (size_t) n;
+    if (len + 1 >= cap) {
+      char *bigger = realloc(buf, cap *= 2);
+      if (!bigger)
+        break;
+      buf = bigger;
+    }
+  }
+  close(fd);
+  buf[len] = '\0';
+  *len_out = len;
+  return buf;
+}
+
+/*
+ * /proc/<pid>/stat with its pid fields put through the namespace.
+ *
+ * The host's line is taken and four numbers in it are rewritten - pid, ppid,
+ * process group and session - rather than the whole thing being invented here.
+ * Everything else in those 52 fields is true of this process and nabi has no
+ * better answer for any of it; rewriting only what the namespace changes keeps
+ * the rest honest.
+ *
+ * Field 2 is the command in parentheses and may contain spaces, so the parse
+ * starts after the last ')' - which is how everything that reads this file
+ * does it, and for the same reason.
+ */
+static char *
+build_stat(int host_pid, size_t *len_out)
+{
+  size_t hlen;
+  char *host = slurp_host_proc(host_pid, "stat", &hlen);
+  if (!host)
+    return NULL;
+
+  char *rp = strrchr(host, ')');
+  if (!rp) {
+    free(host);
+    return NULL;
+  }
+
+  /* The fields after the comm: state, ppid, pgrp, session, then the rest. */
+  char state[8] = "S";
+  long ppid = 0, pgrp = 0, sess = 0;
+  const char *rest = "";
+  {
+    char *p = rp + 1;
+    while (*p == ' ') p++;
+    int i = 0;
+    while (*p && *p != ' ' && i < (int) sizeof state - 1) state[i++] = *p++;
+    state[i] = '\0';
+    char *end;
+    ppid = strtol(p, &end, 10); p = end;
+    pgrp = strtol(p, &end, 10); p = end;
+    sess = strtol(p, &end, 10); p = end;
+    while (*p == ' ') p++;
+    rest = p;
+  }
+
+  /* comm, with its parentheses, exactly as the host gave it. */
+  char *lp = strchr(host, '(');
+  char comm[64] = "(nabi)";
+  if (lp && rp > lp) {
+    size_t n = (size_t) (rp - lp) + 1;
+    if (n >= sizeof comm) n = sizeof comm - 1;
+    memcpy(comm, lp, n);
+    comm[n] = '\0';
+  }
+
+  char *out = malloc(hlen + 128);
+  if (!out) {
+    free(host);
+    return NULL;
+  }
+  int n = snprintf(out, hlen + 128, "%d %s %s %d %d %d %s",
+                   (int) pidns_to_ns(host_pid), comm, state,
+                   (int) pidns_to_ns((int32_t) ppid),
+                   (int) pidns_to_ns((int32_t) pgrp),
+                   (int) pidns_to_ns((int32_t) sess), rest);
+  free(host);
+  if (n < 0) {
+    free(out);
+    return NULL;
+  }
+  *len_out = (size_t) n;
+  return out;
+}
+
+/* The same idea for status, which carries the pids as labelled lines. */
+static char *
+build_status(int host_pid, size_t *len_out)
+{
+  size_t hlen;
+  char *host = slurp_host_proc(host_pid, "status", &hlen);
+  if (!host)
+    return NULL;
+
+  size_t cap = hlen + 256;
+  char *out = malloc(cap);
+  if (!out) {
+    free(host);
+    return NULL;
+  }
+  size_t len = 0;
+  char *line = host;
+  while (*line) {
+    char *nl = strchr(line, '\n');
+    size_t llen = nl ? (size_t) (nl - line) : strlen(line);
+
+    int written = -1;
+    if (strncmp(line, "Pid:", 4) == 0)
+      written = snprintf(out + len, cap - len, "Pid:\t%d\n",
+                         (int) pidns_to_ns(host_pid));
+    else if (strncmp(line, "Tgid:", 5) == 0)
+      written = snprintf(out + len, cap - len, "Tgid:\t%d\n",
+                         (int) pidns_to_ns(host_pid));
+    else if (strncmp(line, "PPid:", 5) == 0)
+      /* Translate the parent the host reported, rather than assuming it is
+       * ours - this file is served for any member of the namespace. A parent
+       * outside it has no pid in it, and 0 is what Linux shows for that. */
+      written = snprintf(out + len, cap - len, "PPid:\t%d\n",
+                         (int) pidns_to_ns((int32_t) atoi(line + 5)));
+    if (written < 0) {
+      if (len + llen + 2 > cap)
+        break;
+      memcpy(out + len, line, llen);
+      len += llen;
+      out[len++] = '\n';
+    } else {
+      len += (size_t) written;
+    }
+    if (!nl)
+      break;
+    line = nl + 1;
+  }
+  free(host);
+  *len_out = len;
+  return out;
 }
 
 static char *
@@ -1104,6 +1313,12 @@ procfs_open(const char *path, int *out_fd)
   case PROCFS_MOUNTINFO:
     content = build_mountinfo(&len);
     break;
+  case PROCFS_STAT:
+    content = build_stat(fdno, &len);
+    break;
+  case PROCFS_STATUS:
+    content = build_status(fdno, &len);
+    break;
   case PROCFS_RANDOM_UUID:
     content = build_random_uuid(&len);
     break;
@@ -1234,4 +1449,44 @@ procfs_readlink(const char *path, char *buf, size_t bufsize)
     n = bufsize;
   memcpy(buf, link, n);
   return (int) n;
+}
+
+/*
+ * Rewrite /proc/<pid>/... from this namespace's numbering into the host's.
+ *
+ * Without it, a container asking about /proc/1 reaches the host's pid 1, which
+ * is launchd - a confusing answer rather than a wrong one, but confusing in the
+ * direction that matters, since pid 1 is precisely the process a container
+ * cares about. A number that names no member of the namespace is refused, which
+ * is the containment half: the host's processes stay visible in the listing,
+ * which is not nabi's to hide, but they cannot be *asked about* by number.
+ *
+ * Returns false for a path this has nothing to say about, which is every path
+ * outside a pid namespace.
+ */
+bool
+procfs_pidns_path(const char *name, char *out, size_t outsz, bool *denied)
+{
+  *denied = false;
+  if (!pidns_active())
+    return false;
+  if (strncmp(name, "/proc/", 6) != 0)
+    return false;
+
+  const char *p = name + 6;
+  if (*p < '0' || *p > '9')
+    return false;               /* /proc/self and the rest are not ours here */
+
+  char *end;
+  long nspid = strtol(p, &end, 10);
+  if (end == p || (*end != '\0' && *end != '/'))
+    return false;
+
+  int32_t host = pidns_to_host((int32_t) nspid);
+  if (host < 0) {
+    *denied = true;             /* not a member: it does not exist here */
+    return true;
+  }
+  snprintf(out, outsz, "/proc/%d%s", (int) host, end);
+  return true;
 }

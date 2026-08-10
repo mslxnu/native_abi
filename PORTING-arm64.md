@@ -3302,3 +3302,65 @@ and read-only, in the same session:
 That leaves `pid` and `cgroup`. `pid` is the large one — guest pids are host
 pids throughout `getpid`, `kill`, `wait4`, signals, `/proc` and the fork
 checkpoint. `cgroup` has nothing to isolate.
+
+### 3.5.63 The pid namespace — **renumbering, which is most of it; not concealment, which is not available**
+
+`CLONE_NEWPID` was refused, and the note in `namespace.h` called it the large
+one: guest pids *are* host pids throughout `getpid`, `kill`, `wait4`, signals,
+`/proc` and the fork checkpoint. It warned that half of it would be worse than
+none — "an init told it is pid 1 while signals and waits use another number is a
+bug that surfaces far from here". That specific hazard is what this had to
+avoid, and does.
+
+**What makes it tractable is that the initial namespace is the identity.** A
+process that never unshares gets its host pid back from every translation on the
+first line, and nothing about it changes. The entire blast radius of this change
+is processes that asked for a namespace — which is why an ordinary session still
+reports real host pids and forks and waits exactly as before.
+
+The translation is applied at every boundary together: `getpid`, `getppid`,
+`gettid`, `getpgrp`, `getpgid`, `getsid`, `setpgid`, `setsid`, `kill`, `tkill`,
+`tgkill`, `wait4` (both its argument and its result), `clone`'s return, and
+`/proc/<pid>`. A child is registered **by its parent**, the moment `fork`
+returns its host pid, rather than by itself when it resumes — `clone` has to
+return the child's pid in the parent's namespace, and a child registering itself
+might not have got there yet. Registering from the side that already has the
+number removes the race instead of narrowing it.
+
+`unshare(CLONE_NEWPID)` does not move the caller, exactly as `CLONE_NEWTIME`
+does not: a process can no more be renumbered underneath itself than its clock
+can be moved. So `pid_for_children` becomes real, and the link that §3.5.60
+added as a placeholder now carries something.
+
+**The boundary, stated plainly, because it is the whole of what this is not:**
+
+- **It does not conceal.** `/proc` is mSL/ProcFS's passthrough of the host's, so
+  a guest already sees all ~450 host processes and goes on doing so inside a pid
+  namespace. Renumbering is real; hiding is not ours to do from here. What *is*
+  contained is reach: a pid that is not a member does not translate, so `kill`
+  gets ESRCH and `/proc/<that pid>` gets ENOENT.
+- **There is no init.** Linux reparents orphans to pid 1 of their namespace and
+  destroys the namespace when that process exits. Both are supervisor
+  behaviour and NABI has no supervisor — the host reparents orphans to launchd.
+  A container whose init exits here leaves its children running.
+
+`/proc/<pid>/stat` and `/status` had to be taken over inside a namespace, and
+this was the interesting part. Left to the host they report host pids, so a
+process would be told it is pid 1 by `getpid` and its host pid by `/proc/self/stat`
+— the contradiction the old note warned about, arriving by a different door.
+They are now served for **any member** of the namespace, with only the pid
+fields rewritten: the host's line is taken and pid, ppid, pgrp and session are
+translated, leaving the other 48 fields exactly as true as they were. `/proc/1`
+resolves to the container's init rather than to launchd.
+
+```
+=== outside (unchanged) ===
+  getpid            = 86244
+=== inside ===
+  getpid            = 1
+  /proc/1/stat      = 1 (nabi) 0     (pid comm ppid; 0 = parent outside)
+  /proc/1/status    Pid:  1
+  /proc/99999/stat  = No such file or directory
+```
+
+That leaves `cgroup`, which has nothing to isolate: there are no cgroups.

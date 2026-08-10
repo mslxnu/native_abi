@@ -36,7 +36,7 @@ static const struct {
   [NS_MNT]    = { NS_MNT,    "mnt",    LINUX_CLONE_NEWNS,     true  },
   [NS_UTS]    = { NS_UTS,    "uts",    LINUX_CLONE_NEWUTS,    true  },
   [NS_IPC]    = { NS_IPC,    "ipc",    LINUX_CLONE_NEWIPC,    true  },
-  [NS_PID]    = { NS_PID,    "pid",    LINUX_CLONE_NEWPID,    false },
+  [NS_PID]    = { NS_PID,    "pid",    LINUX_CLONE_NEWPID,    true  },
   [NS_NET]    = { NS_NET,    "net",    LINUX_CLONE_NEWNET,    false },
   [NS_USER]   = { NS_USER,   "user",   LINUX_CLONE_NEWUSER,   true  },
   [NS_CGROUP] = { NS_CGROUP, "cgroup", LINUX_CLONE_NEWCGROUP, false },
@@ -243,6 +243,7 @@ nsproxy_init(void)
     current_nsproxy.ns[i] = &initial_ns[i];
   }
   current_nsproxy.time_for_children = &initial_ns[NS_TIME];
+  current_nsproxy.pid_for_children  = &initial_ns[NS_PID];
 
   /*
    * The initial uts namespace starts from the host's idea of the machine, so a
@@ -278,6 +279,8 @@ ns_new(enum ns_type type, const struct namespace *from)
     }
     if (type == NS_MNT)
       mount_ns_clone(from->ino, ns->ino);
+    if (type == NS_PID)
+      pidns_create(ns->ino, from->ino);
     if (type == NS_USER) {
       /*
        * Deliberately *not* a copy. A new user namespace starts with no map at
@@ -367,6 +370,16 @@ nsproxy_unshare(unsigned long flags)
       current_nsproxy.time_for_children = ns;
       continue;
     }
+    /*
+     * And pid, for the same reason: a process cannot be renumbered underneath
+     * itself. Linux says so too - unshare(CLONE_NEWPID) puts the *first child*
+     * at pid 1 and leaves the caller where it was.
+     */
+    if (i == NS_PID) {
+      ns_put(current_nsproxy.pid_for_children);
+      current_nsproxy.pid_for_children = ns;
+      continue;
+    }
     ns_put(current_nsproxy.ns[i]);
     current_nsproxy.ns[i] = ns;
   }
@@ -422,6 +435,7 @@ nsproxy_snapshot(uint64_t inos[NS_COUNT], struct uts_namespace *uts)
    * exactly the handover. Nothing else consults this snapshot.
    */
   inos[NS_TIME] = current_nsproxy.time_for_children->ino;
+  inos[NS_PID]  = current_nsproxy.pid_for_children->ino;
   *uts = current_nsproxy.ns[NS_UTS]->uts;
 }
 
@@ -466,6 +480,8 @@ nsproxy_restore(const uint64_t inos[NS_COUNT], const struct uts_namespace *uts)
     current_nsproxy.ns[i] = ns;
     if (i == NS_TIME)
       current_nsproxy.time_for_children = ns;
+    if (i == NS_PID)
+      current_nsproxy.pid_for_children = ns;
   }
 
   /*
@@ -966,4 +982,10 @@ userns_map_write(bool gid, const char *text)
   uns->user = u;
   userns_store(uns->ino, &u);
   return 0;
+}
+
+uint64_t
+ns_ino_pid_for_children(void)
+{
+  return current_nsproxy.pid_for_children->ino;
 }

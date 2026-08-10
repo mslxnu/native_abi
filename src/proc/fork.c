@@ -169,6 +169,17 @@ clone_process_by_exec(unsigned long clone_flags, gaddr_t parent_tid,
   close(ckpt_fd);
   close(snap_fd);
 
+  /*
+   * The child is enrolled here, by the parent, the moment its host pid is
+   * known - not by the child when it resumes. clone's return value has to be
+   * the child's pid in *this* namespace, and a child that registered itself
+   * might not have got there yet; registering from the side that already has
+   * the number removes the race instead of narrowing it.
+   */
+  int nsret = pidns_add_child(ret);
+  if (nsret > 0)
+    ret = nsret;
+
   if (clone_flags & LINUX_CLONE_PARENT_SETTID) {
     if (copy_to_user(parent_tid, &ret, sizeof ret))
       return -LINUX_EFAULT;
@@ -237,6 +248,11 @@ __do_clone_process(unsigned long clone_flags, unsigned long newsp, gaddr_t paren
 
   if (ret < 0) {
     return ret;
+  }
+  if (ret > 0) {
+    int nsret = pidns_add_child(ret);
+    if (nsret > 0)
+      ret = nsret;
   }
 
   if (ret == 0) {

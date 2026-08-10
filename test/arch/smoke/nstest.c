@@ -30,9 +30,12 @@ static long sys6(long n,long a,long b,long c,long d,long e,long f){
 #define SYS_uname 160
 #define SYS_getuid 174
 #define SYS_getgid 176
+#define SYS_getpid 172
+#define SYS_getppid 173
 #define SYS_sethostname 161
 #define SYS_setdomainname 162
 #define SYS_unshare 97
+#define SYS_kill 129
 #define SYS_setns 268
 #define SYS_clone 220
 #define SYS_clock_gettime 113
@@ -63,6 +66,7 @@ static long sys6(long n,long a,long b,long c,long d,long e,long f){
 #define NOBODY          65534
 #define EINVAL 22
 #define EPERM  1
+#define ESRCH  3
 
 struct utsname { char sys[65], node[65], rel[65], ver[65], mach[65], dom[65]; };
 struct tspec { long tv_sec, tv_nsec; };
@@ -128,8 +132,6 @@ void _start(void)
     fail("reading the net link", r, 0);
   if ((r = sys6(SYS_unshare, CLONE_NEWNET, 0,0,0,0,0)) != -EINVAL)
     fail("unshare(CLONE_NEWNET)", r, -EINVAL);
-  if ((r = sys6(SYS_unshare, CLONE_NEWPID, 0,0,0,0,0)) != -EINVAL)
-    fail("unshare(CLONE_NEWPID)", r, -EINVAL);
   if ((r = ns_link("/proc/self/ns/net", b, sizeof b)) < 0)
     fail("re-reading the net link", r, 0);
   if (!eq(a, b))
@@ -375,6 +377,70 @@ void _start(void)
     fail("the target after unmounting", r, -ENOENT);
   if ((r = sys6(SYS_umount2, (long) "/mnt-dst", 0, 0,0,0,0)) != -EINVAL)
     fail("umount2 of something that is not a mount", r, -EINVAL);
+
+  /*
+   * The pid namespace, which unshare treats as it treats time: the caller stays
+   * where it is and the new namespace is for its children. A process cannot be
+   * renumbered underneath itself any more than its clock can be moved, and
+   * Linux says so - unshare(CLONE_NEWPID) puts the *first child* at pid 1.
+   */
+  char pbefore[80], pafter[80], pcbefore[80], pcafter[80];
+  if (ns_link("/proc/self/ns/pid", pbefore, sizeof pbefore) < 0)
+    fail("reading the pid link", -1, 0);
+  if (ns_link("/proc/self/ns/pid_for_children", pcbefore, sizeof pcbefore) < 0)
+    fail("reading the pid_for_children link", -1, 0);
+
+  long mypid = sys6(SYS_getpid, 0,0,0,0,0,0);
+  if ((r = sys6(SYS_unshare, CLONE_NEWPID, 0,0,0,0,0)) != 0)
+    fail("unshare(CLONE_NEWPID)", r, 0);
+
+  if (ns_link("/proc/self/ns/pid", pafter, sizeof pafter) < 0)
+    fail("re-reading the pid link", -1, 0);
+  if (ns_link("/proc/self/ns/pid_for_children", pcafter, sizeof pcafter) < 0)
+    fail("re-reading the pid_for_children link", -1, 0);
+  if (!eq(pbefore, pafter))
+    fails("unshare(CLONE_NEWPID) moved the caller, which it must not", pafter);
+  if (eq(pcbefore, pcafter))
+    fails("unshare(CLONE_NEWPID) left pid_for_children unchanged", pcafter);
+  if (sys6(SYS_getpid, 0,0,0,0,0,0) != mypid)
+    fail("the caller's own pid changed", sys6(SYS_getpid,0,0,0,0,0,0), mypid);
+
+  long ppid2 = sys6(SYS_clone, SIGCHLD, 0, 0, 0, 0, 0);
+  if (ppid2 < 0)
+    fail("clone into the pid namespace", ppid2, 0);
+  if (ppid2 == 0) {
+    /* First in, so pid 1 - and the parent is outside, which Linux reports as
+     * a parent pid of 0 rather than as the number it has elsewhere. */
+    if (sys6(SYS_getpid, 0,0,0,0,0,0) != 1)
+      sys6(SYS_exit, 5, 0,0,0,0,0);
+    if (sys6(SYS_getppid, 0,0,0,0,0,0) != 0)
+      sys6(SYS_exit, 6, 0,0,0,0,0);
+    /* A pid this namespace does not contain cannot be signalled, which is the
+     * containment it does provide. */
+    if (sys6(SYS_kill, 99999, 0, 0,0,0,0) != -ESRCH)
+      sys6(SYS_exit, 7, 0,0,0,0,0);
+    /* Its own link is the namespace the parent set aside. */
+    {
+      char cl[80];
+      if (ns_link("/proc/self/ns/pid", cl, sizeof cl) < 0)
+        sys6(SYS_exit, 8, 0,0,0,0,0);
+      if (!eq(cl, pcafter))
+        sys6(SYS_exit, 9, 0,0,0,0,0);
+    }
+    sys6(SYS_exit, 0, 0,0,0,0,0);
+  }
+  status = 0;
+  if ((r = sys6(SYS_wait4, ppid2, (long) &status, 0, 0,0,0)) != ppid2)
+    fail("wait4 returned a different pid from clone", r, ppid2);
+  switch ((status >> 8) & 0xff) {
+  case 0: break;
+  case 5: fails("the first child of a new pid namespace was not pid 1", "");
+  case 6: fails("its parent, which is outside, was not reported as 0", "");
+  case 7: fails("a pid outside the namespace was signallable", "");
+  case 8: fails("the child could not read its pid link", "");
+  case 9: fails("the child is not in the namespace set aside for it", "");
+  default: fail("the pid child exited with", (status >> 8) & 0xff, 0);
+  }
 
   /*
    * The user namespace. It is an identity here rather than an authority:
