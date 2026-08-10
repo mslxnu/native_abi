@@ -16,6 +16,7 @@
 #include "namespace.h"
 #include "sysv.h"
 #include "mount.h"
+#include "cgroup.h"
 
 #include "linux/common.h"
 #include "linux/errno.h"
@@ -39,7 +40,7 @@ static const struct {
   [NS_PID]    = { NS_PID,    "pid",    LINUX_CLONE_NEWPID,    true  },
   [NS_NET]    = { NS_NET,    "net",    LINUX_CLONE_NEWNET,    false },
   [NS_USER]   = { NS_USER,   "user",   LINUX_CLONE_NEWUSER,   true  },
-  [NS_CGROUP] = { NS_CGROUP, "cgroup", LINUX_CLONE_NEWCGROUP, false },
+  [NS_CGROUP] = { NS_CGROUP, "cgroup", LINUX_CLONE_NEWCGROUP, true  },
   [NS_TIME]   = { NS_TIME,   "time",   LINUX_CLONE_NEWTIME,   true  },
 };
 
@@ -281,6 +282,14 @@ ns_new(enum ns_type type, const struct namespace *from)
       mount_ns_clone(from->ino, ns->ino);
     if (type == NS_PID)
       pidns_create(ns->ino, from->ino);
+    /*
+     * A new cgroup namespace is rooted where the process making it stands.
+     * That is the whole of Linux's semantics for this one, and it is why it
+     * has to be recorded at creation: afterwards the process may move, and the
+     * root must not move with it.
+     */
+    if (type == NS_CGROUP)
+      cgroup_ns_create(ns->ino, cgroup_current());
     if (type == NS_USER) {
       /*
        * Deliberately *not* a copy. A new user namespace starts with no map at
@@ -988,4 +997,44 @@ uint64_t
 ns_ino_pid_for_children(void)
 {
   return current_nsproxy.pid_for_children->ino;
+}
+
+/* ---------------------------------------------------------------- cgroup */
+
+static void
+cgroup_ns_path(uint64_t ino, char *out, size_t n)
+{
+  ns_state_path("cgroupns", ino, out, n);
+}
+
+void
+cgroup_ns_create(uint64_t ino, const char *root)
+{
+  char path[PATH_MAX];
+  cgroup_ns_path(ino, path, sizeof path);
+  int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+  if (fd < 0)
+    return;
+  (void) !write(fd, root, strlen(root) + 1);
+  close(fd);
+}
+
+const char *
+cgroup_ns_root(void)
+{
+  static char root[CGROUP_PATH_MAX];
+  if (current_nsproxy.ns[NS_CGROUP] == &initial_ns[NS_CGROUP])
+    return "/";
+
+  char path[PATH_MAX];
+  cgroup_ns_path(current_nsproxy.ns[NS_CGROUP]->ino, path, sizeof path);
+  int fd = open(path, O_RDONLY);
+  if (fd < 0)
+    return "/";
+  ssize_t n = read(fd, root, sizeof root - 1);
+  close(fd);
+  if (n <= 0)
+    return "/";
+  root[n] = '\0';
+  return root[0] ? root : "/";
 }

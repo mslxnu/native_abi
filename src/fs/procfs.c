@@ -49,6 +49,7 @@ int sysctlbyname(const char *, void *, size_t *, void *, size_t);
 #include "namespace.h"
 #include "sysv.h"
 #include "mount.h"
+#include "cgroup.h"
 #include <sys/stat.h>
 
 #include "page.h"
@@ -169,7 +170,7 @@ enum procfs_file { PROCFS_NONE, PROCFS_MAPS, PROCFS_CMDLINE, PROCFS_COMM,
                    PROCFS_SYSVIPC_SHM, PROCFS_SYSVIPC_SEM, PROCFS_SYSVIPC_MSG,
                    PROCFS_NS_FORCHILDREN, PROCFS_TIMENS_OFFSETS,
                    PROCFS_UID_MAP, PROCFS_GID_MAP, PROCFS_SETGROUPS,
-                   PROCFS_MOUNTINFO, PROCFS_STAT, PROCFS_STATUS };
+                   PROCFS_MOUNTINFO, PROCFS_STAT, PROCFS_STATUS, PROCFS_CGROUP };
 
 /* For PROCFS_FD, the number after /fd/. Meaningless for the others. */
 static enum procfs_file
@@ -281,6 +282,10 @@ own_procfs_file_n(const char *path, int *fd_out)
     if (fd_out) *fd_out = (int) getpid();
     return PROCFS_STATUS;
   }
+
+  /* Which control group this process is in, as its cgroup namespace sees it.
+   * Absent before there was a hierarchy, so anything asking got ENOENT. */
+  if (strcmp(slash, "/cgroup") == 0) return PROCFS_CGROUP;
 
   if (strcmp(slash, "/mounts") == 0)  return PROCFS_MOUNTS;
   /* mountinfo is what systemd and every container runtime actually read; it
@@ -606,6 +611,21 @@ build_status(int host_pid, size_t *len_out)
   }
   free(host);
   *len_out = len;
+  return out;
+}
+
+static char *
+build_cgroup(size_t *len_out)
+{
+  char buf[CGROUP_PATH_MAX + 16];
+  int n = cgroup_proc_text(buf, sizeof buf);
+  if (n < 0)
+    return NULL;
+  char *out = malloc((size_t) n + 1);
+  if (!out)
+    return NULL;
+  memcpy(out, buf, (size_t) n);
+  *len_out = (size_t) n;
   return out;
 }
 
@@ -1312,6 +1332,9 @@ procfs_open(const char *path, int *out_fd)
     break;
   case PROCFS_MOUNTINFO:
     content = build_mountinfo(&len);
+    break;
+  case PROCFS_CGROUP:
+    content = build_cgroup(&len);
     break;
   case PROCFS_STAT:
     content = build_stat(fdno, &len);

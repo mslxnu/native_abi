@@ -32,6 +32,7 @@ static long sys6(long n,long a,long b,long c,long d,long e,long f){
 #define SYS_getgid 176
 #define SYS_getpid 172
 #define SYS_getppid 173
+#define SYS_read 63
 #define SYS_sethostname 161
 #define SYS_setdomainname 162
 #define SYS_unshare 97
@@ -63,6 +64,7 @@ static long sys6(long n,long a,long b,long c,long d,long e,long f){
 #define CLONE_NEWPID    0x20000000
 #define CLONE_NEWNET    0x40000000
 #define CLONE_NEWTIME   0x00000080
+#define CLONE_NEWCGROUP 0x02000000
 #define NOBODY          65534
 #define EINVAL 22
 #define EPERM  1
@@ -440,6 +442,101 @@ void _start(void)
   case 8: fails("the child could not read its pid link", "");
   case 9: fails("the child is not in the namespace set aside for it", "");
   default: fail("the pid child exited with", (status >> 8) & 0xff, 0);
+  }
+
+  /*
+   * The cgroup namespace, which rebases the view of a hierarchy - and needed
+   * the hierarchy building first, as the mount namespace needed mount(2).
+   *
+   * The hierarchy organises processes and controls nothing: cgroup.controllers
+   * is empty and stays empty, because Darwin gives an unprivileged process no
+   * cpu, memory or io control to enforce a limit with. A cgroup that accepted
+   * memory.max and ignored it would be the worst thing here, so there is no
+   * such file to write.
+   */
+  {
+    char cg[64];
+    long f = sys6(SYS_openat, AT_FDCWD, (long) "/proc/self/cgroup", O_RDONLY, 0,0,0);
+    if (f < 0)
+      fail("opening /proc/self/cgroup", f, 0);
+    long n = sys6(SYS_read, f, (long) cg, sizeof cg - 1, 0,0,0);
+    sys6(SYS_close, f, 0,0,0,0,0);
+    if (n <= 0) fail("reading /proc/self/cgroup", n, 1);
+    cg[n] = '\0';
+    if (!eq(cg, "0::/\n"))
+      fails("the cgroup before anything was mounted", cg);
+  }
+
+  if ((r = sys6(SYS_mount, (long) "none", (long) "/cgtest", (long) "cgroup2",
+                0, 0, 0)) != 0)
+    fail("mount(cgroup2)", r, 0);
+  sys6(SYS_mkdirat, AT_FDCWD, (long) "/cgtest/w", 0755, 0,0,0);
+
+  /* A cgroup has the four files a cgroup has, and controllers is empty. */
+  {
+    char buf[32];
+    long f = sys6(SYS_openat, AT_FDCWD, (long) "/cgtest/w/cgroup.controllers",
+                  O_RDONLY, 0,0,0);
+    if (f < 0)
+      fail("a new cgroup has no cgroup.controllers", f, 0);
+    long n = sys6(SYS_read, f, (long) buf, sizeof buf, 0,0,0);
+    sys6(SYS_close, f, 0,0,0,0,0);
+    if (n != 0)
+      fail("cgroup.controllers was not empty, so something claims to control", n, 0);
+  }
+
+  /* Joining it, which is what writing to cgroup.procs does. */
+  {
+    char line[24];
+    int li = 0;
+    long v = sys6(SYS_getpid, 0,0,0,0,0,0);
+    char t[16]; int ti = 0;
+    if (v == 0) t[ti++] = '0';
+    while (v > 0) { t[ti++] = (char) ('0' + v % 10); v /= 10; }
+    while (ti > 0) line[li++] = t[--ti];
+    line[li++] = '\n';
+
+    long f = sys6(SYS_openat, AT_FDCWD, (long) "/cgtest/w/cgroup.procs",
+                  O_WRONLY, 0,0,0);
+    if (f < 0)
+      fail("opening cgroup.procs", f, 0);
+    if ((r = sys6(SYS_write, f, (long) line, li, 0,0,0)) != li)
+      fail("writing to cgroup.procs", r, li);
+    sys6(SYS_close, f, 0,0,0,0,0);
+  }
+
+  {
+    char cg[64];
+    long f = sys6(SYS_openat, AT_FDCWD, (long) "/proc/self/cgroup", O_RDONLY, 0,0,0);
+    long n = sys6(SYS_read, f, (long) cg, sizeof cg - 1, 0,0,0);
+    sys6(SYS_close, f, 0,0,0,0,0);
+    if (n <= 0) fail("re-reading /proc/self/cgroup", n, 1);
+    cg[n] = '\0';
+    if (!eq(cg, "0::/w\n"))
+      fails("the cgroup after joining one", cg);
+  }
+
+  /* And the namespace, whose whole function is to rebase that path: a process
+   * in /w that unshares is at the root of its own view, while its actual
+   * cgroup has not moved. */
+  {
+    char gbefore[80], gafter[80], cg[64];
+    if (ns_link("/proc/self/ns/cgroup", gbefore, sizeof gbefore) < 0)
+      fail("reading the cgroup link", -1, 0);
+    if ((r = sys6(SYS_unshare, CLONE_NEWCGROUP, 0,0,0,0,0)) != 0)
+      fail("unshare(CLONE_NEWCGROUP)", r, 0);
+    if (ns_link("/proc/self/ns/cgroup", gafter, sizeof gafter) < 0)
+      fail("re-reading the cgroup link", -1, 0);
+    if (eq(gbefore, gafter))
+      fails("unshare(CLONE_NEWCGROUP) left the identity unchanged", gafter);
+
+    long f = sys6(SYS_openat, AT_FDCWD, (long) "/proc/self/cgroup", O_RDONLY, 0,0,0);
+    long n = sys6(SYS_read, f, (long) cg, sizeof cg - 1, 0,0,0);
+    sys6(SYS_close, f, 0,0,0,0,0);
+    if (n <= 0) fail("reading the cgroup inside the namespace", n, 1);
+    cg[n] = '\0';
+    if (!eq(cg, "0::/\n"))
+      fails("the namespace did not rebase the cgroup path", cg);
   }
 
   /*

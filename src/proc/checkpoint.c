@@ -17,6 +17,7 @@
 #include "mm.h"
 #include "checkpoint.h"
 #include "namespace.h"
+#include "cgroup.h"
 
 /* From src/mm/pt_arm64.c and lib/vmm_arm64.c. */
 size_t pt_snapshot(uint64_t *ipa_brk_out, uint64_t *l1_ipa_out,
@@ -123,6 +124,7 @@ checkpoint_write(int fd)
   {
     struct uts_namespace uts;
     nsproxy_snapshot(hdr.ns_ino, &uts);
+  snprintf(hdr.cgroup, sizeof hdr.cgroup, "%s", cgroup_current());
     memcpy(hdr.uts_nodename, uts.nodename, sizeof hdr.uts_nodename);
     memcpy(hdr.uts_domainname, uts.domainname, sizeof hdr.uts_domainname);
   }
@@ -265,6 +267,7 @@ checkpoint_read(int fd, struct checkpoint_header *hdr,
     uts.nodename[sizeof uts.nodename - 1] = '\0';
     uts.domainname[sizeof uts.domainname - 1] = '\0';
     nsproxy_restore(hdr->ns_ino, &uts);
+    cgroup_set_current(hdr->cgroup);
   }
 
   *regions_out = regions;

@@ -44,10 +44,19 @@
  *           under TMPDIR; proc, sysfs and the rest are recorded because nabi
  *           already serves them. See include/mount.h.
  *
- *   cgroup  Nothing to isolate. There are no cgroups.
+ *   cgroup  Implemented, over a hierarchy built for it. Cgroups here organise
+ *           processes and control nothing - cgroup.controllers is empty and
+ *           stays empty, because Darwin offers an unprivileged process no cpu,
+ *           memory or io control to enforce a limit with, and a file that took
+ *           a limit and ignored it would be the worst thing in the tree. The
+ *           namespace itself is exact: it rebases the path /proc/<pid>/cgroup
+ *           reports, which is the whole of what it does on Linux too.
  *
- *   net     No. Sockets are the host's, and isolating them would mean a virtual
- *           network stack rather than a namespace.
+ *   net     No, and this one is not a matter of effort. Sockets are the host's,
+ *           and isolating them would mean writing a virtual network stack -
+ *           addresses, routes, an interface, something to carry packets
+ *           between namespaces - which is a different program, not a namespace.
+ *           It is the only one of the eight that stays refused.
  *
  * So unshare and setns accept CLONE_NEWUTS and refuse the rest with EINVAL,
  * which is exactly what Linux returns for a namespace its kernel was not built

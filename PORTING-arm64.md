@@ -3364,3 +3364,68 @@ resolves to the container's init rather than to launchd.
 ```
 
 That leaves `cgroup`, which has nothing to isolate: there are no cgroups.
+
+### 3.5.64 The cgroup namespace, over a hierarchy that controls nothing — **implemented**
+
+Every previous note said the same thing about this one: "nothing to isolate;
+there are no cgroups". That was true — `/proc/self/cgroup`, `/sys/fs/cgroup` and
+`/proc/cgroups` were all absent — so the namespace needed a hierarchy first, as
+the mount namespace needed `mount(2)` and the IPC namespace needed objects of
+its own.
+
+**What is provided and what deliberately is not.** The hierarchy is real:
+cgroups are directories, a process is in exactly one, membership is inherited
+across fork, and `/proc/<pid>/cgroup` answers with it. That is bookkeeping NABI
+can keep honestly.
+
+The controllers are not, and there are none. `cgroup.controllers` is empty and
+cannot be made otherwise, so there is no `memory.max`, no `cpu.max`, no
+`pids.max` — **not as files that accept a number and ignore it, but absent.**
+Darwin gives an unprivileged process no CPU bandwidth control, no memory
+accounting it could enforce and no io control, so a limit written here could
+never be applied. A cgroup that took the number and did nothing would be the
+worst thing in this tree: the caller would believe it was bounded and nothing
+would ever say otherwise.
+
+A hierarchy with no controllers enabled is an ordinary cgroup v2 configuration,
+not an invention — it is what a machine looks like when cgroups organise
+processes rather than constrain them, which is exactly and only what this can
+do.
+
+The namespace itself is then **exact**: it rebases paths, which is the whole of
+what a cgroup namespace does on Linux, and none of it needs a controller.
+
+```
+after joining:  0::/work        <- read by a child, so inherited across fork
+inside unshare -C:  0::/        <- rebased; the process has not moved
+outside still:  0::/work
+```
+
+Membership travels in the checkpoint (version 5 → 6). A child that did not
+inherit it would fall back to the root the moment it forked, and a shell that
+had just joined a cgroup would find every command it ran outside it, with
+nothing to indicate the move had not stuck.
+
+**Two bugs, both about a path not being the path it looked like.**
+
+- `guest_to_host_path` answered from its passthrough shortcut before consulting
+  the mount table, so a cgroup made under `/sys/fs/cgroup` — a mount on top of a
+  passthrough — resolved to the host's `/sys` and was not recognised as a cgroup
+  at all. It now checks mounts first, as `resolve_path` already did.
+
+- **`F_GETPATH` is canonical and `TMPDIR` is not.** A write to `cgroup.procs` is
+  recognised by the file's path, and `TMPDIR` is `/var/folders/…` while `/var`
+  is a symlink, so the descriptor's real path is `/private/var/folders/…`.
+  Compared against the unresolved form nothing ever matched: joining a cgroup
+  wrote the pid into an ordinary file, reported success, and moved no one. The
+  hierarchy's root is resolved with `realpath` now.
+
+One deliberate divergence: a mount target need not already exist. Linux requires
+it, but the conventional location `/sys/fs/cgroup` lives under a host
+passthrough the guest cannot create in, so requiring it would make the standard
+path unmountable.
+
+**That completes seven of the eight namespaces.** Only `net` stays refused, and
+not for want of effort: sockets are the host's, and isolating them would mean
+writing a virtual network stack — addresses, routes, an interface, something to
+carry packets between namespaces. That is a different program, not a namespace.

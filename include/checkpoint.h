@@ -26,7 +26,7 @@
 #include "linux/signal.h"
 
 #define CHECKPOINT_MAGIC   0x4E414249434B5031ULL  /* "NABICKP1" */
-#define CHECKPOINT_VERSION 5
+#define CHECKPOINT_VERSION 6
 
 /* One guest memory region, as src/mm/mmap.c tracks it, with the host address
  * replaced by the arena offset that names the same bytes elsewhere. */
@@ -134,6 +134,16 @@ struct checkpoint_header {
    * they are not.
    */
   uint64_t ns_ino[8];           /* NS_COUNT; indexed by enum ns_type */
+
+  /*
+   * Which control group the process is in, as of version 6.
+   *
+   * Per-process state, so it travels like the credentials do. A child that did
+   * not inherit it would fall back to the root of the hierarchy the moment it
+   * forked, and a shell that had just joined a cgroup would find every command
+   * it ran outside it - with nothing to indicate the move had not stuck.
+   */
+  char     cgroup[256];
   char     uts_nodename[65];
   char     uts_domainname[65];
   uint8_t  _pad4[6];

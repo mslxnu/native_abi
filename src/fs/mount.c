@@ -6,6 +6,7 @@
 #include "noah.h"
 #include "namespace.h"
 #include "mount.h"
+#include "cgroup.h"
 
 #include "linux/common.h"
 #include "linux/errno.h"
@@ -338,9 +339,21 @@ DEFINE_SYSCALL(mount, gstr_t, source_ptr, gstr_t, target_ptr, gstr_t, type_ptr,
     snprintf(e.source, sizeof e.source, "tmpfs");
     snprintf(e.hostdir, sizeof e.hostdir, "%s", dirtpl);
     snprintf(e.type, sizeof e.type, "tmpfs");
+  } else if (type_is(type, "cgroup2") || type_is(type, "cgroup")) {
+    /*
+     * The one hierarchy, wherever it is asked for. cgroups are not per-mount:
+     * mounting cgroup2 twice shows the same tree, which is what the mount is
+     * for - a place to see it from.
+     */
+    char host[PATH_MAX];
+    int cr = cgroup_hierarchy(host, sizeof host);
+    if (cr < 0)
+      return cr;
+    snprintf(e.source, sizeof e.source, "cgroup2");
+    snprintf(e.hostdir, sizeof e.hostdir, "%s", host);
+    snprintf(e.type, sizeof e.type, "cgroup2");
   } else if (type_is(type, "proc") || type_is(type, "sysfs") ||
              type_is(type, "devtmpfs") || type_is(type, "devpts") ||
-             type_is(type, "cgroup") || type_is(type, "cgroup2") ||
              type_is(type, "mqueue") || type_is(type, "securityfs") ||
              type_is(type, "debugfs")) {
     /*

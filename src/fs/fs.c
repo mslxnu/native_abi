@@ -31,6 +31,7 @@
 #include "noah.h"
 #include "namespace.h"
 #include "mount.h"
+#include "cgroup.h"
 #include "checkpoint.h"
 
 #include "linux/common.h"
@@ -1851,6 +1852,15 @@ DEFINE_SYSCALL(write, int, fd, gaddr_t, buf_ptr, size_t, size)
   if (procfs_write_timens(fd, buf, size, &r))
     goto out;
 
+  /*
+   * Writing a pid to cgroup.procs is what moves a process between control
+   * groups. The file is an ordinary one on the host, so a write would land in
+   * it and change nothing - the caller would be told it had moved and would
+   * not have.
+   */
+  if (cgroup_write_procs(fd, buf, size, &r))
+    goto out;
+
   struct file *file = get_file(fd);
   if (file == NULL) {
     r = -LINUX_EBADF;
@@ -3038,6 +3048,22 @@ symlink_into_procfs(int dirfd, const char *name, char *out, size_t outsz)
 int
 guest_to_host_path(const char *name, char *out, size_t outsz)
 {
+  /*
+   * A mount comes first, exactly as it does in resolve_path. Without this the
+   * passthrough shortcut below answered for a path that had been mounted over -
+   * so a cgroup made under /sys/fs/cgroup, which is a mount on top of a
+   * passthrough, resolved to the host's /sys and was not recognised as a
+   * cgroup at all.
+   */
+  if (name[0] == '/') {
+    char mnt[PATH_MAX];
+    if (mount_resolve(name, mnt, sizeof mnt, NULL)) {
+      if (strlcpy(out, mnt, outsz) >= outsz)
+        return -LINUX_ENAMETOOLONG;
+      return 0;
+    }
+  }
+
   if (name[0] == '/' && is_host_passthrough(name)) {
     if (strlcpy(out, name, outsz) >= outsz)
       return -LINUX_ENAMETOOLONG;
@@ -3704,6 +3730,21 @@ DEFINE_SYSCALL(readlink, gstr_t, path_ptr, gaddr_t, buf_ptr, int, bufsize)
   return sys_readlinkat(LINUX_AT_FDCWD, path_ptr, buf_ptr, bufsize);
 }
 
+/* A directory made inside the cgroup hierarchy is a cgroup, and a cgroup has
+ * files. The kernel materialises them on a real cgroupfs; here the directory is
+ * an ordinary one, so they are written when it appears - otherwise a cgroup
+ * just created would have nothing in it to read or to join. */
+static void
+cgroup_after_mkdir(int dirfd, const char *name)
+{
+  char host[PATH_MAX];
+  if (guest_to_host_path(name, host, sizeof host) < 0)
+    return;
+  if (cgroup_is_hierarchy_path(host))
+    cgroup_populate(host);
+  (void) dirfd;
+}
+
 DEFINE_SYSCALL(mkdirat, int, dirfd, gstr_t, path_ptr, int, mode)
 {
   char name[LINUX_PATH_MAX];
@@ -3715,6 +3756,8 @@ DEFINE_SYSCALL(mkdirat, int, dirfd, gstr_t, path_ptr, int, mode)
     return r;
   }
   r = path.fs->ops->mkdirat(path.fs, path.dir, path.subpath, mode);
+  if (r >= 0)
+    cgroup_after_mkdir(dirfd, name);
   vfs_ungrab_dir(&path);
   return r;
 }

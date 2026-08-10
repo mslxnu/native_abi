@@ -114,6 +114,7 @@ COMMON_SRCS := src/main.c \
                src/proc/process.c \
                src/proc/namespace.c \
                src/proc/pidns.c \
+               src/proc/cgroup.c \
                src/proc/ptrace.c \
                src/net/net.c \
                src/ipc/futex.c \
