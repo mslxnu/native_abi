@@ -173,8 +173,8 @@
   SYSCALL(167, unimplemented)                   \
   SYSCALL(168, unimplemented)                   \
   SYSCALL(169, unimplemented)                   \
-  SYSCALL(170, unimplemented)                   \
-  SYSCALL(171, unimplemented)                   \
+  SYSCALL(170, sethostname)                   \
+  SYSCALL(171, setdomainname)                   \
   SYSCALL(172, unimplemented)                   \
   SYSCALL(173, unimplemented)                   \
   SYSCALL(174, unimplemented)                   \
@@ -275,7 +275,7 @@
   SYSCALL(269, faccessat)                       \
   SYSCALL(270, pselect6)                        \
   SYSCALL(271, ppoll)                   \
-  SYSCALL(272, unimplemented)                   \
+  SYSCALL(272, unshare)                   \
   SYSCALL(273, set_robust_list)                 \
   SYSCALL(274, unimplemented)                   \
   SYSCALL(275, unimplemented)                   \
@@ -311,7 +311,7 @@
   SYSCALL(305, unimplemented)                   \
   SYSCALL(306, syncfs)                          \
   SYSCALL(307, sendmmsg)                        \
-  SYSCALL(308, unimplemented)                   \
+  SYSCALL(308, setns)                   \
   SYSCALL(309, unimplemented)                   \
   SYSCALL(310, unimplemented)                   \
   SYSCALL(311, unimplemented)                   \

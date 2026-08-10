@@ -103,7 +103,7 @@
   SYSCALL(94, exit_group) \
   SYSCALL(95, unimplemented) \
   SYSCALL(96, set_tid_address) \
-  SYSCALL(97, unimplemented) \
+  SYSCALL(97, unshare) \
   SYSCALL(98, futex) \
   SYSCALL(99, set_robust_list) \
   SYSCALL(100, unimplemented) \
@@ -167,8 +167,8 @@
   SYSCALL(158, getgroups) \
   SYSCALL(159, setgroups) \
   SYSCALL(160, uname) \
-  SYSCALL(161, unimplemented) \
-  SYSCALL(162, unimplemented) \
+  SYSCALL(161, sethostname) \
+  SYSCALL(162, setdomainname) \
   SYSCALL(163, getrlimit) \
   SYSCALL(164, setrlimit) \
   SYSCALL(165, getrusage) \
@@ -274,7 +274,7 @@
   SYSCALL(265, unimplemented) \
   SYSCALL(266, unimplemented) \
   SYSCALL(267, syncfs) \
-  SYSCALL(268, unimplemented) \
+  SYSCALL(268, setns) \
   SYSCALL(269, sendmmsg) \
   SYSCALL(270, unimplemented) \
   SYSCALL(271, unimplemented) \

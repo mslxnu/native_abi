@@ -16,6 +16,7 @@
 #include "vmm.h"
 #include "mm.h"
 #include "checkpoint.h"
+#include "namespace.h"
 
 /* From src/mm/pt_arm64.c and lib/vmm_arm64.c. */
 size_t pt_snapshot(uint64_t *ipa_brk_out, uint64_t *l1_ipa_out,
@@ -119,6 +120,12 @@ checkpoint_write(int fd)
   hdr.egid = proc.cred.egid;
   hdr.sgid = proc.cred.sgid;
   hdr.nr_groups = (uint32_t) guest_groups_get(NULL);
+  {
+    struct uts_namespace uts;
+    nsproxy_snapshot(hdr.ns_ino, &uts);
+    memcpy(hdr.uts_nodename, uts.nodename, sizeof hdr.uts_nodename);
+    memcpy(hdr.uts_domainname, uts.domainname, sizeof hdr.uts_domainname);
+  }
 
   hdr.tid             = task.tid;
   hdr.set_child_tid   = task.set_child_tid;
@@ -247,6 +254,16 @@ checkpoint_read(int fd, struct checkpoint_header *hdr,
     free(groups);
   } else if (hdr->nr_groups == 0) {
     guest_groups_set(NULL, 0);
+  }
+
+  /* The namespaces the parent was in, identities included. */
+  {
+    struct uts_namespace uts;
+    memcpy(uts.nodename, hdr->uts_nodename, sizeof uts.nodename);
+    memcpy(uts.domainname, hdr->uts_domainname, sizeof uts.domainname);
+    uts.nodename[sizeof uts.nodename - 1] = '\0';
+    uts.domainname[sizeof uts.domainname - 1] = '\0';
+    nsproxy_restore(hdr->ns_ino, &uts);
   }
 
   *regions_out = regions;

@@ -14,6 +14,7 @@
 #include "arch.h"
 #include "mm.h"
 #include "noah.h"
+#include "namespace.h"
 #include "syscall.h"
 #if defined(__arm64__)
 #include "checkpoint.h"
@@ -221,6 +222,9 @@ init_first_proc(const char *root)
   list_add(&task.head, &proc.tasks);
   init_mm(proc.mm);
   init_signal();
+  /* The initial namespace set, seeded from the host's hostname so a guest that
+   * never unshares reports what it always did. */
+  nsproxy_init();
 
   /*
    * Clamp RLIMIT_NOFILE to what the OS can actually give a process.

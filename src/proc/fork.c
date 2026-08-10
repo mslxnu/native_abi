@@ -7,6 +7,7 @@
 
 #include "common.h"
 #include "noah.h"
+#include "namespace.h"
 #include "vmm.h"
 
 #include "linux/common.h"
@@ -385,6 +386,22 @@ do_clone(unsigned long clone_flags, unsigned long newsp, gaddr_t parent_tid, gad
 
 DEFINE_SYSCALL(clone, unsigned long, clone_flags, unsigned long, newsp, gaddr_t, parent_tid, gaddr_t, arg4, gaddr_t, arg5)
 {
+  /*
+   * A namespace flag applies to the *child*, and on arm64 a child is a fresh
+   * process rebuilt from a checkpoint - so the new namespace has to exist
+   * before the checkpoint is written, and the parent has to be put back
+   * afterwards. Refused flags are refused here, before anything forks, so a
+   * clone asking for a namespace that cannot be provided fails outright rather
+   * than producing a child in the wrong one.
+   */
+  if (clone_flags & (LINUX_CLONE_NEWNS | LINUX_CLONE_NEWUTS |
+                     LINUX_CLONE_NEWIPC | LINUX_CLONE_NEWPID |
+                     LINUX_CLONE_NEWNET | LINUX_CLONE_NEWUSER |
+                     LINUX_CLONE_NEWCGROUP | LINUX_CLONE_NEWTIME)) {
+    int nsr = nsproxy_clone(clone_flags);
+    if (nsr < 0)
+      return nsr;
+  }
   /*
    * The last two clone arguments are architecture-ordered. x86-64 is
    * (flags, stack, parent_tid, child_tid, tls); aarch64 (CONFIG_CLONE_BACKWARDS)

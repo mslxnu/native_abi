@@ -183,6 +183,8 @@ struct l_pollfd {
 #define LINUX_CLONE_NEWUSER        0x10000000
 #define LINUX_CLONE_NEWPID         0x20000000
 #define LINUX_CLONE_NEWNET         0x40000000
+#define LINUX_CLONE_NEWCGROUP      0x02000000
+#define LINUX_CLONE_NEWTIME        0x00000080
 #define LINUX_CLONE_IO             0x80000000
 
 #define LINUX_ARCH_SET_GS		0x1001

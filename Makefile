@@ -112,6 +112,7 @@ COMMON_SRCS := src/main.c \
                src/proc/exec.c \
                src/proc/fork.c \
                src/proc/process.c \
+               src/proc/namespace.c \
                src/proc/ptrace.c \
                src/net/net.c \
                src/ipc/futex.c \

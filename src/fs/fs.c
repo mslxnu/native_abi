@@ -3171,6 +3171,22 @@ DEFINE_SYSCALL(newfstatat, int, dirfd, gstr_t, path_ptr, gaddr_t, st_ptr, int, f
   struct l_newstat st;
   int r;
 
+  /* A /proc entry nabi serves itself, which the host has no file for. */
+  {
+    uint32_t mode; uint64_t size, ino;
+    if (procfs_stat(pathname, &mode, &size, &ino)) {
+      memset(&st, 0, sizeof st);
+      st.st_mode = mode;
+      st.st_size = (l_off_t) size;
+      st.st_ino = ino;
+      st.st_nlink = 1;
+      st.st_blksize = 4096;
+      if (copy_to_user(st_ptr, &st, sizeof st))
+        return -LINUX_EFAULT;
+      return 0;
+    }
+  }
+
   if (is_at_empty_path(pathname, flags) && dirfd != LINUX_AT_FDCWD) {
     r = fstat_by_fd(dirfd, &st);
   } else {
@@ -3208,14 +3224,35 @@ DEFINE_SYSCALL(statx, int, dirfd, gstr_t, path_ptr, int, flags, unsigned int, ma
   struct l_newstat st;
   int r;
 
-  if (is_at_empty_path(pathname, flags)) {
+  /* Same as newfstatat: an entry nabi serves itself has no host file behind it.
+   * Hooked here too because a current coreutils calls statx and never
+   * newfstatat, so `ls /proc/self/ns` failed while `stat` through the other
+   * path would have worked. */
+  bool served = false;
+  {
+    uint32_t pmode; uint64_t psize, pino;
+    if (procfs_stat(pathname, &pmode, &psize, &pino)) {
+      memset(&st, 0, sizeof st);
+      st.st_mode = pmode;
+      st.st_size = (off_t) psize;
+      st.st_ino = pino;
+      st.st_nlink = 1;
+      st.st_blksize = 4096;
+      st.st_uid = geteuid();       /* converted below like any other stat */
+      st.st_gid = getegid();
+      served = true;
+      r = 0;
+    }
+  }
+
+  if (!served && is_at_empty_path(pathname, flags)) {
     /* AT_FDCWD names the working directory rather than a descriptor. */
     if (dirfd == LINUX_AT_FDCWD)
       strcpy(pathname, ".");
     else
       r = fstat_by_fd(dirfd, &st);
   }
-  if (!is_at_empty_path(pathname, flags) || dirfd == LINUX_AT_FDCWD) {
+  if (!served && (!is_at_empty_path(pathname, flags) || dirfd == LINUX_AT_FDCWD)) {
     int grab_flags = flags & LINUX_AT_SYMLINK_NOFOLLOW ? LOOKUP_NOFOLLOW : 0;
     struct path path;
     r = vfs_grab_dir(dirfd, pathname, grab_flags, &path);

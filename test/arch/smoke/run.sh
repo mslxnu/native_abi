@@ -494,6 +494,17 @@ else
     fail=1
 fi
 
+# nstest: namespaces - uts works, the rest refuse rather than pretend, and the
+# identity survives a fork (which on arm64 rebuilds it from a checkpoint).
+cp "$here/nstest" "$root/"; chmod +x "$root/nstest"
+out=$("$NABI" -m "$root" /nstest); rc=$?
+if [ "$rc" -eq 0 ] && [ "$out" = "ns ok" ]; then
+    echo "  ok  nstest -> \"$out\", exit 0"
+else
+    echo "  FAIL nstest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 if [ "$fail" -eq 0 ]; then
     echo "smoke: PASS"
 else

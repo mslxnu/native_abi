@@ -26,7 +26,7 @@
 #include "linux/signal.h"
 
 #define CHECKPOINT_MAGIC   0x4E414249434B5031ULL  /* "NABICKP1" */
-#define CHECKPOINT_VERSION 3
+#define CHECKPOINT_VERSION 4
 
 /* One guest memory region, as src/mm/mmap.c tracks it, with the host address
  * replaced by the arena offset that names the same bytes elsewhere. */
@@ -113,6 +113,20 @@ struct checkpoint_header {
   uint64_t sigpending;
   uint64_t sas_sp, sas_size;
   int32_t  sas_flags;
+
+  /*
+   * Namespaces, as of version 4.
+   *
+   * The identities travel as well as the contents, and both matter. A child
+   * sharing its parent's uts namespace has to report the same inode from
+   * /proc/self/ns/uts, or anything comparing the two - which is the main thing
+   * these numbers are for - concludes they are in different namespaces when
+   * they are not.
+   */
+  uint64_t ns_ino[8];           /* NS_COUNT; indexed by enum ns_type */
+  char     uts_nodename[65];
+  char     uts_domainname[65];
+  uint8_t  _pad4[6];
 
   /* the descriptor tables' shapes; the entries follow as checkpoint_fd[] */
   int32_t  rootfd;

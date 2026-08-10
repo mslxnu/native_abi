@@ -46,6 +46,7 @@ int sysctlbyname(const char *, void *, size_t *, void *, size_t);
 #include "common.h"
 #include "noah.h"
 #include "mm.h"
+#include "namespace.h"
 #include <sys/stat.h>
 
 #include "page.h"
@@ -162,7 +163,7 @@ build_maps(size_t *len_out)
  */
 enum procfs_file { PROCFS_NONE, PROCFS_MAPS, PROCFS_CMDLINE, PROCFS_COMM,
                    PROCFS_EXE, PROCFS_FD, PROCFS_MOUNTS, PROCFS_FDDIR,
-                   PROCFS_RANDOM_UUID, PROCFS_RANDOM_BOOT_ID };
+                   PROCFS_RANDOM_UUID, PROCFS_RANDOM_BOOT_ID, PROCFS_NS, PROCFS_NSDIR };
 
 /* For PROCFS_FD, the number after /fd/. Meaningless for the others. */
 static enum procfs_file
@@ -231,6 +232,22 @@ own_procfs_file_n(const char *path, int *fd_out)
   if (strcmp(slash, "/fd") == 0 || strcmp(slash, "/fd/") == 0 ||
       strcmp(slash, "/fd/.") == 0)
     return PROCFS_FDDIR;
+
+  /* The directory itself, which `ls /proc/self/ns` reads and which anything
+   * enumerating a process's namespaces starts from. */
+  if (strcmp(slash, "/ns") == 0 || strcmp(slash, "/ns/") == 0)
+    return PROCFS_NSDIR;
+
+  /* /proc/<pid>/ns/<type>. A symlink on Linux, reading "uts:[4026531838]", and
+   * the thing setns is handed. */
+  if (strncmp(slash, "/ns/", 4) == 0) {
+    enum ns_type t;
+    if (!ns_type_from_name(slash + 4, &t))
+      return PROCFS_NONE;
+    if (fd_out)
+      *fd_out = (int) t;        /* which one, for the caller */
+    return PROCFS_NS;
+  }
 
   if (strncmp(slash, "/fd/", 4) == 0) {
     const char *p = slash + 4;
@@ -456,6 +473,35 @@ procfs_refresh_fddir(int fd)
   return true;
 }
 
+/* Which namespace a descriptor from /proc/<pid>/ns/<type> names. The file
+ * behind it is a stand-in, so this is where the answer actually lives. */
+struct ns_note { int type; uint64_t ino; };
+KHASH_MAP_INIT_INT(nsfd, struct ns_note)
+static khash_t(nsfd) *nsfd_notes;
+
+static void
+procfs_remember_ns(int fd, enum ns_type type, uint64_t ino)
+{
+  int ret;
+  if (nsfd_notes == NULL)
+    nsfd_notes = kh_init(nsfd);
+  khiter_t k = kh_put(nsfd, nsfd_notes, fd, &ret);
+  kh_value(nsfd_notes, k) = (struct ns_note){ (int) type, ino };
+}
+
+bool
+procfs_ns_of_fd(int fd, enum ns_type *type, uint64_t *ino)
+{
+  if (nsfd_notes == NULL)
+    return false;
+  khiter_t k = kh_get(nsfd, nsfd_notes, fd);
+  if (k == kh_end(nsfd_notes))
+    return false;
+  if (type) *type = (enum ns_type) kh_value(nsfd_notes, k).type;
+  if (ino)  *ino  = kh_value(nsfd_notes, k).ino;
+  return true;
+}
+
 static void
 procfs_remember_tmpdir(int fd, const char *dir)
 {
@@ -471,6 +517,11 @@ procfs_remember_tmpdir(int fd, const char *dir)
 void
 procfs_close_fd(int fd)
 {
+  if (nsfd_notes != NULL) {
+    khiter_t nk = kh_get(nsfd, nsfd_notes, fd);
+    if (nk != kh_end(nsfd_notes))
+      kh_del(nsfd, nsfd_notes, nk);
+  }
   if (fddir_tmp == NULL)
     return;
   khiter_t k = kh_get(fddir, fddir_tmp, fd);
@@ -497,6 +548,46 @@ procfs_fd_number(const char *path)
 {
   int fd = -1;
   return own_procfs_file_n(path, &fd) == PROCFS_FD ? fd : -1;
+}
+
+/*
+ * stat for the entries nabi serves itself.
+ *
+ * Most of /proc is the host's - mSL/ProcFS provides maps, cmdline, fd and the
+ * rest - so a stat of those falls through and is answered there. The namespace
+ * entries have no host counterpart at all, and without this `ls /proc/self/ns`
+ * stops at the directory it cannot stat, however well the links inside it read.
+ *
+ * Returns false for anything not ours, which is the ordinary case.
+ */
+bool
+procfs_stat(const char *path, uint32_t *mode, uint64_t *size, uint64_t *ino)
+{
+  int which = -1;
+  enum procfs_file kind = own_procfs_file_n(path, &which);
+
+  switch (kind) {
+  case PROCFS_NSDIR:
+    *mode = 0500 | 0040000;                 /* dr-x------, as Linux has it */
+    *size = 0;
+    *ino  = 1;
+    return true;
+  case PROCFS_NS:
+    /* A symlink, and the length is the text it resolves to - which is what
+     * anything sizing a readlink buffer will ask for. */
+    {
+      char text[64];
+      int n = snprintf(text, sizeof text, "%s:[%llu]",
+                       ns_type_name((enum ns_type) which),
+                       (unsigned long long) ns_ino_of((enum ns_type) which));
+      *mode = 0777 | 0120000;               /* lrwxrwxrwx */
+      *size = n < 0 ? 0 : (uint64_t) n;
+      *ino  = ns_ino_of((enum ns_type) which);
+    }
+    return true;
+  default:
+    return false;
+  }
 }
 
 int
@@ -548,6 +639,70 @@ procfs_open(const char *path, int *out_fd)
      * whole of TMPDIR's business with it either way. */
     procfs_remember_tmpdir(dfd, dirtpl);
     *out_fd = dfd;
+    return 0;
+  }
+  case PROCFS_NSDIR: {
+    /* Built the same way /proc/self/fd is: a directory of symlinks, standing in
+     * for something the host has no equivalent of. The targets are the link
+     * text Linux uses, so `ls -l` reads as it does anywhere else. */
+    char dirtpl[PATH_MAX];
+    const char *tmpd2 = getenv("TMPDIR");
+    snprintf(dirtpl, sizeof dirtpl, "%s/nabi-nsdir-XXXXXX",
+             tmpd2 && *tmpd2 ? tmpd2 : "/tmp");
+    if (mkdtemp(dirtpl) == NULL)
+      return -1;
+
+    for (int t = 0; t < NS_COUNT; t++) {
+      char name[PATH_MAX], target[64];
+      snprintf(name, sizeof name, "%s/%s", dirtpl, ns_type_name((enum ns_type) t));
+      snprintf(target, sizeof target, "%s:[%llu]",
+               ns_type_name((enum ns_type) t),
+               (unsigned long long) ns_ino_of((enum ns_type) t));
+      (void) symlink(target, name);
+    }
+
+    int dfd = open(dirtpl, O_RDONLY | O_DIRECTORY);
+    if (dfd < 0) { procfs_rmtree(dirtpl); return -1; }
+    procfs_remember_tmpdir(dfd, dirtpl);
+    *out_fd = dfd;
+    return 0;
+  }
+  case PROCFS_NS: {
+    /*
+     * Opening a namespace link.
+     *
+     * On Linux this is an nsfs file that carries the namespace itself; here it
+     * is an ordinary temporary file holding the text the link resolves to, and
+     * what makes it a namespace is the note kept beside the descriptor. setns
+     * asks for that note rather than reading the file, because the file is
+     * only a stand-in.
+     */
+    char text[64];
+    int n = snprintf(text, sizeof text, "%s:[%llu]\n",
+                     ns_type_name((enum ns_type) fdno),
+                     (unsigned long long) ns_ino_of((enum ns_type) fdno));
+    if (n < 0)
+      return -1;
+    len = (size_t) n;
+    content = malloc(len);
+    if (content)
+      memcpy(content, text, len);
+    if (!content)
+      return -1;
+
+    const char *tmpd = getenv("TMPDIR");
+    char tpl2[PATH_MAX];
+    snprintf(tpl2, sizeof tpl2, "%s/nabi-ns-XXXXXX", tmpd && *tmpd ? tmpd : "/tmp");
+    int nsfd = mkstemp(tpl2);
+    if (nsfd < 0) { free(content); return -1; }
+    unlink(tpl2);
+    bool ok2 = write(nsfd, content, len) == (ssize_t) len;
+    free(content);
+    if (!ok2 || lseek(nsfd, 0, SEEK_SET) < 0) { close(nsfd); return -1; }
+
+    procfs_remember_ns(nsfd, (enum ns_type) fdno,
+                       ns_ino_of((enum ns_type) fdno));
+    *out_fd = nsfd;
     return 0;
   }
   case PROCFS_FD: {
@@ -656,6 +811,15 @@ procfs_readlink(const char *path, char *buf, size_t bufsize)
   char fdpath[PATH_MAX];
 
   switch (own_procfs_file_n(path, &fd)) {
+  case PROCFS_NS: {
+    int n = snprintf(fdpath, sizeof fdpath, "%s:[%llu]",
+                     ns_type_name((enum ns_type) fd),
+                     (unsigned long long) ns_ino_of((enum ns_type) fd));
+    if (n < 0 || (size_t) n > bufsize)
+      return -1;
+    memcpy(buf, fdpath, (size_t) n);
+    return n;
+  }
   case PROCFS_EXE:
     if (!proc.ident.exe)
       return -1;

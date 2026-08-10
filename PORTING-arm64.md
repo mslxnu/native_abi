@@ -2822,3 +2822,70 @@ instruction still executes correctly.
 
 Anyone who acquires an Intel Mac should run `make check` against the Phase 1 commit
 before trusting the x86 path as a specification.
+
+### 3.5.56 Linux namespaces — **UTS implemented, the rest refused honestly**
+
+`unshare`, `setns`, `sethostname`, `setdomainname` and `/proc/<pid>/ns/` did not
+exist; `unshare` and `setns` were ENOSYS, and `sethostname` was simply absent, so
+a guest could not rename itself at all.
+
+**macOS has no namespaces of any kind.** Nothing here can be delegated to the
+host — a namespace is emulated in NABI's own bookkeeping or it does not exist.
+That is the position credentials are already in (`struct cred`) and file
+ownership (`msl.nabi.owner`), and it has the same consequence: what can be
+emulated must be emulated *completely*, and what cannot must **say so** rather
+than pretend. They differ enormously in how far they can be taken:
+
+| | |
+|---|---|
+| **uts** | **Fully.** A hostname and a domainname per namespace, and NABI already answers `uname`. Implemented. |
+| **ipc** | Reachable. SysV semaphores and shared memory are NABI's own (`src/ipc/`), so their keys could be scoped. |
+| **time** | Reachable. An offset on `CLOCK_MONOTONIC`/`CLOCK_BOOTTIME`, both already translated. |
+| **user** | Reachable, and the largest of these: credentials are already software, so what is missing is `uid_map`/`gid_map` and a capability model. |
+| **pid** | Large. Guest pids *are* host pids — `getpid`, `kill`, `wait4`, signals, `/proc` and the fork checkpoint all use them directly. |
+| **mnt** | Little to isolate yet. There is no mount table, only a rootfs and passthrough prefixes; this waits on `mount(2)`. |
+| **cgroup** | Nothing to isolate. There are no cgroups. |
+| **net** | No. Sockets are the host's; isolating them means a virtual network stack, not a namespace. |
+
+So `unshare` and `setns` accept `CLONE_NEWUTS` and refuse the rest with
+**EINVAL** — exactly what Linux returns for a namespace its kernel was not built
+with, so every caller already handles it. `unshare -n` reports "unshare failed:
+Invalid argument" rather than appearing to work.
+
+Doing half of the pid namespace would be **worse than none**: a container init
+told it is pid 1 while signals and waits use another number is a bug that
+surfaces very far from where it was introduced.
+
+Every type still gets a `/proc/<pid>/ns/` entry, because Linux always has them
+and software reads them to *compare* namespaces far more often than to change
+them. The unsupported ones report the initial namespace, which is the truth —
+every guest is in it. The inodes start at Linux's own `4026531835`; the values
+are opaque, but they are compared, and numbers unlike every other Linux would be
+their own kind of lie.
+
+Two bugs, both from the same root — **arm64's fork is fork plus exec**:
+
+- **The namespace contents were a per-process copy.** `unshare -u sh -c
+  'hostname box; hostname'` printed the old name: `hostname` set it in one
+  rebuilt process and `hostname` read it in another. A namespace is *shared
+  state between processes*, which is the entire point of it, so the contents now
+  live in a file keyed by inode, and the processes hold only the identity.
+  The filename carries the boot session id too — a hostname should outlive the
+  process that set it but not the machine.
+- **`nsproxy_restore` clobbered the parent's namespace.** It built the restored
+  namespace with `ns_new`, which allocates a *fresh* identity from a counter
+  that starts at the same value in every rebuilt process — so a child restoring
+  its parent's namespace was handed the number the parent already had, and wrote
+  the initial hostname over the parent's file before relabelling itself. Every
+  fork silently reset the hostname. The restored namespace is now built by hand
+  and never stores.
+
+`test/arch/smoke/nstest.c` covers the refusals (including that a partly-refused
+combined `unshare` moves *nothing*), `setns` onto the current namespace, and the
+identity as well as the hostname surviving a fork. End to end under Debian:
+
+```
+fresh start:    redstar
+  inside:       inside-box
+outside after:  redstar
+```

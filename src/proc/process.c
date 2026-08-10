@@ -19,6 +19,7 @@
 #include "linux/common.h"
 #include "linux/misc.h"
 #include "linux/time.h"
+#include "namespace.h"
 #include "linux/errno.h"
 #include "linux/futex.h"
 
@@ -710,6 +711,54 @@ DEFINE_SYSCALL(capget, gaddr_t, header_ptr, gaddr_t, data_ptr)
   return 0;
 }
 
+/*
+ * The uts pair. Neither existed, so a guest could not name itself at all -
+ * `hostname foo` reported "Function not implemented" and every guest answered
+ * to whatever the Mac is called.
+ *
+ * They write to the namespace rather than to the host, which is the whole point
+ * of the exercise: two guests in different uts namespaces disagree about the
+ * hostname, and neither renames the Mac. Setting one requires being root, as it
+ * does on Linux, and root here is the guest's own - see struct cred.
+ */
+static int
+uts_set(gaddr_t ptr, size_t len, char *dst, size_t dstsz)
+{
+  if (len > dstsz - 1)
+    return -LINUX_EINVAL;
+  bool is_root;
+  pthread_rwlock_rdlock(&proc.cred.lock);
+  is_root = proc.cred.euid == 0;
+  pthread_rwlock_unlock(&proc.cred.lock);
+  if (!is_root)
+    return -LINUX_EPERM;
+
+  char buf[128];
+  if (len >= sizeof buf)
+    return -LINUX_EINVAL;
+  if (copy_from_user(buf, ptr, len))
+    return -LINUX_EFAULT;
+  buf[len] = '\0';
+
+  memcpy(dst, buf, len);
+  dst[len] = '\0';
+  current_uts_commit();         /* so every process in the namespace sees it */
+  return 0;
+}
+
+DEFINE_SYSCALL(sethostname, gaddr_t, name_ptr, size_t, len)
+{
+  struct uts_namespace *uts = current_uts();   /* reloads, so the domainname
+                                                * beside it is not stale */
+  return uts_set(name_ptr, len, uts->nodename, sizeof uts->nodename);
+}
+
+DEFINE_SYSCALL(setdomainname, gaddr_t, name_ptr, size_t, len)
+{
+  struct uts_namespace *uts = current_uts();
+  return uts_set(name_ptr, len, uts->domainname, sizeof uts->domainname);
+}
+
 struct utsname {
   char sysname[65];
   char nodename[65];
@@ -733,12 +782,19 @@ DEFINE_SYSCALL(uname, gaddr_t, buf_ptr)
 #else
   strncpy(buf.machine, "x86_64", sizeof buf.machine - 1);
 #endif
-  strncpy(buf.domainname, "GNU/Linux", sizeof buf.domainname - 1);
-
-  int err = syswrap(gethostname(buf.nodename, sizeof buf.nodename - 1));
-  if (err < 0) {
-    return err;
-  }
+  /*
+   * The name and domain come from the uts namespace, not from the host.
+   *
+   * Before there were namespaces here this asked the Mac directly, so every
+   * guest reported the Mac's name and sethostname did not exist to change it.
+   * The initial namespace is still seeded from the host, so a guest that never
+   * touches it sees exactly what it saw before.
+   */
+  struct uts_namespace *uts = current_uts();
+  strncpy(buf.nodename, uts->nodename, sizeof buf.nodename - 1);
+  buf.nodename[sizeof buf.nodename - 1] = '\0';
+  strncpy(buf.domainname, uts->domainname, sizeof buf.domainname - 1);
+  buf.domainname[sizeof buf.domainname - 1] = '\0';
 
   if (copy_to_user(buf_ptr, &buf, sizeof(struct utsname))) {
     return -LINUX_EFAULT;
