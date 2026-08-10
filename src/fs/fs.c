@@ -575,7 +575,7 @@ darwinfs_ioctl(struct file *file, int cmd, uint64_t val0)
     struct termios dios;
     struct linux_termios lios;
 
-    if ((r = syswrap(tcgetattr(fd, &dios))) < 0) {
+    if ((r = RETRY_ON_RESTARTABLE_EINTR(tcgetattr(fd, &dios))) < 0) {
       return r;
     }
     darwin_to_linux_termios(&dios, &lios);
@@ -584,6 +584,20 @@ darwinfs_ioctl(struct file *file, int cmd, uint64_t val0)
     }
     return r;
   }
+  /*
+   * The terminal calls retry an EINTR that was never the guest's.
+   *
+   * nabi's own machinery takes signals - a child it reaped, a timer - and a
+   * host EINTR raised by one of those describes an interruption the guest
+   * cannot see and did not ask about. read and write already hid it; these did
+   * not, so apt restoring the terminal after dpkg reported "Setting in Stop via
+   * TCSAFLUSH for stdin failed! - tcsetattr (4: Interrupted system call)" about
+   * a call that had simply been interrupted by nabi.
+   *
+   * sigrestart_wanted is what makes this safe rather than a blanket retry: an
+   * EINTR raised while the guest genuinely has a signal pending is still its
+   * own, and is still reported.
+   */
   case LINUX_TCSETS: {
     struct termios dios;
     struct linux_termios lios;
@@ -591,7 +605,7 @@ darwinfs_ioctl(struct file *file, int cmd, uint64_t val0)
       return -LINUX_EFAULT;
     }
     linux_to_darwin_termios(&lios, &dios);
-    return syswrap(tcsetattr(fd, TCSANOW, &dios));
+    return RETRY_ON_RESTARTABLE_EINTR(tcsetattr(fd, TCSANOW, &dios));
   }
   case LINUX_TCSETSW: {
     struct termios dios;
@@ -600,7 +614,7 @@ darwinfs_ioctl(struct file *file, int cmd, uint64_t val0)
       return -LINUX_EFAULT;
     }
     linux_to_darwin_termios(&lios, &dios);
-    return syswrap(tcsetattr(fd, TCSADRAIN, &dios));
+    return RETRY_ON_RESTARTABLE_EINTR(tcsetattr(fd, TCSADRAIN, &dios));
   }
   /* The third of the three, and it was missing - so tcsetattr(TCSAFLUSH) fell
    * through to the default arm and came back EPERM. apt uses it on stdin when
@@ -614,7 +628,7 @@ darwinfs_ioctl(struct file *file, int cmd, uint64_t val0)
       return -LINUX_EFAULT;
     }
     linux_to_darwin_termios(&lios, &dios);
-    return syswrap(tcsetattr(fd, TCSAFLUSH, &dios));
+    return RETRY_ON_RESTARTABLE_EINTR(tcsetattr(fd, TCSAFLUSH, &dios));
   }
   /*
    * The termios2 family. A guest running glibc 2.42 or newer sends these and
@@ -636,7 +650,7 @@ darwinfs_ioctl(struct file *file, int cmd, uint64_t val0)
     struct linux_termios2 lios2;
     struct linux_termios lios;
 
-    if ((r = syswrap(tcgetattr(fd, &dios))) < 0) {
+    if ((r = RETRY_ON_RESTARTABLE_EINTR(tcgetattr(fd, &dios))) < 0) {
       return r;
     }
     darwin_to_linux_termios(&dios, &lios);
@@ -668,11 +682,11 @@ darwinfs_ioctl(struct file *file, int cmd, uint64_t val0)
     int when = cmd == LINUX_TCSETS2  ? TCSANOW
              : cmd == LINUX_TCSETSW2 ? TCSADRAIN
              :                         TCSAFLUSH;
-    return syswrap(tcsetattr(fd, when, &dios));
+    return RETRY_ON_RESTARTABLE_EINTR(tcsetattr(fd, when, &dios));
   }
   case LINUX_TIOCGPGRP: {
     l_pid_t pgrp;
-    if ((r = syswrap(ioctl(fd, TIOCGPGRP, &pgrp))) < 0) {
+    if ((r = RETRY_ON_RESTARTABLE_EINTR(ioctl(fd, TIOCGPGRP, &pgrp))) < 0) {
       return r;
     }
     if (copy_to_user(val0, &pgrp, sizeof pgrp)) {
@@ -685,14 +699,14 @@ darwinfs_ioctl(struct file *file, int cmd, uint64_t val0)
     if (copy_from_user(&pgrp, val0, sizeof pgrp)) {
       return -LINUX_EFAULT;
     }
-    if ((r = syswrap(ioctl(fd, TIOCSPGRP, &pgrp))) < 0) {
+    if ((r = RETRY_ON_RESTARTABLE_EINTR(ioctl(fd, TIOCSPGRP, &pgrp))) < 0) {
       return r;
     }
     return 0;
   }
   case LINUX_TIOCGWINSZ: {
     struct winsize ws;
-    if ((r = syswrap(ioctl(fd, TIOCGWINSZ, &ws))) < 0) {
+    if ((r = RETRY_ON_RESTARTABLE_EINTR(ioctl(fd, TIOCGWINSZ, &ws))) < 0) {
       return r;
     }
     struct linux_winsize lws;
@@ -709,7 +723,7 @@ darwinfs_ioctl(struct file *file, int cmd, uint64_t val0)
       return -LINUX_EFAULT;
     }
     linux_to_darwin_winsize(&ws, &lws);
-    return syswrap(ioctl(fd, TIOCSWINSZ, &ws));
+    return RETRY_ON_RESTARTABLE_EINTR(ioctl(fd, TIOCSWINSZ, &ws));
   }
   case LINUX_TCXONC: {
     int sel;
@@ -765,10 +779,10 @@ darwinfs_ioctl(struct file *file, int cmd, uint64_t val0)
      * Darwin the slave is unusable until it has been granted. unlockpt is the
      * call that means "I am about to use this", so it is the one place both
      * halves can be done. */
-    if ((r = syswrap(ioctl(fd, TIOCPTYGRANT))) < 0) {
+    if ((r = RETRY_ON_RESTARTABLE_EINTR(ioctl(fd, TIOCPTYGRANT))) < 0) {
       return r;
     }
-    if ((r = syswrap(ioctl(fd, TIOCPTYUNLK))) < 0) {
+    if ((r = RETRY_ON_RESTARTABLE_EINTR(ioctl(fd, TIOCPTYUNLK))) < 0) {
       return r;
     }
     /*
@@ -803,7 +817,7 @@ darwinfs_ioctl(struct file *file, int cmd, uint64_t val0)
   case LINUX_TIOCGPTN: {
     char name[PATH_MAX];
     unsigned int n;
-    if ((r = syswrap(ioctl(fd, TIOCPTYGNAME, name))) < 0) {
+    if ((r = RETRY_ON_RESTARTABLE_EINTR(ioctl(fd, TIOCPTYGNAME, name))) < 0) {
       return r;
     }
     if (!devpts_number_of(name, &n)) {
@@ -817,12 +831,12 @@ darwinfs_ioctl(struct file *file, int cmd, uint64_t val0)
   }
   /* Both take no argument on either side; only the numbers differ. */
   case LINUX_TIOCSCTTY:
-    return syswrap(ioctl(fd, TIOCSCTTY));
+    return RETRY_ON_RESTARTABLE_EINTR(ioctl(fd, TIOCSCTTY));
   case LINUX_TIOCNOTTY:
-    return syswrap(ioctl(fd, TIOCNOTTY));
+    return RETRY_ON_RESTARTABLE_EINTR(ioctl(fd, TIOCNOTTY));
   case LINUX_FIONREAD: {
     int val;
-    int r = syswrap(ioctl(fd, FIONREAD, &val));
+    int r = RETRY_ON_RESTARTABLE_EINTR(ioctl(fd, FIONREAD, &val));
     if (r < 0) {
       return r;
     }
@@ -836,7 +850,7 @@ darwinfs_ioctl(struct file *file, int cmd, uint64_t val0)
     if (copy_from_user(&val, val0, sizeof val)) {
       return -LINUX_EFAULT;
     }
-    return syswrap(ioctl(fd, FIONBIO, &val));
+    return RETRY_ON_RESTARTABLE_EINTR(ioctl(fd, FIONBIO, &val));
   }
   case LINUX_FIOCLEX: {
     pthread_rwlock_wrlock(&proc.fileinfo.fdtable_lock);

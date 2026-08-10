@@ -3481,3 +3481,44 @@ flag lands inside the exit-signal byte `clone` carries — not a gap here. The
 smoke test's "a refused flag alongside a workable one moves nothing" check lost
 its last refusable flag with this change and now tests the same property through
 a failing call instead.
+
+### 3.5.66 Two things that were broken, one of them by me
+
+**`make check` had been failing since §3.5.55, and my own verification hid it.**
+`test/arch/test_checkpoint.c` links `checkpoint.c` standalone against a set of
+stubs, and the namespaces commit gave `checkpoint.c` two new callers —
+`nsproxy_snapshot` and `nsproxy_restore` — which nothing in that link provided.
+The cgroup commit added two more. It has been a link error ever since.
+
+I did not see it because I was checking these runs with
+`make check-decode check-arm64 | grep -cE '^PASS'` and reading the count, rather
+than the exit status. The decode test passed and printed `PASS`; the arm64
+target died at the link before printing anything; the count said `1` and I read
+that as success. **A test summary is not a substitute for an exit status**, and
+counting lines that only appear on success cannot distinguish "the other one
+failed" from "the other one never ran".
+
+The stubs are added, and they participate rather than merely satisfying the
+linker: the writer is handed distinctive namespace inodes, uts names and a
+cgroup path, and the reader's copies are checked against them. Stubs that only
+resolved the symbols would have kept the test building while saying nothing
+about the fields — which is the shape of the original problem, not a fix for it.
+
+**`tcsetattr` returned EINTR to the guest.** `apt-get install` ended with
+
+```
+Error: Setting in Stop via TCSAFLUSH for stdin failed! - tcsetattr (4: Interrupted system call)
+```
+
+which is APT restoring the terminal after dpkg. This is the same fault
+§3.5.x fixed for `read` and `write` and in the same place: NABI's own machinery
+takes signals — a child it reaped, a timer — and a host EINTR raised by one of
+those describes an interruption the guest cannot see and never asked about.
+`read` and `write` already hid it through `RETRY_ON_RESTARTABLE_EINTR`; the
+terminal ioctls did not, so they handed it straight to the caller.
+
+Every host call in `darwinfs_ioctl` retries now. What makes that safe rather
+than a blanket retry is `sigrestart_wanted`: an EINTR raised while the guest
+genuinely has a signal pending is still the guest's, and is still reported. The
+same install now runs to `Processing triggers for libc-bin` with no complaint
+from any of the ~250 processes involved.

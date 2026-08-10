@@ -27,6 +27,8 @@
 #include "vmm.h"
 #include "mm.h"
 #include "checkpoint.h"
+#include "namespace.h"
+#include "cgroup.h"
 
 static int failures, checks;
 #define CHECK(cond, ...)                                                       \
@@ -136,6 +138,44 @@ fdtable_snapshot(struct checkpoint_fd *out, size_t max,
   return FAKE_FDS;
 }
 
+/*
+ * The namespaces and the control group, which the header has carried since
+ * versions 4 and 6.
+ *
+ * Stubbed like the rest of the live machine, and made to *participate*: the
+ * writer is handed distinctive values and the reader's copy is checked against
+ * them below. Stubs that merely satisfied the linker would have kept this test
+ * building while saying nothing about the fields, which is how it came to be
+ * broken in the first place - checkpoint.c grew two callers and the link went
+ * with it, unnoticed because the failure was a build error in a target nobody
+ * was reading the exit status of.
+ */
+#define FAKE_NS_INO_BASE 4026531900ULL
+static char restored_cgroup[256];
+static uint64_t restored_ns[8];
+static struct uts_namespace restored_uts;
+
+void
+nsproxy_snapshot(uint64_t inos[8], struct uts_namespace *uts)
+{
+  for (int i = 0; i < 8; i++)
+    inos[i] = FAKE_NS_INO_BASE + (unsigned) i;
+  snprintf(uts->nodename, sizeof uts->nodename, "%s", "checkpoint-host");
+  snprintf(uts->domainname, sizeof uts->domainname, "%s", "checkpoint-dom");
+}
+
+void
+nsproxy_restore(const uint64_t inos[8], const struct uts_namespace *uts)
+{
+  for (int i = 0; i < 8; i++)
+    restored_ns[i] = inos[i];
+  restored_uts = *uts;
+}
+
+const char *cgroup_current(void) { return "/work/inner"; }
+void cgroup_set_current(const char *p)
+{ snprintf(restored_cgroup, sizeof restored_cgroup, "%s", p ? p : ""); }
+
 /* mm.c pieces the writer walks. */
 int mm_region_cmp(struct mm_region *a, struct mm_region *b)
 { return a->gaddr < b->gaddr ? -1 : a->gaddr > b->gaddr ? 1 : 0; }
@@ -219,6 +259,31 @@ main(void)
   CHECK(hdr.cmdline_len == sizeof ident_cmd - 1 && cmdline &&
         memcmp(cmdline, ident_cmd, sizeof ident_cmd - 1) == 0,
         "the command line did not survive");
+
+  /*
+   * The namespaces and the control group. Both are per-process state that a
+   * fork here has no other way to hand over - a child that did not inherit the
+   * uts identity would compare as being in a different namespace from its
+   * parent, and one that did not inherit the cgroup would fall back to the root
+   * the moment it forked.
+   */
+  for (int i = 0; i < 8; i++)
+    CHECK(hdr.ns_ino[i] == FAKE_NS_INO_BASE + (unsigned) i,
+          "namespace inode %d did not survive", i);
+  CHECK(strcmp(hdr.uts_nodename, "checkpoint-host") == 0 &&
+        strcmp(hdr.uts_domainname, "checkpoint-dom") == 0,
+        "the uts names did not survive");
+  CHECK(strcmp(hdr.cgroup, "/work/inner") == 0,
+        "the control group did not survive");
+
+  /* And the reader handed them on, rather than merely carrying them. */
+  CHECK(restored_ns[0] == FAKE_NS_INO_BASE &&
+        restored_ns[7] == FAKE_NS_INO_BASE + 7,
+        "the reader did not restore the namespaces");
+  CHECK(strcmp(restored_uts.nodename, "checkpoint-host") == 0,
+        "the reader did not restore the hostname");
+  CHECK(strcmp(restored_cgroup, "/work/inner") == 0,
+        "the reader did not restore the control group");
 
   /* The vCPU: the registers a guest resumes on. */
   CHECK(hdr.vcpu.x[0] == 0x1000 && hdr.vcpu.x[30] == 0x1000 + 30,
