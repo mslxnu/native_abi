@@ -164,21 +164,40 @@ guest-code cache sync.
   handed out. A setter that quietly succeeded while the getter said otherwise
   would be worse than either answer alone.
 
-- `nstest` — namespaces. All ten links Linux has under `/proc/<pid>/ns` exist;
-  a type that cannot be isolated here is refused with EINVAL rather than
-  accepted and ignored, and a refused flag alongside a workable one moves
-  nothing; `unshare(CLONE_NEWUTS)` changes the identity and the hostname set
-  inside it survives a fork, which on arm64 means surviving a rebuild from a
-  checkpoint. The time namespace is checked for what makes it unlike the
-  others: `unshare(CLONE_NEWTIME)` must *not* move the caller, only
-  `time_for_children`; `clone(CLONE_NEWTIME)` is EINVAL; and a child of a
-  namespace with offsets written through `/proc/self/timens_offsets` sees
-  `CLOCK_MONOTONIC` and `CLOCK_BOOTTIME` shifted by exactly them while
-  `CLOCK_REALTIME` is untouched. The user namespace covers the map being the
-  only thing that gives an id meaning: before one is written every id reads as
-  nobody, after `100 <self> 1` the process is 100 and a file it owns reads as
-  100 while one owned by an unmapped id still reads as nobody, chowning to an
-  unmapped id is EINVAL, and a second write to `uid_map` is EPERM.
+- `nstest` — namespaces, all eight of them. All ten links Linux has under
+  `/proc/<pid>/ns` exist, and a call that fails leaves every namespace where it
+  was. Per namespace:
+
+  - **uts** — `unshare` changes the identity, and a hostname set inside it
+    survives a fork, which on arm64 means surviving a rebuild from a checkpoint.
+  - **mnt** — a bind mount reads through to its source; a read-only remount
+    refuses `openat` for write and `mkdir` with EROFS while still reading;
+    `MS_MOVE` carries a mount to a new path and uncovers the old one, refusing a
+    source that is not a mount point and a destination inside the mount's own
+    subtree; `umount2` empties the target, and unmounting a non-mount is EINVAL.
+  - **ipc** — covered by `ipctest` below.
+  - **pid** — `unshare(CLONE_NEWPID)` must *not* renumber the caller, only
+    `pid_for_children`; the first child is pid 1 with a reported parent of 0,
+    its parent being outside; `wait4` returns the number `clone` did; a pid
+    outside the namespace cannot be signalled.
+  - **net** — a socket can still be made but has nowhere to go: `connect` is
+    ENETUNREACH and `bind` EADDRNOTAVAIL, while `socketpair(AF_UNIX)` goes on
+    working, pathname sockets being the mount namespace's business.
+  - **user** — the map is the only thing that gives an id meaning. Before one is
+    written every id reads as nobody; after `100 <self> 1` the process is 100
+    and a file it owns reads as 100 while one owned by an unmapped id still
+    reads as nobody; chowning to an unmapped id is EINVAL; a second write to
+    `uid_map` is EPERM.
+  - **cgroup** — a hierarchy mounted with `cgroup2` reports empty
+    `cgroup.controllers`, because nothing here may claim to control anything;
+    writing a pid to `cgroup.procs` moves the process and `/proc/self/cgroup`
+    says so; `unshare(CLONE_NEWCGROUP)` rebases that path to `/` while the
+    process has not moved.
+  - **time** — the one that is unlike the others: `unshare(CLONE_NEWTIME)` must
+    not move the caller, only `time_for_children`; `clone(CLONE_NEWTIME)` is
+    EINVAL; and a child of a namespace with offsets written through
+    `/proc/self/timens_offsets` sees `CLOCK_MONOTONIC` and `CLOCK_BOOTTIME`
+    shifted by exactly them while `CLOCK_REALTIME` is untouched.
 
 - `ipctest` — System V IPC: a segment created, attached, shared across a fork,
   detached and removed; keys resolving to ids; semaphore values through

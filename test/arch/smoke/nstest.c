@@ -57,6 +57,7 @@ static long sys6(long n,long a,long b,long c,long d,long e,long f){
 #define MS_RDONLY 1
 #define MS_REMOUNT 0x20
 #define MS_BIND 0x1000
+#define MS_MOVE 0x2000
 #define EROFS 30
 #define ENOENT 2
 #define SIGCHLD 17
@@ -362,6 +363,39 @@ void _start(void)
     if (n != 6 || !eq(buf, "bound\n"))
       fails("what came back through the bind", buf);
   }
+
+  /*
+   * Moving it, which in a table of prefix rewrites is changing the prefix an
+   * entry answers to. The host object it resolved to when it was mounted is not
+   * consulted again, so a move cannot fail the way a fresh mount might - and
+   * the old mount point is uncovered by it, which is the half a caller checks.
+   */
+  sys6(SYS_mkdirat, AT_FDCWD, (long) "/mnt-moved", 0755, 0,0,0);
+  if ((r = sys6(SYS_mount, (long) "/mnt-dst", (long) "/mnt-moved", 0,
+                MS_MOVE, 0, 0)) != 0)
+    fail("mount(MS_MOVE)", r, 0);
+  {
+    long f = sys6(SYS_openat, AT_FDCWD, (long) "/mnt-moved/f", O_RDONLY, 0,0,0);
+    if (f < 0)
+      fail("reading through a moved mount", f, 0);
+    sys6(SYS_close, f, 0,0,0,0,0);
+  }
+  if ((r = sys6(SYS_openat, AT_FDCWD, (long) "/mnt-dst/f", O_RDONLY, 0,0,0)) != -ENOENT)
+    fail("the mount point a move left behind", r, -ENOENT);
+
+  /* Somewhere that is not a mount point cannot be moved. */
+  if ((r = sys6(SYS_mount, (long) "/mnt-src", (long) "/mnt-moved", 0,
+                MS_MOVE, 0, 0)) != -EINVAL)
+    fail("moving something that is not a mount point", r, -EINVAL);
+  /* Nor into its own subtree, which would put the mount inside itself. */
+  if ((r = sys6(SYS_mount, (long) "/mnt-moved", (long) "/mnt-moved/under", 0,
+                MS_MOVE, 0, 0)) != -EINVAL)
+    fail("moving a mount into its own subtree", r, -EINVAL);
+
+  /* And back, so the checks below still have it where they expect. */
+  if ((r = sys6(SYS_mount, (long) "/mnt-moved", (long) "/mnt-dst", 0,
+                MS_MOVE, 0, 0)) != 0)
+    fail("moving it back", r, 0);
 
   /*
    * Read-only, and honoured rather than recorded. A mount that took the flag

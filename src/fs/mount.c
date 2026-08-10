@@ -27,10 +27,10 @@
 /* Flags nabi can honour or can safely record. Anything else is refused. */
 #define MS_KNOWN                                                              \
   (LINUX_MS_RDONLY | LINUX_MS_NOSUID | LINUX_MS_NODEV | LINUX_MS_NOEXEC |     \
-   LINUX_MS_REMOUNT | LINUX_MS_BIND | LINUX_MS_REC | LINUX_MS_SILENT |        \
-   LINUX_MS_NOATIME | LINUX_MS_NODIRATIME | LINUX_MS_RELATIME |               \
-   LINUX_MS_STRICTATIME | LINUX_MS_PRIVATE | LINUX_MS_SHARED |                \
-   LINUX_MS_SLAVE | LINUX_MS_UNBINDABLE)
+   LINUX_MS_REMOUNT | LINUX_MS_BIND | LINUX_MS_MOVE | LINUX_MS_REC |          \
+   LINUX_MS_SILENT | LINUX_MS_NOATIME | LINUX_MS_NODIRATIME |                 \
+   LINUX_MS_RELATIME | LINUX_MS_STRICTATIME | LINUX_MS_PRIVATE |              \
+   LINUX_MS_SHARED | LINUX_MS_SLAVE | LINUX_MS_UNBINDABLE)
 
 static void
 table_path(uint64_t ino, char *out, size_t n)
@@ -297,6 +297,51 @@ DEFINE_SYSCALL(mount, gstr_t, source_ptr, gstr_t, target_ptr, gstr_t, type_ptr,
     if (at < 0)
       return -LINUX_EINVAL;
     t.m[at].flags = (uint32_t) (flags & ~(unsigned long) LINUX_MS_REMOUNT);
+    table_store(ns_ino_of(NS_MNT), &t);
+    return 0;
+  }
+
+  /*
+   * MS_MOVE: the mount at `source` appears at `target` instead.
+   *
+   * In a table of prefix rewrites this is what it sounds like - the entry keeps
+   * everything about itself and changes where it is seen from. Nothing is
+   * unmounted and nothing is mounted, which matters: a moved bind keeps the
+   * host object it resolved at mount time, so moving it cannot fail the way
+   * mounting it again might.
+   *
+   * Everything at or below the source moves with it. A flat table would
+   * otherwise leave a mount on /a/b pointing at a path that has just been
+   * uncovered, while Linux carries it to /c/b - the subtree moves as a subtree,
+   * which is the only reading under which the mounts inside one survive.
+   */
+  if (flags & LINUX_MS_MOVE) {
+    if (source[0] != '/')
+      return -LINUX_EINVAL;
+
+    int from = -1;
+    for (uint32_t i = 0; i < t.n; i++)
+      if (strcmp(t.m[i].target, source) == 0)
+        from = (int) i;
+    if (from < 0)
+      return -LINUX_EINVAL;     /* not a mount point, as Linux says */
+
+    /*
+     * Into its own subtree, or onto itself, is refused. A mount that contained
+     * the place it was mounted at could not be resolved at all - the longest
+     * match would be the mount, whose own path now runs through it.
+     */
+    if (under(target, source))
+      return -LINUX_EINVAL;
+
+    size_t slen = strlen(source);
+    for (uint32_t i = 0; i < t.n; i++) {
+      if (!under(t.m[i].target, source))
+        continue;
+      char moved[MOUNT_PATH_MAX];
+      snprintf(moved, sizeof moved, "%s%s", target, t.m[i].target + slen);
+      snprintf(t.m[i].target, sizeof t.m[i].target, "%s", moved);
+    }
     table_store(ns_ino_of(NS_MNT), &t);
     return 0;
   }

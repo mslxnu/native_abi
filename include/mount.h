@@ -27,9 +27,14 @@
  *           container that mounts /proc and then cannot see it in the list
  *           concludes the mount failed.
  *
- * Everything else - a real filesystem, overlay, MS_MOVE - is EINVAL or ENODEV
- * rather than a success that did nothing. There is no block device layer here
- * to mount anything on.
+ * Everything else - a real filesystem, overlay - is EINVAL or ENODEV rather
+ * than a success that did nothing. There is no block device layer here to mount
+ * anything on.
+ *
+ * MS_MOVE works and costs almost nothing: a mount here is a prefix rewrite, so
+ * moving one is changing the prefix it answers to. The host object it resolved
+ * to when it was mounted is not consulted again, which is why a move cannot
+ * fail the way a fresh mount might.
  *
  * MS_RDONLY is honoured rather than recorded, because a read-only bind that
  * silently accepted writes would be worse than one that refused to exist: the

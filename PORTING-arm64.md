@@ -3522,3 +3522,37 @@ than a blanket retry is `sigrestart_wanted`: an EINTR raised while the guest
 genuinely has a signal pending is still the guest's, and is still reported. The
 same install now runs to `Processing triggers for libc-bin` with no complaint
 from any of the ~250 processes involved.
+
+### 3.5.67 `MS_MOVE` — **implemented**
+
+§3.5.62 listed `MS_MOVE` with the refusals, alongside overlay and real
+filesystems. It does not belong there: those need something NABI has not got,
+and this needs nothing at all.
+
+A mount here is a prefix rewrite consulted during path resolution, so **moving
+one is changing the prefix it answers to**. The host object it resolved to when
+it was mounted is not consulted again — which is why a move cannot fail the way
+a fresh mount might, and why nothing is unmounted or mounted in the course of
+one.
+
+**The subtree moves as a subtree.** Everything at or below the source is
+rebased, not just the entry named. A flat table would otherwise leave a mount on
+`/a/b` pointing at a path that had just been uncovered, while Linux carries it
+to `/c/b`; carrying the children is the only reading under which the mounts
+inside a moved one survive.
+
+Refused, as Linux refuses them: a source that is not a mount point, and a
+destination inside the mount's own subtree — the latter because a mount
+containing its own mount point cannot be resolved at all, the longest match
+being the mount whose path now runs through itself.
+
+```
+bound at /a: hello
+a nested mount at /a/sub: deep
+--- moving /a to /c ---
+  /c/file:      hello
+  /c/sub/inner: deep          <- the nested mount came too
+  /a/file:      No such file or directory
+    /src     /c     none rw 0 0
+    /src/sub /c/sub none rw 0 0
+```
