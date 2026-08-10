@@ -25,6 +25,7 @@ static long sys6(long n,long a,long b,long c,long d,long e,long f){
 #define SYS_exit    93
 #define SYS_readlinkat 78
 #define SYS_unshare 97
+#define SYS_clock_gettime 113
 #define SYS_msgget  186
 #define SYS_msgctl  187
 #define SYS_msgrcv  188
@@ -32,6 +33,7 @@ static long sys6(long n,long a,long b,long c,long d,long e,long f){
 #define SYS_semget  190
 #define SYS_semctl  191
 #define SYS_semop   193
+#define SYS_semtimedop 192
 #define SYS_shmget  194
 #define SYS_shmctl  195
 #define SYS_shmat   196
@@ -61,6 +63,7 @@ static long sys6(long n,long a,long b,long c,long d,long e,long f){
 #define EEXIST 17
 #define E2BIG  7
 #define ENOMSG 42
+#define EAGAIN 11
 
 #define SEGSZ 4096
 
@@ -70,6 +73,7 @@ struct shmid_ds { struct ipc64_perm perm; unsigned long segsz;
                   long atime, dtime, ctime; int cpid, lpid;
                   unsigned long nattch, u4, u5; };
 struct sembuf { unsigned short num; short op; short flg; };
+struct tspec { long tv_sec, tv_nsec; };
 struct msqid_ds { struct ipc64_perm perm; long stime, rtime, ctime;
                   unsigned long cbytes, qnum, qbytes; int lspid, lrpid;
                   unsigned long u4, u5; };
@@ -187,6 +191,56 @@ void _start(void)
   struct sembuf op = { 0, -2, 0 };
   want("semop(-2)", sys6(SYS_semop, sid, (long) &op, 1, 0,0,0), 0);
   want("the value after semop", sys6(SYS_semctl, sid, 0, GETVAL, 0, 0,0), 1);
+
+  /*
+   * semtimedop. Darwin has no timed semaphore wait of any kind, so a deadline
+   * is honoured by retrying with IPC_NOWAIT - and the two things worth checking
+   * are that the deadline is actually respected rather than returned
+   * immediately, and that retrying has not cost the call its atomicity.
+   */
+  struct tspec t0, t1, ms100 = { 0, 100000000 };
+  struct sembuf top = { 0, -1, 0 };
+
+  /* The value is 1 from the semop above, so this one can proceed at once. */
+  want("semtimedop that need not wait",
+       sys6(SYS_semtimedop, sid, (long) &top, 1, (long) &ms100, 0,0), 0);
+  want("the value after it", sys6(SYS_semctl, sid, 0, GETVAL, 0, 0,0), 0);
+
+  /* Now it cannot, so it must wait the whole timeout and then say EAGAIN. */
+  sys6(SYS_clock_gettime, 1 /*CLOCK_MONOTONIC*/, (long) &t0, 0,0,0,0);
+  want("semtimedop that must time out",
+       sys6(SYS_semtimedop, sid, (long) &top, 1, (long) &ms100, 0,0), -EAGAIN);
+  sys6(SYS_clock_gettime, 1, (long) &t1, 0,0,0,0);
+  {
+    long ms = (t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000;
+    if (ms < 90)
+      fail("semtimedop returned before its timeout; ms elapsed", ms, 100);
+    if (ms > 3000)
+      fail("semtimedop waited far past its timeout; ms elapsed", ms, 100);
+  }
+
+  /*
+   * Atomicity, which is what polling with IPC_NOWAIT could have quietly cost.
+   * The first operation could proceed on its own and the second could not, so
+   * neither may be applied - a set that half took would leave the array in a
+   * state no caller asked for and nothing would report it.
+   */
+  vals[0] = 5; vals[1] = 0;
+  want("semctl(SETALL) before the atomicity check",
+       sys6(SYS_semctl, sid, 0, SETALL, (long) vals, 0,0), 0);
+  struct sembuf pair[2] = { { 0, -1, 0 }, { 1, -1, 0 } };
+  want("semtimedop over a set that cannot all proceed",
+       sys6(SYS_semtimedop, sid, (long) pair, 2, (long) &ms100, 0,0), -EAGAIN);
+  vals[0] = vals[1] = 99;
+  want("semctl(GETALL) after it", sys6(SYS_semctl, sid, 0, GETALL, (long) vals, 0,0), 0);
+  want("the first value, which must not have been taken", vals[0], 5);
+  want("the second value", vals[1], 0);
+
+  /* A null timeout is semop, and still waits properly rather than polling. */
+  vals[0] = 1; vals[1] = 0;
+  sys6(SYS_semctl, sid, 0, SETALL, (long) vals, 0,0);
+  want("semtimedop with a null timeout",
+       sys6(SYS_semtimedop, sid, (long) &top, 1, 0, 0,0), 0);
 
   /*
    * Message queues. The ordering rules are the whole of the interface: a type

@@ -103,7 +103,49 @@ DEFINE_SYSCALL(semget, l_key_t, key, int, nsems, int, semflg)
   return hid < 0 ? hid : id;
 }
 
-DEFINE_SYSCALL(semop, int, semid, gaddr_t, tsops_ptr, unsigned, nsops)
+/*
+ * Whether a semaphore array has gone while somebody was working on it.
+ *
+ * Darwin says EINVAL for an id that is no longer an id, which is also what it
+ * says for one that never was; Linux distinguishes them, and a caller blocked
+ * in semop when the array is removed is owed EIDRM. Ours is removed when the
+ * meta file says so, and that is a question this side can answer.
+ */
+static bool
+sem_gone(int semid)
+{
+  struct sysv_obj o;
+  if (sysv_open(SYSV_SEM, semid, &o) < 0)
+    return true;
+  bool gone = o.m->removed;
+  sysv_close(&o);
+  return gone;
+}
+
+/*
+ * semop and semtimedop are the same call, and the timeout is the whole of the
+ * difference.
+ *
+ * Without one the operations go to Darwin's semop and block there, which is a
+ * real wait: its wait queue, its wakeup, its ordering, and the SEM_UNDO it owes
+ * a process that dies holding an adjustment.
+ *
+ * With one there is nothing to hand the deadline to - Darwin has no
+ * semtimedop, and no timed variant of semop at all - so the operations are
+ * retried with IPC_NOWAIT until they take or the deadline passes. Atomicity
+ * survives that, which is the part that would have mattered: a semop with
+ * IPC_NOWAIT either applies the whole set or applies none of it and says
+ * EAGAIN, so polling it can never leave a caller half applied.
+ *
+ * What does not survive is the queue. A waiter that polls takes its turn
+ * whenever it happens to look rather than in the order it arrived, so under
+ * contention it can be passed over by a later arrival. Linux does not promise
+ * fairness here either, but it is a difference, and it is confined to the timed
+ * form - the ordinary blocking semop is untouched and still waits properly.
+ */
+static int
+sem_do(int semid, gaddr_t tsops_ptr, unsigned nsops,
+       const struct timespec *deadline)
 {
   if (nsops == 0 || nsops > 1024)
     return -LINUX_EINVAL;
@@ -136,8 +178,49 @@ DEFINE_SYSCALL(semop, int, semid, gaddr_t, tsops_ptr, unsigned, nsops)
       tsops[i].sem_flg |= IPC_NOWAIT;
     if (l_tsops[i].sem_flg & LINUX_SEM_UNDO)
       tsops[i].sem_flg |= SEM_UNDO;
+    if (deadline)
+      tsops[i].sem_flg |= IPC_NOWAIT;   /* the waiting is done up here instead */
   }
-  r = syswrap(semop(hid, tsops, nsops));
+
+  if (!deadline) {
+    r = syswrap(semop(hid, tsops, nsops));
+    if (r == -LINUX_EINVAL && sem_gone(semid))
+      r = -LINUX_EIDRM;
+    goto done;
+  }
+
+  unsigned usec = 250;
+  for (;;) {
+    r = syswrap(semop(hid, tsops, nsops));
+    if (r != -LINUX_EAGAIN) {
+      if (r == -LINUX_EINVAL && sem_gone(semid))
+        r = -LINUX_EIDRM;
+      break;
+    }
+    if (sem_gone(semid)) {
+      r = -LINUX_EIDRM;
+      break;
+    }
+    if (has_sigpending()) {
+      r = -LINUX_EINTR;
+      break;
+    }
+
+    struct timespec nowts;
+    clock_gettime(CLOCK_MONOTONIC, &nowts);
+    if (nowts.tv_sec > deadline->tv_sec ||
+        (nowts.tv_sec == deadline->tv_sec && nowts.tv_nsec >= deadline->tv_nsec)) {
+      r = -LINUX_EAGAIN;                /* the timeout expired, as Linux says */
+      break;
+    }
+
+    struct timespec nap = { 0, (long) usec * 1000 };
+    nanosleep(&nap, NULL);
+    if (usec < 2000)
+      usec *= 2;
+  }
+
+ done:
   if (r == 0)
     o.m->otime = (int64_t) time(NULL);
  out:
@@ -145,6 +228,37 @@ DEFINE_SYSCALL(semop, int, semid, gaddr_t, tsops_ptr, unsigned, nsops)
   free(tsops);
   sysv_close(&o);
   return r;
+}
+
+DEFINE_SYSCALL(semop, int, semid, gaddr_t, tsops_ptr, unsigned, nsops)
+{
+  return sem_do(semid, tsops_ptr, nsops, NULL);
+}
+
+DEFINE_SYSCALL(semtimedop, int, semid, gaddr_t, tsops_ptr, unsigned, nsops,
+               gaddr_t, timeout_ptr)
+{
+  /* A null timeout is exactly semop, and takes the path that really waits. */
+  if (timeout_ptr == 0)
+    return sem_do(semid, tsops_ptr, nsops, NULL);
+
+  struct l_timespec l_ts;
+  if (copy_from_user(&l_ts, timeout_ptr, sizeof l_ts))
+    return -LINUX_EFAULT;
+  if (l_ts.tv_sec < 0 || l_ts.tv_nsec < 0 || l_ts.tv_nsec >= 1000000000)
+    return -LINUX_EINVAL;
+
+  /* Relative, and against the monotonic clock, so that the wait is not
+   * lengthened or cut short by the wall clock being set. */
+  struct timespec deadline;
+  clock_gettime(CLOCK_MONOTONIC, &deadline);
+  deadline.tv_sec += l_ts.tv_sec;
+  deadline.tv_nsec += l_ts.tv_nsec;
+  if (deadline.tv_nsec >= 1000000000) {
+    deadline.tv_nsec -= 1000000000;
+    deadline.tv_sec++;
+  }
+  return sem_do(semid, tsops_ptr, nsops, &deadline);
 }
 
 static void

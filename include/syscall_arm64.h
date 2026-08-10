@@ -198,7 +198,7 @@
   SYSCALL(189, msgsnd) \
   SYSCALL(190, semget) \
   SYSCALL(191, semctl) \
-  SYSCALL(192, unimplemented) \
+  SYSCALL(192, semtimedop) \
   SYSCALL(193, semop) \
   SYSCALL(194, shmget) \
   SYSCALL(195, shmctl) \

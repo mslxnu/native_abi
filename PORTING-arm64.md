@@ -3048,5 +3048,46 @@ key        msqid  owner  perms  used-bytes  messages
 0xf12e3aea 1      root   644    0           0
 ```
 
-With this the System V family is complete apart from `semtimedop`, which wants a
-timed wait Darwin's `semop` has no equivalent of.
+That leaves `semtimedop` as the last of the family; §3.5.59 has it.
+
+### 3.5.59 `semtimedop` — **implemented**
+
+The last of the System V family. arm64 192 and x86-64 220 were both
+`unimplemented`, so glibc's `sem_timedwait` over a SysV array, and every
+"acquire this or give up after N milliseconds" loop, got ENOSYS.
+
+**Darwin has no timed semaphore wait of any kind** - no `semtimedop`, and no
+timed variant of `semop` - so there is nothing to hand a deadline to. The
+operations are retried with `IPC_NOWAIT` until they take or the deadline passes.
+
+**Atomicity survives that, and it is the part that would have mattered.** A
+`semop` carrying `IPC_NOWAIT` either applies the whole set or applies none of it
+and returns EAGAIN, so polling it can never leave a caller half applied - which
+would be the worst possible outcome here, because the array would be left in a
+state nobody asked for and nothing would report it. The test checks exactly
+that: a two-operation set whose first could proceed alone and whose second could
+not must leave *both* values untouched.
+
+**What does not survive is the wait queue.** A waiter that polls takes its turn
+whenever it next looks rather than in the order it arrived, so under contention
+a later arrival can go first. This is confined to the timed form: a plain
+`semop` with no timeout still goes straight to Darwin's `semop` and blocks
+there, keeping its queue, its ordering and the `SEM_UNDO` owed to a process that
+dies mid-adjustment. Splitting it this way keeps the approximation off the path
+almost everything actually uses.
+
+A null timeout is `semop` exactly, and takes the real-wait path rather than the
+polling one.
+
+The deadline is measured against **CLOCK_MONOTONIC**, so setting the wall clock
+cannot lengthen or cut short a wait.
+
+While here, `semop` learned to distinguish **EIDRM** from EINVAL. Darwin returns
+EINVAL both for an id that never existed and for one whose array has been
+removed; Linux owes EIDRM to a caller whose semaphore is removed underneath it,
+and the meta file records removal, so that is now a question this side can
+answer.
+
+The test covers a `semtimedop` that need not wait, one that must wait its whole
+timeout and then return EAGAIN (checked against the clock, so a version that
+returned immediately would fail), the atomicity case above, and a null timeout.

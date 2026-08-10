@@ -223,7 +223,7 @@
   SYSCALL(217, getdents64)                      \
   SYSCALL(218, set_tid_address)                 \
   SYSCALL(219, unimplemented)                   \
-  SYSCALL(220, unimplemented)                   \
+  SYSCALL(220, semtimedop)                      \
   SYSCALL(221, fadvise64)                       \
   SYSCALL(222, unimplemented)                   \
   SYSCALL(223, unimplemented)                   \
