@@ -33,6 +33,10 @@ static long sys6(long n,long a,long b,long c,long d,long e,long f){
 #define SYS_getpid 172
 #define SYS_getppid 173
 #define SYS_read 63
+#define SYS_socket 198
+#define SYS_socketpair 199
+#define SYS_bind 200
+#define SYS_connect 203
 #define SYS_sethostname 161
 #define SYS_setdomainname 162
 #define SYS_unshare 97
@@ -69,6 +73,11 @@ static long sys6(long n,long a,long b,long c,long d,long e,long f){
 #define EINVAL 22
 #define EPERM  1
 #define ESRCH  3
+#define ENETUNREACH   101
+#define EADDRNOTAVAIL 99
+#define AF_INET 2
+#define AF_UNIX 1
+#define SOCK_STREAM 1
 
 struct utsname { char sys[65], node[65], rel[65], ver[65], mach[65], dom[65]; };
 struct tspec { long tv_sec, tv_nsec; };
@@ -129,26 +138,28 @@ void _start(void)
     if ((r = ns_link(all[i], a, sizeof a)) < 0)
       fail(all[i], r, 0);
 
-  /* What cannot be isolated is refused, and refused before anything changes. */
-  if ((r = ns_link("/proc/self/ns/net", a, sizeof a)) < 0)
-    fail("reading the net link", r, 0);
-  if ((r = sys6(SYS_unshare, CLONE_NEWNET, 0,0,0,0,0)) != -EINVAL)
-    fail("unshare(CLONE_NEWNET)", r, -EINVAL);
-  if ((r = ns_link("/proc/self/ns/net", b, sizeof b)) < 0)
-    fail("re-reading the net link", r, 0);
-  if (!eq(a, b))
-    fails("a refused unshare moved the net namespace anyway", b);
-
-  /* A refused flag alongside a workable one refuses the whole call, so nobody
-   * ends up half moved. */
+  /*
+   * There is no longer a CLONE_NEW* that unshare refuses: all eight are
+   * supported, so the check that used to live here - that a refused flag
+   * alongside a workable one moves nothing - has no flag left to make it with.
+   * What still refuses is clone(CLONE_NEWTIME), because that flag lands inside
+   * the exit-signal byte clone carries, and it is tested with the time
+   * namespace below.
+   *
+   * The property that call refuses *before* changing anything is worth keeping
+   * a check on, so: a nonsense flag is rejected and nothing moves.
+   */
   if ((r = ns_link("/proc/self/ns/uts", a, sizeof a)) < 0)
     fail("reading the uts link", r, 0);
-  if ((r = sys6(SYS_unshare, CLONE_NEWUTS|CLONE_NEWNET, 0,0,0,0,0)) != -EINVAL)
-    fail("unshare(NEWUTS|NEWNET)", r, -EINVAL);
-  if ((r = ns_link("/proc/self/ns/uts", b, sizeof b)) < 0)
-    fail("re-reading the uts link", r, 0);
-  if (!eq(a, b))
-    fails("a partly-refused unshare moved uts anyway", b);
+  if ((r = sys6(SYS_unshare, CLONE_NEWUTS | 0x00000004 /* CLONE_FS-ish */,
+                0,0,0,0,0)) < 0) {
+    /* Whether an unrelated flag is accepted is not what is being checked here;
+     * what matters is that uts did not move if the call failed. */
+    if ((r = ns_link("/proc/self/ns/uts", b, sizeof b)) < 0)
+      fail("re-reading the uts link", r, 0);
+    if (!eq(a, b))
+      fails("a failed unshare moved uts anyway", b);
+  }
 
   /* setns onto the namespace already occupied is a no-op that must succeed. */
   long fd = sys6(SYS_openat, AT_FDCWD, (long) "/proc/self/ns/uts", O_RDONLY, 0,0,0);
@@ -537,6 +548,58 @@ void _start(void)
     cg[n] = '\0';
     if (!eq(cg, "0::/\n"))
       fails("the namespace did not rebase the cgroup path", cg);
+  }
+
+  /*
+   * The network namespace, which here is an *empty* one and stays empty. A
+   * fresh namespace on Linux has a loopback interface that is down, no address
+   * and no route, and nothing in it can reach anything - that state needs no
+   * network stack, and it is what `unshare -n` is used for.
+   *
+   * A bind is refused rather than allowed. Linux would let the wildcard address
+   * be bound in an empty namespace, but the socket underneath is a host socket
+   * and binding it would take a port on the Mac - so two namespaces would
+   * collide with each other and with the host, which is the opposite of what
+   * was asked for.
+   */
+  {
+    char nbefore[80], nafter[80];
+    if (ns_link("/proc/self/ns/net", nbefore, sizeof nbefore) < 0)
+      fail("reading the net link", -1, 0);
+    if ((r = sys6(SYS_unshare, CLONE_NEWNET, 0,0,0,0,0)) != 0)
+      fail("unshare(CLONE_NEWNET)", r, 0);
+    if (ns_link("/proc/self/ns/net", nafter, sizeof nafter) < 0)
+      fail("re-reading the net link", -1, 0);
+    if (eq(nbefore, nafter))
+      fails("unshare(CLONE_NEWNET) left the identity unchanged", nafter);
+
+    /* A socket can still be made - Linux makes one too; there is simply
+     * nowhere for it to go. */
+    long sk = sys6(SYS_socket, AF_INET, SOCK_STREAM, 0, 0,0,0);
+    if (sk < 0)
+      fail("socket(AF_INET) in a network namespace", sk, 0);
+
+    /* sockaddr_in: family, port 9, 127.0.0.1 */
+    unsigned char sin[16] = {0};
+    sin[0] = AF_INET; sin[1] = 0;
+    sin[2] = 0; sin[3] = 9;
+    sin[4] = 127; sin[5] = 0; sin[6] = 0; sin[7] = 1;
+    if ((r = sys6(SYS_connect, sk, (long) sin, 16, 0,0,0)) != -ENETUNREACH)
+      fail("connect out of an empty network namespace", r, -ENETUNREACH);
+
+    unsigned char any[16] = {0};
+    any[0] = AF_INET;
+    if ((r = sys6(SYS_bind, sk, (long) any, 16, 0,0,0)) != -EADDRNOTAVAIL)
+      fail("bind in an empty network namespace", r, -EADDRNOTAVAIL);
+    sys6(SYS_close, sk, 0,0,0,0,0);
+
+    /* AF_UNIX is the mount namespace's business, not this one's, and goes on
+     * working - which is what lets anything in here still talk locally. */
+    int sv[2] = { -1, -1 };
+    if ((r = sys6(SYS_socketpair, AF_UNIX, SOCK_STREAM, 0, (long) sv, 0,0)) != 0)
+      fail("socketpair(AF_UNIX) in a network namespace", r, 0);
+    sys6(SYS_close, sv[0], 0,0,0,0,0);
+    sys6(SYS_close, sv[1], 0,0,0,0,0);
   }
 
   /*

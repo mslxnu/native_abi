@@ -1,4 +1,5 @@
 #include "noah.h"
+#include "namespace.h"
 #include "common.h"
 
 #include <sys/socket.h>
@@ -16,6 +17,56 @@
 #include "linux/common.h"
 #include "linux/socket.h"
 #include "linux/misc.h"
+
+/*
+ * A network namespace here is an *empty* one, and that is the whole of it.
+ *
+ * The earlier notes in this series refused this namespace, and the reasoning
+ * held for what it addressed: making sockets *work* inside a namespace of their
+ * own would mean a virtual network stack - addresses, routes, an interface,
+ * something to carry packets between namespaces - which is a different program.
+ * None of that is here and none of it is coming.
+ *
+ * But a network namespace on Linux does not start with a working network. It
+ * starts with a loopback interface that is *down*, no addresses and no routes,
+ * and nothing in it can reach anything until it is configured. Reaching that
+ * state needs no stack at all - and it is the state `unshare -n` is used for,
+ * which is to run something with no network.
+ *
+ * So that is what this provides, exactly and permanently: a namespace whose
+ * network is empty. What it cannot do is let the guest configure its way out
+ * again - `ip link set lo up`, a veth pair, an address - because that is where
+ * the stack would have to begin.
+ *
+ * A bind is refused rather than allowed, and that is a deliberate divergence:
+ * Linux lets a process bind the wildcard address in an empty namespace, but
+ * here the socket is a Darwin socket and binding it would take a port on the
+ * *host* - so two namespaces would collide with each other and with the Mac,
+ * which is the opposite of the isolation being asked for. Refusing keeps the
+ * guarantee; allowing would keep the letter of one call and break the point of
+ * the feature.
+ *
+ * AF_UNIX is untouched. Pathname sockets belong to the filesystem and are
+ * isolated by the mount namespace, not this one, so they go on working - which
+ * is correct, and is what lets anything inside a network namespace still talk
+ * to things on the same machine the way Linux does.
+ */
+static bool
+netns_blocks(int family)
+{
+  if (!netns_active())
+    return false;
+  return family == LINUX_AF_INET || family == LINUX_AF_INET6;
+}
+
+/* The family a sockaddr the guest handed us names, before conversion. */
+static int
+guest_sa_family(const char *addr, size_t addrlen)
+{
+  if (addrlen < sizeof(unsigned short))
+    return -1;
+  return (int) ((const struct l_sockaddr *) addr)->sa_family;
+}
 
 DEFINE_SYSCALL(socket, int, family, int, type, int, protocol)
 {
@@ -162,6 +213,11 @@ DEFINE_SYSCALL(connect, int, sockfd, gaddr_t, addr_ptr, uint64_t, addrlen)
   int r;
   if (copy_from_user(addr, addr_ptr, addrlen)) {
     r = -LINUX_EFAULT;
+    goto err;
+  }
+
+  if (netns_blocks(guest_sa_family(addr, addrlen))) {
+    r = -LINUX_ENETUNREACH;     /* no interface, no route: nothing to reach */
     goto err;
   }
 
@@ -333,6 +389,8 @@ DEFINE_SYSCALL(sendto, int, socket, gaddr_t, buf_ptr, int, length, int, flags, g
   if (addr_ptr != 0) {
     if (copy_from_user(&l_sockaddr, addr_ptr, addrlen))
       return -LINUX_EFAULT;
+    if (netns_blocks((int) l_sockaddr.sa_family))
+      return -LINUX_ENETUNREACH;
     if (linux_to_darwin_sockaddr(&sockaddr, &l_sockaddr, addrlen) < 0)
       return -LINUX_EINVAL;
   }
@@ -645,6 +703,11 @@ DEFINE_SYSCALL(bind, int, sockfd, gaddr_t, addr_ptr, int, addrlen)
   if (copy_from_user(addr, addr_ptr, addrlen)) {
     free(addr);
     return -LINUX_EFAULT;
+  }
+
+  if (netns_blocks(guest_sa_family(addr, addrlen))) {
+    free(addr);
+    return -LINUX_EADDRNOTAVAIL;
   }
 
   if (linux_to_darwin_sockaddr(&sockaddr, (struct l_sockaddr *) addr, addrlen) < 0) {

@@ -3429,3 +3429,55 @@ path unmountable.
 not for want of effort: sockets are the host's, and isolating them would mean
 writing a virtual network stack — addresses, routes, an interface, something to
 carry packets between namespaces. That is a different program, not a namespace.
+
+### 3.5.65 The network namespace, as an empty one — **implemented**
+
+Every note in this series refused this namespace, and the reasoning held for
+what it addressed: making sockets *work* inside a namespace of their own means a
+virtual network stack — addresses, routes, an interface, something to carry
+packets between namespaces — which is a different program. None of that is here
+and none of it is coming.
+
+**But a network namespace on Linux does not start with a working network.** It
+starts with a loopback interface that is *down*, no addresses and no routes, and
+nothing in it can reach anything until it is configured. Reaching that state
+needs no stack at all — and it is the state `unshare -n` is actually used for,
+which is to run something with no network.
+
+So that is what this provides, exactly and permanently: a namespace whose
+network is empty. `connect` to an inet address is **ENETUNREACH**, there being
+no route; `sendto` likewise; `/proc/net/dev` lists one interface, `lo`, with
+zero counters. A socket can still be *created*, because Linux creates one too —
+there is simply nowhere for it to go.
+
+**A `bind` is refused rather than allowed, and that is a deliberate
+divergence.** Linux lets a process bind the wildcard address in an empty
+namespace. Here the socket underneath is a Darwin socket, so binding it would
+take a port on the *host* — two namespaces would collide with each other and
+with the Mac, which is the opposite of the isolation being asked for. Refusing
+with EADDRNOTAVAIL keeps the guarantee; allowing would keep the letter of one
+call and break the point of the feature.
+
+**AF_UNIX is untouched.** Pathname sockets belong to the filesystem and are
+isolated by the mount namespace, not this one, so they go on working — which is
+correct, and is what lets anything inside a network namespace still talk locally
+the way it does on Linux.
+
+What is not available is configuring a namespace back into working order:
+`ip link set lo up`, a veth pair, an address. That needs netlink and something
+behind it, which is where the stack would have to begin. A namespace here is
+created empty and stays empty.
+
+```
+=== outside ===            dns resolves; /proc/net/dev lists the Mac's utun2, en0…
+=== inside unshare -n ===  ns: net:[4026531843]
+                           lo   0 0 0 0 …
+                           connect: unreachable
+```
+
+**That completes all eight namespaces.** The only `CLONE_NEW*` flag any call
+still refuses is `CLONE_NEWTIME` in `clone`, and that is Linux's own rule — the
+flag lands inside the exit-signal byte `clone` carries — not a gap here. The
+smoke test's "a refused flag alongside a workable one moves nothing" check lost
+its last refusable flag with this change and now tests the same property through
+a failing call instead.

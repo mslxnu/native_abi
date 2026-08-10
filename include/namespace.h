@@ -52,11 +52,17 @@
  *           namespace itself is exact: it rebases the path /proc/<pid>/cgroup
  *           reports, which is the whole of what it does on Linux too.
  *
- *   net     No, and this one is not a matter of effort. Sockets are the host's,
- *           and isolating them would mean writing a virtual network stack -
- *           addresses, routes, an interface, something to carry packets
- *           between namespaces - which is a different program, not a namespace.
- *           It is the only one of the eight that stays refused.
+ *   net     An *empty* namespace, which is what a fresh one is on Linux too: a
+ *           loopback interface that is down, no address, no route, and nothing
+ *           in it able to reach anything. That state needs no network stack and
+ *           is what `unshare -n` is used for. What is still out of reach is
+ *           configuring a namespace back into working order - an address, a
+ *           route, a veth pair - because that is where a stack would have to
+ *           begin. See src/net/net.c.
+ *
+ * All eight are now supported by unshare. The one call that still refuses a
+ * CLONE_NEW* flag is clone(CLONE_NEWTIME), and that is Linux's rule rather than
+ * a gap here: the flag lands inside the exit-signal byte clone carries.
  *
  * So unshare and setns accept CLONE_NEWUTS and refuse the rest with EINVAL,
  * which is exactly what Linux returns for a namespace its kernel was not built
@@ -194,6 +200,10 @@ uint64_t ns_ino_time_for_children(void);
  */
 uint64_t ns_ino_pid_for_children(void);
 bool     pidns_active(void);
+
+/* Whether this process is in a network namespace of its own, which here means
+ * one with no network at all. See src/net/net.c. */
+bool     netns_active(void);
 int32_t  pidns_to_ns(int32_t host);     /* 0 when it is not a member */
 int32_t  pidns_to_host(int32_t ns);     /* -1 when there is no such pid */
 int32_t  pidns_add_child(int32_t host); /* the parent registers; returns its own view */

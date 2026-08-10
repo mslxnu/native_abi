@@ -38,7 +38,7 @@ static const struct {
   [NS_UTS]    = { NS_UTS,    "uts",    LINUX_CLONE_NEWUTS,    true  },
   [NS_IPC]    = { NS_IPC,    "ipc",    LINUX_CLONE_NEWIPC,    true  },
   [NS_PID]    = { NS_PID,    "pid",    LINUX_CLONE_NEWPID,    true  },
-  [NS_NET]    = { NS_NET,    "net",    LINUX_CLONE_NEWNET,    false },
+  [NS_NET]    = { NS_NET,    "net",    LINUX_CLONE_NEWNET,    true  },
   [NS_USER]   = { NS_USER,   "user",   LINUX_CLONE_NEWUSER,   true  },
   [NS_CGROUP] = { NS_CGROUP, "cgroup", LINUX_CLONE_NEWCGROUP, true  },
   [NS_TIME]   = { NS_TIME,   "time",   LINUX_CLONE_NEWTIME,   true  },
@@ -1037,4 +1037,10 @@ cgroup_ns_root(void)
     return "/";
   root[n] = '\0';
   return root[0] ? root : "/";
+}
+
+bool
+netns_active(void)
+{
+  return current_nsproxy.ns[NS_NET] != &initial_ns[NS_NET];
 }

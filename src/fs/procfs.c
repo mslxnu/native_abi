@@ -170,7 +170,8 @@ enum procfs_file { PROCFS_NONE, PROCFS_MAPS, PROCFS_CMDLINE, PROCFS_COMM,
                    PROCFS_SYSVIPC_SHM, PROCFS_SYSVIPC_SEM, PROCFS_SYSVIPC_MSG,
                    PROCFS_NS_FORCHILDREN, PROCFS_TIMENS_OFFSETS,
                    PROCFS_UID_MAP, PROCFS_GID_MAP, PROCFS_SETGROUPS,
-                   PROCFS_MOUNTINFO, PROCFS_STAT, PROCFS_STATUS, PROCFS_CGROUP };
+                   PROCFS_MOUNTINFO, PROCFS_STAT, PROCFS_STATUS, PROCFS_CGROUP,
+                   PROCFS_NET_DEV };
 
 /* For PROCFS_FD, the number after /fd/. Meaningless for the others. */
 static enum procfs_file
@@ -209,6 +210,16 @@ own_procfs_file_n(const char *path, int *fd_out)
    * looks broken. They are answered here now, from the namespace the caller is
    * actually in.
    */
+  /*
+   * /proc/net/dev inside a network namespace, which has one interface and it
+   * is down. The host's answer would list the Mac's - and by their Darwin
+   * names, lo0 and en0 - which is exactly the thing a process asked to be
+   * isolated from. Outside a namespace this is not ours and mSL/ProcFS answers
+   * it as before.
+   */
+  if (netns_active() && strcmp(rest, "net/dev") == 0)
+    return PROCFS_NET_DEV;
+
   if (strcmp(rest, "sysvipc/shm") == 0)
     return PROCFS_SYSVIPC_SHM;
   if (strcmp(rest, "sysvipc/sem") == 0)
@@ -610,6 +621,23 @@ build_status(int host_pid, size_t *len_out)
     line = nl + 1;
   }
   free(host);
+  *len_out = len;
+  return out;
+}
+
+/* One interface, no traffic: what a namespace nobody has configured contains. */
+static char *
+build_net_dev(size_t *len_out)
+{
+  static const char text[] =
+    "Inter-|   Receive                                                |  Transmit\n"
+    " face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed\n"
+    "    lo:       0       0    0    0    0     0          0         0        0       0    0    0    0     0       0          0\n";
+  size_t len = sizeof text - 1;
+  char *out = malloc(len);
+  if (!out)
+    return NULL;
+  memcpy(out, text, len);
   *len_out = len;
   return out;
 }
@@ -1335,6 +1363,9 @@ procfs_open(const char *path, int *out_fd)
     break;
   case PROCFS_CGROUP:
     content = build_cgroup(&len);
+    break;
+  case PROCFS_NET_DEV:
+    content = build_net_dev(&len);
     break;
   case PROCFS_STAT:
     content = build_stat(fdno, &len);
