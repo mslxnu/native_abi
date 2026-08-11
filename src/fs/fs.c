@@ -37,6 +37,7 @@
 #include "linux/common.h"
 #include "linux/time.h"
 #include "linux/fs.h"
+#include "linux/fanotify.h"
 #include "linux/misc.h"
 #include "linux/errno.h"
 #include "linux/ioctl.h"
@@ -1886,6 +1887,8 @@ DEFINE_SYSCALL(write, int, fd, gaddr_t, buf_ptr, size_t, size)
   }
   struct iovec iov = { buf, size };
   r =  file->ops->writev(file, &iov, 1);
+  if (r >= 0 && fanotify_watching())
+    fanotify_note_fd(file->fd, LINUX_FAN_MODIFY);
 out:
   free(buf);
   return r;
@@ -1895,6 +1898,20 @@ DEFINE_SYSCALL(read, int, fd, gaddr_t, buf_ptr, size_t, size)
 {
   int r;
   char *buf = malloc(size);
+
+  /*
+   * A read of a fanotify descriptor is not a read of a file: the records carry
+   * a descriptor, so they have to be built in the process that will use it.
+   * Recognised before the descriptor is looked up, since it is not one of the
+   * guest's files.
+   */
+  if (buf != NULL && fanotify_read(fd, buf, size, &r)) {
+    if (r > 0 && copy_to_user(buf_ptr, buf, (size_t) r))
+      r = -LINUX_EFAULT;
+    free(buf);
+    return r;
+  }
+
   struct file *file = get_file(fd);
   if (file == NULL) {
     r = -LINUX_EBADF;
@@ -1909,6 +1926,8 @@ DEFINE_SYSCALL(read, int, fd, gaddr_t, buf_ptr, size_t, size)
   if (r < 0) {
     goto out;
   }
+  if (fanotify_watching())
+    fanotify_note_fd(file->fd, LINUX_FAN_ACCESS);
   if (copy_to_user(buf_ptr, buf, r)) {
     r = -LINUX_EFAULT;
     goto out;
@@ -3137,11 +3156,15 @@ user_openat(int atdirfd, const char *name, int flags, int mode)
   if (fd < 0) {
     goto out;
   }
-  if (inotify_watching()) {
+  if (inotify_watching() || fanotify_watching()) {
     char opath[PATH_MAX];
     struct stat ost;
-    if (fcntl(fd, F_GETPATH, opath) == 0)
+    if (fcntl(fd, F_GETPATH, opath) == 0) {
       inotify_note_open(opath, fstat(fd, &ost) == 0 && S_ISDIR(ost.st_mode));
+      /* fanotify sees the open itself, which is what it is for - and unlike
+       * inotify's, this one is reported wherever the open happened. */
+      fanotify_note(opath, LINUX_FAN_OPEN);
+    }
   }
   int err = register_fd(fd, flags & LINUX_O_CLOEXEC);
   if (err < 0) {
@@ -3187,17 +3210,20 @@ user_close(int fd)
    * nabi already knows, and before the close so the path can still be found.
    * Both questions are asked only when something is watching.
    */
-  if (inotify_watching()) {
+  if (inotify_watching() || fanotify_watching()) {
     char path[PATH_MAX];
     if (fcntl(fd, F_GETPATH, path) == 0) {
       int fl = fcntl(fd, F_GETFL);
       bool wrote = fl >= 0 && ((fl & O_ACCMODE) == O_WRONLY ||
                                (fl & O_ACCMODE) == O_RDWR);
       inotify_note_close(path, wrote);
+      fanotify_note(path, wrote ? LINUX_FAN_CLOSE_WRITE
+                                : LINUX_FAN_CLOSE_NOWRITE);
     }
   }
-  /* And an inotify descriptor of the guest's own takes its watcher with it. */
+  /* And a notification descriptor of the guest's own takes its queue with it. */
   inotify_close(fd);
+  fanotify_close(fd);
 
   pthread_rwlock_wrlock(&proc.fileinfo.fdtable_lock);
   int ret = do_close(&proc.fileinfo.fdtable, fd);

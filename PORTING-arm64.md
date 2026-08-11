@@ -3680,3 +3680,57 @@ Watches established.
 The `open`/`close` hooks ask `inotify_watching()` first, so a guest with no
 watches — nearly every guest — pays a load and a branch per close rather than
 two `fcntl`s.
+
+### 3.5.70 fanotify — **notification implemented; permission events refused**
+
+`fanotify_init` and `fanotify_mark` were in neither syscall table.
+
+**It fits this host better than inotify did, and is harder somewhere else.**
+inotify asks what happened to a *file*, and only Darwin knows, so §3.5.69 had to
+derive it from kqueue. fanotify asks what a *process* did — opened, read, wrote,
+closed — and for a guest the thing that knows is NABI, which sees every one of
+those calls as it makes them. The events are observed directly rather than
+inferred, which is more faithful than anything in `inotify.c`.
+
+The difficulty moves to **delivery**. A fanotify listener exists to watch *other*
+processes, and NABI's processes are separate host processes: the open happens in
+one and the listener sits in another, with no kernel between them. So the marks
+live in a file every process maps and the events go down a FIFO named after the
+instance. That is the machinery §3.5.69 deferred, and here it is not optional —
+a fanotify that saw only its own process would be watching the one process
+nobody uses fanotify to watch. The smoke test does the work in a forked child
+for exactly that reason: a test that opened the file itself would pass against an
+implementation that could never be useful.
+
+**Guests that do not use it pay a load.** The mark table is a shared mapping
+with a count at the front, so the question every open, close, read and write
+asks — "is anything marked?" — is a memory read rather than a syscall. A guest
+that never marks anything never even creates the file.
+
+**Permission events are refused, and that is the one substantive thing
+missing.** `FAN_OPEN_PERM` and its relatives block the accessing process until
+the listener writes a verdict; a listener that then died would leave every open
+in the guest waiting on an answer that was not coming, with nothing in a
+position to notice. Linux ships exactly this configuration when
+`CONFIG_FANOTIFY_ACCESS_PERMISSIONS` is off — `FAN_CLASS_CONTENT` and
+`FAN_CLASS_PRE_CONTENT` return EINVAL — so a caller that needs them is refused
+in a way it already handles, rather than being handed a guard that can wedge the
+machine. `FAN_REPORT_FID` and friends are refused too: they change the record
+format into one carrying file handles, and a listener given the wrong shape
+would parse whatever the bytes happened to be.
+
+One divergence worth naming: the descriptor an event carries is opened by the
+*listener's* NABI from the path in the record, rather than passed from the
+process that caused the event. Linux guarantees that descriptor refers to the
+object as it was; here it is a fresh open of the same name, so an object renamed
+in between comes back as whatever holds the name now. For `FAN_OPEN` and the
+closes the window is not reachable in practice, and saying so is better than
+passing descriptors between processes to close a gap nobody is standing in.
+
+```
+fanotify_init -> 4
+permission class -> -22          (refused, as Linux without the option does)
+fanotify_mark -> 0
+a permission mark -> -22
+from ANOTHER process: opens=1 modifies=1 closes=1
+```

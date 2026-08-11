@@ -234,6 +234,14 @@ bool inotify_watching(void);
 void inotify_note_open(const char *hostpath, bool isdir);
 void inotify_note_close(const char *hostpath, bool written);
 void inotify_close(int fd);
+
+/* fanotify (src/fs/fanotify.c). Unlike inotify's, these events are what the
+ * guest's own syscalls did, seen where nabi makes them. */
+bool fanotify_watching(void);
+void fanotify_note(const char *hostpath, uint64_t mask);
+void fanotify_note_fd(int hostfd, uint64_t mask);
+bool fanotify_read(int fd, char *out, size_t size, int *ret);
+void fanotify_close(int fd);
 bool procfs_pidns_path(const char *name, char *out, size_t outsz, bool *denied);
 bool procfs_stat(const char *path, uint32_t *mode, uint64_t *size, uint64_t *ino);
 bool procfs_refresh_fddir(int fd);

@@ -303,8 +303,8 @@
   SYSCALL(297, unimplemented)                   \
   SYSCALL(298, unimplemented)                   \
   SYSCALL(299, unimplemented)                   \
-  SYSCALL(300, unimplemented)                   \
-  SYSCALL(301, unimplemented)                   \
+  SYSCALL(300, fanotify_init)                   \
+  SYSCALL(301, fanotify_mark)                   \
   SYSCALL(302, prlimit64)                        \
   SYSCALL(303, unimplemented)                   \
   SYSCALL(304, unimplemented)                   \

@@ -268,8 +268,8 @@
   SYSCALL(259, unimplemented) \
   SYSCALL(260, wait4) \
   SYSCALL(261, prlimit64) \
-  SYSCALL(262, unimplemented) \
-  SYSCALL(263, unimplemented) \
+  SYSCALL(262, fanotify_init) \
+  SYSCALL(263, fanotify_mark) \
   SYSCALL(264, unimplemented) \
   SYSCALL(265, unimplemented) \
   SYSCALL(266, unimplemented) \

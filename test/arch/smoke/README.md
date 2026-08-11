@@ -214,6 +214,13 @@ guest-code cache sync.
   only for events that cannot arrive from anywhere being refused rather than
   left to wait.
 
+- `fantest` — fanotify, which unlike inotify exists to watch *other* processes.
+  The file is opened, written and closed by a forked child, so an implementation
+  that could only see its own process fails here rather than passing by
+  accident. Also that the permission class and a mark asking for `FAN_OPEN_PERM`
+  are refused with EINVAL: those block the accessing process until the listener
+  answers, and a listener that died would leave every open in the guest waiting.
+
 - `ipctest` — System V IPC: a segment created, attached, shared across a fork,
   detached and removed; keys resolving to ids; semaphore values through
   `SETVAL`/`GETALL`/`semop`; and `unshare(CLONE_NEWIPC)` making the same key

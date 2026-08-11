@@ -532,6 +532,20 @@ else
     fail=1
 fi
 
+# fantest: fanotify, which unlike inotify exists to watch *other* processes -
+# so the file is touched by a forked child, and a listener that could only see
+# its own process would fail here rather than pass by accident. Needs guest
+# root, as fanotify needs CAP_SYS_ADMIN.
+cp "$here/fantest" "$root/"; chmod +x "$root/fantest"
+rm -rf "$root/fan-dir"
+out=$(MSL_ROOT=1 "$NABI" -m "$root" /fantest); rc=$?
+if [ "$rc" -eq 0 ] && [ "$out" = "fan ok" ]; then
+    echo "  ok  fantest -> \"$out\", exit 0"
+else
+    echo "  FAIL fantest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 if [ "$fail" -eq 0 ]; then
     echo "smoke: PASS"
 else

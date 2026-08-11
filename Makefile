@@ -124,6 +124,7 @@ COMMON_SRCS := src/main.c \
                src/ipc/msg.c \
                src/fs/mount.c \
                src/fs/inotify.c \
+               src/fs/fanotify.c \
                src/fs/fs.c \
                src/fs/epoll.c \
                src/fs/procfs.c \
