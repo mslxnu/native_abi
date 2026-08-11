@@ -261,6 +261,8 @@ void timerfd_close(int fd);
 
 /* tee (src/fs/tee.c). What tee removed from a pipe is held in front of it, so
  * reads and readiness have to consult it before the pipe itself. */
+void    eventfd_signal(int fd, uint64_t add);
+
 bool    tee_pending(void);
 ssize_t tee_take(int fd, char *buf, size_t want);
 bool    tee_readable(int fd);

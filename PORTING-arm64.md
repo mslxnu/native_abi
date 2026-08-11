@@ -4315,3 +4315,50 @@ That is also why the denominator moved: `sync_file_range2` was never a separate
 aarch64 call, only the other name for 84.
 
 233 of 395.
+
+### 3.5.83 The `io_setup` family — asynchronous I/O, and which thread may touch what
+
+This is the older of Linux's two async interfaces. io_uring is the other, and is
+a different subsystem rather than more of this one — mapped submission and
+completion rings with their own opcode space, which is a phase of work and not a
+commit.
+
+Darwin has POSIX `aio_read`/`aio_write`, and they are not a substitute: they
+complete by signal or by a spawned thread, they have no shared completion queue
+to reap from, and `aio_cancel` does not mean what `io_cancel` means. But what
+Linux's interface actually promises is narrower than "the kernel does I/O by
+itself" — submit returns without waiting, and results turn up in completion order
+when asked for. A worker thread per context delivers exactly that.
+
+**Two decisions matter, and both are about which thread touches what.**
+
+The first is guest memory. The worker never reads or writes it. A write's data is
+copied out of the guest at submit time and a read's data is copied in at reap
+time, both on the guest's own thread, with the worker seeing only a buffer NABI
+owns. That is not a workaround — it is the contract. A read buffer's contents are
+undefined until the operation completes and is reaped, so filling it at reap time
+is indistinguishable from filling it earlier, and it means no guest page can be
+unmapped underneath a thread that is mid-write to it. Linux prevents that by
+pinning the pages; there is no equivalent here, and this sidesteps needing one.
+
+The second is the context id, which is the part that would have bitten. Linux's
+`aio_context_t` is not a handle — it is the address of a ring the kernel mapped
+into the process, and libaio treats it as one: `io_getevents` dereferences it to
+read a magic number before deciding whether it can answer without a syscall. Hand
+back a small integer and that dereference is a segfault *in the guest*, which
+would read as a guest bug. So a page is mapped and its address is the id,
+deliberately left zeroed — a magic that does not match is exactly what sends
+libaio down the syscall path, which is the only path here.
+
+`io_cancel` only cancels what the worker has not started. One already running
+cannot be called back — Darwin cannot abort a `pread` in flight — and one already
+finished has a result the guest is owed, so both answer `EINVAL` rather than
+pretending. `io_destroy` joins the worker rather than abandoning it, so nothing
+is still reading a descriptor the guest is about to close.
+
+None of it is inherited across fork, which is not a limitation but the specified
+behaviour: `fork(2)` is explicit that a child inherits neither its parent's aio
+contexts nor its outstanding operations. arm64's fork is fork-plus-exec and this
+table is process memory, so the child gets none — which is what it is owed.
+
+239 of 395.

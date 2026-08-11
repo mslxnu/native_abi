@@ -287,6 +287,17 @@ guest-code cache sync.
   checked as `splice`'s are, and `copy_file_range` is checked to refuse
   overlapping ranges of one file across *two separate opens* of it.
 
+- `aiotest` — Linux asynchronous I/O, the `io_setup` family. That a read reads is
+  the easy half. The checks that matter: a read's data must be in the *guest's*
+  buffer by the time the event is reaped (NABI's worker thread never touches
+  guest memory, so the copy happens at reap time — remove it and the buffer comes
+  back empty); each event must carry its own iocb's `aio_data` **and address**,
+  which is how a caller matches a completion to its request and which is
+  invisibly correct with only one in flight; `io_getevents(min_nr)` must wait for
+  `min_nr` rather than return what happens to be ready; and an eventfd named by
+  `IOCB_FLAG_RESFD` must be poked on completion — without that the test hangs
+  rather than fails, which is what a guest folding aio into a poll loop would do.
+
 The ELF binaries are committed prebuilt (as the x86 guest tests under
 `test/*/build/` are), so the check needs no cross-toolchain. The `.s` sources
 are here for reference; rebuild with an aarch64-linux clang + ld.lld:

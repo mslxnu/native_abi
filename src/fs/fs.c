@@ -329,6 +329,27 @@ eventfd_drain(int fd)
   (void) recv(fd, &one, 1, MSG_DONTWAIT);
 }
 
+/*
+ * Add to an eventfd from outside the syscall path.
+ *
+ * An aio request can name an eventfd to be signalled when it completes, and the
+ * thing that completes it is a worker thread rather than a guest syscall. This
+ * is that thread's way in: it does what a guest write of the same value would
+ * do, and nothing else.
+ */
+void
+eventfd_signal(int fd, uint64_t add)
+{
+  struct eventfd_state *ev = eventfd_lookup(fd);
+  if (ev == NULL || add == 0)
+    return;
+  if (ev->count > UINT64_MAX - add)
+    return;                     /* a guest write would block here; a completion
+                                 * cannot, so the count simply stops */
+  ev->count += add;
+  eventfd_poke(ev);
+}
+
 static int
 eventfd_do_read(struct file *file, struct eventfd_state *ev,
                 struct iovec *iov, size_t iovcnt)

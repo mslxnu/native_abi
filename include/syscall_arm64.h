@@ -6,11 +6,11 @@
 #include <stdint.h>
 
 #define SYSCALLS \
-  SYSCALL(0, unimplemented) \
-  SYSCALL(1, unimplemented) \
-  SYSCALL(2, unimplemented) \
-  SYSCALL(3, unimplemented) \
-  SYSCALL(4, unimplemented) \
+  SYSCALL(0, io_setup) \
+  SYSCALL(1, io_destroy) \
+  SYSCALL(2, io_submit) \
+  SYSCALL(3, io_cancel) \
+  SYSCALL(4, io_getevents) \
   SYSCALL(5, setxattr) \
   SYSCALL(6, lsetxattr) \
   SYSCALL(7, fsetxattr) \
@@ -298,7 +298,7 @@
   SYSCALL(289, unimplemented) \
   SYSCALL(290, unimplemented) \
   SYSCALL(291, statx) \
-  SYSCALL(292, unimplemented) \
+  SYSCALL(292, io_pgetevents) \
   SYSCALL(293, rseq) \
   SYSCALL(294, unimplemented) \
   SYSCALL(295, unimplemented) \

@@ -626,6 +626,21 @@ else
     fail=1
 fi
 
+# aiotest: the io_setup family. Reading is the easy half; the checks that matter
+# are that a read's data is in the *guest's* buffer by the time the event is
+# reaped (NABI's worker never touches guest memory, so the copy happens at reap
+# time), that each event carries its own iocb's data and address - crossed wires
+# are invisible with one request in flight - and that an eventfd named by
+# IOCB_FLAG_RESFD is poked, without which the test hangs rather than fails.
+cp "$here/aiotest" "$root/"; chmod +x "$root/aiotest"
+out=$("$NABI" -m "$root" /aiotest); rc=$?
+if [ "$rc" -eq 0 ] && [ "$out" = "aio ok" ]; then
+    echo "  ok  aiotest -> \"$out\", exit 0"
+else
+    echo "  FAIL aiotest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 if [ "$fail" -eq 0 ]; then
     echo "smoke: PASS"
 else
