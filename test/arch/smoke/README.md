@@ -399,6 +399,16 @@ guest-code cache sync.
   same every time — which is what they were when the array was left
   uninitialised.
 
+- `pvmtest` — `process_vm_readv` and `process_vm_writev`. Only the same-process
+  form can work here, so the cross-process form is checked to be *refused* and
+  told apart from a process that does not exist. The part that is easy to get
+  wrong in the half that works is the vector walk: the local and remote sides are
+  gathered and scattered **independently**, need not have the same number of
+  entries or the same lengths, and the transfer stops when either runs out. The
+  shapes in the test deliberately do not match — three remote pieces into two
+  local ones — so an implementation that pairs them entry by entry reports 8
+  where 10 were asked for.
+
 The ELF binaries are committed prebuilt (as the x86 guest tests under
 `test/*/build/` are), so the check needs no cross-toolchain. The `.s` sources
 are here for reference; rebuild with an aarch64-linux clang + ld.lld:

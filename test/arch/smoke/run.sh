@@ -715,6 +715,21 @@ else
     fail=1
 fi
 
+# pvmtest: process_vm_readv and process_vm_writev. Only the same-process form
+# can work here - a guest process is a host process with its own guest memory -
+# so the cross-process form is refused, and both halves are checked. What is
+# easy to get wrong in the half that works is the vector walk: the two sides are
+# gathered and scattered independently, and the shapes here deliberately do not
+# match, so an implementation that pairs entry with entry reports 8 of 10.
+cp "$here/pvmtest" "$root/"; chmod +x "$root/pvmtest"
+out=$("$NABI" -m "$root" /pvmtest); rc=$?
+if [ "$rc" -eq 0 ] && [ "$out" = "pvm ok" ]; then
+    echo "  ok  pvmtest -> \"$out\", exit 0"
+else
+    echo "  FAIL pvmtest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 if [ "$fail" -eq 0 ]; then
     echo "smoke: PASS"
 else

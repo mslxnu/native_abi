@@ -4994,3 +4994,47 @@ values show why. They are not all-zero and not all-identical, so every check tha
 looks at one run's bytes passes on them. What is wrong with them is only visible
 *between* runs, so `run.sh` runs the dump twice and requires the two to differ.
 No single run can tell random bytes from bytes that are merely always the same.
+
+### 3.5.94 process_vm_readv and process_vm_writev — one side of two
+
+These copy between the address spaces of two processes without either agreeing
+to it, and on Linux that works because the kernel is on both sides of the copy.
+Here the two sides are two *host* processes, and there is no way into the other
+one. Three separate things stand in the way, and it is worth listing them
+because any one alone might have been worked around:
+
+The arena that names guest memory is created and **immediately unlinked**, so it
+has no name a sibling could open; the descriptor reaches only the children that
+inherited it across the exec. The running guest's mappings are `MAP_PRIVATE`, so
+the arena does not hold what the guest currently has anyway — it holds what was
+written at the last handover, and `src/mm/arena.c` explains why that is
+deliberate: sharing it would take copy-on-write away from `fork` and let the two
+halves of `cmd | cmd` write over each other. And a guest address means nothing
+without the region table that translates it, which is process memory belonging to
+the process that owns it.
+
+Darwin does offer `mach_vm_read_overwrite` through a task port, but
+`task_for_pid` on another process wants root and an entitlement NABI does not
+carry — and it would still leave the third problem untouched.
+
+So the same-process form is implemented and the cross-process form is refused.
+That is less narrow than it sounds: the call is defined for a process to use on
+itself, where it is a gather-scatter copy that skips the intermediate buffer a
+`readv` into a `writev` would need. But it is not what most callers want, and
+they are told so rather than handed a wrong answer. **`EPERM`, not `ENOSYS`** —
+`EPERM` is what Linux says when the ptrace access check fails, so every caller
+already has a path for it, usually falling back to `/proc/pid/mem`; `ENOSYS`
+would claim the call does not exist, which is untrue of the half that works.
+
+Two details the test pinned down. The vector walk is the part that is easy to get
+wrong: the two sides are gathered and scattered **independently** and need not
+have matching shapes, so the test reads three remote pieces into two local ones
+and an implementation that pairs them entry by entry reports 8 of 10.
+
+And "no such process" had to be told from "not allowed". `pidns_to_host` is the
+identity outside a pid namespace, so a translated number proves nothing about
+whether anything is there — the first version answered `EPERM` for a pid that did
+not exist. The process is now actually looked for, with `kill(pid, 0)`, which is
+the same test Linux would be making.
+
+262 of 375.

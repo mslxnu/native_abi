@@ -315,8 +315,8 @@
   SYSCALL(307, sendmmsg) \
   SYSCALL(308, setns) \
   SYSCALL(309, unimplemented) \
-  SYSCALL(310, unimplemented) \
-  SYSCALL(311, unimplemented) \
+  SYSCALL(310, process_vm_readv) \
+  SYSCALL(311, process_vm_writev) \
   SYSCALL(312, unimplemented) \
   SYSCALL(313, unimplemented) \
   SYSCALL(314, unimplemented) \

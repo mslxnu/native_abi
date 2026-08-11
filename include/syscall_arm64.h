@@ -276,8 +276,8 @@
   SYSCALL(267, syncfs) \
   SYSCALL(268, setns) \
   SYSCALL(269, sendmmsg) \
-  SYSCALL(270, unimplemented) \
-  SYSCALL(271, unimplemented) \
+  SYSCALL(270, process_vm_readv) \
+  SYSCALL(271, process_vm_writev) \
   SYSCALL(272, unimplemented) \
   SYSCALL(273, unimplemented) \
   SYSCALL(274, unimplemented) \

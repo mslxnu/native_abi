@@ -5,7 +5,11 @@
 #include "mm.h"
 #include "x86/vm.h"
 
+#include <signal.h>
+
+#include "namespace.h"
 #include "linux/mman.h"
+#include "linux/socket.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -594,4 +598,145 @@ DEFINE_SYSCALL(mbind, gaddr_t, addr, unsigned long, len, int, mode,
    * could later disagree with it: a second node is not going to appear. */
   (void) len;
   return 0;
+}
+
+/* ------------------------------------------------- process_vm_readv/writev */
+
+/*
+ * process_vm_readv and process_vm_writev: copying between the address spaces of
+ * two processes without either of them agreeing to it.
+ *
+ * On Linux the kernel is on both sides of that copy - it can reach into any
+ * address space it is allowed to. Here the two sides are two *host* processes.
+ * arm64's fork is fork-plus-exec, so a guest process is a host process with its
+ * own guest memory, and nabi has no way into another one:
+ *
+ *   The arena that names guest memory is created and immediately unlinked, so
+ *   it has no name a sibling could open, and the descriptor reaches only the
+ *   children that inherited it across the exec.
+ *
+ *   The running guest's mappings are MAP_PRIVATE, so the arena does not hold
+ *   what the guest currently has anyway - it holds what was written into it at
+ *   the last handover. See src/mm/arena.c, where that is a deliberate choice:
+ *   sharing it would take copy-on-write away from fork and let the two halves
+ *   of `cmd | cmd` write over each other.
+ *
+ *   And a guest address means nothing without the region table that translates
+ *   it, which is process memory in the process that owns it.
+ *
+ * Darwin does offer mach_vm_read_overwrite through a task port, but task_for_pid
+ * on another process wants root and an entitlement nabi does not carry, and
+ * would still leave the third problem: the address to read is a guest address
+ * and only that process knows where it lives.
+ *
+ * So the same-process case is implemented and the cross-process case is
+ * refused. That is not as narrow as it sounds - the call is defined for a
+ * process to use on itself, where it is a gather-scatter copy that skips the
+ * intermediate buffer readv into writev would need - but it is not what most
+ * callers want, and they are told so rather than being given a wrong answer.
+ *
+ * EPERM rather than ENOSYS, because EPERM is the answer Linux gives when the
+ * ptrace access check fails, and every caller of this already has a path for
+ * it: they fall back to /proc/pid/mem, or to asking the other process nicely.
+ * ENOSYS would say the call does not exist, which is not true of the half that
+ * works.
+ */
+static int
+process_vm_rw(int pid, gaddr_t lvec, unsigned long liovcnt,
+              gaddr_t rvec, unsigned long riovcnt, unsigned long flags,
+              bool writing)
+{
+  if (flags != 0)
+    return -LINUX_EINVAL;
+  if (liovcnt > 1024 || riovcnt > 1024)
+    return -LINUX_EINVAL;       /* UIO_MAXIOV */
+
+  if (pid <= 0)
+    return -LINUX_ESRCH;
+  int32_t host = pidns_to_host(pid);
+  if (host < 0)
+    return -LINUX_ESRCH;        /* not a member of this pid namespace */
+  /*
+   * "No such process" and "not allowed" are different answers and a caller acts
+   * on them differently, so the process is actually looked for rather than
+   * assumed to exist because a number translated - outside a pid namespace the
+   * translation is the identity and would accept anything. kill(pid, 0) is the
+   * existence test, and it is the same one Linux would be doing.
+   */
+  if (host != getpid()) {
+    if (kill(host, 0) < 0 && errno == ESRCH)
+      return -LINUX_ESRCH;
+    return -LINUX_EPERM;        /* see above: not refused for want of trying */
+  }
+
+  if (liovcnt == 0 || riovcnt == 0)
+    return 0;
+
+  struct l_iovec *liov = calloc(liovcnt, sizeof *liov);
+  struct l_iovec *riov = calloc(riovcnt, sizeof *riov);
+  if (!liov || !riov) {
+    free(liov); free(riov);
+    return -LINUX_ENOMEM;
+  }
+  if (copy_from_user(liov, lvec, liovcnt * sizeof *liov) ||
+      copy_from_user(riov, rvec, riovcnt * sizeof *riov)) {
+    free(liov); free(riov);
+    return -LINUX_EFAULT;
+  }
+
+  /*
+   * The transfer stops when either side runs out, which is why both are walked
+   * together rather than one being flattened first: a short local vector is not
+   * an error, it is how much was asked for.
+   */
+  unsigned long li = 0, ri = 0;
+  size_t loff = 0, roff = 0;
+  int64_t moved = 0;
+  int err = 0;
+
+  while (li < liovcnt && ri < riovcnt) {
+    size_t lrem = liov[li].iov_len - loff;
+    size_t rrem = riov[ri].iov_len - roff;
+    if (lrem == 0) { li++; loff = 0; continue; }
+    if (rrem == 0) { ri++; roff = 0; continue; }
+
+    size_t n = lrem < rrem ? lrem : rrem;
+    char *tmp = malloc(n);
+    if (!tmp) { err = -LINUX_ENOMEM; break; }
+
+    /* Both addresses are in this process, so each hop is two ordinary copies
+     * through nabi rather than anything exotic. */
+    gaddr_t from = writing ? liov[li].iov_base + loff : riov[ri].iov_base + roff;
+    gaddr_t to   = writing ? riov[ri].iov_base + roff : liov[li].iov_base + loff;
+    if (copy_from_user(tmp, from, n) || copy_to_user(to, tmp, n)) {
+      free(tmp);
+      /* A fault part way through is reported as what did move, if anything -
+       * the bytes already copied cannot be taken back. */
+      err = moved > 0 ? 0 : -LINUX_EFAULT;
+      break;
+    }
+    free(tmp);
+
+    loff += n;
+    roff += n;
+    moved += n;
+  }
+
+  free(liov);
+  free(riov);
+  if (err < 0)
+    return err;
+  return (int) moved;
+}
+
+DEFINE_SYSCALL(process_vm_readv, int, pid, gaddr_t, lvec, unsigned long, liovcnt,
+               gaddr_t, rvec, unsigned long, riovcnt, unsigned long, flags)
+{
+  return process_vm_rw(pid, lvec, liovcnt, rvec, riovcnt, flags, false);
+}
+
+DEFINE_SYSCALL(process_vm_writev, int, pid, gaddr_t, lvec, unsigned long, liovcnt,
+               gaddr_t, rvec, unsigned long, riovcnt, unsigned long, flags)
+{
+  return process_vm_rw(pid, lvec, liovcnt, rvec, riovcnt, flags, true);
 }
