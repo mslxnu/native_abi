@@ -269,6 +269,14 @@ guest-code cache sync.
   timerfd's `poll` is — bytes only `read` can see are invisible to an event loop,
   and a guest that polls first would wait forever on data it already has.
 
+- `splicetest` — `splice(2)` and `vmsplice(2)` in both directions, between a
+  pipe and a file and between two pipes. Because these consume what they move
+  they avoid the ordering trap `tee` posed, with one exception: splicing a pipe
+  that `tee` is holding bytes for must see those first, and without that lookup
+  the test gets 2 bytes where it wanted 4. The offset arguments are the other
+  half — an offset splice must advance the caller's offset and leave the file's
+  own position where it was, a pair that is easy to get half right.
+
 The ELF binaries are committed prebuilt (as the x86 guest tests under
 `test/*/build/` are), so the check needs no cross-toolchain. The `.s` sources
 are here for reference; rebuild with an aarch64-linux clang + ld.lld:

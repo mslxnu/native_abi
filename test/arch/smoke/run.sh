@@ -597,6 +597,20 @@ else
     fail=1
 fi
 
+# splicetest: splice and vmsplice. These consume what they move, so they avoid
+# tee's ordering trap - except when splicing a pipe tee is holding bytes for,
+# which is the case checked here and the one that fails without the pushback
+# lookup (2 bytes instead of 4). The offset pair is the other half: an offset
+# splice must advance the caller's offset and leave the file's own alone.
+cp "$here/splicetest" "$root/"; chmod +x "$root/splicetest"
+out=$("$NABI" -m "$root" /splicetest); rc=$?
+if [ "$rc" -eq 0 ] && [ "$out" = "splice ok" ]; then
+    echo "  ok  splicetest -> \"$out\", exit 0"
+else
+    echo "  FAIL splicetest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 if [ "$fail" -eq 0 ]; then
     echo "smoke: PASS"
 else

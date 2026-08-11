@@ -4205,3 +4205,41 @@ same pipe, and the pairing is remembered from `pipe2`, which is the one place th
 sees both.
 
 229 of 396.
+
+### 3.5.81 `splice` and `vmsplice` — the rest of the family, and what a copy costs
+
+These are much less trouble than `tee`, for one reason: they **consume** what
+they move. Tee's whole difficulty was leaving the source untouched on a host that
+cannot look into a pipe without taking from it. Splice is allowed to take, so
+taking is the implementation.
+
+What they cannot do is the reason the family exists at all. On Linux these move
+pipe buffers *by reference* — `splice` never copies, which is the point of using
+it instead of read-then-write, and `vmsplice` hands the kernel the caller's own
+pages. A guest pipe here is a Darwin pipe, and Darwin has no way to attach a page
+to one, so the bytes go through a buffer. That costs a copy and changes nothing a
+caller can observe: the same bytes arrive, in the same order, and the same count
+comes back. **It is the guarantee of speed that is lost, not the guarantee of
+behaviour** — which is the opposite of the trade `tee` would have made by
+read-and-write-back, where the speed was fine and the data was wrong.
+
+Two flags fall out of that. `SPLICE_F_MOVE` is documented as a hint the kernel may
+ignore, and Linux itself has ignored it since 2.6.21, so ignoring it is not a
+shortfall. `SPLICE_F_GIFT` says the caller is donating its pages and will not
+touch them again; copying honours that promise without taking it up, which is the
+conservative direction and the only one available here.
+
+The part they share with `tee` is the pushback. A pipe `tee` has taken bytes out
+of is holding them in front of the pipe, so a `splice` or `vmsplice` from that
+pipe has to see them first — otherwise a guest that tees and then splices gets
+its stream back with a hole in it, which is the exact failure the pushback exists
+to prevent. `splicetest` checks it, and without the lookup the test gets two
+bytes where it wanted four.
+
+`SPLICE_F_NONBLOCK` is applied to the pipe end only, since Linux is explicit that
+it does not make a blocking *file* descriptor behave differently — and it is put
+back afterwards, because `O_NONBLOCK` belongs to the open file description and
+would otherwise outlive the call and change how every other user of that
+descriptor behaves.
+
+231 of 396.

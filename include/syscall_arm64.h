@@ -81,8 +81,8 @@
   SYSCALL(72, pselect6) \
   SYSCALL(73, ppoll) \
   SYSCALL(74, unimplemented) \
-  SYSCALL(75, unimplemented) \
-  SYSCALL(76, unimplemented) \
+  SYSCALL(75, vmsplice) \
+  SYSCALL(76, splice) \
   SYSCALL(77, tee) \
   SYSCALL(78, readlinkat) \
   SYSCALL(79, newfstatat) \
