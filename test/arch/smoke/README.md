@@ -346,7 +346,14 @@ guest-code cache sync.
   wanted. Registered buffers are checked on their bound, which is the one
   guarantee registration carries here: a read that runs off the end of its
   registration is refused even though the memory either side of it is perfectly
-  valid.
+  valid. Last, the ring is closed **through itself** — a `CLOSE` submitted
+  against the ring's own descriptor — which exercises the ring surviving being
+  freed underneath the call still running it, and catches a `CLOSE` that reaches
+  the descriptor table directly instead of going through `user_close` (the ring
+  is never detached, and entering it afterwards succeeds where it should say
+  `EOPNOTSUPP`). Note the suite does **not** cover the ring lock being released
+  around a blocking operation: showing that needs a second guest thread to be
+  held up, and these tests are single-threaded.
 
 The ELF binaries are committed prebuilt (as the x86 guest tests under
 `test/*/build/` are), so the check needs no cross-toolchain. The `.s` sources

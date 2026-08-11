@@ -140,6 +140,9 @@ struct uring {
    * worth saving, so what is left is the naming - and the naming is the part a
    * guest can observe, so it is the part that has to be right.
    */
+  unsigned         inuse;       /* threads inside enter or register */
+  bool             dead;        /* closed; freed when the last of them leaves */
+
   int             *files;
   uint32_t         nfiles;
   struct l_iovec  *bufs;
@@ -154,14 +157,40 @@ struct uring {
 };
 
 static struct uring *rings;
+static pthread_mutex_t rings_lock = PTHREAD_MUTEX_INITIALIZER;
 
+static void ring_free(struct uring *r);
+
+/*
+ * Find a ring and say that it is in use.
+ *
+ * The count exists because io_uring_enter releases the ring's own lock while an
+ * operation runs - see the note there - and a descriptor can be closed while it
+ * is released. Without this the close would free the ring under the thread
+ * still working on it. Detaching from the list happens at close; the freeing
+ * waits for the last user.
+ */
 static struct uring *
-ring_of(int fd)
+ring_get(int fd)
 {
-  for (struct uring *r = rings; r; r = r->next)
-    if (r->fd == fd)
-      return r;
-  return NULL;
+  pthread_mutex_lock(&rings_lock);
+  struct uring *r = rings;
+  while (r && r->fd != fd)
+    r = r->next;
+  if (r)
+    r->inuse++;
+  pthread_mutex_unlock(&rings_lock);
+  return r;
+}
+
+static void
+ring_put(struct uring *r)
+{
+  pthread_mutex_lock(&rings_lock);
+  bool last = (--r->inuse == 0) && r->dead;
+  pthread_mutex_unlock(&rings_lock);
+  if (last)
+    ring_free(r);
 }
 
 static uint32_t
@@ -618,8 +647,10 @@ DEFINE_SYSCALL(io_uring_setup, uint32_t, entries, gaddr_t, params_ptr)
     return err;
   }
   r->fd = fd;
+  pthread_mutex_lock(&rings_lock);
   r->next = rings;
   rings = r;
+  pthread_mutex_unlock(&rings_lock);
 
   p.sq_entries = sq_entries;
   p.cq_entries = cq_entries;
@@ -647,49 +678,68 @@ DEFINE_SYSCALL(io_uring_setup, uint32_t, entries, gaddr_t, params_ptr)
 }
 
 /*
- * A ring's descriptor has been closed, so its mappings go with it. Called from
- * the close path, because a ring outliving its descriptor would keep a mapping
- * of a file nothing can reach.
+ * Releasing everything a ring holds. Reached either from the close, when
+ * nothing was using it, or from the last thread to leave one that was closed
+ * while it worked - which is why it is separate from the detaching below.
+ */
+static void
+ring_free(struct uring *r)
+{
+  /* The poller is stopped and joined before anything it looks at is freed;
+   * abandoning it would leave a thread polling a descriptor that is about to
+   * be closed and writing into a mapping about to go. */
+  if (r->polling) {
+    pthread_mutex_lock(&r->lock);
+    r->stopping = true;
+    pthread_cond_broadcast(&r->posted);
+    pthread_mutex_unlock(&r->lock);
+    wake_poller(r);
+    pthread_join(r->poller, NULL);
+    close(r->wake[0]);
+    close(r->wake[1]);
+  }
+  for (struct pending *p = r->pending; p; ) {
+    struct pending *n = p->next;
+    free(p);
+    p = n;
+  }
+  free(r->files);
+  free(r->bufs);
+  pthread_cond_destroy(&r->posted);
+  pthread_mutex_destroy(&r->lock);
+  munmap(r->sq, r->sq_len);
+  munmap(r->cq, r->cq_len);
+  munmap(r->sqes, r->sqes_len);
+  free(r);
+}
+
+/*
+ * A ring's descriptor has been closed, so its mappings go with it.
+ *
+ * Detaching is immediate, so nothing new can find it; freeing waits for anyone
+ * already inside. That wait is the point: io_uring_enter runs an operation with
+ * the ring's lock released, so a descriptor can be closed while one is in
+ * flight, and without the count the close would free the ring under the thread
+ * still working on it.
  */
 void
 uring_close(int fd)
 {
-  struct uring **pp = &rings;
+  pthread_mutex_lock(&rings_lock);
+  struct uring **pp = &rings, *found = NULL;
   while (*pp) {
     if ((*pp)->fd == fd) {
-      struct uring *r = *pp;
-      *pp = r->next;
-
-      /* The poller is stopped and joined before anything it looks at is freed;
-       * abandoning it would leave a thread polling a descriptor that is about
-       * to be closed and writing into a mapping about to go. */
-      if (r->polling) {
-        pthread_mutex_lock(&r->lock);
-        r->stopping = true;
-        pthread_mutex_unlock(&r->lock);
-        wake_poller(r);
-        pthread_join(r->poller, NULL);
-        close(r->wake[0]);
-        close(r->wake[1]);
-      }
-      for (struct pending *p = r->pending; p; ) {
-        struct pending *n = p->next;
-        free(p);
-        p = n;
-      }
-      free(r->files);
-      free(r->bufs);
-      pthread_cond_destroy(&r->posted);
-      pthread_mutex_destroy(&r->lock);
-
-      munmap(r->sq, r->sq_len);
-      munmap(r->cq, r->cq_len);
-      munmap(r->sqes, r->sqes_len);
-      free(r);
-      return;
+      found = *pp;
+      *pp = found->next;
+      found->dead = true;
+      break;
     }
     pp = &(*pp)->next;
   }
+  bool now = found && found->inuse == 0;
+  pthread_mutex_unlock(&rings_lock);
+  if (now)
+    ring_free(found);
 }
 
 /* ------------------------------------------------------------- one entry */
@@ -700,7 +750,7 @@ uring_close(int fd)
  * operation blocks the caller. See the note at the top.
  */
 static int32_t
-run_sqe(struct uring *r, const struct l_io_uring_sqe *s)
+run_sqe(const struct l_io_uring_sqe *s)
 {
   ssize_t n;
 
@@ -709,63 +759,26 @@ run_sqe(struct uring *r, const struct l_io_uring_sqe *s)
     return 0;
 
   case LINUX_IORING_OP_READ:
-  case LINUX_IORING_OP_WRITE: {
+  case LINUX_IORING_OP_WRITE:
+  /* The fixed forms are these, with the range already checked against the
+   * registration by the caller - which happens there and not here because the
+   * table it checks against is ring state, and this runs without the ring's
+   * lock. */
+  case LINUX_IORING_OP_READ_FIXED:
+  case LINUX_IORING_OP_WRITE_FIXED: {
     if (s->len == 0)
       return 0;
     char *buf = malloc(s->len);
     if (!buf)
       return -LINUX_ENOMEM;
-    bool writing = (s->opcode == LINUX_IORING_OP_WRITE);
+    bool writing = (s->opcode == LINUX_IORING_OP_WRITE ||
+                    s->opcode == LINUX_IORING_OP_WRITE_FIXED);
     if (writing && copy_from_user(buf, (gaddr_t) s->addr, s->len)) {
       free(buf);
       return -LINUX_EFAULT;
     }
     /* An offset of -1 means "use the file's own position", which is how the
      * non-vectored forms stand in for read(2) and write(2). */
-    bool at_off = (s->off != (uint64_t) -1);
-    if (writing)
-      n = at_off ? pwrite(s->fd, buf, s->len, (off_t) s->off)
-                 : write(s->fd, buf, s->len);
-    else
-      n = at_off ? pread(s->fd, buf, s->len, (off_t) s->off)
-                 : read(s->fd, buf, s->len);
-    int e = errno;
-    if (!writing && n > 0 && copy_to_user((gaddr_t) s->addr, buf, (size_t) n)) {
-      free(buf);
-      return -LINUX_EFAULT;
-    }
-    free(buf);
-    return n < 0 ? -darwin_to_linux_errno(e) : (int32_t) n;
-  }
-
-  case LINUX_IORING_OP_READ_FIXED:
-  case LINUX_IORING_OP_WRITE_FIXED: {
-    /*
-     * The same transfer as READ and WRITE, except the memory was named ahead of
-     * time: buf_index picks a registered buffer and addr points somewhere inside
-     * it. The range is checked against that buffer, which is the one guarantee
-     * registration actually carries here - the kernel checks it because it has
-     * pinned those pages and will touch nothing else, and a caller that relies
-     * on the check should get it whether or not there is pinning behind it.
-     */
-    if (!r->bufs || s->buf_index >= r->nbufs)
-      return -LINUX_EFAULT;
-    const struct l_iovec *b = &r->bufs[s->buf_index];
-    uint64_t base = (uint64_t) b->iov_base;
-    if (s->addr < base || s->addr - base > b->iov_len ||
-        s->len > b->iov_len - (s->addr - base))
-      return -LINUX_EFAULT;
-    if (s->len == 0)
-      return 0;
-
-    char *buf = malloc(s->len);
-    if (!buf)
-      return -LINUX_ENOMEM;
-    bool writing = (s->opcode == LINUX_IORING_OP_WRITE_FIXED);
-    if (writing && copy_from_user(buf, (gaddr_t) s->addr, s->len)) {
-      free(buf);
-      return -LINUX_EFAULT;
-    }
     bool at_off = (s->off != (uint64_t) -1);
     if (writing)
       n = at_off ? pwrite(s->fd, buf, s->len, (off_t) s->off)
@@ -846,12 +859,16 @@ run_sqe(struct uring *r, const struct l_io_uring_sqe *s)
      * fsync is stronger than requested, which is the safe way to be wrong. */
     return fsync(s->fd) < 0 ? -darwin_to_linux_errno(errno) : 0;
 
-  case LINUX_IORING_OP_CLOSE: {
-    pthread_rwlock_wrlock(&proc.fileinfo.fdtable_lock);
-    int ret = do_close(&proc.fileinfo.fdtable, s->fd);
-    pthread_rwlock_unlock(&proc.fileinfo.fdtable_lock);
-    return ret;
-  }
+  case LINUX_IORING_OP_CLOSE:
+    /*
+     * user_close, not do_close. do_close is the descriptor table's half; the
+     * rest of what closing means - the inotify and fanotify notes, a timerfd's
+     * timer, a ring's own mappings - hangs off user_close above it. An opcode
+     * that called the inner half closed the descriptor and left everything
+     * attached to it behind, which is the same mistake OPENAT made by calling
+     * do_openat.
+     */
+    return user_close(s->fd);
 
   case LINUX_IORING_OP_OPENAT: {
     char guestpath[LINUX_PATH_MAX];
@@ -918,6 +935,36 @@ run_sqe(struct uring *r, const struct l_io_uring_sqe *s)
      * the batch failing. */
     return -LINUX_EINVAL;
   }
+}
+
+/*
+ * A fixed transfer names its memory by index and points somewhere inside it, so
+ * the range has to be inside the registration it named.
+ *
+ * That check is worth keeping even though nothing is pinned here. The kernel
+ * makes it because it has pinned those pages and will touch nothing else; a
+ * caller relying on the bound should get the bound whatever the reason for it,
+ * and a fixed read running off the end of its buffer is a mistake worth being
+ * told about rather than quietly served.
+ *
+ * Checked here, under the ring's lock, because r->bufs is ring state that
+ * io_uring_register can replace - and the operation itself runs with that lock
+ * released.
+ */
+static int
+check_fixed_buffer(struct uring *r, const struct l_io_uring_sqe *s)
+{
+  if (s->opcode != LINUX_IORING_OP_READ_FIXED &&
+      s->opcode != LINUX_IORING_OP_WRITE_FIXED)
+    return 0;
+  if (!r->bufs || s->buf_index >= r->nbufs)
+    return -LINUX_EFAULT;
+  const struct l_iovec *b = &r->bufs[s->buf_index];
+  uint64_t base = (uint64_t) b->iov_base;
+  if (s->addr < base || s->addr - base > b->iov_len ||
+      s->len > b->iov_len - (s->addr - base))
+    return -LINUX_EFAULT;
+  return 0;
 }
 
 /*
@@ -1104,11 +1151,13 @@ DEFINE_SYSCALL(io_uring_enter, int, fd, uint32_t, to_submit,
                uint32_t, min_complete, uint32_t, flags, gaddr_t, sig,
                size_t, sigsz)
 {
-  struct uring *r = ring_of(fd);
+  struct uring *r = ring_get(fd);
   if (!r)
     return -LINUX_EOPNOTSUPP;   /* not a ring; what the kernel answers here */
-  if (flags & ~(LINUX_IORING_ENTER_GETEVENTS | LINUX_IORING_ENTER_SQ_WAKEUP))
+  if (flags & ~(LINUX_IORING_ENTER_GETEVENTS | LINUX_IORING_ENTER_SQ_WAKEUP)) {
+    ring_put(r);
     return -LINUX_EINVAL;
+  }
 
   pthread_mutex_lock(&r->lock);
 
@@ -1137,6 +1186,7 @@ DEFINE_SYSCALL(io_uring_enter, int, fd, uint32_t, to_submit,
        * the call, since the other submissions are perfectly good. */
       dropped++;
       done++;
+      st(r->sq, SQ_OFF_HEAD, sq_head + i + 1);
       continue;
     }
 
@@ -1144,7 +1194,19 @@ DEFINE_SYSCALL(io_uring_enter, int, fd, uint32_t, to_submit,
     memcpy(&s, r->sqes + (size_t) slot * sizeof s, sizeof s);
     done++;
 
+    /*
+     * The entry is claimed now, before anything can release the lock. The copy
+     * above is what the rest of this works from, so the guest is free to reuse
+     * the slot the moment it sees the head move - and another thread entering
+     * this same ring must not find the entry still waiting and run it twice.
+     */
+    st(r->sq, SQ_OFF_HEAD, sq_head + i + 1);
+
+    /* Both of these read tables that io_uring_register can replace, so they
+     * happen here rather than inside the operation. */
     int fixed = resolve_fixed_file(r, &s);
+    if (fixed == 0)
+      fixed = check_fixed_buffer(r, &s);
     if (fixed < 0) {
       post_cqe(r, s.user_data, fixed);
       continue;
@@ -1152,11 +1214,30 @@ DEFINE_SYSCALL(io_uring_enter, int, fd, uint32_t, to_submit,
 
     if (arm_async(r, &s))
       continue;
-    post_cqe(r, s.user_data, run_sqe(r, &s));
+
+    /*
+     * And here the ring's lock is released for the duration of the operation.
+     *
+     * Holding it across a read held up everything else this ring does. The
+     * poller cannot post a completion without this lock, so a poll that came
+     * ready sat waiting for an unrelated file to finish reading, a timeout
+     * fired late by however long that took, and a second thread entering the
+     * same ring waited behind it as well. None of that is what the operation
+     * was waiting for.
+     *
+     * Nothing below touches ring state, which is what makes releasing it safe:
+     * the entry is a copy, the descriptor and the buffer bound were resolved
+     * above, and the ring itself cannot be freed while this thread is counted
+     * as using it.
+     */
+    pthread_mutex_unlock(&r->lock);
+    int32_t res = run_sqe(&s);
+    pthread_mutex_lock(&r->lock);
+
+    post_cqe(r, s.user_data, res);
   }
 
   st(r->sq, SQ_OFF_DROPPED, dropped);
-  st(r->sq, SQ_OFF_HEAD, sq_head + done);
   check_counted_timeouts(r);
 
   /*
@@ -1180,11 +1261,13 @@ DEFINE_SYSCALL(io_uring_enter, int, fd, uint32_t, to_submit,
     if (sig) {
       if (sigsz != sizeof(l_sigset_t)) {
         pthread_mutex_unlock(&r->lock);
+        ring_put(r);
         return -LINUX_EINVAL;
       }
       l_sigset_t lset;
       if (copy_from_user(&lset, sig, sizeof lset)) {
         pthread_mutex_unlock(&r->lock);
+        ring_put(r);
         return -LINUX_EFAULT;
       }
       sigset_t dset;
@@ -1213,6 +1296,7 @@ DEFINE_SYSCALL(io_uring_enter, int, fd, uint32_t, to_submit,
   }
 
   pthread_mutex_unlock(&r->lock);
+  ring_put(r);
   if (err < 0 && done == 0)
     return err;
   return (int) done;
@@ -1321,12 +1405,13 @@ uring_register(struct uring *r, uint32_t opcode, gaddr_t arg, uint32_t nr_args)
 DEFINE_SYSCALL(io_uring_register, int, fd, uint32_t, opcode, gaddr_t, arg,
                uint32_t, nr_args)
 {
-  struct uring *r = ring_of(fd);
+  struct uring *r = ring_get(fd);
   if (!r)
     return -LINUX_EOPNOTSUPP;
 
   pthread_mutex_lock(&r->lock);
   int ret = uring_register(r, opcode, arg, nr_args);
   pthread_mutex_unlock(&r->lock);
+  ring_put(r);
   return ret;
 }

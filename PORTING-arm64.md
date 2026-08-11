@@ -4604,3 +4604,48 @@ The first attempt at that first check proved nothing: the edit that was supposed
 to disable the flag never matched, so the test ran against correct code and
 passed. A verification that silently does not verify is worse than none, because
 it is recorded as evidence. It is asserted now.
+
+### 3.5.87 The ring lock, and what was actually wrong with holding it
+
+`io_uring_enter` held the ring's lock across the operation it was running. That
+lock is what the poller needs to post a completion, so a poll that came ready sat
+waiting for an unrelated file to finish reading, a timeout fired late by however
+long that read took, and a second thread entering the same ring queued behind it.
+None of that is what the operation was waiting for. The lock is now released for
+the duration of the operation and taken again to post the completion.
+
+Two things had to be true first. The submission entry is claimed before the lock
+goes — the head is advanced for that entry rather than for the whole batch at the
+end — so another thread entering the same ring cannot find it still waiting and
+run it twice; the entry itself is worked from a copy, so the guest reusing the
+slot is fine. And everything that reads ring state moves above the release:
+`IOSQE_FIXED_FILE` resolution and the fixed-buffer bound check both consult
+tables `io_uring_register` can replace, so they happen under the lock and the
+operation itself consults nothing.
+
+**A ring can now be closed while one of its operations is in flight**, which the
+lock had previously made impossible, so rings gained a use count. Closing detaches
+immediately, so nothing new can find it; freeing waits for the last thread
+inside. Without that the close would free the ring under the thread still working
+on it.
+
+**A claim in the first draft of this was wrong and is worth recording.** It said
+holding the lock was also a deadlock: that closing a descriptor takes the
+descriptor table's write lock and then the ring's, while an operation opening a
+file does the reverse. The second half is right and the first is not —
+`uring_close` is called from `user_close` *before* that lock is taken, not under
+it. There was no deadlock, only the delay above. The error surfaced because the
+test written to demonstrate the deadlock failed for an entirely different reason,
+which was the good outcome: a test that had passed would have left the wrong
+explanation in the tree.
+
+What that test found instead was a real bug of the same shape as the `OPENAT` one
+two sections up. The `CLOSE` opcode called `do_close`, the descriptor table's
+half, rather than `user_close` above it — so it closed the descriptor and left
+behind everything hanging off it: the inotify and fanotify notes, a timerfd's
+timer, and a ring's own mappings and registrations. Closing a ring through itself
+left the ring attached, and entering it afterwards succeeded.
+
+The suite does not cover the lock release itself. Showing it needs a second guest
+thread to be held up by the first, and these tests are single-threaded; what is
+tested is the lifetime the release made necessary.

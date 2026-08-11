@@ -76,6 +76,7 @@ static long sys6(long n, long a, long b, long c, long d, long e, long f){
 #define OP_UNLINKAT       36
 #define OP_MKDIRAT        37
 #define OP_OPENAT         18
+#define OP_CLOSE          19
 #define OP_SEND           26
 #define OP_RECV           27
 #define OP_OPENAT2        28
@@ -1069,7 +1070,35 @@ void _start(void)
     fail("a registration that is not implemented", r, -EINVAL);
 
   sys6(SYS_close, f, 0, 0, 0, 0, 0);
-  sys6(SYS_close, fd, 0, 0, 0, 0, 0);
+
+  /*
+   * ---- closing the ring through the ring ----
+   *
+   * Last, because it ends the ring. This is the shape of the lock ordering
+   * problem in one thread: closing a descriptor takes the descriptor table's
+   * lock and then the ring's, and an operation running inside the ring used to
+   * hold the ring's lock while asking for the table's. Submitting a close of
+   * the ring's own descriptor put both halves on one thread, and it stopped
+   * there and never returned.
+   *
+   * It also has to survive the ring being freed underneath the call that is
+   * still running it - the completion below is posted after the close has taken
+   * the ring off the list.
+   */
+  { struct sqe *s = push();
+    s->opcode = OP_CLOSE;
+    s->fd = fd;                 /* the ring's own descriptor */
+    s->user_data = 0xC10E;
+    if ((r = sys6(SYS_io_uring_enter, fd, 1, 1, IORING_ENTER_GETEVENTS, 0, 0)) != 1)
+      fail("closing the ring through itself", r, 1);
+    struct cqe c = pop("a completion for closing the ring");
+    if (c.res != 0)
+      fail("what closing the ring reported", c.res, 0);
+
+    /* And it is gone: nothing more can be submitted to it. */
+    if ((r = sys6(SYS_io_uring_enter, fd, 0, 0, 0, 0, 0)) != -EOPNOTSUPP)
+      fail("entering a ring that closed itself", r, -EOPNOTSUPP); }
+
   sys6(SYS_unlinkat, AT_FDCWD, (long) "/uringfile", 0, 0, 0, 0);
 
   put("uring ok\n");
