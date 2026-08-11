@@ -335,6 +335,8 @@
   SYSCALL(329, unimplemented)                   \
   SYSCALL(330, unimplemented)                   \
   SYSCALL(331, unimplemented)                   \
-  SYSCALL(332, statx)
+  SYSCALL(332, statx)                           \
+  SYSCALL(333, unimplemented)                   \
+  SYSCALL(334, rseq)
 
-#define NR_SYSCALLS 333
+#define NR_SYSCALLS 335

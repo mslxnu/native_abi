@@ -3831,3 +3831,74 @@ The test takes the handle out of an event and hands it straight to
 `open_by_handle_at`, then checks the **content** that comes back. A handle that
 opened the wrong file would pass any check of the return value alone — which is
 exactly what the padding bug did until the content was compared.
+
+### 3.5.73 `rseq`, a table that had drifted into live numbers, and a generated syscall list
+
+**`rseq` (293) is registered and deliberately refused.** glibc 2.35 and later
+register a restartable-sequence area on every thread, so this arrived eight
+times before a guest ran any of its own code and was written to the warning log
+as "unimplemented syscall: 293" — a false alarm about something working
+correctly, which is worse than silence because somebody eventually investigates
+it.
+
+ENOSYS is the *right* answer, not a placeholder. Linux returns exactly this
+without `CONFIG_RSEQ`, glibc sets `__rseq_size` to zero, and callers fall back to
+atomics. Accepting the registration would be the harmful choice: a restartable
+sequence is a critical section the **kernel** promises to abort on preemption or
+migration, and there is no scheduler here to make that promise. The obvious
+repair — a private `cpu_id` per thread, so no two share a slot and no abort is
+needed — does not survive contact with how the values are used, since per-CPU
+arrays are sized by the CPU count and an id beyond it indexes past the end of
+somebody's array.
+
+**The aarch64 table had drifted into live syscall numbers.** The generator
+appends x86-legacy handlers with no aarch64 number as a compat tail, "past the
+real range" — which it was when written, and stopped being when Linux allocated
+more. The committed table put that tail at 453, and 453–462 are now
+`map_shadow_stack`, the `futex_*` trio, `statmount`, `listmount`, the `lsm_*`
+trio and `mseal`. A guest calling `mseal` would have reached `epoll_wait_old`.
+The tail is pinned at 1024 now, chosen so the kernel moving cannot walk into it.
+
+Two further things fell out of regenerating:
+
+- **The generator asked the wrong source what was implemented.** It took the set
+  from the x86 table, which stops where the x86-64 numbering stops — so a
+  handler numbered beyond it looked absent and was written out of the aarch64
+  table. `faccessat2` (439 there) would have been dropped. It asks the sources
+  as well now, and unions the two.
+- **`inotify_init` was guarded to x86 only**, which was a workaround for the
+  missing table entry rather than a fix. The compat tail exists precisely so
+  every x86-legacy handler is present in both builds; the guard made the arm64
+  link fail once the tail was correct.
+
+**The README now carries the whole syscall table, generated.** A hand-written
+list of 400-odd calls is wrong within a month and wrong in the direction that
+matters — claiming coverage that is not there. `util/gen_syscall_doc.py` reads
+the numbers and names from the kernel's own headers and the status from NABI's
+dispatch tables.
+
+Writing it honestly cost 13 syscalls: a handler whose entire answer is "this does
+not exist" is not coverage, so `rseq` and the twelve `DEFINE_NOT_IMPLEMENTED_SYSCALL`
+stubs are marked apart from the implemented ones. **204 of 398**, not the 217 a
+naive count of named table entries gives.
+
+**Against hyper-linux**, the nearest peer by approach — the same per-process VM,
+EL1 shim and syscall translation — it reports 172 translated against these 204,
+and states that it lacks namespaces and cgroups, treats `MAP_SHARED` as
+`MAP_PRIVATE`, and has no `clone3` or robust futexes. NABI has all eight
+namespaces, a cgroup hierarchy, real shared file mappings, System V IPC,
+`mount(2)` with bind mounts and propagation, inotify and fanotify. It has
+`clone3` and robust futexes no more than hyper-linux does. Where hyper-linux is
+ahead is real and worth recording: it runs **x86-64 Linux binaries on Apple
+Silicon** through Rosetta, which NABI does not — the x86 backend here is a
+separate build for Intel Macs and is compile-tested rather than run — and it
+describes demand-paged memory over a 1TB address space where NABI maps eagerly.
+
+**fakedir** turned out not to be applicable, and the reason is worth writing
+down. It redirects paths with `DYLD_INSERT_LIBRARIES`, which means it cannot
+touch static binaries, is defeated by SIP and notarisation, does not affect
+directory listings, and cannot reach dyld's own view of the filesystem. Every one
+of those limits comes from intercepting *above* the syscall boundary. NABI is on
+the other side of it: path translation happens where the guest's `svc` is
+handled, so static binaries, listings and the guest's own `ld.so` are all covered
+for the same reason.

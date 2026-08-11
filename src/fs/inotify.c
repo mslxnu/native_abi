@@ -382,14 +382,17 @@ DEFINE_SYSCALL(inotify_init1, int, flags)
   return in->rd;
 }
 
-/* Only x86-64 has the flagless form; the asm-generic table arm64 uses dropped
- * it and kept inotify_init1 alone. */
-#if defined(__x86_64__)
+/*
+ * Only x86-64 numbers the flagless form; the asm-generic table arm64 uses kept
+ * inotify_init1 alone. The handler is still built on both, because the
+ * generated aarch64 table gives every x86-legacy handler a slot in its compat
+ * tail - that is what the tail is for - and a handler missing from one build
+ * is a link error in it.
+ */
 DEFINE_SYSCALL(inotify_init)
 {
   return sys_inotify_init1(0);
 }
-#endif
 
 /*
  * The events that can arrive from anywhere. A watch asking for nothing outside

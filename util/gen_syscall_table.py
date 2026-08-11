@@ -26,11 +26,25 @@ import sys
 
 
 def implemented_names(x86_syscall_h):
-    text = open(x86_syscall_h).read()
+    """Every syscall NABI has a handler for.
+
+    The x86 table alone is not that set. It stops where the x86-64 numbering
+    stops, so a handler for something numbered beyond it - faccessat2 is 439
+    there, rseq 334 - looked unimplemented and was written out of the aarch64
+    table as though it did not exist. The sources are asked as well, and the
+    two are unioned: a name in either is a name with code behind it.
+    """
     names = set()
+    text = open(x86_syscall_h).read()
     for m in re.finditer(r'SYSCALL\(\s*\d+\s*,\s*(\w+)\s*\)', text):
         if m.group(1) != 'unimplemented':
             names.add(m.group(1))
+
+    import glob
+    for path in glob.glob('src/**/*.c', recursive=True):
+        for m in re.finditer(r'DEFINE_SYSCALL\(\s*(\w+)', open(path).read()):
+            if m.group(1) not in ('name',):
+                names.add(m.group(1))
     return names
 
 
@@ -102,8 +116,18 @@ def main():
     # numbers; a guest that deliberately did would reach the legacy handler
     # instead of the unknown-syscall path, which is benign (the handlers are
     # safe, and most return -ENOSYS).
+    # The compat tail sits at a fixed, deliberately distant base rather than
+    # immediately after the last real number.
+    #
+    # It used to start at `count`, which was past the end of the header it was
+    # generated from - and stopped being past the end as soon as Linux allocated
+    # more. The committed table had the tail at 453, and 453..462 are now
+    # map_shadow_stack, the futex_* trio, statmount, listmount, the lsm_* trio
+    # and mseal: a guest calling mseal would have reached epoll_wait_old. The
+    # numbering has to be chosen so that the kernel moving cannot walk into it.
+    COMPAT_BASE = 1024
     compat = dropped
-    total = count + len(compat)
+    total = COMPAT_BASE + len(compat)
 
     src = unistd.replace('\\', '/').split('/')[-1]
     o = sys.stdout
@@ -120,10 +144,15 @@ def main():
         sym = name if (name and name in impl) else 'unimplemented'
         print(f"  SYSCALL({n}, {sym}) \\", file=o)
     if compat:
+        print("  /* Numbers Linux has not allocated. Left explicitly empty so "
+              "that the \\", file=o)
+        print("   * compat tail below cannot be mistaken for them. */ \\", file=o)
+        for n in range(count, COMPAT_BASE):
+            print(f"  SYSCALL({n}, unimplemented) \\", file=o)
         print("  /* x86-legacy handlers with no aarch64 number - see the "
               "generator. */ \\", file=o)
         for i, name in enumerate(compat):
-            print(f"  SYSCALL({count + i}, {name}) \\", file=o)
+            print(f"  SYSCALL({COMPAT_BASE + i}, {name}) \\", file=o)
     print("", file=o)
     print(f"#define NR_SYSCALLS {total}", file=o)
 
