@@ -47,7 +47,9 @@
 #include "linux/time.h"
 #include "linux/fs.h"
 
-void init_userstack(int argc, char *argv[], char **envp, uint64_t exe_base, const Elf64_Ehdr *ehdr, uint64_t global_offset, uint64_t interp_base, bool secure);
+void init_userstack(int argc, char *argv[], char **envp, uint64_t exe_base,
+               const Elf64_Ehdr *ehdr, uint64_t global_offset,
+               uint64_t interp_base, bool secure, const char *execfn);
 
 int
 load_elf_interp(const char *path, ulong load_addr)
@@ -137,7 +139,8 @@ load_elf_interp(const char *path, ulong load_addr)
 }
 
 int
-load_elf(Elf64_Ehdr *ehdr, int argc, char *argv[], char **envp, bool secure)
+load_elf(Elf64_Ehdr *ehdr, int argc, char *argv[], char **envp, bool secure,
+         const char *execfn)
 {
   uint64_t map_top = 0;
 
@@ -231,7 +234,7 @@ load_elf(Elf64_Ehdr *ehdr, int argc, char *argv[], char **envp, bool secure)
   }
 
   init_userstack(argc, argv, envp, load_base, ehdr, global_offset,
-                 interp ? map_top : 0, secure);
+                 interp ? map_top : 0, secure, execfn);
 
   return 1;
 }
@@ -310,7 +313,9 @@ push(const void *data, size_t n)
 }
 
 void
-init_userstack(int argc, char *argv[], char **envp, uint64_t exe_base, const Elf64_Ehdr *ehdr, uint64_t global_offset, uint64_t interp_base, bool secure)
+init_userstack(int argc, char *argv[], char **envp, uint64_t exe_base,
+               const Elf64_Ehdr *ehdr, uint64_t global_offset,
+               uint64_t interp_base, bool secure, const char *execfn)
 {
   static const uint64_t zero = 0;
 
@@ -326,6 +331,32 @@ init_userstack(int argc, char *argv[], char **envp, uint64_t exe_base, const Elf
   char random[16];
 
   uint64_t rand_ptr = push(random, sizeof random);
+
+  /*
+   * The two auxv entries that are strings rather than numbers, pushed here so
+   * they end up above the argument and environment arrays - push() moves the
+   * stack pointer down, so what goes first sits highest, which is where Linux
+   * puts them too.
+   *
+   * AT_EXECFN is the path execve was *given*, which is not argv[0]: a program
+   * may pass whatever argv[0] it likes, and the two differing is the ordinary
+   * case for a login shell spelled `-bash` and the whole basis of a multi-call
+   * binary like busybox. Something re-executing itself reads this to find out
+   * what to re-execute.
+   */
+  uint64_t execfn_ptr = push(execfn, strlen(execfn) + 1);
+
+  /*
+   * AT_PLATFORM names the instruction set, and glibc builds library search
+   * directories out of it. It has to be the architecture the *guest* runs,
+   * which is the one nabi was built for.
+   */
+#if defined(__arm64__)
+  static const char platform[] = "aarch64";
+#else
+  static const char platform[] = "x86_64";
+#endif
+  uint64_t platform_ptr = push(platform, sizeof platform);
 
   char **renvp;
   for (renvp = envp; *renvp; ++renvp)
@@ -413,6 +444,8 @@ init_userstack(int argc, char *argv[], char **envp, uint64_t exe_base, const Elf
      */
     { AT_HWCAP, 0 },
     { AT_HWCAP2, 0 },
+    { AT_EXECFN, execfn_ptr },
+    { AT_PLATFORM, platform_ptr },
     { AT_NULL, 0 },
   };
 
@@ -565,7 +598,8 @@ do_exec(const char *elf_path, int argc, char *argv[], char **envp)
      * elevation itself happens below, after the image is loaded.
      */
     bool secure = (g_mode & (S_ISUID | S_ISGID)) != 0;
-    if ((err = load_elf((Elf64_Ehdr *) data, argc, argv, envp, secure)) < 0)
+    if ((err = load_elf((Elf64_Ehdr *) data, argc, argv, envp, secure,
+                        elf_path)) < 0)
       return err;
     /*
      * Recorded here rather than where do_exec returns, because a `#!` script

@@ -4930,7 +4930,28 @@ paper over a gap. Against the previous build it reports `AT_SECURE -> 0, wanted
 
 Still 260 of 375: this is a bug in what `execve` builds, not a new call.
 
-Two entries are still absent and are strings rather than numbers, which is why
-they were not folded in here: `AT_EXECFN`, the path the program was run as, and
-`AT_PLATFORM`. Both need a string pushed onto the guest stack before the vector
-is laid out.
+`AT_EXECFN` and `AT_PLATFORM` followed, and being strings is the whole of what
+made them a separate step: each needs bytes pushed onto the guest stack before
+the vector is laid out, and the vector then carries a pointer to them. They go
+down before the argument and environment arrays, so they end up above them —
+`push()` moves the stack pointer down, so what goes first sits highest, which is
+where Linux puts them too.
+
+`AT_EXECFN` is the path `execve` was **given**, which is not `argv[0]`. A program
+may pass whatever `argv[0]` it likes, and the two differing is the ordinary case
+for a login shell spelled `-bash` and the whole basis of a multi-call binary like
+busybox; something re-executing itself reads this to find out what to re-execute.
+So it is threaded down from `do_exec`, which is where the real path is, rather
+than taken from the argument vector that happens to be to hand.
+
+`AT_PLATFORM` names the instruction set and glibc builds library search
+directories out of it, so it has to be the architecture the *guest* runs — the
+one NABI was built for, not the host it runs on, which on Apple Silicon are the
+same and on an x86_64 build are not.
+
+Testing a pointer needs more than testing a number. An entry that is present but
+points into memory the guest cannot read, or at a string nothing wrote, passes a
+presence check and fails everything after it — so `auxvtest` follows both and
+reads them. Against a build where `AT_EXECFN` is a valid pointer to the wrong
+thing it reports `240, wanted 47`, and against one claiming `x86_64` on an arm64
+guest, `120, wanted 97`.

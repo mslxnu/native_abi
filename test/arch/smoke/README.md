@@ -390,7 +390,11 @@ guest-code cache sync.
   for `AT_SECURE` and calls `g_error()` if `errno` is set, which aborts. A
   missing entry is not a feature a program does without, it is a program that
   dies, and without this one `dconf`'s RPM scriptlet trapped during a Fedora
-  install and took every other GLib program with it.
+  install and took every other GLib program with it. `AT_EXECFN` and
+  `AT_PLATFORM` are pointers, so being present is only half of it — a pointer
+  into memory the guest cannot read, or at a string that was never written,
+  passes a presence check and fails everything after it. Both are followed and
+  read.
 
 The ELF binaries are committed prebuilt (as the x86 guest tests under
 `test/*/build/` are), so the check needs no cross-toolchain. The `.s` sources

@@ -31,6 +31,8 @@
 #define AT_SECURE 23
 #define AT_RANDOM 25
 #define AT_HWCAP2 26
+#define AT_PLATFORM 15
+#define AT_EXECFN   31
 
 #define SYS_write 64
 #define SYS_exit  93
@@ -136,6 +138,40 @@ start_c(unsigned long *sp)
     unsigned long sum = 0;
     for (int i = 0; i < 16; i++) sum += r[i];
     (void) sum; }
+
+  must("AT_EXECFN",  AT_EXECFN);
+  must("AT_PLATFORM", AT_PLATFORM);
+
+  /*
+   * Both are pointers to strings, so being present is only half of it - a
+   * pointer into memory the guest cannot read, or at a string that was never
+   * written, passes a presence check and fails everything after it.
+   */
+  { unsigned long v = 0;
+    have(AT_EXECFN, &v);
+    if (v == 0)
+      fail("AT_EXECFN's pointer", (long) v, 1);
+    const char *fn = (const char *) v;
+    /* The path execve was given, so it starts at the root and names this
+     * program. argv[0] would do too here, which is why the check is that it is
+     * a path rather than that it equals argv[0]. */
+    if (fn[0] != '/')
+      fail("AT_EXECFN, which should be the path execve was given", fn[0], '/');
+    int n = 0;
+    while (fn[n] && n < 256) n++;
+    if (n == 0 || n >= 256)
+      fail("the length of AT_EXECFN's string", n, 1); }
+
+  { unsigned long v = 0;
+    have(AT_PLATFORM, &v);
+    if (v == 0)
+      fail("AT_PLATFORM's pointer", (long) v, 1);
+    const char *pl = (const char *) v;
+    /* This binary is aarch64, so the platform it is told about must be. */
+    const char *want = "aarch64";
+    for (int i = 0; want[i] || pl[i]; i++)
+      if (pl[i] != want[i])
+        fail("AT_PLATFORM's string", pl[i], want[i]); }
 
   put("auxv ok\n");
   sys3(SYS_exit, 0, 0, 0);
