@@ -382,6 +382,16 @@ guest-code cache sync.
   through the clone. `statmount` is read at the offsets it reports rather
   than at assumed ones.
 
+- `auxvtest` — the auxiliary vector a process starts with, walked off its own
+  stack rather than through `getauxval`, so it checks what NABI actually put
+  there with no libc in between to paper over a gap. `AT_SECURE` is why it
+  exists: `getauxval` sets `errno` to `ENOENT` for an entry that is absent, and
+  not every caller treats that as "no answer" — GLib's `g_check_setuid()` asks
+  for `AT_SECURE` and calls `g_error()` if `errno` is set, which aborts. A
+  missing entry is not a feature a program does without, it is a program that
+  dies, and without this one `dconf`'s RPM scriptlet trapped during a Fedora
+  install and took every other GLib program with it.
+
 The ELF binaries are committed prebuilt (as the x86 guest tests under
 `test/*/build/` are), so the check needs no cross-toolchain. The `.s` sources
 are here for reference; rebuild with an aarch64-linux clang + ld.lld:

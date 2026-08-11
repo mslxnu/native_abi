@@ -47,7 +47,7 @@
 #include "linux/time.h"
 #include "linux/fs.h"
 
-void init_userstack(int argc, char *argv[], char **envp, uint64_t exe_base, const Elf64_Ehdr *ehdr, uint64_t global_offset, uint64_t interp_base);
+void init_userstack(int argc, char *argv[], char **envp, uint64_t exe_base, const Elf64_Ehdr *ehdr, uint64_t global_offset, uint64_t interp_base, bool secure);
 
 int
 load_elf_interp(const char *path, ulong load_addr)
@@ -137,7 +137,7 @@ load_elf_interp(const char *path, ulong load_addr)
 }
 
 int
-load_elf(Elf64_Ehdr *ehdr, int argc, char *argv[], char **envp)
+load_elf(Elf64_Ehdr *ehdr, int argc, char *argv[], char **envp, bool secure)
 {
   uint64_t map_top = 0;
 
@@ -230,7 +230,8 @@ load_elf(Elf64_Ehdr *ehdr, int argc, char *argv[], char **envp)
   proc.mm->start_brk = roundup(map_top, GUEST_MMAP_GRANULE);
   }
 
-  init_userstack(argc, argv, envp, load_base, ehdr, global_offset, interp ? map_top : 0);
+  init_userstack(argc, argv, envp, load_base, ehdr, global_offset,
+                 interp ? map_top : 0, secure);
 
   return 1;
 }
@@ -309,7 +310,7 @@ push(const void *data, size_t n)
 }
 
 void
-init_userstack(int argc, char *argv[], char **envp, uint64_t exe_base, const Elf64_Ehdr *ehdr, uint64_t global_offset, uint64_t interp_base)
+init_userstack(int argc, char *argv[], char **envp, uint64_t exe_base, const Elf64_Ehdr *ehdr, uint64_t global_offset, uint64_t interp_base, bool secure)
 {
   static const uint64_t zero = 0;
 
@@ -358,6 +359,25 @@ init_userstack(int argc, char *argv[], char **envp, uint64_t exe_base, const Elf
   uint64_t args_start = push(buf, total);
   uint64_t args_end = args_start + args_total, env_end = args_start + total;
 
+  /*
+   * The auxiliary vector.
+   *
+   * What goes in it is not only a matter of what a program might find useful,
+   * because of how it is read. getauxval() sets errno to ENOENT for an entry
+   * that is absent, and callers do not all treat that as "no answer" - GLib's
+   * g_check_setuid() asks for AT_SECURE and calls g_error() if errno is set,
+   * which aborts. So a missing entry is not a feature a program does without;
+   * it is a program that dies. That was dconf, and with it every GLib program:
+   * the RPM scriptlet for dconf ended in a trap during a Fedora install.
+   *
+   * Linux supplies all of these on every exec, so this does too. The ids are
+   * the guest's own rather than the host's, which is the whole point of them.
+   */
+  pthread_rwlock_rdlock(&proc.cred.lock);
+  uint64_t a_uid = proc.cred.uid, a_euid = proc.cred.euid;
+  uint64_t a_gid = proc.cred.gid, a_egid = proc.cred.egid;
+  pthread_rwlock_unlock(&proc.cred.lock);
+
   Elf64_Auxv aux[] = {
     { AT_BASE, interp_base },
     { AT_ENTRY, ehdr->e_entry + global_offset },
@@ -370,6 +390,29 @@ init_userstack(int argc, char *argv[], char **envp, uint64_t exe_base, const Elf
     { AT_PAGESZ, PAGE_SIZEOF(PAGE_4KB) },
 #endif
     { AT_RANDOM, rand_ptr },
+    /*
+     * Whether this exec crossed a privilege boundary. Nonzero tells the dynamic
+     * linker to ignore LD_PRELOAD and the rest, so answering it wrongly in the
+     * permissive direction would matter; it is computed from the file's setuid
+     * bits by the caller rather than guessed at here.
+     */
+    { AT_SECURE, secure ? 1 : 0 },
+    { AT_UID, a_uid },
+    { AT_EUID, a_euid },
+    { AT_GID, a_gid },
+    { AT_EGID, a_egid },
+    /* Jiffies per second, which is what sysconf(_SC_CLK_TCK) reports. glibc
+     * falls back to 100 when this is absent, and 100 is the answer, so this
+     * changes nothing except that asking for it no longer sets errno. */
+    { AT_CLKTCK, 100 },
+    /*
+     * No optional CPU features claimed. That is the conservative direction:
+     * glibc dispatches its string routines on these, so an over-claim selects
+     * an implementation the guest may fault on, where an under-claim only
+     * selects a slower one that always works.
+     */
+    { AT_HWCAP, 0 },
+    { AT_HWCAP2, 0 },
     { AT_NULL, 0 },
   };
 
@@ -516,7 +559,13 @@ do_exec(const char *elf_path, int argc, char *argv[], char **envp)
   drop_privilege();
 
   if (4 <= st.st_size && memcmp(data, ELFMAG, 4) == 0) {
-    if ((err = load_elf((Elf64_Ehdr *) data, argc, argv, envp)) < 0)
+    /*
+     * Whether this exec crosses a privilege boundary, which is what AT_SECURE
+     * reports. Decided here because it is where the file's mode is known - the
+     * elevation itself happens below, after the image is loaded.
+     */
+    bool secure = (g_mode & (S_ISUID | S_ISGID)) != 0;
+    if ((err = load_elf((Elf64_Ehdr *) data, argc, argv, envp, secure)) < 0)
       return err;
     /*
      * Recorded here rather than where do_exec returns, because a `#!` script

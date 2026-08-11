@@ -686,6 +686,21 @@ else
     fail=1
 fi
 
+# auxvtest: the auxiliary vector, walked off the process's own stack rather than
+# through getauxval - so it checks what NABI put there with no libc in between.
+# AT_SECURE is why it exists: getauxval sets errno for an entry that is absent,
+# and GLib's g_check_setuid turns that into g_error, which aborts. Without it
+# dconf's RPM scriptlet trapped during a Fedora install, and with it every other
+# GLib program.
+cp "$here/auxvtest" "$root/"; chmod +x "$root/auxvtest"
+out=$("$NABI" -m "$root" /auxvtest); rc=$?
+if [ "$rc" -eq 0 ] && [ "$out" = "auxv ok" ]; then
+    echo "  ok  auxvtest -> \"$out\", exit 0"
+else
+    echo "  FAIL auxvtest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 if [ "$fail" -eq 0 ]; then
     echo "smoke: PASS"
 else

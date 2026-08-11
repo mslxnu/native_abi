@@ -4882,3 +4882,55 @@ which is why `FSCONFIG_CMD_RECONFIGURE` answers `EOPNOTSUPP` — there is no
 context it could arrive on.
 
 260 of 375.
+
+### 3.5.92 The auxiliary vector, and an entry whose absence is fatal
+
+A Fedora install failed in dconf's RPM scriptlet:
+
+```
+(/usr/bin/dconf:91724): GLib-ERROR **: getauxval () failed: No such file or directory
+/var/tmp/rpm-tmp.7YU0PA: line 1: 91724 Trace/breakpoint trap  /usr/bin/dconf
+```
+
+The auxiliary vector NABI built carried eight entries: `AT_BASE`, `AT_ENTRY`,
+`AT_PHDR`, `AT_PHENT`, `AT_PHNUM`, `AT_PAGESZ`, `AT_RANDOM`, `AT_NULL`. Linux
+supplies a good many more, and the missing ones had been assumed harmless on the
+grounds that a program which cannot find an entry does without it.
+
+**That assumption is wrong, and the reason is in how the vector is read.**
+`getauxval()` sets `errno` to `ENOENT` when the entry asked for is absent, and
+not every caller treats that as "no answer". GLib's `g_check_setuid()` asks for
+`AT_SECURE` and calls `g_error()` if `errno` is set — and `g_error()` aborts. So
+a missing entry is not a feature a program does without; it is a program that
+dies. Not only dconf: every GLib program, which on a desktop install is most of
+them.
+
+`AT_SECURE` reports whether the exec crossed a privilege boundary, and the
+dynamic linker uses it to decide whether to honour `LD_PRELOAD`. Answering it
+wrongly in the permissive direction would matter, so it is computed from the
+file's setuid bits in `do_exec`, where the mode is known — the elevation itself
+happens after the image is loaded, so asking the credentials at auxv time would
+report the pre-elevation state and say no for exactly the binaries it should say
+yes for.
+
+The rest went in with it, on the principle the failure established: Linux
+supplies them on every exec, so an absent one is a loaded gun rather than a
+missing convenience. `AT_UID`/`AT_EUID`/`AT_GID`/`AT_EGID` are the guest's ids,
+which is the whole point of their being there; `AT_CLKTCK` is 100, which is what
+glibc falls back to anyway, so it changes nothing except that asking no longer
+sets `errno`. `AT_HWCAP` and `AT_HWCAP2` claim **no** optional CPU features, and
+that direction is deliberate: glibc dispatches its string routines on them, so an
+over-claim selects an implementation the guest may fault on where an under-claim
+only selects a slower one that always works.
+
+`auxvtest` walks the vector off its own stack rather than calling `getauxval`,
+which is the point — it checks what NABI put there, with no libc in between to
+paper over a gap. Against the previous build it reports `AT_SECURE -> 0, wanted
+23`.
+
+Still 260 of 375: this is a bug in what `execve` builds, not a new call.
+
+Two entries are still absent and are strings rather than numbers, which is why
+they were not folded in here: `AT_EXECFN`, the path the program was run as, and
+`AT_PLATFORM`. Both need a string pushed onto the guest stack before the vector
+is laid out.
