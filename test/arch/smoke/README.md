@@ -217,9 +217,12 @@ guest-code cache sync.
 - `fantest` — fanotify, which unlike inotify exists to watch *other* processes.
   The file is opened, written and closed by a forked child, so an implementation
   that could only see its own process fails here rather than passing by
-  accident. Also that the permission class and a mark asking for `FAN_OPEN_PERM`
-  are refused with EINVAL: those block the accessing process until the listener
-  answers, and a listener that died would leave every open in the guest waiting.
+  accident. Permission events are covered too: a listener denies an open made by
+  another process and that open has to actually fail, since a guard that
+  reported the open after allowing it would pass a notification test and be
+  worthless. The last case is the one the feature rests on - a listener that
+  dies *without* answering must release whoever is waiting, or a guest that ran
+  a guard once could never open a file again.
 
 - `ipctest` — System V IPC: a segment created, attached, shared across a fork,
   detached and removed; keys resolving to ids; semaphore values through

@@ -21,14 +21,26 @@
  * mapping with a count at the front, so the question every open and close asks -
  * "is anything marked?" - is a memory read, not a syscall.
  *
- * Permission events are refused, and that is the one substantive thing missing.
- * FAN_OPEN_PERM and its relatives block the accessing process until the listener
- * writes a verdict; a listener that then dies would leave every open in the
- * guest waiting on an answer that is not coming, with nothing in a position to
- * notice. Linux ships exactly this configuration when CONFIG_FANOTIFY_ACCESS_-
- * PERMISSIONS is off - FAN_CLASS_CONTENT and FAN_CLASS_PRE_CONTENT return
- * EINVAL - so a caller that needs them is refused in a way it already handles,
- * rather than being given a guard that can wedge the machine.
+ * Permission events work, and the hazard in them is worth naming because it is
+ * the reason they were refused at first. FAN_OPEN_PERM stops the process that
+ * opened the file until the listener writes a verdict, so a listener that dies
+ * mid-decision would leave every open in the guest waiting for an answer that
+ * is not coming.
+ *
+ * Linux has the same hazard and answers it in one place: when the fanotify
+ * descriptor goes - including because the listener died - the kernel releases
+ * everything pending with FAN_ALLOW. There is no kernel here to notice that, so
+ * the listener's pid is recorded with its marks and a waiting process checks it
+ * is still there. A listener that goes away releases the guest, in the same
+ * direction Linux releases it. A listener that is alive and simply slow is
+ * waited for indefinitely, exactly as on Linux - a timeout would be this port
+ * inventing a policy, and "allow after a while" is not a decision a guard would
+ * thank us for making on its behalf.
+ *
+ * An instance is never sent a permission event caused by the process holding it.
+ * On Linux that is a listener's own footgun to avoid; here it would be a
+ * deadlock against itself with the answer in the same thread, and refusing to
+ * build it costs nothing that a real listener wanted.
  *
  * The descriptor an event carries is opened by the *listener's* nabi from the
  * path in the record, rather than passed from the process that caused the
@@ -47,7 +59,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/file.h>
+#include <signal.h>
 #include <sys/mman.h>
+#include <time.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -71,6 +85,8 @@ struct fan_mark {
   uint64_t mask;
   uint32_t flags;
   uint32_t inst;
+  int32_t  listener;            /* the host pid holding the instance */
+  uint32_t _pad;
   char     path[FAN_PATH];
 };
 
@@ -78,7 +94,7 @@ struct fan_registry {
   uint32_t magic;
   uint32_t nmarks;
   uint32_t next_inst;
-  uint32_t _pad;
+  uint32_t next_req;
   struct fan_mark m[FAN_MARKS_MAX];
 };
 
@@ -90,7 +106,9 @@ struct fan_wire {
   uint64_t mask;
   int32_t  pid;
   uint32_t pathlen;
-  char     path[FAN_WIRE - 16];
+  uint32_t reqid;               /* non-zero: a verdict is being waited for */
+  uint32_t _pad;
+  char     path[FAN_WIRE - 24];
 };
 
 static struct fan_registry *registry;
@@ -98,8 +116,18 @@ static pthread_mutex_t reg_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* The guest's fanotify descriptors, so read can be recognised as a fanotify
  * read. Small and linear: a guest has one or two of these, never many. */
-static struct { int fd; uint32_t inst; } inst_fds[16];
+static struct { int fd; uint32_t inst; unsigned cls; } inst_fds[16];
 static int n_inst_fds;
+
+/*
+ * Which request each descriptor handed to the listener belongs to.
+ *
+ * A verdict names the descriptor it is answering, because that is the only
+ * handle the listener was given - so the way back to the process that is
+ * waiting runs through this.
+ */
+static struct { int fd; uint32_t reqid; } pending[64];
+static int n_pending;
 
 static void
 registry_path(char *out, size_t n)
@@ -107,6 +135,16 @@ registry_path(char *out, size_t n)
   const char *tmp = getenv("TMPDIR");
   snprintf(out, n, "%s/nabi-fanmarks-%s",
            tmp && *tmp ? tmp : "/tmp", nabi_boot_tag());
+}
+
+/* Where the verdict for one request comes back. One per request, so two
+ * processes waiting at once cannot read each other's answer. */
+static void
+reply_path(uint32_t reqid, char *out, size_t n)
+{
+  const char *tmp = getenv("TMPDIR");
+  snprintf(out, n, "%s/nabi-fanp-%s-%u",
+           tmp && *tmp ? tmp : "/tmp", nabi_boot_tag(), reqid);
 }
 
 static void
@@ -200,10 +238,130 @@ mark_covers(const struct fan_mark *m, const char *hostpath)
   return false;
 }
 
+/* Send one record to one instance. Returns whether it went. */
+static bool
+send_wire(uint32_t inst, const char *hostpath, uint64_t mask, uint32_t reqid)
+{
+  char qpath[PATH_MAX];
+  queue_path(inst, qpath, sizeof qpath);
+  /*
+   * Non-blocking, so a listener that has stopped reading costs the process
+   * that caused the event nothing. Linux drops events and marks the queue
+   * overflowed; the listener here sees a gap, which is the same loss.
+   */
+  int q = open(qpath, O_WRONLY | O_NONBLOCK);
+  if (q < 0)
+    return false;
+
+  struct fan_wire w;
+  memset(&w, 0, sizeof w);
+  w.mask = mask;
+  w.pid = (int32_t) pidns_to_ns((int32_t) getpid());
+  w.reqid = reqid;
+  size_t pl = strlen(hostpath);
+  if (pl >= sizeof w.path)
+    pl = sizeof w.path - 1;
+  memcpy(w.path, hostpath, pl);
+  w.pathlen = (uint32_t) pl;
+  bool ok = write(q, &w, sizeof w) == (ssize_t) sizeof w;
+  close(q);
+  return ok;
+}
+
+/*
+ * Ask, and wait for the answer.
+ *
+ * The wait is unbounded on purpose - Linux's is - and is made survivable by
+ * watching the listener rather than the clock. If the process holding the
+ * instance goes away, the request is released the way Linux releases everything
+ * pending when the descriptor closes: allowed.
+ */
+static bool
+ask_permission(uint32_t inst, int32_t listener, const char *hostpath,
+               uint64_t mask)
+{
+  struct fan_registry *r = registry;
+  if (!r)
+    return true;
+
+  /* A listener is never asked about its own access; see the top of the file. */
+  if (listener == (int32_t) getpid())
+    return true;
+
+  uint32_t reqid = __sync_fetch_and_add(&r->next_req, 1);
+  if (reqid == 0)
+    reqid = __sync_fetch_and_add(&r->next_req, 1);
+
+  char rpath[PATH_MAX];
+  reply_path(reqid, rpath, sizeof rpath);
+  unlink(rpath);
+  if (mkfifo(rpath, 0600) < 0)
+    return true;                /* cannot ask, so cannot refuse */
+
+  int rfd = open(rpath, O_RDWR | O_NONBLOCK);
+  if (rfd < 0) {
+    unlink(rpath);
+    return true;
+  }
+
+  if (!send_wire(inst, hostpath, mask, reqid)) {
+    close(rfd);
+    unlink(rpath);
+    return true;                /* nobody listening: nothing is denying it */
+  }
+
+  bool allow = true;
+  for (;;) {
+    uint32_t verdict;
+    ssize_t n = read(rfd, &verdict, sizeof verdict);
+    if (n == (ssize_t) sizeof verdict) {
+      allow = (verdict & LINUX_FAN_DENY) == 0;
+      break;
+    }
+    /* The listener is gone, so there is no verdict coming and nothing to
+     * enforce. Linux allows in the same situation. */
+    if (listener > 0 && kill((pid_t) listener, 0) < 0 && errno == ESRCH)
+      break;
+    /* A signal for the guest is the guest's; do not swallow it in a wait it
+     * did not ask for. */
+    if (has_sigpending())
+      break;
+    struct timespec nap = { 0, 20 * 1000 * 1000 };
+    nanosleep(&nap, NULL);
+  }
+
+  close(rfd);
+  unlink(rpath);
+  return allow;
+}
+
 /*
  * Tell every instance that asked. Called from the syscall paths, in whichever
  * process made the call - which is the point of the table being shared.
+ *
+ * Returns false only when a permission event was denied, which is the one case
+ * where the caller must not go on with what it was doing.
  */
+bool
+fanotify_permit(const char *hostpath, uint64_t mask)
+{
+  struct fan_registry *r = registry;
+  if (!r || r->nmarks == 0 || !hostpath)
+    return true;
+
+  bool allow = true;
+  for (uint32_t i = 0; i < r->nmarks && i < FAN_MARKS_MAX; i++) {
+    const struct fan_mark *m = &r->m[i];
+    if (m->inst == 0 || !(m->mask & mask))
+      continue;
+    if (!mark_covers(m, hostpath))
+      continue;
+    if (!ask_permission(m->inst, m->listener, hostpath, mask))
+      allow = false;
+  }
+  return allow;
+}
+
 void
 fanotify_note(const char *hostpath, uint64_t mask)
 {
@@ -218,28 +376,7 @@ fanotify_note(const char *hostpath, uint64_t mask)
     if (!mark_covers(m, hostpath))
       continue;
 
-    char qpath[PATH_MAX];
-    queue_path(m->inst, qpath, sizeof qpath);
-    /*
-     * Non-blocking, so a listener that has stopped reading costs the process
-     * that caused the event nothing. Linux drops events and marks the queue
-     * overflowed; the listener here sees a gap, which is the same loss.
-     */
-    int q = open(qpath, O_WRONLY | O_NONBLOCK);
-    if (q < 0)
-      continue;
-
-    struct fan_wire w;
-    memset(&w, 0, sizeof w);
-    w.mask = mask;
-    w.pid = (int32_t) pidns_to_ns((int32_t) getpid());
-    size_t pl = strlen(hostpath);
-    if (pl >= sizeof w.path)
-      pl = sizeof w.path - 1;
-    memcpy(w.path, hostpath, pl);
-    w.pathlen = (uint32_t) pl;
-    (void) !write(q, &w, sizeof w);
-    close(q);
+    (void) send_wire(m->inst, hostpath, mask, 0);
   }
 }
 
@@ -275,9 +412,8 @@ DEFINE_SYSCALL(fanotify_init, unsigned int, flags, unsigned int, event_f_flags)
     return -LINUX_EPERM;
 
   unsigned cls = flags & LINUX_FAN_CLASS_BITS;
-  if (cls == LINUX_FAN_CLASS_CONTENT || cls == LINUX_FAN_CLASS_PRE_CONTENT)
-    return -LINUX_EINVAL;       /* permission events; see the top of this file */
-  if (cls != LINUX_FAN_CLASS_NOTIF)
+  if (cls != LINUX_FAN_CLASS_NOTIF && cls != LINUX_FAN_CLASS_CONTENT &&
+      cls != LINUX_FAN_CLASS_PRE_CONTENT)
     return -LINUX_EINVAL;
 
   /*
@@ -336,6 +472,7 @@ DEFINE_SYSCALL(fanotify_init, unsigned int, flags, unsigned int, event_f_flags)
 
   inst_fds[n_inst_fds].fd = fd;
   inst_fds[n_inst_fds].inst = inst;
+  inst_fds[n_inst_fds].cls = cls;
   n_inst_fds++;
   return fd;
 }
@@ -371,12 +508,22 @@ DEFINE_SYSCALL(fanotify_mark, int, fanotify_fd, unsigned int, flags,
     return 0;
   }
 
-  if (mask & (LINUX_FAN_OPEN_PERM | LINUX_FAN_ACCESS_PERM |
-              LINUX_FAN_OPEN_EXEC_PERM))
-    return -LINUX_EINVAL;       /* the class that would allow these is refused */
+  /*
+   * A permission event on a notification instance has nowhere for the verdict
+   * to come from, and Linux refuses that pairing too.
+   */
+  unsigned cls = LINUX_FAN_CLASS_NOTIF;
+  for (int i = 0; i < n_inst_fds; i++)
+    if (inst_fds[i].fd == fanotify_fd)
+      cls = inst_fds[i].cls;
+  if ((mask & (LINUX_FAN_OPEN_PERM | LINUX_FAN_ACCESS_PERM |
+               LINUX_FAN_OPEN_EXEC_PERM)) && cls == LINUX_FAN_CLASS_NOTIF)
+    return -LINUX_EINVAL;
+
   if ((mask & (LINUX_FAN_ACCESS | LINUX_FAN_MODIFY | LINUX_FAN_CLOSE_WRITE |
                LINUX_FAN_CLOSE_NOWRITE | LINUX_FAN_OPEN |
-               LINUX_FAN_OPEN_EXEC)) == 0)
+               LINUX_FAN_OPEN_EXEC | LINUX_FAN_OPEN_PERM |
+               LINUX_FAN_ACCESS_PERM | LINUX_FAN_OPEN_EXEC_PERM)) == 0)
     return -LINUX_EINVAL;       /* nothing in it can be observed here */
 
   char guestpath[LINUX_PATH_MAX];
@@ -443,10 +590,26 @@ DEFINE_SYSCALL(fanotify_mark, int, fanotify_fd, unsigned int, flags,
   m->mask = mask;
   m->flags = flags;
   m->inst = (uint32_t) inst;
+  m->listener = (int32_t) getpid();
   snprintf(m->path, sizeof m->path, "%s", host);
   r->nmarks++;
   pthread_mutex_unlock(&reg_lock);
   return 0;
+}
+
+/* Answer a request without presenting it, when there is nothing to present. */
+static void
+release(uint32_t reqid, uint32_t verdict)
+{
+  if (reqid == 0)
+    return;
+  char rpath[PATH_MAX];
+  reply_path(reqid, rpath, sizeof rpath);
+  int rfd = open(rpath, O_WRONLY | O_NONBLOCK);
+  if (rfd < 0)
+    return;
+  (void) !write(rfd, &verdict, sizeof verdict);
+  close(rfd);
 }
 
 /*
@@ -481,11 +644,24 @@ fanotify_read(int fd, char *out, size_t size, int *ret)
     }
     w.path[sizeof w.path - 1] = '\0';
 
+    /*
+     * A request that cannot be presented has to be answered anyway.
+     *
+     * The record carries a descriptor to the object, so one has to be opened -
+     * and an object that is being *created* does not exist yet, which is
+     * exactly what an O_CREAT open asks permission for. Dropping the event
+     * there left the process that asked waiting for a verdict nobody could send
+     * it, and it never returned from open. Nothing was presented, so nothing is
+     * denied.
+     */
     int objfd = open(w.path, O_RDONLY);
-    if (objfd < 0)
-      continue;                 /* it has gone; there is nothing to report on */
+    if (objfd < 0) {
+      release(w.reqid, LINUX_FAN_ALLOW);
+      continue;
+    }
     if (register_fd(objfd, false) < 0) {
       close(objfd);
+      release(w.reqid, LINUX_FAN_ALLOW);
       continue;
     }
 
@@ -497,11 +673,55 @@ fanotify_read(int fd, char *out, size_t size, int *ret)
     md.mask = w.mask;
     md.fd = objfd;
     md.pid = w.pid;
+    if (w.reqid != 0 && n_pending < (int) (sizeof pending / sizeof pending[0])) {
+      pending[n_pending].fd = objfd;
+      pending[n_pending].reqid = w.reqid;
+      n_pending++;
+    }
     memcpy(out + produced, &md, sizeof md);
     produced += sizeof md;
   }
 
   *ret = (int) produced;
+  return true;
+}
+
+/*
+ * The listener answering.
+ *
+ * A write to a fanotify descriptor is a verdict, not data - and it must be
+ * recognised, because the descriptor underneath is the queue's own FIFO and an
+ * unrecognised write would inject the verdict into the event stream as though
+ * something had reported it.
+ */
+bool
+fanotify_write(int fd, const char *buf, size_t size, int *ret)
+{
+  if (inst_of_fd(fd) < 0)
+    return false;
+
+  size_t used = 0;
+  while (size - used >= sizeof(struct l_fanotify_response)) {
+    struct l_fanotify_response resp;
+    memcpy(&resp, buf + used, sizeof resp);
+    used += sizeof resp;
+
+    for (int i = 0; i < n_pending; i++) {
+      if (pending[i].fd != resp.fd)
+        continue;
+      char rpath[PATH_MAX];
+      reply_path(pending[i].reqid, rpath, sizeof rpath);
+      int rfd = open(rpath, O_WRONLY | O_NONBLOCK);
+      if (rfd >= 0) {
+        uint32_t v = resp.response;
+        (void) !write(rfd, &v, sizeof v);
+        close(rfd);
+      }
+      pending[i] = pending[--n_pending];
+      break;
+    }
+  }
+  *ret = (int) used;
   return true;
 }
 
@@ -523,6 +743,12 @@ fanotify_close(int fd)
     r->nmarks = k;
     pthread_mutex_unlock(&reg_lock);
   }
+
+  /* Anything still waiting on this listener is released, which is what Linux
+   * does when the descriptor goes: allowed, not left. */
+  for (int i = 0; i < n_pending; i++)
+    release(pending[i].reqid, LINUX_FAN_ALLOW);
+  n_pending = 0;
 
   char qpath[PATH_MAX];
   queue_path((uint32_t) inst, qpath, sizeof qpath);

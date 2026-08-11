@@ -241,6 +241,8 @@ bool fanotify_watching(void);
 void fanotify_note(const char *hostpath, uint64_t mask);
 void fanotify_note_fd(int hostfd, uint64_t mask);
 bool fanotify_read(int fd, char *out, size_t size, int *ret);
+bool fanotify_write(int fd, const char *buf, size_t size, int *ret);
+bool fanotify_permit(const char *hostpath, uint64_t mask);
 void fanotify_close(int fd);
 bool procfs_pidns_path(const char *name, char *out, size_t outsz, bool *denied);
 bool procfs_stat(const char *path, uint32_t *mode, uint64_t *size, uint64_t *ino);

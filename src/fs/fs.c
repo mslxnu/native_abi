@@ -1876,6 +1876,12 @@ DEFINE_SYSCALL(write, int, fd, gaddr_t, buf_ptr, size_t, size)
   if (cgroup_write_procs(fd, buf, size, &r))
     goto out;
 
+  /* A write to a fanotify descriptor is the listener's verdict. It has to be
+   * recognised: the descriptor underneath is the queue's own FIFO, and letting
+   * it through would put the verdict into the event stream. */
+  if (fanotify_write(fd, buf, size, &r))
+    goto out;
+
   struct file *file = get_file(fd);
   if (file == NULL) {
     r = -LINUX_EBADF;
@@ -1920,6 +1926,14 @@ DEFINE_SYSCALL(read, int, fd, gaddr_t, buf_ptr, size_t, size)
   if (file->ops->readv == NULL) {
     r = -LINUX_EBADF;
     goto out;
+  }
+  if (fanotify_watching()) {
+    char rpath[PATH_MAX];
+    if (fcntl(file->fd, F_GETPATH, rpath) == 0 &&
+        !fanotify_permit(rpath, LINUX_FAN_ACCESS_PERM)) {
+      r = -LINUX_EPERM;
+      goto out;
+    }
   }
   struct iovec iov = { buf, size };
   r = file->ops->readv(file, &iov, 1);
@@ -3142,6 +3156,24 @@ int
 user_openat(int atdirfd, const char *name, int flags, int mode)
 {
   int fd;
+
+  /*
+   * The verdict is taken here, before the descriptor table is locked.
+   *
+   * Asking after the open would be asking too late - the file would already be
+   * open and a denial would have denied nothing - but asking while holding the
+   * table's write lock would stall every other thread in this process for as
+   * long as the listener took to answer, which is a wait with no bound on it.
+   * The path is resolved without opening anything instead. A path that does not
+   * resolve is one there is nothing yet to permit.
+   */
+  if (fanotify_watching()) {
+    char opath[PATH_MAX];
+    if (guest_to_host_path(name, opath, sizeof opath) == 0 &&
+        !fanotify_permit(opath, LINUX_FAN_OPEN_PERM))
+      return -LINUX_EPERM;
+  }
+
   pthread_rwlock_wrlock(&proc.fileinfo.fdtable_lock);
   /* A few /proc files describe the guest rather than the nabi running it, and
    * only NABI can answer those. Anything else falls through to the host's. */

@@ -54,6 +54,9 @@
 
 #define LINUX_FANOTIFY_METADATA_VERSION 3
 
+#define LINUX_FAN_ALLOW 0x01
+#define LINUX_FAN_DENY  0x02
+
 #define LINUX_FAN_NOFD (-1)
 
 struct l_fanotify_event_metadata {

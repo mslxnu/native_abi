@@ -3734,3 +3734,61 @@ fanotify_mark -> 0
 a permission mark -> -22
 from ANOTHER process: opens=1 modifies=1 closes=1
 ```
+
+### 3.5.71 fanotify permission events — **implemented**
+
+§3.5.70 refused these and gave a reason: `FAN_OPEN_PERM` stops the process that
+opened the file until the listener writes a verdict, so a listener that died
+mid-decision would leave every open in the guest waiting for an answer that was
+not coming. That objection was about a hazard, not about feasibility, and the
+hazard has an answer.
+
+**Linux has the same hazard and handles it in one place**: when the fanotify
+descriptor goes — including because the listener died — the kernel releases
+everything pending with `FAN_ALLOW`. There is no kernel here to notice, so the
+listener's pid is recorded alongside its marks and the waiting process watches
+it. A listener that goes away releases the guest, in the same direction Linux
+releases it.
+
+A listener that is alive and merely slow is waited for **indefinitely**, exactly
+as on Linux. A timeout would be this port inventing a policy, and "allow after a
+while" is not a decision a guard would thank us for making on its behalf.
+
+The shape: a request goes down the instance's queue carrying a request id; the
+asking process waits on a FIFO of its own named by that id; the listener's
+verdict — a `write` to the fanotify descriptor — is routed back to it. That
+write has to be recognised, because the descriptor underneath is the queue's own
+FIFO and letting it through would put the verdict into the event stream as
+though something had reported it.
+
+**Three things this surfaced.**
+
+- **A request that cannot be presented must still be answered.** The event
+  record carries a descriptor to the object, so the listener's NABI opens it —
+  and an object being *created* does not exist yet, which is exactly what an
+  `O_CREAT` open asks permission for. Dropping the event there left the asking
+  process waiting for a verdict nobody could send, and it never returned from
+  `open`. Nothing was presented, so nothing is denied: it is released.
+
+- **The verdict is taken before the descriptor table is locked.** Asking after
+  the open would be asking too late — the file would already be open and a
+  denial would have denied nothing — but asking while holding the table's write
+  lock would stall every other thread in that process for as long as the
+  listener took. The path is resolved without opening anything instead.
+
+- **A listener is never asked about its own access.** On Linux that is a
+  listener's own footgun to avoid; here it would be a deadlock against itself
+  with the answer in the same thread.
+
+The smoke test denies an open made by *another* process and insists the open
+actually fails — a guard that reported the open after allowing it would pass a
+notification test and be worthless — and then kills a listener mid-guard and
+insists the next open still returns. Without the liveness check that last open
+never comes back, and a guest that ran a guard once could not open a file again.
+
+```
+fanotify_init(FAN_CLASS_CONTENT) -> 5
+FAN_OPEN_PERM on a notification instance -> -22
+denied open in another process -> child exited 7 (open failed)
+listener killed mid-guard; next open -> 4 (released, not hung)
+```
