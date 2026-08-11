@@ -30,11 +30,25 @@
  * It works because nabi is the only thing that ever reads a guest pipe. There
  * is no host process on the other end to bypass this.
  *
- * The pushback is shared, not per-process, because a pipe is. It is keyed by
- * the read end's inode, which macOS gives a 64-bit value that is identical in a
- * forked child and across the exec nabi's fork is built on - verified, not
- * assumed - so the two processes sharing a pipe share its pushback too. A guest
- * with no pending pushback pays one load in read and in poll to find that out.
+ * The pushback is shared, not per-process, because a pipe is. It is keyed by the
+ * pipe itself, so the two processes sharing one share its pushback too, and a
+ * guest with no pending pushback pays one load from a shared mapping to find
+ * that out.
+ *
+ * Naming the pipe took two goes. A read end's inode is stable across fork and
+ * across the exec nabi's fork is built on, which is what sharing needs - but it
+ * is *not* unique over time. Darwin's pipe inodes look random and are drawn from
+ * a pool that is reused: three runs of a two-pipe program produced the same
+ * value twice. Keyed on the inode alone, a pushback left behind by a process
+ * that teed and exited without reading would be picked up by an unrelated later
+ * pipe that drew the same number, and its bytes injected into that stream. That
+ * is the exact corruption this file exists to avoid, arriving by the back door.
+ *
+ * So a pipe is named by *both* ends: its own handle and its peer's, which
+ * proc_pidfdinfo reports and which are allocated independently. A stale file
+ * cannot be mistaken for a live pipe unless a new pipe draws both numbers as the
+ * same matched pair, rather than either one of them. The peer is in the name and
+ * not in a header, so a mismatch is simply a file that is not found.
  */
 #include <dirent.h>
 #include <errno.h>
@@ -43,7 +57,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <pthread.h>
 #include <sys/file.h>
 #include <sys/mman.h>
 #include <sys/select.h>
@@ -55,6 +68,10 @@
 #include "namespace.h"
 #include "linux/common.h"
 #include "linux/errno.h"
+
+/* Last on purpose: libproc.h reaches sys/param.h, whose roundup() macro eats
+ * the inline of that name in util/misc.h if it gets there first. */
+#include <libproc.h>
 
 /*
  * How many pipes currently hold pushback, in a mapping every process shares.
@@ -78,12 +95,12 @@ counter_path(char *out, size_t n)
 }
 
 static void
-pushback_path(uint64_t ino, char *out, size_t n)
+pushback_path(uint64_t self, uint64_t peer, char *out, size_t n)
 {
   const char *tmp = getenv("TMPDIR");
-  snprintf(out, n, "%s/nabi-tee-%s-%llu",
+  snprintf(out, n, "%s/nabi-tee-%s-%llu-%llu",
            tmp && *tmp ? tmp : "/tmp", nabi_boot_tag(),
-           (unsigned long long) ino);
+           (unsigned long long) self, (unsigned long long) peer);
 }
 
 static struct tee_counter *
@@ -120,60 +137,24 @@ tee_pending(void)
   return c != NULL && c->pending != 0;
 }
 
-/* The read end's inode, or 0 for anything that is not a pipe. */
-static uint64_t
-pipe_id(int fd)
-{
-  struct stat st;
-  if (fstat(fd, &st) < 0 || !S_ISFIFO(st.st_mode))
-    return 0;
-  return (uint64_t) st.st_ino;
-}
-
 /*
- * Which write end belongs to which read end.
- *
- * tee(p[0], p[1]) is EINVAL on Linux, and the check is easy there because both
- * ends of a pipe share one inode. Darwin gives them unrelated ones - measured,
- * not assumed - so nothing in fstat says the two descriptors are the same pipe,
- * and the pairing has to be remembered from the one place that sees both, which
- * is pipe2.
- *
- * A ring of the last few hundred, because pipes are made and dropped constantly
- * and a table keyed by inode would only grow. Falling off the end means the
- * check is skipped for a very old pipe, and means the same for one inherited
- * across a fork, since this is per-process. Both are the wrong answer to a call
- * no working program makes - a guest that teed a pipe into itself would get its
- * bytes duplicated instead of EINVAL - and neither is worth making every pipe in
- * the system pay for a shared mapping to catch.
+ * A pipe's two handles: its own and the far end's. False for anything that is
+ * not a pipe, which is also how the callers below test for one - proc_pidfdinfo
+ * answers for pipes and refuses everything else, so it settles both questions at
+ * once.
  */
-#define PAIRS 256
-static struct { uint64_t r, w; } pairs[PAIRS];
-static int pairs_next;
-static pthread_mutex_t pairs_lock = PTHREAD_MUTEX_INITIALIZER;
-
-void
-tee_note_pipe(int rfd, int wfd)
-{
-  struct stat r, w;
-  if (fstat(rfd, &r) < 0 || fstat(wfd, &w) < 0)
-    return;
-  pthread_mutex_lock(&pairs_lock);
-  pairs[pairs_next].r = (uint64_t) r.st_ino;
-  pairs[pairs_next].w = (uint64_t) w.st_ino;
-  pairs_next = (pairs_next + 1) % PAIRS;
-  pthread_mutex_unlock(&pairs_lock);
-}
-
 static bool
-same_pipe(uint64_t r, uint64_t w)
+pipe_ids(int fd, uint64_t *self, uint64_t *peer)
 {
-  bool found = false;
-  pthread_mutex_lock(&pairs_lock);
-  for (int i = 0; i < PAIRS && !found; i++)
-    found = pairs[i].r == r && pairs[i].w == w;
-  pthread_mutex_unlock(&pairs_lock);
-  return found;
+  struct pipe_fdinfo pi;
+  if (proc_pidfdinfo(getpid(), fd, PROC_PIDFDPIPEINFO, &pi, sizeof pi)
+      != sizeof pi)
+    return false;
+  if (self)
+    *self = (uint64_t) pi.pipeinfo.pipe_handle;
+  if (peer)
+    *peer = (uint64_t) pi.pipeinfo.pipe_peerhandle;
+  return true;
 }
 
 /* --------------------------------------------------------------- the store */
@@ -188,12 +169,12 @@ tee_take(int fd, char *buf, size_t want)
 {
   if (!tee_pending() || want == 0)
     return -1;
-  uint64_t id = pipe_id(fd);
-  if (id == 0)
+  uint64_t self, peer;
+  if (!pipe_ids(fd, &self, &peer))
     return -1;
 
   char path[PATH_MAX];
-  pushback_path(id, path, sizeof path);
+  pushback_path(self, peer, path, sizeof path);
   int f = open(path, O_RDWR);
   if (f < 0)
     return -1;
@@ -244,11 +225,11 @@ tee_readable(int fd)
 {
   if (!tee_pending())
     return false;
-  uint64_t id = pipe_id(fd);
-  if (id == 0)
+  uint64_t self, peer;
+  if (!pipe_ids(fd, &self, &peer))
     return false;
   char path[PATH_MAX];
-  pushback_path(id, path, sizeof path);
+  pushback_path(self, peer, path, sizeof path);
   struct stat st;
   return stat(path, &st) == 0 && st.st_size > 0;
 }
@@ -333,13 +314,15 @@ DEFINE_SYSCALL(tee, int, fd_in, int, fd_out, size_t, len, unsigned int, flags)
   if (len == 0)
     return 0;
 
-  struct stat si, so;
-  if (fstat(fd_in, &si) < 0 || fstat(fd_out, &so) < 0)
-    return -LINUX_EBADF;
-  if (!S_ISFIFO(si.st_mode) || !S_ISFIFO(so.st_mode))
+  uint64_t in_self, in_peer, out_self;
+  if (!pipe_ids(fd_in, &in_self, &in_peer) ||
+      !pipe_ids(fd_out, &out_self, NULL))
     return -LINUX_EINVAL;       /* both must be pipes, as on Linux */
-  if (same_pipe((uint64_t) si.st_ino, (uint64_t) so.st_ino))
-    return -LINUX_EINVAL;       /* and not the two ends of the same one */
+  /* And not the two ends of one pipe. Linux detects that by the shared inode
+   * its two ends have; Darwin gives them unrelated numbers, so the question is
+   * put to the pipe itself - the far end of fd_in is exactly fd_out. */
+  if (in_peer == out_self)
+    return -LINUX_EINVAL;
 
   if (len > 65536)
     len = 65536;
@@ -353,7 +336,7 @@ DEFINE_SYSCALL(tee, int, fd_in, int, fd_out, size_t, len, unsigned int, flags)
    */
   ssize_t n = 0;
   char path[PATH_MAX];
-  pushback_path((uint64_t) si.st_ino, path, sizeof path);
+  pushback_path(in_self, in_peer, path, sizeof path);
   int pb = open(path, O_RDWR);
   off_t have = 0;
   if (pb >= 0) {

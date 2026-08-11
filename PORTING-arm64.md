@@ -4191,18 +4191,35 @@ a descriptor readable when bytes are held for it. That last half is the one a
 simpler implementation would skip and a real program would hang on, for the same
 reason a timerfd that only `read` could see is useless in an event loop.
 
-The pushback is shared rather than per-process, because a pipe is. It is keyed by
-the read end's inode, which macOS gives a 64-bit value that is identical in a
-forked child *and* across the exec NABI's fork is built on — measured, not
-assumed — so two processes sharing a pipe share its pushback. A guest with no
-pending pushback pays one load from a shared mapping to find that out, the same
-fast path `fanotify` uses.
+The pushback is shared rather than per-process, because a pipe is. A guest with
+no pending pushback pays one load from a shared mapping to find that out, the
+same fast path `fanotify` uses.
 
-One thing Darwin does not provide is the pairing: `tee(p[0], p[1])` is `EINVAL` on
-Linux, where it is easy to detect because both ends of a pipe share one inode.
-Here they get unrelated ones, so nothing in `fstat` says two descriptors are the
-same pipe, and the pairing is remembered from `pipe2`, which is the one place that
-sees both.
+**Naming the pipe took two goes, and the first one was wrong.** A read end's
+inode is stable across fork and across the exec NABI's fork is built on, which is
+what sharing needs, and it was taken to be unique as well — 64-bit and
+random-looking. It is not. Darwin draws pipe inodes from a pool it reuses: three
+runs of a two-pipe program produced the same value twice, and the smoke suite hit
+it within minutes. Keyed on the inode alone, a pushback left behind by a process
+that teed and then exited without reading gets picked up by an unrelated later
+pipe that draws the same number, and its bytes are injected into that stream —
+the exact corruption this whole design exists to avoid, arriving by the back
+door. It surfaced as `splicetest` failing only when `teetest` had run first.
+
+So a pipe is named by **both** ends: its own handle and its peer's, which
+`proc_pidfdinfo(PROC_PIDFDPIPEINFO)` reports and which are allocated
+independently. The peer is part of the filename rather than a header, so a
+mismatch is simply a file that is not found. A stale pushback can now only be
+mistaken for a live pipe if a new pipe draws both numbers as the same matched
+pair, rather than either one of them.
+
+That same peer handle settles the other question Darwin would not answer.
+`tee(p[0], p[1])` is `EINVAL` on Linux, where it is easy to detect because both
+ends of a pipe share one inode; here they get unrelated ones. This was first done
+by remembering the pairing at `pipe2`, which is the one place that sees both —
+but that is per-process bookkeeping and a pipe inherited across a fork fell
+outside it. Asking the pipe is strictly better: the far end of `fd_in` *is*
+`fd_out`, and it holds for an inherited pipe as readily as a fresh one.
 
 229 of 396.
 
@@ -4243,3 +4260,58 @@ would otherwise outlive the call and change how every other user of that
 descriptor behaves.
 
 231 of 396.
+
+### 3.5.82 `sendfile` and `copy_file_range` — and where a short write loses data
+
+Both exist so a program does not route bytes through its own memory. On Linux
+that saves two copies across the user boundary, and `copy_file_range` can go
+further: on a filesystem that supports it the kernel shares extents instead of
+copying, so a gigabyte "copy" costs almost nothing.
+
+Neither shortcut is available. Darwin's own `sendfile(2)` is a different call
+with a different shape — its destination must be a socket, which Linux has not
+required since 2.6.33 — so using it would implement a *narrower* syscall than the
+one being asked for. APFS does have copy-on-write cloning, but `clonefile(2)`
+clones a whole file to a new path; it cannot place a range inside a file that
+already exists, which is precisely what `copy_file_range` does. So the bytes go
+through a buffer, and the guest gets the behaviour without the saving — the same
+trade `splice` makes, for the same reason.
+
+**The part that needed care is not the copying, it is the bookkeeping.** Read 64K
+from the source with `read(2)`, have `write(2)` accept only 8K, and the other 56K
+is gone: consumed from the source, never delivered, and not reported. The file
+position has already moved. It is a silent hole in the middle of a copy, and it
+only appears when the destination is slow — which is never true in a small test,
+and always true of the sockets and pipes `sendfile` exists for.
+
+So nothing here reads with `read(2)`. Every read is a `pread` from a cursor this
+code owns, and a file position is only set at the end, from the count that
+actually made it out. A short write then costs nothing — it ends the call early
+with a smaller number, which both syscalls are allowed to do and every correct
+caller already handles. `copytest` pins it down by sending a 200K file into a
+non-blocking pipe that cannot take it all and checking the source's position
+against the returned count; with the naive form the file sits at 131072 having
+delivered 65536.
+
+`copy_file_range` also refuses overlapping ranges within one file, where the
+source is rewritten as it is read and there is no defined answer. Same file means
+same inode rather than same descriptor — two separate opens of one file are the
+case that would otherwise slip through, and the test uses exactly that.
+
+**A generator bug surfaced alongside this.** `sendfile` came out of the doc
+generator with no aarch64 number at all, which is false — it is 71. asm-generic
+reaches a third of its table through `#define __NR_<name> __NR3264_<name>`, and
+the doc generator only read lines ending in digits, so it had been silently
+dropping every one: `lseek`, `fcntl`, `mmap`, `fstat`, `statfs`, `truncate` and
+the rest all showed a dash where a number belongs. The dispatch-table generator
+had always followed the indirection; the doc generator now does too, which is the
+whole point of generating the table rather than keeping it by hand.
+
+Following it picks up both sides of the header's 32-bit split, so one number
+arrives under two spellings — `lseek` and `llseek`, `sendfile` and `sendfile64`.
+Whichever name the dispatch table dispatches is the one kept, and where neither
+has a handler the plain spelling wins, since the alias is always the longer one.
+That is also why the denominator moved: `sync_file_range2` was never a separate
+aarch64 call, only the other name for 84.
+
+233 of 395.

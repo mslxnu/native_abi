@@ -277,6 +277,16 @@ guest-code cache sync.
   half — an offset splice must advance the caller's offset and leave the file's
   own position where it was, a pair that is easy to get half right.
 
+- `copytest` — `sendfile(2)` and `copy_file_range(2)`. The copying is the easy
+  part and the bookkeeping is not: the test sends a 200K file into a
+  *non-blocking pipe* that cannot take it all, then checks the source's position
+  against what the call reported moving. An implementation that reads with
+  `read(2)` and finds out about the short write afterwards leaves the file 64K
+  past what it delivered — bytes consumed, undelivered and unreported, and only
+  when the destination is slow, which no small test makes it. Offsets are
+  checked as `splice`'s are, and `copy_file_range` is checked to refuse
+  overlapping ranges of one file across *two separate opens* of it.
+
 The ELF binaries are committed prebuilt (as the x86 guest tests under
 `test/*/build/` are), so the check needs no cross-toolchain. The `.s` sources
 are here for reference; rebuild with an aarch64-linux clang + ld.lld:

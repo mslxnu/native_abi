@@ -77,7 +77,7 @@
   SYSCALL(68, pwrite64) \
   SYSCALL(69, unimplemented) \
   SYSCALL(70, unimplemented) \
-  SYSCALL(71, unimplemented) \
+  SYSCALL(71, sendfile) \
   SYSCALL(72, pselect6) \
   SYSCALL(73, ppoll) \
   SYSCALL(74, unimplemented) \
@@ -291,7 +291,7 @@
   SYSCALL(282, unimplemented) \
   SYSCALL(283, unimplemented) \
   SYSCALL(284, unimplemented) \
-  SYSCALL(285, unimplemented) \
+  SYSCALL(285, copy_file_range) \
   SYSCALL(286, unimplemented) \
   SYSCALL(287, unimplemented) \
   SYSCALL(288, unimplemented) \

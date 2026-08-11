@@ -611,6 +611,21 @@ else
     fail=1
 fi
 
+# copytest: sendfile and copy_file_range. The copying is the easy part; the
+# check that matters sends a 200K file into a non-blocking pipe that cannot take
+# it all and then looks at the source's position, which must equal what the call
+# said it moved. An implementation that reads with read(2) and discovers the
+# short write afterwards leaves the file 64K further on than it delivered - a
+# silent hole that only appears when the destination is slow.
+cp "$here/copytest" "$root/"; chmod +x "$root/copytest"
+out=$("$NABI" -m "$root" /copytest); rc=$?
+if [ "$rc" -eq 0 ] && [ "$out" = "copy ok" ]; then
+    echo "  ok  copytest -> \"$out\", exit 0"
+else
+    echo "  FAIL copytest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 if [ "$fail" -eq 0 ]; then
     echo "smoke: PASS"
 else

@@ -23,12 +23,57 @@ def kernel_names(path):
     architecture numbers its private ones from. The dispatch-table generator has
     always skipped them; this one did not, and listed 463 and 244 as calls NABI
     had failed to implement.
+
+    Not every number is spelled as one. asm-generic reaches a third of its
+    table through `#define __NR_<name> __NR3264_<name>`, and reading only the
+    lines that end in digits silently drops every one of them - which is how
+    `lseek`, `fcntl`, `mmap`, `fstat` and `sendfile` came to be listed as having
+    no aarch64 number at all. The dispatch-table generator has always followed
+    the indirection; this one now does too.
     """
+    text = open(path).read()
+    nr3264 = {m.group(1): int(m.group(2))
+              for m in re.finditer(r'#define\s+__NR3264_(\w+)\s+(\d+)', text)}
     out = {}
-    for line in open(path):
-        m = re.match(r'#define\s+__NR_(\w+)\s+(\d+)\s*$', line)
-        if m and m.group(1) not in ('syscalls', 'arch_specific_syscall'):
-            out[m.group(1)] = int(m.group(2))
+    for m in re.finditer(r'^#define\s+__NR_(\w+)\s+(\S+)\s*$', text, re.M):
+        name, val = m.group(1), m.group(2)
+        if name in ('syscalls', 'arch_specific_syscall'):
+            continue
+        if val.isdigit():
+            out[name] = int(val)
+        elif val.startswith('__NR3264_'):
+            key = val[len('__NR3264_'):]
+            if key in nr3264:
+                out[name] = nr3264[key]
+    return out
+
+
+def dedupe(table, handlers):
+    """Drop the spelling of a number that the dispatch table does not use.
+
+    Following the __NR3264_ indirection picks up both sides of the header's
+    32-bit split, so one number arrives under two names - `lseek` and `llseek`,
+    `fcntl` and `fcntl64`, `sendfile` and `sendfile64`. They are one call, and
+    listing both would count it twice and claim an alias this architecture does
+    not expose. Whichever name the dispatch table dispatches is the one kept, so
+    the doc and the table cannot disagree about what exists.
+    """
+    by_nr = {}
+    for name, nr in table.items():
+        by_nr.setdefault(nr, []).append(name)
+    out = dict(table)
+    for names in by_nr.values():
+        if len(names) < 2:
+            continue
+        wins = [n for n in names if n in handlers]
+        # Whichever the dispatch table uses; failing that the plain spelling,
+        # since the alias is always the longer one - truncate64 for truncate,
+        # llseek for lseek - and neither having a handler is no reason to list
+        # the same call twice.
+        keep = wins[0] if len(wins) == 1 else min(names, key=lambda n: (len(n), n))
+        for n in names:
+            if n != keep:
+                del out[n]
     return out
 
 
@@ -59,10 +104,10 @@ def implemented(path):
 
 
 def main():
-    a64 = kernel_names(sys.argv[1])
-    x64 = kernel_names(sys.argv[2])
     ia = implemented('include/syscall_arm64.h')
     ix = implemented('include/syscall_x86.h')
+    a64 = dedupe(kernel_names(sys.argv[1]), ia)
+    x64 = kernel_names(sys.argv[2])
     no = refuses()
 
     names = sorted(set(a64) | set(x64))

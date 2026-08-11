@@ -4123,9 +4123,6 @@ DEFINE_SYSCALL(pipe2, gaddr_t, fildes_ptr, int, flags)
     }
   }
 
-  /* Which end pairs with which, for tee - the only place both are known. */
-  tee_note_pipe(fildes[0], fildes[1]);
-
   err0 = register_fd(fildes[0], flags & LINUX_O_CLOEXEC);
   err1 = register_fd(fildes[1], flags & LINUX_O_CLOEXEC);
   if (err0 < 0 || err1 < 0) {
