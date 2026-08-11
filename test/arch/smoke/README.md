@@ -315,7 +315,13 @@ guest-code cache sync.
   then — an implementation that answered the poll at submit time reports a
   completion that should not exist yet and fails there. A timeout ended by its
   clock reports `-ETIME`; one ended by its completion count reports 0, which is
-  how a caller tells the two apart.
+  how a caller tells the two apart. `TIMEOUT_REMOVE` is checked in both of its
+  modes, and the update mode is **timed** — a ten-second timeout is shortened to
+  40ms and the wait must finish well inside two seconds. That is the only way to
+  catch a deadline that was updated without waking the poller: the completion
+  still arrives with the right result, ten seconds late. The test sleeps briefly
+  before updating so the poller has actually settled onto the old deadline,
+  without which the update races ahead of it and the timing proves nothing.
 
 The ELF binaries are committed prebuilt (as the x86 guest tests under
 `test/*/build/` are), so the check needs no cross-toolchain. The `.s` sources

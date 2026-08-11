@@ -4466,5 +4466,23 @@ failure to arm produces one. `POLL_REMOVE` fell through to the ordinary
 dispatcher and came back `EINVAL` — an opcode it had never heard of. Arming now
 posts its own completions and simply says whether it handled the entry.
 
+`TIMEOUT_REMOVE` came next, and it is one opcode with two operations in it. Left
+alone it cancels the timeout named by `addr`; with `IORING_TIMEOUT_UPDATE` set in
+the flags the timeout stays and its deadline is replaced by the one at `addr2`.
+The flag cannot be ignored, which is the whole reason it is worth a paragraph: a
+caller asking to *extend* a timeout would have it cancelled instead, be told the
+update succeeded, and never hear from the timeout it was relying on. That is a
+wrong answer wearing a right one's clothes, which is the failure this tree keeps
+refusing to ship.
+
+Updating a deadline also has to wake the poller, and that is the part a test
+almost cannot see. The poller is asleep on the old deadline; change it without
+saying so and the completion still arrives with the correct result, ten seconds
+after it should have. So `uringtest` **times** that wait — a ten-second timeout
+shortened to 40ms must complete well inside two seconds — and sleeps first, so
+the poller has genuinely settled onto the old deadline rather than racing to pick
+up the new one. Without that sleep the check passed with the wake deleted, which
+is to say it was proving nothing.
+
 Still 242 of 395: these are opcodes inside `io_uring_enter`, not syscalls of
 their own, so the table does not move for them.

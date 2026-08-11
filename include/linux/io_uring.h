@@ -71,8 +71,11 @@
 /* fsync_flags */
 #define LINUX_IORING_FSYNC_DATASYNC (1U << 0)
 
-/* timeout_flags: the deadline is absolute rather than a duration from now. */
+/* timeout_flags. UPDATE turns TIMEOUT_REMOVE from a cancellation into a change
+ * of deadline, which is why it cannot simply be ignored: a caller asking to
+ * extend a timeout would have it cancelled instead. */
 #define LINUX_IORING_TIMEOUT_ABS    (1U << 0)
+#define LINUX_IORING_TIMEOUT_UPDATE (1U << 1)
 
 /*
  * A submission entry: 64 bytes, and the unions matter. A caller fills one of

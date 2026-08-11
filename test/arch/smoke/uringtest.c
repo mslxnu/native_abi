@@ -30,6 +30,8 @@ static long sys6(long n, long a, long b, long c, long d, long e, long f){
 #define SYS_mmap              222
 #define SYS_eventfd2           19
 #define SYS_pipe2              59
+#define SYS_clock_gettime     113
+#define SYS_nanosleep         101
 #define SYS_exit               93
 #define SYS_io_uring_setup    425
 #define SYS_io_uring_enter    426
@@ -68,6 +70,8 @@ static long sys6(long n, long a, long b, long c, long d, long e, long f){
 #define OP_POLL_ADD     6
 #define OP_POLL_REMOVE  7
 #define OP_TIMEOUT     11
+#define OP_TIMEOUT_REMOVE 12
+#define TIMEOUT_UPDATE  2
 
 struct sqe {
   unsigned char opcode, flags; unsigned short ioprio; int fd;
@@ -457,6 +461,109 @@ void _start(void)
       fail("the counted timeout's user_data", (long) c2.user_data, 0x7002);
     if (c2.res != 0)
       fail("a timeout ended by its count reports 0, not ETIME", c2.res, 0); }
+
+  /*
+   * ---- a timeout cancelled before its clock runs out ----
+   *
+   * Ten seconds, removed at once. That the test finishes at all is half the
+   * assertion: a removal that waited for the timeout it was cancelling would
+   * sit here.
+   */
+  { struct { long long sec, nsec; } ts = { 10, 0 };
+    struct sqe *s1 = push();
+    s1->opcode = OP_TIMEOUT;
+    s1->addr = (unsigned long long) (long) &ts;
+    s1->len = 1; s1->off = 0;
+    s1->user_data = 0x7011;
+    if ((r = sys6(SYS_io_uring_enter, fd, 1, 0, 0, 0, 0)) != 1)
+      fail("submitting a timeout to remove", r, 1);
+
+    struct sqe *s2 = push();
+    s2->opcode = OP_TIMEOUT_REMOVE;
+    s2->addr = 0x7011;          /* the user_data of the timeout to cancel */
+    s2->user_data = 0x7012;
+    if ((r = sys6(SYS_io_uring_enter, fd, 1, 0, 0, 0, 0)) != 1)
+      fail("submitting a timeout removal", r, 1);
+
+    struct cqe c1 = pop("a completion for the cancelled timeout");
+    struct cqe c2 = pop("a completion for the removal itself");
+    if (c1.user_data != 0x7011 || c1.res != -ECANCELED)
+      fail("what the cancelled timeout reported", c1.res, -ECANCELED);
+    if (c2.user_data != 0x7012 || c2.res != 0)
+      fail("what the timeout removal reported", c2.res, 0);
+
+    struct sqe *s3 = push();
+    s3->opcode = OP_TIMEOUT_REMOVE;
+    s3->addr = 0xDEAD;
+    s3->user_data = 0x7013;
+    if ((r = sys6(SYS_io_uring_enter, fd, 1, 0, 0, 0, 0)) != 1)
+      fail("submitting a removal of nothing", r, 1);
+    struct cqe c3 = pop("a completion for the removal of nothing");
+    if (c3.res != -ENOENT)
+      fail("removing a timeout that was never armed", c3.res, -ENOENT); }
+
+  /*
+   * ---- the same opcode, updating instead of cancelling ----
+   *
+   * This is the case that separates the two. A ten-second timeout is updated
+   * down to 40ms and then waited for. It must come back -ETIME rather than
+   * -ECANCELED, which is what ignoring the UPDATE flag would produce.
+   *
+   * The wait is timed, and that is deliberate. Accepting the update but not
+   * waking the poller leaves it asleep on the original deadline, so the
+   * completion still arrives with the right result - ten seconds later. Only
+   * the clock can tell that apart from a working update.
+   */
+  { struct { long long sec, nsec; } slow = { 10, 0 };
+    struct { long long sec, nsec; } soon = { 0, 40 * 1000 * 1000 };
+    struct sqe *s1 = push();
+    s1->opcode = OP_TIMEOUT;
+    s1->addr = (unsigned long long) (long) &slow;
+    s1->len = 1; s1->off = 0;
+    s1->user_data = 0x7021;
+    if ((r = sys6(SYS_io_uring_enter, fd, 1, 0, 0, 0, 0)) != 1)
+      fail("submitting a timeout to update", r, 1);
+
+    /*
+     * Let the poller settle onto the ten-second deadline before changing it.
+     * Without this the update can land while the poller has not yet gone back
+     * to sleep, and it picks up the new deadline whether or not anything woke
+     * it - which would make the timing check below prove nothing.
+     */
+    { struct { long long sec, nsec; } nap = { 0, 100 * 1000 * 1000 };
+      sys6(SYS_nanosleep, (long) &nap, 0, 0, 0, 0, 0); }
+
+    struct sqe *s2 = push();
+    s2->opcode = OP_TIMEOUT_REMOVE;
+    s2->rw_flags = TIMEOUT_UPDATE;
+    s2->addr = 0x7021;          /* which timeout */
+    s2->off = (unsigned long long) (long) &soon;   /* addr2: its new deadline */
+    s2->user_data = 0x7022;
+    if ((r = sys6(SYS_io_uring_enter, fd, 1, 0, 0, 0, 0)) != 1)
+      fail("submitting a timeout update", r, 1);
+
+    struct cqe c1 = pop("a completion for the update itself");
+    if (c1.user_data != 0x7022 || c1.res != 0)
+      fail("what the timeout update reported", c1.res, 0);
+
+    struct { long long sec, nsec; } t0, t1;
+    sys6(SYS_clock_gettime, 1 /* MONOTONIC */, (long) &t0, 0, 0, 0, 0);
+    if ((r = sys6(SYS_io_uring_enter, fd, 0, 1, IORING_ENTER_GETEVENTS, 0, 0)) < 0)
+      fail("waiting for the updated timeout", r, 0);
+    sys6(SYS_clock_gettime, 1, (long) &t1, 0, 0, 0, 0);
+
+    struct cqe c2 = pop("a completion for the updated timeout");
+    if (c2.user_data != 0x7021)
+      fail("the updated timeout's user_data", (long) c2.user_data, 0x7021);
+    if (c2.res != -ETIME)
+      fail("an updated timeout must still expire, not be cancelled", c2.res,
+           -ETIME);
+    /* Two seconds is far above the 40ms asked for and far below the ten
+     * seconds the timeout was originally armed with, so it separates the two
+     * without depending on how fast this machine is. */
+    if (t1.sec - t0.sec >= 2)
+      fail("the update did not shorten the wait; seconds elapsed",
+           (long) (t1.sec - t0.sec), 0); }
 
   /* ---- what these refuse ---- */
   if ((r = sys6(SYS_io_uring_enter, f, 0, 0, 0, 0, 0)) != -EOPNOTSUPP)

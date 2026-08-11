@@ -207,6 +207,17 @@ pending_take(struct uring *r, uint64_t user_data, uint8_t op)
   return NULL;
 }
 
+/* The same lookup without detaching, for the operations that change a pending
+ * entry rather than end it. */
+static struct pending *
+pending_find(struct uring *r, uint64_t user_data, uint8_t op)
+{
+  for (struct pending *p = r->pending; p; p = p->next)
+    if (p->user_data == user_data && p->op == op)
+      return p;
+  return NULL;
+}
+
 static void
 wake_poller(struct uring *r)
 {
@@ -238,6 +249,41 @@ check_counted_timeouts(struct uring *r)
       return;
     post_cqe(r, hit->user_data, 0);   /* 0: the count was reached, not the clock */
     free(hit);
+  }
+}
+
+/*
+ * Work out when a timeout should fire, and record it against the clock the
+ * poller measures with.
+ *
+ * A relative timeout is simply added to now. An absolute one is named against
+ * the realtime clock, which is not the clock the poller reads - so it is
+ * converted to a monotonic deadline here rather than compared later across two
+ * different origins. A deadline already in the past becomes now, which fires on
+ * the next pass instead of never.
+ */
+static void
+set_deadline(struct pending *p, const struct l_timespec *ts, bool absolute)
+{
+  struct timespec now;
+  clock_gettime(CLOCK_MONOTONIC, &now);
+
+  if (absolute) {
+    struct timespec real;
+    clock_gettime(CLOCK_REALTIME, &real);
+    int64_t delta = (int64_t) (ts->tv_sec - real.tv_sec) * 1000000000LL +
+                    (ts->tv_nsec - real.tv_nsec);
+    if (delta < 0)
+      delta = 0;
+    p->deadline.tv_sec = now.tv_sec + delta / 1000000000LL;
+    p->deadline.tv_nsec = now.tv_nsec + delta % 1000000000LL;
+  } else {
+    p->deadline.tv_sec = now.tv_sec + ts->tv_sec;
+    p->deadline.tv_nsec = now.tv_nsec + ts->tv_nsec;
+  }
+  if (p->deadline.tv_nsec >= 1000000000L) {
+    p->deadline.tv_sec++;
+    p->deadline.tv_nsec -= 1000000000L;
   }
 }
 
@@ -749,6 +795,52 @@ arm_async(struct uring *r, const struct l_io_uring_sqe *s)
     return true;
   }
 
+  case LINUX_IORING_OP_TIMEOUT_REMOVE: {
+    /*
+     * One opcode, two operations, told apart by a flag. Without UPDATE this
+     * cancels the timeout named by addr; with it, the timeout stays and its
+     * deadline is replaced by the one at addr2.
+     *
+     * The flag has to be looked at rather than ignored. Ignoring it would turn
+     * a request to *extend* a timeout into a cancellation - the caller is told
+     * its update succeeded and the timeout it was relying on never fires, which
+     * is a wrong answer dressed as a right one.
+     */
+    if (s->rw_flags & LINUX_IORING_TIMEOUT_UPDATE) {
+      struct pending *p = pending_find(r, s->addr, LINUX_IORING_OP_TIMEOUT);
+      if (!p) {
+        post_cqe(r, s->user_data, -LINUX_ENOENT);
+        return true;
+      }
+      /* The replacement deadline is at addr2, which shares its slot with off -
+       * so this is the one timeout operation where off is not a count. */
+      struct l_timespec ts;
+      if (copy_from_user(&ts, (gaddr_t) s->off, sizeof ts)) {
+        post_cqe(r, s->user_data, -LINUX_EFAULT);
+        return true;
+      }
+      set_deadline(p, &ts, (s->rw_flags & LINUX_IORING_TIMEOUT_ABS) != 0);
+      /* The poller is sleeping on the old deadline, so it has to recompute -
+       * otherwise a shortened timeout still fires at its original time. */
+      wake_poller(r);
+      post_cqe(r, s->user_data, 0);
+      return true;
+    }
+
+    struct pending *p = pending_take(r, s->addr, LINUX_IORING_OP_TIMEOUT);
+    if (!p) {
+      post_cqe(r, s->user_data, -LINUX_ENOENT);
+      return true;
+    }
+    /* Two completions, as for POLL_REMOVE: the cancelled timeout answers on its
+     * own user_data so a caller waiting on it is not left waiting forever. */
+    post_cqe(r, p->user_data, -LINUX_ECANCELED);
+    free(p);
+    wake_poller(r);
+    post_cqe(r, s->user_data, 0);
+    return true;
+  }
+
   case LINUX_IORING_OP_TIMEOUT: {
     if (s->len != 1) { post_cqe(r, s->user_data, -LINUX_EINVAL); return true; }
     struct l_timespec ts;
@@ -761,30 +853,7 @@ arm_async(struct uring *r, const struct l_io_uring_sqe *s)
     p->op = LINUX_IORING_OP_TIMEOUT;
     p->user_data = s->user_data;
 
-    struct timespec now;
-    clock_gettime(CLOCK_MONOTONIC, &now);
-    if (s->rw_flags & LINUX_IORING_TIMEOUT_ABS) {
-      /*
-       * An absolute deadline is against the clock the caller named, and the
-       * poller measures against CLOCK_MONOTONIC - so it is converted here
-       * rather than compared across two different origins.
-       */
-      struct timespec real;
-      clock_gettime(CLOCK_REALTIME, &real);
-      int64_t delta = (int64_t) (ts.tv_sec - real.tv_sec) * 1000000000LL +
-                      (ts.tv_nsec - real.tv_nsec);
-      if (delta < 0)
-        delta = 0;
-      p->deadline.tv_sec = now.tv_sec + delta / 1000000000LL;
-      p->deadline.tv_nsec = now.tv_nsec + delta % 1000000000LL;
-    } else {
-      p->deadline.tv_sec = now.tv_sec + ts.tv_sec;
-      p->deadline.tv_nsec = now.tv_nsec + ts.tv_nsec;
-    }
-    if (p->deadline.tv_nsec >= 1000000000L) {
-      p->deadline.tv_sec++;
-      p->deadline.tv_nsec -= 1000000000L;
-    }
+    set_deadline(p, &ts, (s->rw_flags & LINUX_IORING_TIMEOUT_ABS) != 0);
 
     /* off is a number of completions to wait for; zero means the clock alone. */
     if (s->off > 0) {
