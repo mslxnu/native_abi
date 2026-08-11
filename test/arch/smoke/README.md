@@ -409,6 +409,15 @@ guest-code cache sync.
   local ones — so an implementation that pairs them entry by entry reports 8
   where 10 were asked for.
 
+- `pidfdtest` — `pidfd_open`, `process_madvise` and `process_mrelease`. The trap
+  is that a pidfd is a *file* here, and `poll` and `select` call a file readable
+  always — so a live process would look exited, and a readiness hook that only
+  *added* readability could not fix it. Both halves are checked: a running
+  process must **not** be readable, and a child that has exited must be, through
+  `poll`, `select` and `epoll` alike. The `epoll` half needed its own work in the
+  opposite direction, since kqueue raises no read event for a regular file at
+  all, so an event loop would otherwise wait on a pidfd forever.
+
 The ELF binaries are committed prebuilt (as the x86 guest tests under
 `test/*/build/` are), so the check needs no cross-toolchain. The `.s` sources
 are here for reference; rebuild with an aarch64-linux clang + ld.lld:

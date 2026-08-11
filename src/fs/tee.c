@@ -245,10 +245,10 @@ tee_readable(int fd)
 bool
 tee_any_readable(int nfds, const fd_set *want)
 {
-  if (!want || !tee_pending())
+  if (!want || (!tee_pending() && !pidfd_any()))
     return false;
   for (int fd = 0; fd < nfds; fd++)
-    if (FD_ISSET(fd, want) && tee_readable(fd))
+    if (FD_ISSET(fd, want) && (tee_readable(fd) || pidfd_readable(fd)))
       return true;
   return false;
 }
@@ -256,11 +256,12 @@ tee_any_readable(int nfds, const fd_set *want)
 int
 tee_mark_readable(int nfds, fd_set *out, const fd_set *want)
 {
-  if (!out || !want || !tee_pending())
+  if (!out || !want || (!tee_pending() && !pidfd_any()))
     return 0;
   int n = 0;
   for (int fd = 0; fd < nfds; fd++) {
-    if (FD_ISSET(fd, want) && !FD_ISSET(fd, out) && tee_readable(fd)) {
+    if (FD_ISSET(fd, want) && !FD_ISSET(fd, out) &&
+        (tee_readable(fd) || pidfd_readable(fd))) {
       FD_SET(fd, out);
       n++;
     }

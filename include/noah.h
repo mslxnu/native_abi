@@ -282,6 +282,17 @@ uint64_t sys_recvfrom(int socket, gaddr_t buf_ptr, int length, int flags,
 
 int     do_close(struct fdtable *table, int fd);
 void    uring_close(int fd);
+void    epoll_close(int epfd);
+/* pidfd (src/proc/pidfd.c). A pidfd is readable exactly when its process has
+ * exited, which poll and select have to answer since Darwin has no descriptor
+ * that does it. */
+int     pidfd_host_pid(int fd);
+bool    pidfd_any(void);
+bool    pidfd_is(int fd);
+int     pidfd_fix_readset(int nfds, fd_set *out, const fd_set *want);
+bool    pidfd_readable(int fd);
+void    pidfd_close(int fd);
+
 void    eventfd_signal(int fd, uint64_t add);
 
 bool    tee_pending(void);

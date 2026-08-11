@@ -440,13 +440,13 @@
   SYSCALL(431, fsconfig) \
   SYSCALL(432, fsmount) \
   SYSCALL(433, unimplemented) \
-  SYSCALL(434, unimplemented) \
+  SYSCALL(434, pidfd_open) \
   SYSCALL(435, clone3) \
   SYSCALL(436, unimplemented) \
   SYSCALL(437, openat2) \
   SYSCALL(438, unimplemented) \
   SYSCALL(439, faccessat2) \
-  SYSCALL(440, unimplemented) \
+  SYSCALL(440, process_madvise) \
   SYSCALL(441, unimplemented) \
   SYSCALL(442, mount_setattr) \
   SYSCALL(443, unimplemented) \
@@ -454,7 +454,7 @@
   SYSCALL(445, unimplemented) \
   SYSCALL(446, unimplemented) \
   SYSCALL(447, unimplemented) \
-  SYSCALL(448, unimplemented) \
+  SYSCALL(448, process_mrelease) \
   SYSCALL(449, futex_waitv) \
   SYSCALL(450, unimplemented) \
   SYSCALL(451, unimplemented) \

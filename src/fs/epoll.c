@@ -60,6 +60,30 @@ KHASH_MAP_INIT_INT64(epoll, struct epoll_reg)
 static khash_t(epoll) *epoll_regs;
 static pthread_mutex_t epoll_lock = PTHREAD_MUTEX_INITIALIZER;
 
+/*
+ * Everything registered on an epoll instance goes when its descriptor does.
+ *
+ * Without this the registrations outlive the instance, and a descriptor number
+ * is reused: a later epoll_create1 that lands on the same number inherits them,
+ * and adding a descriptor that instance has never seen answers EEXIST. That is
+ * how this was found - a second epoll instance in one process, which is not an
+ * exotic thing for an event loop to do.
+ */
+void
+epoll_close(int epfd)
+{
+  pthread_mutex_lock(&epoll_lock);
+  if (epoll_regs) {
+    for (khiter_t k = kh_begin(epoll_regs); k != kh_end(epoll_regs); k++) {
+      if (!kh_exist(epoll_regs, k))
+        continue;
+      if ((int) (kh_key(epoll_regs, k) >> 32) == epfd)
+        kh_del(epoll, epoll_regs, k);
+    }
+  }
+  pthread_mutex_unlock(&epoll_lock);
+}
+
 static uint64_t
 reg_key(int epfd, int fd)
 {
@@ -244,7 +268,7 @@ epoll_wait_common(int epfd, gaddr_t events_ptr, int maxevents, int timeout)
    */
   struct epoll_reg pb[64];
   int npb = 0;
-  if (tee_pending()) {
+  if (tee_pending() || pidfd_any()) {
     pthread_mutex_lock(&epoll_lock);
     epoll_regs_init();
     for (khiter_t k = kh_begin(epoll_regs); k != kh_end(epoll_regs); k++) {
@@ -256,7 +280,16 @@ epoll_wait_common(int epfd, gaddr_t events_ptr, int maxevents, int timeout)
       struct epoll_reg reg = kh_value(epoll_regs, k);
       if (!(reg.events & LINUX_EPOLLIN))
         continue;
-      if (npb < (int) (sizeof pb / sizeof pb[0]) && tee_readable((int) (uint32_t) key))
+      int rfd = (int) (uint32_t) key;
+      /*
+       * Two things kqueue will not report. Bytes tee is holding in front of a
+       * pipe, and a pidfd whose process has gone - the latter because kqueue
+       * does not raise EVFILT_READ for a regular file at all, which is what a
+       * pidfd is here. Without this an event loop waiting on a pidfd would
+       * never learn that the process exited.
+       */
+      if (npb < (int) (sizeof pb / sizeof pb[0]) &&
+          (tee_readable(rfd) || pidfd_readable(rfd)))
         pb[npb++] = reg;
     }
     pthread_mutex_unlock(&epoll_lock);

@@ -448,9 +448,11 @@ DEFINE_SYSCALL(clone3, gaddr_t, args_ptr, size_t, size)
 
   /*
    * Things this cannot do, refused rather than dropped. CLONE_PIDFD wants a
-   * descriptor written back that nothing here can produce, and set_tid asks to
-   * choose the child's pid - which is the pid namespace's to allocate, and here
-   * comes from the host besides.
+   * descriptor written back for the new child; src/proc/pidfd.c can now make
+   * one, so this is a wiring job rather than an impossibility, but it is not
+   * wired yet and saying yes without writing the descriptor would be worse than
+   * saying no. set_tid asks to choose the child's pid - which is the pid
+   * namespace's to allocate, and here comes from the host besides.
    */
   if (a.flags & LINUX_CLONE_PIDFD)
     return -LINUX_EINVAL;

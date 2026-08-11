@@ -5038,3 +5038,65 @@ not exist. The process is now actually looked for, with `kill(pid, 0)`, which is
 the same test Linux would be making.
 
 262 of 375.
+
+### 3.5.95 process_madvise, process_mrelease — and the pidfd they needed
+
+Both name their target by **pidfd**, and there was no way for a guest to obtain
+one: `clone3` refuses `CLONE_PIDFD`, `pidfd_getfd` does not exist. Implementing
+the two asked for would have been implementing two calls nothing could invoke,
+so `pidfd_open` came with them — the same judgement `fsconfig` got.
+
+A pidfd is an unlinked file with a magic and a pid, the shape the message queues
+and mount contexts use. The hard part is that a pidfd must become **readable when
+its process exits**, and Darwin has no descriptor that does that. It is answered
+where every readiness question here is answered — `poll`, `select` and `epoll`
+are NABI's own, and they ask whether the process is still there.
+
+**That hook had to work in the opposite direction from the others.** Every
+previous one *adds* readability: `tee` holds bytes the host does not know about.
+A pidfd is a file, and the host calls a file readable **always**, so an
+additive hook reports every pidfd ready from the moment it is made. The answer
+has to *replace* what the host said, which is why `poll`, `select` and `pselect6`
+each got a distinct fixup rather than another clause in the tee one. The test
+that catches this is the one asserting a *running* process is not readable.
+
+`epoll` then needed the reverse, and finding out why was the useful part. kqueue
+raises no read event for a regular file at all — so there was nothing to suppress
+and, worse, an exited pidfd would never be reported either. An event loop waiting
+on one would have waited forever. It is added to the same pre-wait scan that
+surfaces tee's pushback.
+
+**A pre-existing bug fell out of writing that test.** `epoll_ctl` answered
+`EEXIST` adding a descriptor to a *fresh* epoll instance. Registrations are keyed
+by `(epfd, fd)` and were never removed when the epoll descriptor closed, so a
+later `epoll_create1` landing on the same number inherited the old ones. Two
+epoll instances in one process is not exotic; it is what an event loop does when
+it re-creates its poller. There is now a close hook, alongside the ones inotify,
+fanotify, timerfd and io_uring already had.
+
+On the two that were asked for. `process_madvise`'s advice is **purely
+advisory** — the set it accepts is `COLD`, `PAGEOUT`, `WILLNEED`, `COLLAPSE`, and
+Linux deliberately excludes the destructive `MADV_DONTNEED` and `MADV_FREE`
+because those change what a read returns. So a kernel that takes the hint and
+does nothing is inside the contract, and reporting the range as processed is
+true rather than a polite fiction. Ranges are still checked for being mapped,
+because an advisory call must still say `EFAULT` for memory that is not there.
+
+`process_mrelease` is **not** like that, and the difference is written down
+rather than glossed. What it promises is that a dying process's memory is freed
+*now*, and NABI cannot free another process's memory at all. Every input it can
+be given gets the answer Linux would give — a target that is not dying is
+`EINVAL`, one that is gone is `ESRCH`, another process is `EPERM` — but there is
+no input on this system for which it would do the work.
+
+The cross-process half of both is refused for the reasons `process_vm_readv` sets
+out: a guest process is a host process with its own guest memory, and nothing
+here reaches into another one.
+
+**One thing found and not fixed here.** `madvise` itself is a stub — it prints
+"madvise is not implemented" and returns 0 — while the generated table marks it
+implemented, because the table marks by the presence of a handler and cannot see
+that the handler does nothing. `mlock` and `munlock` are the same. That
+overstatement predates this work and is left alone rather than folded in.
+
+265 of 375.

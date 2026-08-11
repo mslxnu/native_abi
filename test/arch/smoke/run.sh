@@ -730,6 +730,21 @@ else
     fail=1
 fi
 
+# pidfdtest: pidfd_open, process_madvise and process_mrelease. The two that were
+# asked for take a pidfd and there was no way to obtain one, so pidfd_open came
+# with them. The trap it walks into is that a pidfd is a file here, and poll and
+# select call a file readable always - so a live process would look exited. Both
+# halves are checked: a running process must not be readable, and a child that
+# has exited must be, through poll, select and epoll alike.
+cp "$here/pidfdtest" "$root/"; chmod +x "$root/pidfdtest"
+out=$("$NABI" -m "$root" /pidfdtest); rc=$?
+if [ "$rc" -eq 0 ] && [ "$out" = "pidfd ok" ]; then
+    echo "  ok  pidfdtest -> \"$out\", exit 0"
+else
+    echo "  FAIL pidfdtest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 if [ "$fail" -eq 0 ]; then
     echo "smoke: PASS"
 else

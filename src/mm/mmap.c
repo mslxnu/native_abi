@@ -740,3 +740,127 @@ DEFINE_SYSCALL(process_vm_writev, int, pid, gaddr_t, lvec, unsigned long, liovcn
 {
   return process_vm_rw(pid, lvec, liovcnt, rvec, riovcnt, flags, true);
 }
+
+/* ------------------------------------- process_madvise / process_mrelease */
+
+/*
+ * process_madvise and process_mrelease: reclaim, aimed at another process.
+ *
+ * Both name their target by pidfd, and both are about memory pressure - one
+ * says which of a process's pages are cold enough to page out, the other
+ * releases a dying process's pages now rather than waiting for it to finish
+ * exiting. They are what a userspace out-of-memory daemon is built from.
+ *
+ * The cross-process half is unreachable here for the reasons process_vm_readv
+ * sets out above: a guest process is a host process with its own guest memory,
+ * the arena naming it is unlinked, its live mappings are private, and a guest
+ * address means nothing without the region table belonging to the process that
+ * owns it. So a target that is not this process answers EPERM, which is what
+ * Linux answers when the ptrace access check fails and which callers have a
+ * path for.
+ *
+ * The two differ in what is left after that, and it is worth being exact.
+ *
+ * process_madvise's advice is *purely advisory*: the set it accepts - COLD,
+ * PAGEOUT, WILLNEED, COLLAPSE - are reclaim hints with no effect a program can
+ * observe. Linux deliberately excludes the destructive ones, MADV_DONTNEED and
+ * MADV_FREE, precisely because they change what a read returns. So a kernel
+ * that takes the hint and does nothing with it is behaving within the contract,
+ * and reporting the range as processed is true rather than a polite fiction.
+ *
+ * process_mrelease is not like that. What it promises is that the memory is
+ * freed *now*, and nabi cannot free another process's memory at all. Every
+ * input it can be given gets the answer Linux would give - a target that is not
+ * dying is EINVAL, one that is gone is ESRCH, another process is EPERM - but
+ * there is no input on this system for which it would do the work. That is a
+ * narrower thing than the other and is written down rather than glossed.
+ */
+#define LINUX_MADV_WILLNEED  3
+#define LINUX_MADV_COLD     20
+#define LINUX_MADV_PAGEOUT  21
+#define LINUX_MADV_COLLAPSE 25
+
+DEFINE_SYSCALL(process_madvise, int, pidfd, gaddr_t, vec, unsigned long, vlen,
+               int, advice, unsigned int, flags)
+{
+  if (flags != 0)
+    return -LINUX_EINVAL;
+  if (vlen > 1024)
+    return -LINUX_EINVAL;       /* UIO_MAXIOV */
+
+  /*
+   * The advice is checked before the target, because the set this call accepts
+   * is narrower than madvise's and a caller that passes a destructive one is
+   * asking for something Linux refuses from here whatever the target is.
+   */
+  switch (advice) {
+  case LINUX_MADV_COLD:
+  case LINUX_MADV_PAGEOUT:
+  case LINUX_MADV_WILLNEED:
+  case LINUX_MADV_COLLAPSE:
+    break;
+  default:
+    return -LINUX_EINVAL;
+  }
+
+  int host = pidfd_host_pid(pidfd);
+  if (host < 0)
+    return -LINUX_EBADF;        /* not a pidfd */
+  if (kill(host, 0) < 0 && errno == ESRCH)
+    return -LINUX_ESRCH;
+  if (host != getpid())
+    return -LINUX_EPERM;        /* see above */
+
+  if (vlen == 0)
+    return 0;
+
+  struct l_iovec *iov = calloc(vlen, sizeof *iov);
+  if (!iov)
+    return -LINUX_ENOMEM;
+  if (copy_from_user(iov, vec, vlen * sizeof *iov)) {
+    free(iov);
+    return -LINUX_EFAULT;
+  }
+
+  /*
+   * Each range is checked for being real before it is counted. An advisory
+   * call still has to say EFAULT for memory that is not there, or a caller
+   * cannot tell a range it got wrong from one that was simply not worth acting
+   * on.
+   */
+  int64_t total = 0;
+  for (unsigned long i = 0; i < vlen; i++) {
+    if (iov[i].iov_len == 0)
+      continue;
+    if (guest_to_host(iov[i].iov_base) == NULL ||
+        guest_to_host(iov[i].iov_base + iov[i].iov_len - 1) == NULL) {
+      free(iov);
+      return total > 0 ? (int) total : -LINUX_EFAULT;
+    }
+    total += iov[i].iov_len;
+  }
+  free(iov);
+  return (int) total;
+}
+
+DEFINE_SYSCALL(process_mrelease, int, pidfd, unsigned int, flags)
+{
+  if (flags != 0)
+    return -LINUX_EINVAL;
+
+  int host = pidfd_host_pid(pidfd);
+  if (host < 0)
+    return -LINUX_EBADF;
+  if (kill(host, 0) < 0 && errno == ESRCH)
+    return -LINUX_ESRCH;
+  if (host != getpid())
+    return -LINUX_EPERM;
+
+  /*
+   * Reaching here means the target is this process, and this process is
+   * running - so it is not a dying one, which is the only kind this call acts
+   * on. EINVAL is what Linux answers for that, and it is the right answer for
+   * the right reason rather than a stand-in for "cannot".
+   */
+  return -LINUX_EINVAL;
+}

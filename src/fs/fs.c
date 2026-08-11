@@ -3331,6 +3331,8 @@ user_close(int fd)
   fanotify_close(fd);
   timerfd_close(fd);
   uring_close(fd);
+  pidfd_close(fd);
+  epoll_close(fd);
 
   pthread_rwlock_wrlock(&proc.fileinfo.fdtable_lock);
   int ret = do_close(&proc.fileinfo.fdtable, fd);
@@ -4408,6 +4410,10 @@ DEFINE_SYSCALL(select, int, nfds, gaddr_t, readfds_ptr, gaddr_t, writefds_ptr, g
     return r;
   if (pushed)
     r += tee_mark_readable(nfds, rfds, &asked);
+  /* And a pidfd's answer replaces the host's, which calls the file behind it
+   * readable always. See pidfd_readable. */
+  if (rfds)
+    r += pidfd_fix_readset(nfds, rfds, &asked);
 
   if (readfds_ptr != 0 && copy_to_user(readfds_ptr, &readfds, sizeof readfds))
     return -LINUX_EFAULT;
@@ -4474,6 +4480,10 @@ DEFINE_SYSCALL(pselect6, int, nfds, gaddr_t, readfds_ptr, gaddr_t, writefds_ptr,
     return r;
   if (pushed)
     r += tee_mark_readable(nfds, rfds, &asked);
+  /* And a pidfd's answer replaces the host's, which calls the file behind it
+   * readable always. See pidfd_readable. */
+  if (rfds)
+    r += pidfd_fix_readset(nfds, rfds, &asked);
 
   if (readfds_ptr != 0 && copy_to_user(readfds_ptr, &readfds, sizeof readfds))
     return -LINUX_EFAULT;
@@ -4532,14 +4542,21 @@ poll_common(gaddr_t fds_ptr, int nfds, int timeout)
    * meanwhile. All the pushback changes is that it must not block.
    */
   bool pushed = false;
-  if (tee_pending()) {
+  if (tee_pending() || pidfd_any()) {
     for (int i = 0; i < nfds; i++) {
-      if ((l_fds[i].events & POLLIN) && in_userfd(l_fds[i].fd) &&
-          tee_readable(l_fds[i].fd)) {
+      if (!(l_fds[i].events & POLLIN) || !in_userfd(l_fds[i].fd))
+        continue;
+      /* A pidfd is readable exactly when its process has gone, which nothing
+       * in the host will report - so it is asked about here, alongside the
+       * bytes tee is holding. */
+      if (tee_readable(l_fds[i].fd) || pidfd_readable(l_fds[i].fd)) {
         pushed = true;
         break;
       }
     }
+    /* A pidfd whose process is still running must not make this wait either:
+     * the host would call the file behind it readable and return at once,
+     * which is the opposite of what the caller asked to wait for. */
     if (pushed)
       timeout = 0;
   }
@@ -4557,10 +4574,26 @@ poll_common(gaddr_t fds_ptr, int nfds, int timeout)
     }
   }
 
-  if (pushed) {
+  if (pushed || pidfd_any()) {
     for (int i = 0; i < nfds; i++) {
+      if (!in_userfd(l_fds[i].fd))
+        continue;
+      /*
+       * A pidfd's readiness *replaces* what the host said rather than adding
+       * to it. The descriptor is a file and the host calls a file readable
+       * always, so anything less than a replacement reports every pidfd ready
+       * from the moment it exists.
+       */
+      if (pidfd_is(l_fds[i].fd)) {
+        bool was = (l_fds[i].revents != 0);
+        l_fds[i].revents = pidfd_readable(l_fds[i].fd) ? POLLIN : 0;
+        bool now = (l_fds[i].revents != 0);
+        if (was && !now) r--;
+        if (!was && now) r++;
+        continue;
+      }
       if ((l_fds[i].events & POLLIN) && !(l_fds[i].revents & POLLIN) &&
-          in_userfd(l_fds[i].fd) && tee_readable(l_fds[i].fd)) {
+          tee_readable(l_fds[i].fd)) {
         if (l_fds[i].revents == 0)
           r++;                  /* poll counts descriptors, not events */
         l_fds[i].revents |= POLLIN;
