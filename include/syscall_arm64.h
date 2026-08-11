@@ -110,7 +110,7 @@
   SYSCALL(101, nanosleep) \
   SYSCALL(102, getitimer) \
   SYSCALL(103, setitimer) \
-  SYSCALL(104, unimplemented) \
+  SYSCALL(104, kexec_load) \
   SYSCALL(105, unimplemented) \
   SYSCALL(106, unimplemented) \
   SYSCALL(107, timer_create) \
@@ -241,7 +241,7 @@
   SYSCALL(232, unimplemented) \
   SYSCALL(233, madvise) \
   SYSCALL(234, unimplemented) \
-  SYSCALL(235, unimplemented) \
+  SYSCALL(235, mbind) \
   SYSCALL(236, get_mempolicy) \
   SYSCALL(237, unimplemented) \
   SYSCALL(238, unimplemented) \
@@ -300,7 +300,7 @@
   SYSCALL(291, statx) \
   SYSCALL(292, io_pgetevents) \
   SYSCALL(293, rseq) \
-  SYSCALL(294, unimplemented) \
+  SYSCALL(294, kexec_file_load) \
   SYSCALL(295, unimplemented) \
   SYSCALL(296, unimplemented) \
   SYSCALL(297, unimplemented) \
@@ -448,7 +448,7 @@
   SYSCALL(439, faccessat2) \
   SYSCALL(440, unimplemented) \
   SYSCALL(441, unimplemented) \
-  SYSCALL(442, unimplemented) \
+  SYSCALL(442, mount_setattr) \
   SYSCALL(443, unimplemented) \
   SYSCALL(444, unimplemented) \
   SYSCALL(445, unimplemented) \
@@ -464,7 +464,7 @@
   SYSCALL(455, futex_wait) \
   SYSCALL(456, futex_requeue) \
   SYSCALL(457, unimplemented) \
-  SYSCALL(458, unimplemented) \
+  SYSCALL(458, listmount) \
   SYSCALL(459, unimplemented) \
   SYSCALL(460, unimplemented) \
   SYSCALL(461, unimplemented) \

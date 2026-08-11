@@ -52,6 +52,39 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+/*
+ * mount_setattr's argument. Fixed ABI: a caller passes its size, which is how
+ * the kernel tells an old caller from a new one.
+ */
+struct l_mount_attr {
+  uint64_t attr_set;
+  uint64_t attr_clr;
+  uint64_t propagation;
+  uint64_t userns_fd;
+};
+
+#define LINUX_MOUNT_ATTR_RDONLY      0x00000001
+#define LINUX_MOUNT_ATTR_NOSUID      0x00000002
+#define LINUX_MOUNT_ATTR_NODEV       0x00000004
+#define LINUX_MOUNT_ATTR_NOEXEC      0x00000008
+#define LINUX_MOUNT_ATTR__ATIME      0x00000070
+#define LINUX_MOUNT_ATTR_RELATIME    0x00000000
+#define LINUX_MOUNT_ATTR_NOATIME     0x00000010
+#define LINUX_MOUNT_ATTR_STRICTATIME 0x00000020
+#define LINUX_MOUNT_ATTR_NODIRATIME  0x00000080
+#define LINUX_MOUNT_ATTR_IDMAP       0x00100000
+#define LINUX_MOUNT_ATTR_NOSYMFOLLOW 0x00200000
+
+/* listmount's request, and the id that means "start at the root". */
+struct l_mnt_id_req {
+  uint32_t size;
+  uint32_t spare;
+  uint64_t mnt_id;
+  uint64_t param;
+};
+#define LINUX_MNT_ID_REQ_SIZE_VER0 24
+#define LINUX_LSMT_ROOT 0xffffffffffffffffULL
+
 #define MOUNT_MAX      64
 #define MOUNT_PATH_MAX 256
 

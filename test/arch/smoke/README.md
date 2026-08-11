@@ -364,6 +364,16 @@ guest-code cache sync.
   refusals are checked too — a name with no leading slash, a name with a path in
   it, and a notification asking for a realtime signal NABI cannot deliver.
 
+- `mounttest` — `mount_setattr`, `listmount`, `mbind`, and the two `kexec` calls
+  answering `ENOSYS`. The load-bearing check is that `mount_setattr` **takes
+  effect** rather than being recorded: a bind made read-only through it has to
+  start refusing writes, and an implementation that stored the attribute instead
+  reports a successful create where `-EROFS` was wanted. Clearing is checked as
+  precisely as setting, since saying which attributes to change rather than
+  handing over a whole flag word is the reason the call exists. `mbind` has one
+  node to work with, so what is tested is the validation — a nodemask naming a
+  node this machine does not have is refused rather than accepted and ignored.
+
 The ELF binaries are committed prebuilt (as the x86 guest tests under
 `test/*/build/` are), so the check needs no cross-toolchain. The `.s` sources
 are here for reference; rebuild with an aarch64-linux clang + ld.lld:

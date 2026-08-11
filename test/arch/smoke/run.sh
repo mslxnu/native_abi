@@ -671,6 +671,21 @@ else
     fail=1
 fi
 
+# mounttest: mount_setattr, listmount and mbind, plus the two kexec refusals.
+# The check that matters is that mount_setattr *takes effect* rather than being
+# recorded - a bind made read-only through it has to start refusing writes, and
+# an implementation that stored the attribute instead reports 4 where -EROFS was
+# wanted. mbind has one node to work with, so what is tested is that a nodemask
+# naming a node this machine does not have is refused rather than ignored.
+cp "$here/mounttest" "$root/"; chmod +x "$root/mounttest"
+out=$("$NABI" -m "$root" /mounttest); rc=$?
+if [ "$rc" -eq 0 ] && [ "$out" = "mount ok" ]; then
+    echo "  ok  mounttest -> \"$out\", exit 0"
+else
+    echo "  FAIL mounttest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 if [ "$fail" -eq 0 ]; then
     echo "smoke: PASS"
 else

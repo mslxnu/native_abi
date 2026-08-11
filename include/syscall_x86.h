@@ -242,7 +242,7 @@
   SYSCALL(234, tgkill) \
   SYSCALL(235, utimes) \
   SYSCALL(236, vserver) \
-  SYSCALL(237, unimplemented) \
+  SYSCALL(237, mbind) \
   SYSCALL(238, unimplemented) \
   SYSCALL(239, get_mempolicy) \
   SYSCALL(240, mq_open) \
@@ -251,7 +251,7 @@
   SYSCALL(243, mq_timedreceive) \
   SYSCALL(244, mq_notify) \
   SYSCALL(245, mq_getsetattr) \
-  SYSCALL(246, unimplemented) \
+  SYSCALL(246, kexec_load) \
   SYSCALL(247, unimplemented) \
   SYSCALL(248, unimplemented) \
   SYSCALL(249, unimplemented) \
@@ -325,7 +325,7 @@
   SYSCALL(317, unimplemented) \
   SYSCALL(318, getrandom) \
   SYSCALL(319, unimplemented) \
-  SYSCALL(320, unimplemented) \
+  SYSCALL(320, kexec_file_load) \
   SYSCALL(321, unimplemented) \
   SYSCALL(322, unimplemented) \
   SYSCALL(323, unimplemented) \
@@ -447,7 +447,7 @@
   SYSCALL(439, faccessat2) \
   SYSCALL(440, unimplemented) \
   SYSCALL(441, unimplemented) \
-  SYSCALL(442, unimplemented) \
+  SYSCALL(442, mount_setattr) \
   SYSCALL(443, unimplemented) \
   SYSCALL(444, unimplemented) \
   SYSCALL(445, unimplemented) \
@@ -463,7 +463,7 @@
   SYSCALL(455, futex_wait) \
   SYSCALL(456, futex_requeue) \
   SYSCALL(457, unimplemented) \
-  SYSCALL(458, unimplemented) \
+  SYSCALL(458, listmount) \
   SYSCALL(459, unimplemented) \
   SYSCALL(460, unimplemented) \
   SYSCALL(461, unimplemented) \

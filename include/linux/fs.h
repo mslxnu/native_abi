@@ -44,6 +44,10 @@
                                      LINUX_SPECIFIC)\
   DECL_LINUX(_,AT_EMPTY_PATH,        0x1000,\
                                      LINUX_SPECIFIC)\
+  /* mount_setattr's, and the only AT_ flag that changes what it does rather\
+   * than how the path is resolved. */\
+  DECL_LINUX(_,AT_RECURSIVE,         0x8000,\
+                                     LINUX_SPECIFIC)\
 
 DECLARE_CENUM(at, LINUX_AT);
 

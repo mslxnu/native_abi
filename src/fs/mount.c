@@ -693,3 +693,181 @@ DEFINE_SYSCALL(umount2, gstr_t, target_ptr, int, flags)
   }
   return -LINUX_EINVAL;         /* not a mount point, as Linux says */
 }
+
+/* ------------------------------------------------------- mount_setattr */
+
+/*
+ * mount_setattr: changing a mount's attributes after it exists.
+ *
+ * This is umount's opposite number and mount(2)'s successor for the flags half
+ * of the job. What makes it worth having rather than a synonym for a remount is
+ * that it is *precise* - it says which attributes to set and which to clear,
+ * instead of handing over a whole flag word and hoping the ones not mentioned
+ * survive - and that it can descend a subtree in one call.
+ *
+ * Both of those land well here, because a mount is a row in a table: setting an
+ * attribute is a masked update of that row, and AT_RECURSIVE is the same update
+ * on every row whose target falls under it. MS_RDONLY is honoured by path
+ * resolution already, so making a mount read-only this way genuinely refuses
+ * writes rather than recording an intention.
+ *
+ * MOUNT_ATTR_IDMAP is refused. It asks for the mount's uids to be shifted
+ * through a user namespace, which needs the file's owner to be translated on
+ * every access, and the identity nabi keeps in an xattr is not something a
+ * mount can re-map. Accepting it would hand back a mount whose ownership a
+ * caller believes was shifted and which behaves as though it were not.
+ */
+DEFINE_SYSCALL(mount_setattr, int, dfd, gstr_t, path_ptr, unsigned int, flags,
+               gaddr_t, uattr, size_t, usize)
+{
+  if (!may_mount())
+    return -LINUX_EPERM;
+  /* AT_RECURSIVE is the only one of these that changes what happens; the
+   * others are about how the path is resolved, which a table of prefixes does
+   * the same way regardless. */
+  if (flags & ~(unsigned) (LINUX_AT_RECURSIVE | LINUX_AT_SYMLINK_NOFOLLOW |
+                           LINUX_AT_EMPTY_PATH | LINUX_AT_NO_AUTOMOUNT))
+    return -LINUX_EINVAL;
+  if (usize < sizeof(struct l_mount_attr))
+    return -LINUX_EINVAL;
+
+  struct l_mount_attr a;
+  if (copy_from_user(&a, uattr, sizeof a))
+    return -LINUX_EFAULT;
+  /* A caller from a future with more fields must not be told its extra request
+   * was honoured. */
+  for (size_t i = sizeof a; i < usize; i++) {
+    char pad;
+    if (copy_from_user(&pad, uattr + i, 1))
+      return -LINUX_EFAULT;
+    if (pad != 0)
+      return -LINUX_E2BIG;
+  }
+
+  const uint64_t known = LINUX_MOUNT_ATTR_RDONLY | LINUX_MOUNT_ATTR_NOSUID |
+                         LINUX_MOUNT_ATTR_NODEV | LINUX_MOUNT_ATTR_NOEXEC |
+                         LINUX_MOUNT_ATTR__ATIME | LINUX_MOUNT_ATTR_NODIRATIME |
+                         LINUX_MOUNT_ATTR_IDMAP | LINUX_MOUNT_ATTR_NOSYMFOLLOW;
+  if ((a.attr_set | a.attr_clr) & ~known)
+    return -LINUX_EINVAL;
+  /* Setting and clearing the same attribute has no answer, so it is refused
+   * rather than resolved by whichever happens to be applied second. */
+  if (a.attr_set & a.attr_clr & ~(uint64_t) LINUX_MOUNT_ATTR__ATIME)
+    return -LINUX_EINVAL;
+  /* The atime bits are one choice spelled in three values, so clearing them is
+   * clearing the field, and asking to set two at once is asking for two. */
+  if ((a.attr_set & LINUX_MOUNT_ATTR__ATIME) == LINUX_MOUNT_ATTR__ATIME)
+    return -LINUX_EINVAL;
+  if (a.attr_set & LINUX_MOUNT_ATTR_IDMAP)
+    return -LINUX_EINVAL;       /* see above: cannot be honoured, so refused */
+
+  char target[MOUNT_PATH_MAX];
+  if (strncpy_from_user(target, path_ptr, sizeof target) < 0)
+    return -LINUX_EFAULT;
+  /*
+   * An absolute path, as mount(2) here also requires. A dirfd-relative one
+   * would have to be resolved against a descriptor's path, and the mount table
+   * is keyed by the guest path a mount answers to - so a relative name has
+   * nothing to match against until that resolution exists.
+   */
+  if (target[0] != '/')
+    return -LINUX_EINVAL;
+  (void) dfd;
+
+  struct mount_table t;
+  if (!current_table(&t))
+    return -LINUX_EINVAL;
+
+  /* Which flags a mount carries, in the words the table already speaks. */
+  uint32_t set = 0, clr = 0;
+  if (a.attr_set & LINUX_MOUNT_ATTR_RDONLY) set |= LINUX_MS_RDONLY;
+  if (a.attr_set & LINUX_MOUNT_ATTR_NOSUID) set |= LINUX_MS_NOSUID;
+  if (a.attr_set & LINUX_MOUNT_ATTR_NODEV)  set |= LINUX_MS_NODEV;
+  if (a.attr_set & LINUX_MOUNT_ATTR_NOEXEC) set |= LINUX_MS_NOEXEC;
+  if (a.attr_clr & LINUX_MOUNT_ATTR_RDONLY) clr |= LINUX_MS_RDONLY;
+  if (a.attr_clr & LINUX_MOUNT_ATTR_NOSUID) clr |= LINUX_MS_NOSUID;
+  if (a.attr_clr & LINUX_MOUNT_ATTR_NODEV)  clr |= LINUX_MS_NODEV;
+  if (a.attr_clr & LINUX_MOUNT_ATTR_NOEXEC) clr |= LINUX_MS_NOEXEC;
+
+  bool found = false;
+  for (uint32_t i = 0; i < t.n; i++) {
+    bool hit = strcmp(t.m[i].target, target) == 0;
+    if (!hit && (flags & LINUX_AT_RECURSIVE))
+      hit = under(t.m[i].target, target) > 0;
+    if (!hit)
+      continue;
+    found = true;
+    t.m[i].flags = (t.m[i].flags & ~clr) | set;
+    if (a.propagation)
+      t.m[i].propagation = (uint32_t) a.propagation;
+  }
+  if (!found)
+    return -LINUX_EINVAL;       /* not a mount point, as Linux says */
+
+  table_store(ns_ino_of(NS_MNT), &t);
+  return 0;
+}
+
+/* ----------------------------------------------------------- listmount */
+
+/*
+ * listmount: the ids of the mounts under one mount.
+ *
+ * The newer half of the pair whose other half is statmount - one says which
+ * mounts exist, the other describes one of them. Reading /proc/mounts answers
+ * the same question, and this exists because parsing it is a text format that
+ * has to stay compatible forever; a list of numbers does not.
+ *
+ * Which makes it cheap here: the mounts already are a list of numbered rows,
+ * and /proc/mounts is built from the same table, so the two cannot disagree.
+ */
+DEFINE_SYSCALL(listmount, gaddr_t, req_ptr, gaddr_t, ids_ptr,
+               size_t, nr_ids, unsigned int, flags)
+{
+  if (flags != 0)
+    return -LINUX_EINVAL;
+
+  struct l_mnt_id_req req;
+  memset(&req, 0, sizeof req);
+  uint32_t size;
+  if (copy_from_user(&size, req_ptr, sizeof size))
+    return -LINUX_EFAULT;
+  if (size < LINUX_MNT_ID_REQ_SIZE_VER0)
+    return -LINUX_EINVAL;
+  if (copy_from_user(&req, req_ptr, sizeof req > size ? size : sizeof req))
+    return -LINUX_EFAULT;
+
+  struct mount_table t;
+  if (!current_table(&t))
+    return 0;                   /* no mounts of its own is not an error */
+
+  /*
+   * The root request lists everything; anything else lists what is *under* the
+   * mount named, which for a table of path prefixes is exactly the entries
+   * whose target falls inside its target and is not it.
+   */
+  const char *parent = NULL;
+  if (req.mnt_id != LINUX_LSMT_ROOT) {
+    for (uint32_t i = 0; i < t.n; i++) {
+      if (t.m[i].id == (uint32_t) req.mnt_id) {
+        parent = t.m[i].target;
+        break;
+      }
+    }
+    if (!parent)
+      return -LINUX_ENOENT;
+  }
+
+  size_t n = 0;
+  for (uint32_t i = 0; i < t.n && n < nr_ids; i++) {
+    if (parent) {
+      if (strcmp(t.m[i].target, parent) == 0 || under(t.m[i].target, parent) == 0)
+        continue;
+    }
+    uint64_t id = t.m[i].id;
+    if (copy_to_user(ids_ptr + n * sizeof id, &id, sizeof id))
+      return -LINUX_EFAULT;
+    n++;
+  }
+  return (int) n;
+}

@@ -4766,3 +4766,61 @@ And a symbol in the header's own `__NR`/`__SC_` namespace is the header's
 business: absent means absent, not unknown.
 
 Still 251 implemented; the denominator is now 375.
+
+### 3.5.90 Two mount calls, one memory policy, and two that cannot exist
+
+Five calls, and they are not the same kind of thing, which is the point worth
+recording.
+
+**`mount_setattr`** is mount(2)'s successor for the flags half of the job, and
+what makes it worth having rather than a synonym for a remount is that it is
+*precise*: it says which attributes to set and which to clear instead of handing
+over a whole flag word and hoping the rest survive, and it can descend a subtree
+in one call. Both land well on a table of rows — setting is a masked update,
+`AT_RECURSIVE` is the same update on every row whose target falls under it. And
+because `MS_RDONLY` is honoured by path resolution rather than merely recorded,
+a mount made read-only this way genuinely starts refusing writes. That is the
+only check that can tell an implementation which *applied* the attribute from one
+that stored it, so it is the one `mounttest` makes; without the flag update it
+reports a successful create where `EROFS` was wanted.
+
+`MOUNT_ATTR_IDMAP` is refused. It asks for a mount's uids to be shifted through a
+user namespace, which needs the owner translated on every access, and the
+identity NABI keeps in an xattr is not something a mount can re-map. Accepting it
+would hand back a mount whose ownership a caller believes was shifted and which
+behaves as though it were not.
+
+**`listmount`** is the newer half of the pair whose other half is `statmount`.
+Reading `/proc/mounts` answers the same question; this exists because parsing a
+text format that must stay compatible forever is worse than reading numbers. It
+is nearly free here, since the mounts already are numbered rows and `/proc/mounts`
+is built from the same table — so the two cannot disagree.
+
+**`mbind`** is the interesting one to be honest about. There is exactly one NUMA
+node here, and that is not a limitation to paper over — it is the machine. A
+policy is a constraint on where pages come from, and on a single-node system
+every constraint permitting that node is already satisfied by every page. So this
+is **not a stub that returns success**: it checks that what was asked is
+satisfiable, and then it is satisfied with nothing left to do. Which makes the
+validation the whole of the implementation and worth doing properly — a nodemask
+naming a node that does not exist is refused exactly as Linux refuses it, because
+a program that binds to node 3 and is told yes goes on believing its memory is
+somewhere it is not.
+
+**`kexec_load` and `kexec_file_load` are refused**, and unlike most refusals here
+it is not for want of a Darwin equivalent — the operation has no meaning in this
+program. NABI is a Linux ABI on top of macOS: there is no kernel of its own to
+replace, no boot to shorten, nothing a loaded image could be executed by. A guest
+calling these is asking to reboot the machine into something else, and the
+machine is not NABI's to reboot. `ENOSYS` rather than `EPERM`, deliberately:
+`EPERM` says "not you", and a caller that gets it retries as root and fails
+identically forever, where `ENOSYS` says the facility is absent — which is true,
+and which every caller already knows how to stop at.
+
+One limitation worth naming: `mount_setattr` takes a `dirfd` and this requires an
+absolute path, as `mount(2)` here already does. A relative name would have to be
+resolved against a descriptor's path, and the mount table is keyed by the guest
+path a mount answers to, so there is nothing for a relative name to match until
+that resolution exists.
+
+254 of 375.

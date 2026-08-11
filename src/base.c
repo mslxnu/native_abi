@@ -157,6 +157,25 @@ char *sc_name_table[NR_SYSCALLS] = {
     return -LINUX_ENOSYS;                                             \
   }
 
+/*
+ * kexec_load and kexec_file_load: loading a kernel to boot into instead of
+ * rebooting through firmware.
+ *
+ * Refused, and unlike most refusals here it is not for want of a Darwin
+ * equivalent - the operation has no meaning in this program. nabi is a Linux
+ * ABI on top of macOS: there is no kernel of its own to replace, no boot to
+ * shorten, and nothing a loaded image could be executed by. A guest calling
+ * these is asking to reboot the machine into something else, and the machine is
+ * not nabi's to reboot.
+ *
+ * ENOSYS rather than EPERM, deliberately. EPERM says "not you", and a caller
+ * that gets it retries as root, which here would fail identically forever.
+ * ENOSYS says the facility is absent, which is true and which every caller
+ * already knows how to stop at.
+ */
+DEFINE_NOT_IMPLEMENTED_SYSCALL(kexec_load)
+DEFINE_NOT_IMPLEMENTED_SYSCALL(kexec_file_load)
+
 DEFINE_NOT_IMPLEMENTED_SYSCALL(vserver)
 DEFINE_NOT_IMPLEMENTED_SYSCALL(uselib)
 DEFINE_NOT_IMPLEMENTED_SYSCALL(epoll_ctl_old)

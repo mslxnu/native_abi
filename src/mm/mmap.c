@@ -485,3 +485,113 @@ linux_mprot_to_hv_mflag(int mprot)
   if (mprot & LINUX_PROT_EXEC) mflag |= HV_MEMORY_EXEC;
   return mflag;
 }
+
+/* ---------------------------------------------------------------- mbind */
+
+/*
+ * mbind: which NUMA nodes a range of memory should come from.
+ *
+ * There is exactly one node here, and that is not a shortcoming to work around
+ * - it is the machine. A policy is a constraint on where pages are allocated,
+ * and on a single-node system every constraint that permits that node is
+ * already satisfied by every page. So this is not a stub that returns success:
+ * it checks that what was asked for is satisfiable and then it *is* satisfied,
+ * with nothing left to do.
+ *
+ * Which makes the validation the whole of the implementation, and worth doing
+ * properly. A nodemask naming a node that does not exist cannot be honoured and
+ * is refused, exactly as Linux refuses it - a program that binds to node 3 and
+ * is told yes would go on believing its memory is somewhere it is not. MPOL_BIND
+ * with an empty mask is the same case. And MPOL_DEFAULT means "no policy", so a
+ * mask with anything in it contradicts the mode it came with.
+ *
+ * MPOL_MF_STRICT asks to be told if pages already in the range are on the wrong
+ * node. None can be, so the answer is that none are.
+ */
+/* The modes and MF_ flags are in linux/mman.h already; these are the two the
+ * header predates - a mode added later, and the flags packed into the mode's
+ * high bits. */
+#define LINUX_MPOL_LOCAL           4
+#define LINUX_MPOL_PREFERRED_MANY  5
+
+#define LINUX_MPOL_F_STATIC_NODES     (1 << 15)
+#define LINUX_MPOL_F_RELATIVE_NODES   (1 << 14)
+#define LINUX_MPOL_F_NUMA_BALANCING   (1 << 13)
+#define LINUX_MPOL_MODE_FLAGS \
+  (LINUX_MPOL_F_STATIC_NODES | LINUX_MPOL_F_RELATIVE_NODES | \
+   LINUX_MPOL_F_NUMA_BALANCING)
+
+DEFINE_SYSCALL(mbind, gaddr_t, addr, unsigned long, len, int, mode,
+               gaddr_t, nodemask, unsigned long, maxnode, unsigned int, flags)
+{
+  if (flags & ~(unsigned) (LINUX_MPOL_MF_STRICT | LINUX_MPOL_MF_MOVE |
+                           LINUX_MPOL_MF_MOVE_ALL))
+    return -LINUX_EINVAL;
+
+  int bare = mode & ~LINUX_MPOL_MODE_FLAGS;
+  int mflags = mode & LINUX_MPOL_MODE_FLAGS;
+  if (bare < LINUX_MPOL_DEFAULT || bare > LINUX_MPOL_PREFERRED_MANY)
+    return -LINUX_EINVAL;
+  /* Two ways of reinterpreting a nodemask, and they contradict each other. */
+  if ((mflags & LINUX_MPOL_F_STATIC_NODES) &&
+      (mflags & LINUX_MPOL_F_RELATIVE_NODES))
+    return -LINUX_EINVAL;
+
+  if (addr & (PAGE_SIZEOF(PAGE_4KB) - 1))
+    return -LINUX_EINVAL;       /* a policy applies to whole pages */
+  if (maxnode > 1024 * 1024)
+    return -LINUX_EINVAL;
+
+  /*
+   * Whether node 0 - the only one - is in the mask. Only the first word is
+   * read because any bit beyond it names a node that cannot exist, and that is
+   * checked separately rather than ignored.
+   */
+  bool names_node0 = false, names_others = false;
+  if (nodemask != 0 && maxnode > 0) {
+    unsigned long words = (maxnode + 63) / 64;
+    for (unsigned long i = 0; i < words; i++) {
+      uint64_t w;
+      if (copy_from_user(&w, nodemask + i * sizeof w, sizeof w))
+        return -LINUX_EFAULT;
+      if (i == 0) {
+        names_node0 = (w & 1) != 0;
+        if (w & ~1ULL)
+          names_others = true;
+      } else if (w) {
+        names_others = true;
+      }
+    }
+  }
+
+  if (names_others)
+    return -LINUX_EINVAL;       /* a node this machine does not have */
+
+  switch (bare) {
+  case LINUX_MPOL_DEFAULT:
+    /* "No policy", so a mask is a contradiction rather than a refinement. */
+    if (names_node0)
+      return -LINUX_EINVAL;
+    break;
+  case LINUX_MPOL_BIND:
+  case LINUX_MPOL_INTERLEAVE:
+  case LINUX_MPOL_PREFERRED_MANY:
+    /* These constrain allocation to the set, so an empty set constrains it to
+     * nowhere and cannot be satisfied. */
+    if (!names_node0)
+      return -LINUX_EINVAL;
+    break;
+  case LINUX_MPOL_LOCAL:
+    if (names_node0)
+      return -LINUX_EINVAL;     /* local is where the thread is, not a set */
+    break;
+  case LINUX_MPOL_PREFERRED:
+    /* An empty mask means "no preference", which is allowed. */
+    break;
+  }
+
+  /* Satisfied by the only node there is. Nothing is recorded because nothing
+   * could later disagree with it: a second node is not going to appear. */
+  (void) len;
+  return 0;
+}
