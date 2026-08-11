@@ -227,6 +227,13 @@ enum ns_type;
 bool procfs_ns_of_fd(int fd, enum ns_type *type, uint64_t *ino);
 bool procfs_write_timens(int fd, const char *buf, size_t size, int *out);
 void procfs_dup_fd(int oldfd, int newfd);
+
+/* inotify (src/fs/inotify.c). The opens and closes are the guest's own: kqueue
+ * cannot see them, so they are taken where nabi already knows. */
+bool inotify_watching(void);
+void inotify_note_open(const char *hostpath, bool isdir);
+void inotify_note_close(const char *hostpath, bool written);
+void inotify_close(int fd);
 bool procfs_pidns_path(const char *name, char *out, size_t outsz, bool *denied);
 bool procfs_stat(const char *path, uint32_t *mode, uint64_t *size, uint64_t *ino);
 bool procfs_refresh_fddir(int fd);

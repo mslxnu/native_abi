@@ -3617,3 +3617,66 @@ The smoke test makes the child `unshare` before it mounts, which is the whole
 point: a plain fork shares this namespace's table, so without the unshare the
 mount arriving in the parent would prove nothing was isolated rather than that
 propagation happened.
+
+### 3.5.69 inotify — **implemented over kqueue**
+
+`inotify_init`, `inotify_init1`, `inotify_add_watch` and `inotify_rm_watch` were
+in neither syscall table. macOS has no inotify; it has kqueue, which answers a
+different question, and the gap between the two questions is the whole of this.
+
+**The shape comes almost free.** The descriptor a guest gets back is the read
+end of a pipe, so `read`, `poll`, `select` and `epoll` work on it without
+anything else being taught about inotify. A thread per instance waits on a
+kqueue and writes `inotify_event` records into the other end. What the guest
+then does is ordinary file reading, which is what it is on Linux too.
+
+**Names are the difficulty.** kqueue reports that a *directory* changed and not
+what changed in it, while `IN_CREATE` and `IN_DELETE` carry a name and callers
+use it. So the listing is remembered and diffed when the directory fires. That
+gives the right names and the right events; what it cannot give is the ordering
+of two changes inside one notification, or the cookie pairing `IN_MOVED_FROM`
+with `IN_MOVED_TO` — a rename inside a watched directory arrives as a delete and
+a create, which is also what Linux sends when the two ends are in different
+watched directories, so callers already handle it.
+
+File events map exactly: `NOTE_WRITE`/`NOTE_EXTEND` → `IN_MODIFY`, `NOTE_ATTRIB`
+→ `IN_ATTRIB`, `NOTE_RENAME` → `IN_MOVE_SELF`, `NOTE_DELETE` → `IN_DELETE_SELF`
+followed by `IN_IGNORED`, as Linux orders them. A full pipe becomes
+`IN_Q_OVERFLOW` rather than events quietly dropped.
+
+**What `IN_CLOSE_WRITE` cost, and the honest answer.** kqueue has no notion of a
+file being opened or closed, so `IN_OPEN` and the two closes are synthesised
+from the guest's own calls — and only within the process holding the instance,
+because that is the only process that can reach the pipe. `inotifywait -m -e
+close_write /w` then established a watch and reported nothing, because a shell's
+`echo x > /w/f` forks and the close happens somewhere with no instance to tell.
+A watch that is accepted and never fires is the failure this port keeps refusing
+to hand anybody, so these are **not** counted among the events a watch can be
+built from: a mask made only of them is EINVAL, and `inotifywait -e close_write`
+now says
+
+```
+Couldn't watch /w: Invalid argument
+```
+
+rather than waiting. A mask that also asks for something real is accepted and
+gets the real part. Making them work generally needs the instance reachable by
+name rather than by descriptor — a FIFO and a registry of watches — which is a
+larger change than the rest of the file and has not been made.
+
+`IN_ACCESS` is not delivered at all: it would mean a hook on every read, for an
+event almost nothing waits on.
+
+With `inotify-tools` installed from Debian, unmodified:
+
+```
+Setting up watches.
+Watches established.
+/w/ CREATE one
+/w/ CREATE,ISDIR sub
+/w/ DELETE one
+```
+
+The `open`/`close` hooks ask `inotify_watching()` first, so a guest with no
+watches — nearly every guest — pays a load and a branch per close rather than
+two `fcntl`s.

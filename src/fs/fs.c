@@ -3137,6 +3137,12 @@ user_openat(int atdirfd, const char *name, int flags, int mode)
   if (fd < 0) {
     goto out;
   }
+  if (inotify_watching()) {
+    char opath[PATH_MAX];
+    struct stat ost;
+    if (fcntl(fd, F_GETPATH, opath) == 0)
+      inotify_note_open(opath, fstat(fd, &ost) == 0 && S_ISDIR(ost.st_mode));
+  }
   int err = register_fd(fd, flags & LINUX_O_CLOEXEC);
   if (err < 0) {
     fd = err;
@@ -3175,6 +3181,24 @@ do_close(struct fdtable *table, int fd)
 int
 user_close(int fd)
 {
+  /*
+   * IN_CLOSE_WRITE and IN_CLOSE_NOWRITE, which kqueue has no way to report -
+   * the host cannot see a descriptor being closed. They are taken here, where
+   * nabi already knows, and before the close so the path can still be found.
+   * Both questions are asked only when something is watching.
+   */
+  if (inotify_watching()) {
+    char path[PATH_MAX];
+    if (fcntl(fd, F_GETPATH, path) == 0) {
+      int fl = fcntl(fd, F_GETFL);
+      bool wrote = fl >= 0 && ((fl & O_ACCMODE) == O_WRONLY ||
+                               (fl & O_ACCMODE) == O_RDWR);
+      inotify_note_close(path, wrote);
+    }
+  }
+  /* And an inotify descriptor of the guest's own takes its watcher with it. */
+  inotify_close(fd);
+
   pthread_rwlock_wrlock(&proc.fileinfo.fdtable_lock);
   int ret = do_close(&proc.fileinfo.fdtable, fd);
   pthread_rwlock_unlock(&proc.fileinfo.fdtable_lock);

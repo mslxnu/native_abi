@@ -256,9 +256,9 @@
   SYSCALL(250, unimplemented)                   \
   SYSCALL(251, unimplemented)                   \
   SYSCALL(252, unimplemented)                   \
-  SYSCALL(253, unimplemented)                   \
-  SYSCALL(254, unimplemented)                   \
-  SYSCALL(255, unimplemented)                   \
+  SYSCALL(253, inotify_init)                    \
+  SYSCALL(254, inotify_add_watch)               \
+  SYSCALL(255, inotify_rm_watch)                \
   SYSCALL(256, unimplemented)                   \
   SYSCALL(257, openat)                          \
   SYSCALL(258, mkdirat)                         \
@@ -297,7 +297,7 @@
   SYSCALL(291, epoll_create1)                   \
   SYSCALL(292, dup3)                            \
   SYSCALL(293, pipe2)                           \
-  SYSCALL(294, unimplemented)                   \
+  SYSCALL(294, inotify_init1)                   \
   SYSCALL(295, unimplemented)                   \
   SYSCALL(296, unimplemented)                   \
   SYSCALL(297, unimplemented)                   \

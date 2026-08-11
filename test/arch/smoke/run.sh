@@ -518,6 +518,20 @@ else
     fail=1
 fi
 
+# inotest: inotify over kqueue. The names on the events are the point - kqueue
+# says a directory changed and not what changed in it - and so is the refusal
+# of a mask that could never fire, which is the difference between a caller
+# that fails and one that waits forever.
+cp "$here/inotest" "$root/"; chmod +x "$root/inotest"
+rm -rf "$root/ino-dir"
+out=$("$NABI" -m "$root" /inotest); rc=$?
+if [ "$rc" -eq 0 ] && [ "$out" = "ino ok" ]; then
+    echo "  ok  inotest -> \"$out\", exit 0"
+else
+    echo "  FAIL inotest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 if [ "$fail" -eq 0 ]; then
     echo "smoke: PASS"
 else

@@ -204,6 +204,16 @@ guest-code cache sync.
     `/proc/self/timens_offsets` sees `CLOCK_MONOTONIC` and `CLOCK_BOOTTIME`
     shifted by exactly them while `CLOCK_REALTIME` is untouched.
 
+- `inotest` — inotify, which macOS has no equivalent of. The descriptor is the
+  read end of a pipe a kqueue watcher feeds, so `read` and `poll` work by
+  construction; what the test is for is the events themselves carrying the right
+  *names*, since kqueue reports that a directory changed and not what changed in
+  it. Also `IN_CLOSE_WRITE`, which no host notification can produce and which is
+  taken from the guest's own `close` - the test creates and closes the file in
+  the same process, which is the only case where that works - and a watch asking
+  only for events that cannot arrive from anywhere being refused rather than
+  left to wait.
+
 - `ipctest` — System V IPC: a segment created, attached, shared across a fork,
   detached and removed; keys resolving to ids; semaphore values through
   `SETVAL`/`GETALL`/`semop`; and `unshare(CLONE_NEWIPC)` making the same key

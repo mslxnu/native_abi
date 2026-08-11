@@ -32,9 +32,9 @@
   SYSCALL(23, dup) \
   SYSCALL(24, dup3) \
   SYSCALL(25, fcntl) \
-  SYSCALL(26, unimplemented) \
-  SYSCALL(27, unimplemented) \
-  SYSCALL(28, unimplemented) \
+  SYSCALL(26, inotify_init1) \
+  SYSCALL(27, inotify_add_watch) \
+  SYSCALL(28, inotify_rm_watch) \
   SYSCALL(29, ioctl) \
   SYSCALL(30, unimplemented) \
   SYSCALL(31, unimplemented) \
