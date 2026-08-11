@@ -745,6 +745,28 @@ else
     fail=1
 fi
 
+# staletest: a recorded guest mode the host mode contradicts.
+#
+# NABI writes the mode attribute and the host mode together, and the host mode is
+# always `record | 0600`, so a pair that disagrees is one NABI cannot have
+# written. A Fedora tree carried records of 0200 against files the host held at
+# 0644 - 0200 denies read to everyone, so Python could not import `encodings` and
+# every GLib program that touched one died. The two files here are that case and
+# its opposite: /etc/shadow's shape, 0000 recorded against a host 0600, which is
+# consistent, correct, and must go on being obeyed.
+printf 'hello-stale\n' > "$root/stale"; chmod 644 "$root/stale"
+xattr -w -x msl.nabi.mode '80 00 00 00' "$root/stale"
+printf 'secret\n' > "$root/shadowlike"; chmod 600 "$root/shadowlike"
+xattr -w -x msl.nabi.mode '00 00 00 00' "$root/shadowlike"
+cp "$here/staletest" "$root/"; chmod +x "$root/staletest"
+out=$("$NABI" -m "$root" /staletest); rc=$?
+if [ "$rc" -eq 0 ] && [ "$out" = "stale ok" ]; then
+    echo "  ok  staletest -> \"$out\", exit 0"
+else
+    echo "  FAIL staletest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 if [ "$fail" -eq 0 ]; then
     echo "smoke: PASS"
 else

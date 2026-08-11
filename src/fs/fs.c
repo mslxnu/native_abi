@@ -1365,6 +1365,54 @@ host_mode_for(uint32_t guest_mode, bool is_dir)
   return m | (is_dir ? 0700 : 0600);
 }
 
+/*
+ * Whether a recorded mode can be believed.
+ *
+ * guest_mode_record writes the attribute and sets the host mode together, and
+ * the host mode it sets is always `record | 0600` - or `| 0700` for a
+ * directory, since nabi has to be able to look inside one. So a record whose
+ * host mode is not that could not have been produced here, and the pair is a
+ * checksum on itself.
+ *
+ * "Restrictive" is emphatically not the test, and getting that wrong would be
+ * worse than the fault being fixed. /etc/shadow records 0000 against a host
+ * 0600 and sudo records 04111 against a host 0711 - both are exactly what this
+ * writes, both are correct, and a rule that discarded records denying read
+ * would discard those too. What is discarded is only a pair that disagrees.
+ *
+ * A stale record is worth finding because of what one costs. A Fedora tree
+ * carried records of 0200 against files the host held at 0644, written by a
+ * version of nabi since fixed; 0200 denies read to everyone, so Python could
+ * not import `encodings` and took every GLib program down with it. The guest
+ * cannot diagnose that - it is told the file is mode 0200 and has no way to
+ * know the number is wrong.
+ */
+static bool
+guest_mode_consistent(uint32_t rec, mode_t host_mode, bool is_dir)
+{
+  return (mode_t) (host_mode & 0777) == host_mode_for(rec, is_dir);
+}
+
+/*
+ * Read a recorded mode, discarding one the host mode contradicts.
+ *
+ * The attribute is removed rather than merely disbelieved, so the repair
+ * happens once instead of on every stat, and a tree that has been read ends up
+ * describing itself correctly. A removal that fails costs nothing - the record
+ * is disbelieved either way.
+ */
+static bool
+guest_mode_read_at(const char *abs, bool nofollow, mode_t host_mode,
+                   bool is_dir, uint32_t *out)
+{
+  if (!guest_mode_read(abs, nofollow, out))
+    return false;
+  if (guest_mode_consistent(*out, host_mode, is_dir))
+    return true;
+  removexattr(abs, GUEST_MODE_XATTR, nofollow ? XATTR_NOFOLLOW : 0);
+  return false;
+}
+
 /* Overlay the recorded mode onto a stat already converted for the guest. */
 static void
 guest_mode_overlay(int dirfd, const char *path, bool nofollow,
@@ -1374,7 +1422,10 @@ guest_mode_overlay(int dirfd, const char *path, bool nofollow,
   uint32_t m;
   if (!abs_path_at(dirfd, path, abs, sizeof abs))
     return;
-  if (guest_mode_read(abs, nofollow, &m))
+  /* The mode in l_st is still the host's, which is what makes it the thing to
+   * check the record against. */
+  if (guest_mode_read_at(abs, nofollow, (mode_t) l_st->st_mode,
+                         S_ISDIR(l_st->st_mode), &m))
     l_st->st_mode = (l_st->st_mode & ~(uint32_t) GUEST_MODE_BITS)
                   | (m & GUEST_MODE_BITS);
 }
@@ -1383,9 +1434,17 @@ static void
 guest_mode_overlay_fd(int fd, struct l_newstat *l_st)
 {
   uint32_t m;
-  if (fgetxattr(fd, GUEST_MODE_XATTR, &m, sizeof m, 0, 0) == (ssize_t) sizeof m)
-    l_st->st_mode = (l_st->st_mode & ~(uint32_t) GUEST_MODE_BITS)
-                  | (m & GUEST_MODE_BITS);
+  if (fgetxattr(fd, GUEST_MODE_XATTR, &m, sizeof m, 0, 0) != (ssize_t) sizeof m)
+    return;
+  if (!guest_mode_consistent(m, (mode_t) l_st->st_mode,
+                             S_ISDIR(l_st->st_mode))) {
+    char abs[PATH_MAX];
+    if (fcntl(fd, F_GETPATH, abs) == 0)
+      removexattr(abs, GUEST_MODE_XATTR, 0);
+    return;
+  }
+  l_st->st_mode = (l_st->st_mode & ~(uint32_t) GUEST_MODE_BITS)
+                | (m & GUEST_MODE_BITS);
 }
 
 /*

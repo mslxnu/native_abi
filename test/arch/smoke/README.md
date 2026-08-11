@@ -418,6 +418,17 @@ guest-code cache sync.
   opposite direction, since kqueue raises no read event for a regular file at
   all, so an event loop would otherwise wait on a pidfd forever.
 
+- `staletest` — a recorded guest mode that the host mode contradicts. NABI writes
+  the mode attribute and the host mode together, and the host mode is always
+  `record | 0600`, so a pair that disagrees is one NABI cannot have written. A
+  Fedora tree carried records of `0200` against files the host held at `0644`;
+  `0200` denies read to *everyone*, so Python could not import `encodings` and
+  every GLib program that reached one died with a bare `PermissionError`. The
+  test runs as an ordinary user, because root short-circuits the permission check
+  and would never have seen it. Its other half matters as much: a file recorded
+  `0000` against a host `0600` — `/etc/shadow`'s exact shape — is *consistent*,
+  and must still be refused. "Restrictive" is not the test; disagreement is.
+
 The ELF binaries are committed prebuilt (as the x86 guest tests under
 `test/*/build/` are), so the check needs no cross-toolchain. The `.s` sources
 are here for reference; rebuild with an aarch64-linux clang + ld.lld:

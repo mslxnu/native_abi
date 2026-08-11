@@ -5100,3 +5100,60 @@ that the handler does nothing. `mlock` and `munlock` are the same. That
 overstatement predates this work and is left alone rather than folded in.
 
 265 of 375.
+
+### 3.5.96 A recorded mode that could not have been recorded
+
+A Fedora install could not run `waydroid`, and the failure was Python's:
+
+```
+Fatal Python error: Failed to import encodings module
+PermissionError: [Errno 13] Permission denied:
+    '/usr/lib64/python3.14/encodings/__init__.py'
+```
+
+The file was `0644` on the host, owned by the user NABI runs as, on APFS with
+extended attributes working. `stat` from inside the guest reported
+`--w------- 1 0 0` — mode `0200`, and `0200` denies read to everyone, so a
+non-root guest could not open it. The number came from `msl.nabi.mode`, the
+attribute NABI keeps a guest mode in when the host cannot carry it.
+
+**The pair is the evidence.** `guest_mode_record` writes that attribute and sets
+the host mode together, and the host mode it sets is always `record | 0600` — or
+`| 0700` for a directory, since NABI must be able to look inside one. A record of
+`0200` against a host of `0644` is therefore not merely surprising, it is
+*arithmetically impossible* for this code to have produced: `0200 | 0600` is
+`0600`, not `0644`. Something wrote the record and something else later changed
+the host mode without going back to it.
+
+That gives an exact test for a stale record, and — this is the part that needed
+care — it is not "the record is restrictive". A sweep of the tree found
+`/etc/shadow` recording `0000` against a host `0600`, and `/usr/bin/sudo`
+recording `04111` against a host `0711`. Both deny read to somebody, both are
+precisely what `guest_mode_record` writes, and both are correct. A rule that
+threw away records denying read would have thrown away the shadow file's
+protection. What is thrown away is only a pair that **disagrees**.
+
+So a record the host mode contradicts is now discarded on read, and the
+attribute removed — the repair happens once rather than on every stat, and a
+tree that has been read ends up describing itself correctly. `staletest` covers
+both directions, as an ordinary user, because root short-circuits `cred_may` and
+would never have met any of this. Against the previous code it reports mode
+`128` where `420` was wanted, which is `0200` where `0644` belongs.
+
+Two things about the original damage are worth recording. `dnf reinstall
+python3-libs` repaired every `.py` file it owned, which says the version of NABI
+that wrote those records has since been fixed and the current one is sound. And
+the `.pyc` files were *not* repaired, because they were never the cause:
+CPython's `_cache_bytecode` derives a bytecode file's mode from its source's —
+
+```python
+mode = _path_stat(source_path).st_mode
+mode |= 0o200
+```
+
+— so with the `.py` reading `0200`, every `.pyc` was created `0200` and NABI
+recorded faithfully what it was asked for. The cascade is the clearest argument
+for self-healing rather than a sweep: a wrong mode does not stay where it was
+written.
+
+Still 265 of 375: this is a bug in what a recorded mode means, not a new call.
