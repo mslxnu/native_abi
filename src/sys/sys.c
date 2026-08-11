@@ -10,6 +10,7 @@
 #include "linux/errno.h"
 #include <stdlib.h>
 #include <time.h>
+#include <sys/resource.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/time.h>
@@ -242,5 +243,99 @@ DEFINE_SYSCALL(sysfs, int, option, unsigned long, arg1, unsigned long, arg2)
     return (int) NR_KNOWN_FS;
   default:
     return -LINUX_EINVAL;
+  }
+}
+
+/* ------------------------------------------------------------- io priority */
+
+/*
+ * ioprio_get and ioprio_set: how much of the disk a process is entitled to.
+ *
+ * Linux encodes a class and a level in one integer - realtime, best-effort or
+ * idle, with eight levels inside the first two. Darwin has the same idea under a
+ * different name and a coarser scale: setiopolicy_np assigns a process one of
+ * important, standard, utility, passive or throttle, with no levels within them.
+ *
+ * So the class translates and the level does not. Setting best-effort level 0
+ * and best-effort level 7 both land on standard, and reading back gives level 4
+ * - the middle of the range, since the host has forgotten which end of it was
+ * asked for. That is a real loss of resolution and it is worth being plain
+ * about, but the part programs actually use is the class: ionice -c3 to keep a
+ * backup out of the way is the common case, and idle really does map onto
+ * throttle.
+ *
+ * Only the calling process can be adjusted. Darwin's interface has no way to
+ * name another process - there is no pid argument to setiopolicy_np - so asking
+ * about somebody else is refused rather than answered about the wrong process.
+ */
+#define LINUX_IOPRIO_CLASS_NONE 0
+#define LINUX_IOPRIO_CLASS_RT   1
+#define LINUX_IOPRIO_CLASS_BE   2
+#define LINUX_IOPRIO_CLASS_IDLE 3
+#define LINUX_IOPRIO_CLASS_SHIFT 13
+#define LINUX_IOPRIO_PRIO_MASK  ((1 << LINUX_IOPRIO_CLASS_SHIFT) - 1)
+
+#define LINUX_IOPRIO_WHO_PROCESS 1
+#define LINUX_IOPRIO_WHO_PGRP    2
+#define LINUX_IOPRIO_WHO_USER    3
+
+/* True when `who` names this process and nothing else. */
+static bool
+ioprio_is_self(int which, int who)
+{
+  if (which != LINUX_IOPRIO_WHO_PROCESS)
+    return false;
+  return who == 0 || who == getpid();
+}
+
+DEFINE_SYSCALL(ioprio_set, int, which, int, who, int, ioprio)
+{
+  if (which < LINUX_IOPRIO_WHO_PROCESS || which > LINUX_IOPRIO_WHO_USER)
+    return -LINUX_EINVAL;
+  if (!ioprio_is_self(which, who))
+    return -LINUX_EPERM;        /* the host cannot name another process here */
+
+  int class = ioprio >> LINUX_IOPRIO_CLASS_SHIFT;
+  int level = ioprio & LINUX_IOPRIO_PRIO_MASK;
+  if (level > 7)
+    return -LINUX_EINVAL;
+
+  int policy;
+  switch (class) {
+  case LINUX_IOPRIO_CLASS_RT:   policy = IOPOL_IMPORTANT; break;
+  case LINUX_IOPRIO_CLASS_BE:   policy = IOPOL_STANDARD;  break;
+  case LINUX_IOPRIO_CLASS_IDLE: policy = IOPOL_THROTTLE;  break;
+  case LINUX_IOPRIO_CLASS_NONE: policy = IOPOL_DEFAULT;   break;
+  default:
+    return -LINUX_EINVAL;
+  }
+  if (setiopolicy_np(IOPOL_TYPE_DISK, IOPOL_SCOPE_PROCESS, policy) < 0)
+    return -darwin_to_linux_errno(errno);
+  return 0;
+}
+
+DEFINE_SYSCALL(ioprio_get, int, which, int, who)
+{
+  if (which < LINUX_IOPRIO_WHO_PROCESS || which > LINUX_IOPRIO_WHO_USER)
+    return -LINUX_EINVAL;
+  if (!ioprio_is_self(which, who))
+    return -LINUX_EPERM;
+
+  int policy = getiopolicy_np(IOPOL_TYPE_DISK, IOPOL_SCOPE_PROCESS);
+  if (policy < 0)
+    return -darwin_to_linux_errno(errno);
+
+  /* Level 4 for the classes that have levels: the host kept no level, and the
+   * middle of the range is the least wrong answer to invent. */
+  switch (policy) {
+  case IOPOL_IMPORTANT:
+    return (LINUX_IOPRIO_CLASS_RT << LINUX_IOPRIO_CLASS_SHIFT) | 4;
+  case IOPOL_THROTTLE:
+  case IOPOL_UTILITY:
+    return LINUX_IOPRIO_CLASS_IDLE << LINUX_IOPRIO_CLASS_SHIFT;
+  case IOPOL_PASSIVE:
+  case IOPOL_STANDARD:
+  default:
+    return (LINUX_IOPRIO_CLASS_BE << LINUX_IOPRIO_CLASS_SHIFT) | 4;
   }
 }

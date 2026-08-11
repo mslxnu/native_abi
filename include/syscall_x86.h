@@ -245,19 +245,19 @@
   SYSCALL(237, unimplemented) \
   SYSCALL(238, unimplemented) \
   SYSCALL(239, get_mempolicy) \
-  SYSCALL(240, unimplemented) \
-  SYSCALL(241, unimplemented) \
-  SYSCALL(242, unimplemented) \
-  SYSCALL(243, unimplemented) \
-  SYSCALL(244, unimplemented) \
-  SYSCALL(245, unimplemented) \
+  SYSCALL(240, mq_open) \
+  SYSCALL(241, mq_unlink) \
+  SYSCALL(242, mq_timedsend) \
+  SYSCALL(243, mq_timedreceive) \
+  SYSCALL(244, mq_notify) \
+  SYSCALL(245, mq_getsetattr) \
   SYSCALL(246, unimplemented) \
   SYSCALL(247, unimplemented) \
   SYSCALL(248, unimplemented) \
   SYSCALL(249, unimplemented) \
   SYSCALL(250, unimplemented) \
-  SYSCALL(251, unimplemented) \
-  SYSCALL(252, unimplemented) \
+  SYSCALL(251, ioprio_set) \
+  SYSCALL(252, ioprio_get) \
   SYSCALL(253, inotify_init) \
   SYSCALL(254, inotify_add_watch) \
   SYSCALL(255, inotify_rm_watch) \

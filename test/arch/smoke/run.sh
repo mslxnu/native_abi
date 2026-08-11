@@ -656,6 +656,21 @@ else
     fail=1
 fi
 
+# mqtest: POSIX message queues, which Darwin does not have at all, and the io
+# priority pair. The checks that matter are the ones a pipe-shaped implementation
+# would fail: a later message with a higher priority comes out first, equal
+# priorities come out oldest-first, a receive buffer smaller than the queue's
+# message size is refused without consuming anything, and mq_unlink removes the
+# name while a still-open descriptor keeps working.
+cp "$here/mqtest" "$root/"; chmod +x "$root/mqtest"
+out=$("$NABI" -m "$root" /mqtest); rc=$?
+if [ "$rc" -eq 0 ] && [ "$out" = "mq ok" ]; then
+    echo "  ok  mqtest -> \"$out\", exit 0"
+else
+    echo "  FAIL mqtest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 if [ "$fail" -eq 0 ]; then
     echo "smoke: PASS"
 else

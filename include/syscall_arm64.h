@@ -36,8 +36,8 @@
   SYSCALL(27, inotify_add_watch) \
   SYSCALL(28, inotify_rm_watch) \
   SYSCALL(29, ioctl) \
-  SYSCALL(30, unimplemented) \
-  SYSCALL(31, unimplemented) \
+  SYSCALL(30, ioprio_set) \
+  SYSCALL(31, ioprio_get) \
   SYSCALL(32, flock) \
   SYSCALL(33, mknodat) \
   SYSCALL(34, mkdirat) \
@@ -186,12 +186,12 @@
   SYSCALL(177, getegid) \
   SYSCALL(178, gettid) \
   SYSCALL(179, sysinfo) \
-  SYSCALL(180, unimplemented) \
-  SYSCALL(181, unimplemented) \
-  SYSCALL(182, unimplemented) \
-  SYSCALL(183, unimplemented) \
-  SYSCALL(184, unimplemented) \
-  SYSCALL(185, unimplemented) \
+  SYSCALL(180, mq_open) \
+  SYSCALL(181, mq_unlink) \
+  SYSCALL(182, mq_timedsend) \
+  SYSCALL(183, mq_timedreceive) \
+  SYSCALL(184, mq_notify) \
+  SYSCALL(185, mq_getsetattr) \
   SYSCALL(186, msgget) \
   SYSCALL(187, msgctl) \
   SYSCALL(188, msgrcv) \

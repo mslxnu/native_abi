@@ -355,6 +355,15 @@ guest-code cache sync.
   around a blocking operation: showing that needs a second guest thread to be
   held up, and these tests are single-threaded.
 
+- `mqtest` — POSIX message queues, which macOS does not have in any form, plus
+  `ioprio_get`/`ioprio_set`. The checks are the ones an implementation shaped
+  like a pipe would fail: a message sent *later* with a higher priority comes out
+  first, equal priorities come out oldest-first, a receive buffer smaller than
+  the queue's message size is refused **without consuming the message**, and
+  `mq_unlink` removes the name while a descriptor still open keeps working. The
+  refusals are checked too — a name with no leading slash, a name with a path in
+  it, and a notification asking for a realtime signal NABI cannot deliver.
+
 The ELF binaries are committed prebuilt (as the x86 guest tests under
 `test/*/build/` are), so the check needs no cross-toolchain. The `.s` sources
 are here for reference; rebuild with an aarch64-linux clang + ld.lld:

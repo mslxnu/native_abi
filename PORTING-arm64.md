@@ -4649,3 +4649,70 @@ left the ring attached, and entering it afterwards succeeded.
 The suite does not cover the lock release itself. Showing it needs a second guest
 thread to be held up by the first, and these tests are single-threaded; what is
 tested is the lifetime the release made necessary.
+
+### 3.5.88 POSIX message queues, and the I/O priority pair
+
+`mq_open` and its five companions are not the System V queues in `msg.c`. Those
+are named by a key and reached by an id; these are named by a path and reached by
+a **descriptor**, and that difference decides the design. macOS has none of it —
+`mq_open` does not exist there at all — so all of it is NABI's own, built the way
+the System V objects are: a file in a directory belonging to the IPC namespace,
+with the ordering rules enforced under an exclusive lock on that file. Linux
+scopes these per IPC namespace too, so the existing directory scheme gets that
+for nothing.
+
+The descriptor is what makes them different and also what makes them easy. **The
+queue is the file**, so the descriptor handed back is an open descriptor on it
+and there is no side table mapping one to the other. That pays for itself: the
+descriptor survives fork, survives the exec arm64's fork is built on, and closes
+when the guest closes it, with none of this code involved. What marks a
+descriptor as a queue rather than an ordinary file is the magic in its header.
+
+A queue holds a header and a fixed array of slots, and messages are *not* stored
+in order. Each slot carries the priority it was sent with and a sequence number,
+and the receiver picks the highest priority and the oldest within it. Storing
+them ordered would mean moving the tail of the file on every send, and the
+ordering has to be computed on receive regardless. `mqtest` sends low, high, low
+and requires high, first-low, second-low back — an implementation shaped like a
+pipe returns them as sent and looks entirely reasonable doing it.
+
+Two honest gaps. **`mq_notify` is refused for the notifications it cannot
+deliver.** It asks for a signal when an empty queue becomes non-empty, those
+signals are realtime ones, and NABI drops everything at or above `SIGRTMIN` for
+want of anything on Darwin to map them onto — the wall `timer_create` hit. A
+registration accepted and never acted on is worse than one refused: the caller
+waits forever instead of falling back to a blocking receive, which works
+perfectly. `SIGEV_NONE` asks to be registered and told nothing, which is exactly
+what can be provided, so that form is honoured, along with the exclusivity that
+programs use as a lock. **And the guest's access mode is not enforced**: the host
+descriptor must be read-write because taking a message *out* of a queue is a
+write to the file it lives in, and nothing re-checks the mode the guest asked
+for, so a queue opened `O_RDONLY` here will accept a send.
+
+`ioprio_set` and `ioprio_get` translate a class and lose a level. Linux encodes
+realtime, best-effort or idle with eight levels inside the first two; Darwin's
+`setiopolicy_np` has important, standard, utility, passive and throttle, with no
+levels within them. So best-effort 0 and best-effort 7 both land on standard and
+read back as level 4, the middle of a range the host never kept. The part
+programs actually use is the class — `ionice -c3` to keep a backup out of the way
+— and idle really does map onto throttle. Only the calling process can be
+adjusted, because Darwin's interface has no way to name another one; asking about
+somebody else is refused rather than answered about the wrong process.
+
+**A reporting inaccuracy found here and deliberately not fixed here.** Three
+members of these families — `io_pgetevents_time64`, `mq_timedsend_time64`,
+`mq_timedreceive_time64` — are listed with aarch64 numbers they do not have. They
+sit inside the kernel header's `#if __BITS_PER_LONG == 32 || defined(__SYSCALL_COMPAT)`
+block, and both generators scan the file with a regex that reads *both* branches
+of every conditional, so all 58 of that block's numbers appear as aarch64
+syscalls NABI has failed to implement. Nothing malfunctions — those numbers are
+genuinely unassigned on aarch64, so a guest cannot reach them and the
+`unimplemented` entries are unreachable — but the denominator is inflated and the
+table claims calls this architecture does not have. Fixing it properly means
+resolving the conditionals rather than ignoring them, which means either driving
+a real preprocessor or hard-coding which `__ARCH_WANT_*` symbols aarch64 defines.
+Guessing that set wrong would silently add or drop syscalls from both dispatch
+tables, which is a worse failure than the one being fixed, so it is left for a
+commit of its own where it can be verified rather than folded into this one.
+
+251 of 395.
