@@ -91,9 +91,9 @@
   SYSCALL(82, fsync) \
   SYSCALL(83, fdatasync) \
   SYSCALL(84, sync_file_range) \
-  SYSCALL(85, unimplemented) \
-  SYSCALL(86, unimplemented) \
-  SYSCALL(87, unimplemented) \
+  SYSCALL(85, timerfd_create) \
+  SYSCALL(86, timerfd_settime) \
+  SYSCALL(87, timerfd_gettime) \
   SYSCALL(88, utimensat) \
   SYSCALL(89, unimplemented) \
   SYSCALL(90, capget) \
@@ -113,11 +113,11 @@
   SYSCALL(104, unimplemented) \
   SYSCALL(105, unimplemented) \
   SYSCALL(106, unimplemented) \
-  SYSCALL(107, unimplemented) \
-  SYSCALL(108, unimplemented) \
-  SYSCALL(109, unimplemented) \
-  SYSCALL(110, unimplemented) \
-  SYSCALL(111, unimplemented) \
+  SYSCALL(107, timer_create) \
+  SYSCALL(108, timer_gettime) \
+  SYSCALL(109, timer_getoverrun) \
+  SYSCALL(110, timer_settime) \
+  SYSCALL(111, timer_delete) \
   SYSCALL(112, unimplemented) \
   SYSCALL(113, clock_gettime) \
   SYSCALL(114, clock_getres) \

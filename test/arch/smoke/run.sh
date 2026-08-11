@@ -571,6 +571,19 @@ else
     fail=1
 fi
 
+# timertest: timerfd and POSIX timers, neither of which Darwin has at all. The
+# check that matters is ppoll seeing the timerfd - one that only worked through
+# read() would pass a simpler test and be useless in an event loop, which is
+# where timerfds are used.
+cp "$here/timertest" "$root/"; chmod +x "$root/timertest"
+out=$("$NABI" -m "$root" /timertest); rc=$?
+if [ "$rc" -eq 0 ] && [ "$out" = "timer ok" ]; then
+    echo "  ok  timertest -> \"$out\", exit 0"
+else
+    echo "  FAIL timertest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 if [ "$fail" -eq 0 ]; then
     echo "smoke: PASS"
 else

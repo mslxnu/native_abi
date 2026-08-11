@@ -74,4 +74,32 @@ struct l_itimerval {
 #define LINUX_CLOCK_SGI_CYCLE            10
 #define LINUX_CLOCK_TAI                  11
 
+
+/* timerfd */
+#define LINUX_TFD_CLOEXEC        02000000
+#define LINUX_TFD_NONBLOCK       00004000
+#define LINUX_TFD_TIMER_ABSTIME  (1 << 0)
+
+/* sigevent.sigev_notify */
+#define LINUX_SIGEV_SIGNAL     0
+#define LINUX_SIGEV_NONE       1
+#define LINUX_SIGEV_THREAD     2
+#define LINUX_SIGEV_THREAD_ID  4
+
+struct l_itimerspec {
+  struct l_timespec it_interval;
+  struct l_timespec it_value;
+};
+
+/* Only the head of it: the union that follows is the caller's business, and
+ * nothing here reads past sigev_notify. */
+struct l_sigevent {
+  int32_t  sigev_value;
+  int32_t  _pad_value;
+  int32_t  sigev_signo;
+  int32_t  sigev_notify;
+  int32_t  sigev_tid;
+  int32_t  _pad[11];
+};
+
 #endif

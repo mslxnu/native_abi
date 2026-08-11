@@ -4081,3 +4081,45 @@ Worth noting what this depended on: `futex_wake`, `futex_wait` and
 `futex_requeue` are **454, 455 and 456** — exactly the numbers the compat tail
 was squatting on before §3.5.74 pinned it at 1024. Wired into the old table,
 `futex_wake` would have dispatched to `afs_syscall`.
+
+### 3.5.79 `timerfd_*` and `timer_*` — **implemented on a host with neither**
+
+Darwin does not implement `timer_create` at all — there is no `timer_t` in its
+headers — and has no timerfd. What it has is threads and a condition variable
+that can be waited on until a deadline, which is enough for both, because both
+are the same object with two ways of saying it fired: a timerfd makes a
+descriptor readable, a POSIX timer raises a signal.
+
+So there is one engine and two faces on it. A timer is a deadline, an interval
+and a thread asleep until the first of them; the wait is on a condition variable
+rather than a plain sleep so that `settime` can move the deadline — or disarm it
+— without waiting for the old one to pass, which is what a program rearming a
+timer in its event loop does constantly.
+
+**The descriptor is the read end of a pipe**, as inotify's and fanotify's are,
+so `poll`, `select` and `epoll` work on it without being taught anything. That
+matters more here than anywhere else: a timerfd exists to go in an event loop,
+and one that worked only through `read()` would pass a simpler test and be
+useless where these are actually used. What `read()` returns is *not* what is in
+the pipe — Linux answers with the number of expirations since the last read, as
+a `u64`, and resets it — so the pipe carries readability and the count is kept
+beside it. An interval timer that has fallen behind counts **every** deadline
+that passed, which is how a program that was slow finds out it was.
+
+**What POSIX timers cannot do here is worth stating plainly.** `SIGEV_SIGNAL`
+asks for a signal, and `send_signal` drops everything at or above `SIGRTMIN` —
+Darwin has no realtime signals to map them onto — so a timer asked to raise one
+would be a timer that never fired. glibc's `SIGEV_THREAD` is built on exactly
+that: it registers `SIGEV_THREAD_ID` against `SIGTIMER`, which is `SIGRTMIN`.
+Those are **refused at `timer_create`** rather than accepted, because a caller
+told its timer was created and then never woken has no way to find out why, and
+the failure surfaces a long way from here. `SIGEV_NONE` — the polled form — and
+any signal NABI can actually deliver both work.
+
+That refusal is a real gap rather than a design choice, and it has one cause:
+realtime signals are not delivered. Fixing it is its own change — the pending
+mask already has room for 32–64, so what is missing is raising them without
+routing through a Darwin signal that does not exist, and interrupting a thread
+that is blocked so it notices.
+
+226 of 398 now.

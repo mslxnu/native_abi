@@ -253,6 +253,11 @@ bool fanotify_read(int fd, char *out, size_t size, int *ret);
 bool fanotify_write(int fd, const char *buf, size_t size, int *ret);
 bool fanotify_permit(const char *hostpath, uint64_t mask);
 void fanotify_close(int fd);
+
+/* timerfd (src/sys/timer.c). read(2) on one answers with the number of
+ * expirations rather than with what is in the pipe underneath. */
+bool timerfd_read(int fd, char *out, size_t size, int *ret);
+void timerfd_close(int fd);
 bool procfs_pidns_path(const char *name, char *out, size_t outsz, bool *denied);
 bool procfs_stat(const char *path, uint32_t *mode, uint64_t *size, uint64_t *ino);
 bool procfs_refresh_fddir(int fd);

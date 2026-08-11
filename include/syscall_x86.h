@@ -227,11 +227,11 @@
   SYSCALL(219, unimplemented) \
   SYSCALL(220, semtimedop) \
   SYSCALL(221, fadvise64) \
-  SYSCALL(222, unimplemented) \
-  SYSCALL(223, unimplemented) \
-  SYSCALL(224, unimplemented) \
-  SYSCALL(225, unimplemented) \
-  SYSCALL(226, unimplemented) \
+  SYSCALL(222, timer_create) \
+  SYSCALL(223, timer_settime) \
+  SYSCALL(224, timer_gettime) \
+  SYSCALL(225, timer_getoverrun) \
+  SYSCALL(226, timer_delete) \
   SYSCALL(227, unimplemented) \
   SYSCALL(228, clock_gettime) \
   SYSCALL(229, clock_getres) \
@@ -288,11 +288,11 @@
   SYSCALL(280, utimensat) \
   SYSCALL(281, epoll_pwait) \
   SYSCALL(282, unimplemented) \
-  SYSCALL(283, unimplemented) \
+  SYSCALL(283, timerfd_create) \
   SYSCALL(284, unimplemented) \
   SYSCALL(285, fallocate) \
-  SYSCALL(286, unimplemented) \
-  SYSCALL(287, unimplemented) \
+  SYSCALL(286, timerfd_settime) \
+  SYSCALL(287, timerfd_gettime) \
   SYSCALL(288, unimplemented) \
   SYSCALL(289, unimplemented) \
   SYSCALL(290, eventfd2) \

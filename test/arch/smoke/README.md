@@ -243,6 +243,15 @@ guest-code cache sync.
   queued only the first, or woke correctly but reported the wrong index, would
   satisfy a test that merely saw the call return.
 
+- `timertest` — timerfd and POSIX timers, neither of which Darwin has at all.
+  The check that matters is `ppoll` seeing the timerfd: one that worked only
+  through `read()` would pass a simpler test and be useless in an event loop,
+  which is the only place timerfds are used. Then that `read()` answers with the
+  *count of expirations* and resets it, that an interval timer accumulates while
+  nobody reads, that disarming stops it, and — for POSIX timers — that a
+  realtime signal is refused at creation rather than becoming a timer that never
+  fires.
+
 - `ipctest` — System V IPC: a segment created, attached, shared across a fork,
   detached and removed; keys resolving to ids; semaphore values through
   `SETVAL`/`GETALL`/`semop`; and `unshare(CLONE_NEWIPC)` making the same key

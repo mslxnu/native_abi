@@ -1911,6 +1911,15 @@ DEFINE_SYSCALL(read, int, fd, gaddr_t, buf_ptr, size_t, size)
    * Recognised before the descriptor is looked up, since it is not one of the
    * guest's files.
    */
+  /* A timerfd answers with a count of expirations, not with the bytes that
+   * made it readable. */
+  if (buf != NULL && timerfd_read(fd, buf, size, &r)) {
+    if (r > 0 && copy_to_user(buf_ptr, buf, (size_t) r))
+      r = -LINUX_EFAULT;
+    free(buf);
+    return r;
+  }
+
   if (buf != NULL && fanotify_read(fd, buf, size, &r)) {
     if (r > 0 && copy_to_user(buf_ptr, buf, (size_t) r))
       r = -LINUX_EFAULT;
@@ -3256,6 +3265,7 @@ user_close(int fd)
   /* And a notification descriptor of the guest's own takes its queue with it. */
   inotify_close(fd);
   fanotify_close(fd);
+  timerfd_close(fd);
 
   pthread_rwlock_wrlock(&proc.fileinfo.fdtable_lock);
   int ret = do_close(&proc.fileinfo.fdtable, fd);
