@@ -282,7 +282,7 @@
   SYSCALL(274, unimplemented) \
   SYSCALL(275, unimplemented) \
   SYSCALL(276, unimplemented) \
-  SYSCALL(277, unimplemented) \
+  SYSCALL(277, sync_file_range) \
   SYSCALL(278, unimplemented) \
   SYSCALL(279, unimplemented) \
   SYSCALL(280, utimensat) \

@@ -128,6 +128,7 @@ COMMON_SRCS := src/main.c \
                src/fs/fanotify.c \
                src/fs/handle.c \
                src/fs/xattr.c \
+               src/fs/sync.c \
                src/fs/fs.c \
                src/fs/epoll.c \
                src/fs/procfs.c \

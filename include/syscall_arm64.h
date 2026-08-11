@@ -90,7 +90,7 @@
   SYSCALL(81, sync) \
   SYSCALL(82, fsync) \
   SYSCALL(83, fdatasync) \
-  SYSCALL(84, unimplemented) \
+  SYSCALL(84, sync_file_range) \
   SYSCALL(85, unimplemented) \
   SYSCALL(86, unimplemented) \
   SYSCALL(87, unimplemented) \

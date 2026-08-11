@@ -3975,3 +3975,24 @@ owner still: 4242
 `xattrtest` guards the round trip and all four halves of the containment: absent
 from the listing, `ENODATA` on read, `EPERM` on write and remove, and the
 ownership still working afterwards.
+
+### 3.5.76 `sync_file_range` — **implemented**
+
+The most frequently reached unimplemented call in the tree, by a wide margin:
+**532 refusals** in a single `apt` reinstall, all of it dpkg unpacking. Nothing
+else came close.
+
+Darwin has no ranged flush — `fsync` is whole-file or nothing — so the range is
+widened to the file, which writes back more than was asked and never less. That
+is the safe direction to be wrong in.
+
+**The waiting matters more than the range.** `SYNC_FILE_RANGE_WRITE` only
+*starts* writeback and promises nothing about when it lands; Linux's own manual
+is emphatic that this form is not a durability guarantee, so it is answered
+without doing anything and the data reaches the file either way. The `WAIT_BEFORE`
+and `WAIT_AFTER` forms do promise the writeback has finished, and get an `fsync`,
+which is the promise they asked for.
+
+Reaching it at all needed the generator tie-break from §3.5.74: the header offers
+`sync_file_range2` at 84 for architectures that set `__ARCH_WANT_SYNC_FILE_RANGE2`,
+and aarch64 does not.
