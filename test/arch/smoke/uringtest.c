@@ -29,6 +29,7 @@ static long sys6(long n, long a, long b, long c, long d, long e, long f){
 #define SYS_write              64
 #define SYS_mmap              222
 #define SYS_eventfd2           19
+#define SYS_pipe2              59
 #define SYS_exit               93
 #define SYS_io_uring_setup    425
 #define SYS_io_uring_enter    426
@@ -45,6 +46,10 @@ static long sys6(long n, long a, long b, long c, long d, long e, long f){
 #define EINVAL    22
 #define EOPNOTSUPP 95
 #define ENXIO      6
+#define ENOENT     2
+#define ETIME     62
+#define ECANCELED 125
+#define POLLIN     1
 #define REGISTER_EVENTFD   4
 #define UNREGISTER_EVENTFD 5
 
@@ -60,6 +65,9 @@ static long sys6(long n, long a, long b, long c, long d, long e, long f){
 #define OP_FSYNC  3
 #define OP_READ  22
 #define OP_WRITE 23
+#define OP_POLL_ADD     6
+#define OP_POLL_REMOVE  7
+#define OP_TIMEOUT     11
 
 struct sqe {
   unsigned char opcode, flags; unsigned short ioprio; int fd;
@@ -328,6 +336,127 @@ void _start(void)
     if ((r = sys6(SYS_io_uring_register, fd, UNREGISTER_EVENTFD, 0, 0, 0, 0)) != -ENXIO)
       fail("unregistering it twice", r, -ENXIO);
     sys6(SYS_close, efd, 0, 0, 0, 0, 0); }
+
+  /* ---- a timeout completes with ETIME when its clock runs out ---- */
+  { struct { long long sec, nsec; } ts = { 0, 40 * 1000 * 1000 };
+    struct sqe *s = push();
+    s->opcode = OP_TIMEOUT;
+    s->addr = (unsigned long long) (long) &ts;
+    s->len = 1;                 /* one timespec */
+    s->off = 0;                 /* no completion count; the clock alone */
+    s->user_data = 0x7001;
+    if ((r = sys6(SYS_io_uring_enter, fd, 1, 1, IORING_ENTER_GETEVENTS, 0, 0)) != 1)
+      fail("io_uring_enter for a timeout", r, 1);
+    struct cqe c = pop("a completion for the timeout");
+    if (c.user_data != 0x7001)
+      fail("the timeout's user_data", (long) c.user_data, 0x7001);
+    if (c.res != -ETIME)
+      fail("what an expired timeout reported", c.res, -ETIME); }
+
+  /*
+   * ---- a poll that is not ready when it is submitted ----
+   *
+   * This is the case the whole thread exists for. The poll is armed and the
+   * submitting call returns *without waiting* - there is nothing to report yet.
+   * The pipe is fed afterwards, and only then is the completion asked for. An
+   * implementation that ran the poll to completion inside the submitting call
+   * would block right here with nothing able to write.
+   */
+  { int pfd[2];
+    if (sys6(SYS_pipe2, (long) pfd, 0, 0, 0, 0, 0) != 0)
+      fail("pipe2", -1, 0);
+
+    struct sqe *s = push();
+    s->opcode = OP_POLL_ADD;
+    s->fd = pfd[0];
+    s->rw_flags = POLLIN;
+    s->user_data = 0x9001;
+    if ((r = sys6(SYS_io_uring_enter, fd, 1, 0, 0, 0, 0)) != 1)
+      fail("submitting a poll that cannot be ready yet", r, 1);
+
+    /* Nothing should have been posted: the pipe is empty. */
+    if (*cq(p.cq_off.head) != *cq(p.cq_off.tail))
+      fail("a completion for a poll that is not ready", 1, 0);
+
+    sys6(SYS_write, pfd[1], (long) "!", 1, 0, 0, 0);
+
+    if ((r = sys6(SYS_io_uring_enter, fd, 0, 1, IORING_ENTER_GETEVENTS, 0, 0)) < 0)
+      fail("waiting for the poll", r, 0);
+    struct cqe c = pop("a completion for the poll");
+    if (c.user_data != 0x9001)
+      fail("the poll's user_data", (long) c.user_data, 0x9001);
+    if (!(c.res & POLLIN))
+      fail("what the poll reported", c.res, POLLIN);
+
+    /* ---- and one that is removed before it can fire ---- */
+    char drain[8];
+    sys6(SYS_read, pfd[0], (long) drain, 1, 0, 0, 0);
+
+    struct sqe *s2 = push();
+    s2->opcode = OP_POLL_ADD;
+    s2->fd = pfd[0];
+    s2->rw_flags = POLLIN;
+    s2->user_data = 0x9002;
+    if ((r = sys6(SYS_io_uring_enter, fd, 1, 0, 0, 0, 0)) != 1)
+      fail("submitting a poll to remove", r, 1);
+
+    struct sqe *s3 = push();
+    s3->opcode = OP_POLL_REMOVE;
+    s3->addr = 0x9002;            /* the user_data of the poll to cancel */
+    s3->user_data = 0x9003;
+    if ((r = sys6(SYS_io_uring_enter, fd, 1, 0, 0, 0, 0)) != 1)
+      fail("submitting a poll removal", r, 1);
+
+    /* The cancelled poll is answered too, so a caller waiting on its user_data
+     * is not left waiting for something that will never come. */
+    struct cqe c1 = pop("a completion for the cancelled poll");
+    struct cqe c2 = pop("a completion for the removal itself");
+    if (c1.user_data != 0x9002 || c1.res != -ECANCELED)
+      fail("what the cancelled poll reported", c1.res, -ECANCELED);
+    if (c2.user_data != 0x9003 || c2.res != 0)
+      fail("what the removal reported", c2.res, 0);
+
+    /* Removing something that is not there. */
+    struct sqe *s4 = push();
+    s4->opcode = OP_POLL_REMOVE;
+    s4->addr = 0xDEAD;
+    s4->user_data = 0x9004;
+    if ((r = sys6(SYS_io_uring_enter, fd, 1, 0, 0, 0, 0)) != 1)
+      fail("submitting a removal of nothing", r, 1);
+    struct cqe c3 = pop("a completion for the removal of nothing");
+    if (c3.res != -ENOENT)
+      fail("removing a poll that was never armed", c3.res, -ENOENT);
+
+    sys6(SYS_close, pfd[0], 0, 0, 0, 0, 0);
+    sys6(SYS_close, pfd[1], 0, 0, 0, 0, 0); }
+
+  /*
+   * ---- a timeout that is waiting on a count, not on its clock ----
+   *
+   * off is a number of completions to wait for. Ten seconds is long enough that
+   * the clock cannot be what ends this, so a res of 0 rather than -ETIME is the
+   * proof that the count is what did.
+   */
+  { struct { long long sec, nsec; } ts = { 10, 0 };
+    struct sqe *s1 = push();
+    s1->opcode = OP_TIMEOUT;
+    s1->addr = (unsigned long long) (long) &ts;
+    s1->len = 1;
+    s1->off = 1;                /* complete once one other completion lands */
+    s1->user_data = 0x7002;
+    struct sqe *s2 = push();
+    s2->opcode = OP_NOP;
+    s2->user_data = 0x7003;
+    if ((r = sys6(SYS_io_uring_enter, fd, 2, 2, IORING_ENTER_GETEVENTS, 0, 0)) != 2)
+      fail("a counted timeout beside a nop", r, 2);
+    struct cqe c1 = pop("the nop's completion");
+    struct cqe c2 = pop("the counted timeout's completion");
+    if (c1.user_data != 0x7003)
+      fail("the nop came first", (long) c1.user_data, 0x7003);
+    if (c2.user_data != 0x7002)
+      fail("the counted timeout's user_data", (long) c2.user_data, 0x7002);
+    if (c2.res != 0)
+      fail("a timeout ended by its count reports 0, not ETIME", c2.res, 0); }
 
   /* ---- what these refuse ---- */
   if ((r = sys6(SYS_io_uring_enter, f, 0, 0, 0, 0, 0)) != -EOPNOTSUPP)

@@ -4420,3 +4420,51 @@ the one that costs nothing and is worth having, since it is what lets a guest
 wait on the ring inside an ordinary poll loop.
 
 242 of 395.
+
+### 3.5.85 `POLL_ADD`, `POLL_REMOVE`, `TIMEOUT` — the ops that forced a thread
+
+The previous section could say that every submission ran on the thread that
+submitted it. These three are why that stopped being true.
+
+A poll whose descriptor is not ready has nothing to report, and a five-second
+timeout has nothing to report for five seconds. Running either to completion
+inside `io_uring_enter` would make a *submission* block, which is the one thing
+the interface promises it does not do — so they are recorded as pending and a
+per-ring thread waits on them.
+
+**That thread is safe for exactly these operations, and the reason does not
+generalise.** A completion for a poll carries a readiness mask and a completion
+for a timeout carries an error; neither reads nor writes a guest buffer. And the
+completion ring is *NABI's own mapping* of the ring file rather than guest memory
+reached through the page tables, so posting into it touches nothing the guest
+could unmap underneath the writer. A read or a write has a buffer and would not
+be safe there, which is why those stay on the submitting thread — the same
+constraint that shaped `src/fs/aio.c`, arriving at a different answer because
+these operations carry no data.
+
+The thread is started on demand, so a ring that only ever does file I/O never
+gets one. It waits on the pending descriptors plus a pipe, because a poll armed
+while it is already waiting would otherwise not be noticed until the current
+wait happened to end. `io_uring_enter` with `GETEVENTS` now genuinely waits,
+which is the path liburing takes when the completion ring is empty; asking for
+completions when nothing is pending and nothing is ready answers `EAGAIN` rather
+than entering a wait that cannot end.
+
+Three details worth recording. `POLL_REMOVE` posts **two** completions — the
+cancelled poll gets its own, or a caller waiting on that `user_data` waits
+forever for something that will never arrive. A `TIMEOUT` carries a completion
+count in `off`, and one ended by that count reports 0 while one ended by its
+clock reports `-ETIME`, which is how a caller tells the two apart. And an
+absolute deadline is converted at arm time: the caller names it against the
+realtime clock and the poller measures against the monotonic one, so comparing
+them directly would be comparing two different origins.
+
+The refactor that made this work is small but was the actual bug: arming
+originally reported a result back to the submit loop, which cannot express what
+these three do. A poll produces no completion yet, a removal produces two, and a
+failure to arm produces one. `POLL_REMOVE` fell through to the ordinary
+dispatcher and came back `EINVAL` — an opcode it had never heard of. Arming now
+posts its own completions and simply says whether it handled the entry.
+
+Still 242 of 395: these are opcodes inside `io_uring_enter`, not syscalls of
+their own, so the table does not move for them.

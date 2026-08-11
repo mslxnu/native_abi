@@ -46,6 +46,7 @@
 #define LINUX_IORING_OP_POLL_REMOVE     7
 #define LINUX_IORING_OP_SYNC_FILE_RANGE 8
 #define LINUX_IORING_OP_TIMEOUT        11
+#define LINUX_IORING_OP_TIMEOUT_REMOVE 12
 #define LINUX_IORING_OP_OPENAT         18
 #define LINUX_IORING_OP_CLOSE          19
 #define LINUX_IORING_OP_STATX          21
@@ -69,6 +70,9 @@
 
 /* fsync_flags */
 #define LINUX_IORING_FSYNC_DATASYNC (1U << 0)
+
+/* timeout_flags: the deadline is absolute rather than a duration from now. */
+#define LINUX_IORING_TIMEOUT_ABS    (1U << 0)
 
 /*
  * A submission entry: 64 bytes, and the unions matter. A caller fills one of

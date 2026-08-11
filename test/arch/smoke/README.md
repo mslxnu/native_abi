@@ -309,6 +309,13 @@ guest-code cache sync.
   call (each completion must carry its own `user_data`; with one in flight a
   mix-up is invisible), a vectored read, an unknown opcode failing per entry
   rather than per batch, and a registered eventfd counting one per completion.
+  The poll and timeout cases are the ones that pin down the asynchrony: a poll is
+  armed on an *empty* pipe and the submitting call must return having posted
+  nothing, the pipe is fed only afterwards, and the completion is asked for
+  then — an implementation that answered the poll at submit time reports a
+  completion that should not exist yet and fails there. A timeout ended by its
+  clock reports `-ETIME`; one ended by its completion count reports 0, which is
+  how a caller tells the two apart.
 
 The ELF binaries are committed prebuilt (as the x86 guest tests under
 `test/*/build/` are), so the check needs no cross-toolchain. The `.s` sources

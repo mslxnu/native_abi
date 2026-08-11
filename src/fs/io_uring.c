@@ -24,17 +24,30 @@
  * the gap. The alternative - intercepting mmap to translate the offsets - would
  * put an io_uring special case into the middle of the memory manager.
  *
- * What this does not do is run the work asynchronously. A real io_uring hands
- * anything that would block to a worker pool; here, a submission is executed
- * during io_uring_enter, on the thread that called it. Every visible rule still
- * holds - completions carry the right user_data, the counters advance, a caller
- * reading the completion ring finds its entries there - and for the file I/O
- * this supports, the kernel very often completes inline too. What a guest loses
- * is the case where it submits a read that blocks and expects to do other work
- * meanwhile: here it waits. That is a performance property rather than a
- * correctness one, and it is the honest place to start; the alternative is the
- * aio worker-pool machinery plus a way to touch guest memory off-thread, which
- * src/fs/aio.c had to avoid for reasons that apply here too.
+ * The file operations are executed during io_uring_enter, on the thread that
+ * called it. A real io_uring hands anything that would block to a worker pool;
+ * here a guest that submits a blocking read and expects to work meanwhile will
+ * wait instead. That is a performance property rather than a correctness one -
+ * completions carry the right user_data, the counters advance, a caller reading
+ * the completion ring finds its entries - and it is what makes it legal to touch
+ * guest memory in the handler at all, which is the difficulty src/fs/aio.c had
+ * to design around.
+ *
+ * Poll and timeout cannot work that way, and they are why there is a thread
+ * here. A poll that is not ready yet has nothing to report, and a five-second
+ * timeout has nothing to report for five seconds; running either to completion
+ * inside io_uring_enter would make a submission block, which is the one thing
+ * the interface promises it does not do. So they are recorded as pending and a
+ * per-ring thread waits on them.
+ *
+ * That thread is safe for exactly these operations, and the reason is worth
+ * stating because it does not generalise. A completion for a poll carries a
+ * readiness mask and a completion for a timeout carries an error - neither reads
+ * or writes a guest buffer - and the completion ring itself is *nabi's own
+ * mapping* of the ring file rather than guest memory reached through the page
+ * tables. So posting one touches nothing the guest could unmap underneath it.
+ * A read or a write has a buffer, and would not be safe here; that is why those
+ * stay on the submitting thread.
  *
  * SQPOLL and IOPOLL are refused rather than ignored. Both are promises about
  * *how* the ring is serviced - a kernel thread polling submissions, and busy
@@ -47,6 +60,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <poll.h>
+#include <pthread.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/uio.h>
@@ -89,6 +104,21 @@
 
 #define URING_MAX_ENTRIES 4096
 
+/*
+ * A submission that cannot answer yet: a poll waiting for its descriptor, or a
+ * timeout waiting for its deadline.
+ */
+struct pending {
+  uint8_t          op;
+  uint64_t         user_data;
+  int              fd;          /* poll */
+  short            events;      /* poll */
+  struct timespec  deadline;    /* timeout */
+  uint64_t         target;      /* timeout: the completion count it waits for */
+  bool             counted;     /* timeout: whether it waits on a count at all */
+  struct pending  *next;
+};
+
 struct uring {
   int       fd;                 /* the guest's ring descriptor, and ours */
   uint32_t  sq_entries, cq_entries;
@@ -97,6 +127,16 @@ struct uring {
   char     *sqes;
   size_t    sq_len, cq_len, sqes_len;
   int       eventfd;            /* poked per completion, or -1 */
+
+  pthread_mutex_t  lock;        /* between the submitting thread and the poller */
+  pthread_cond_t   posted;      /* a completion has been added */
+  struct pending  *pending;
+  uint64_t         completions; /* posted since setup; what a counted timeout waits on */
+  pthread_t        poller;
+  bool             polling;     /* the thread exists */
+  bool             stopping;
+  int              wake[2];     /* the poller's way of being interrupted */
+
   struct uring *next;
 };
 
@@ -123,6 +163,219 @@ static void
 st(char *base, size_t off, uint32_t v)
 {
   memcpy(base + off, &v, sizeof v);
+}
+
+/* -------------------------------------------------------- completions */
+
+/*
+ * Add one completion to the ring. Called from the submitting thread and from
+ * the poller, so it is the one place the completion tail is written.
+ *
+ * The tail is published after the entry it accounts for, because a guest reads
+ * the tail first and then the entry: the reverse order would let it read an
+ * entry that had not been written yet.
+ */
+static void
+post_cqe(struct uring *r, uint64_t user_data, int32_t res)
+{
+  uint32_t tail = ld(r->cq, CQ_OFF_TAIL);
+  struct l_io_uring_cqe c = { .user_data = user_data, .res = res, .flags = 0 };
+  memcpy(r->cq + CQ_OFF_CQES +
+         (size_t) (tail & (r->cq_entries - 1)) * sizeof c, &c, sizeof c);
+  __sync_synchronize();
+  st(r->cq, CQ_OFF_TAIL, tail + 1);
+
+  r->completions++;
+  if (r->eventfd >= 0)
+    eventfd_signal(r->eventfd, 1);
+  pthread_cond_broadcast(&r->posted);
+}
+
+/* Detach one pending operation by user_data. */
+static struct pending *
+pending_take(struct uring *r, uint64_t user_data, uint8_t op)
+{
+  struct pending **pp = &r->pending;
+  while (*pp) {
+    if ((*pp)->user_data == user_data && (*pp)->op == op) {
+      struct pending *p = *pp;
+      *pp = p->next;
+      return p;
+    }
+    pp = &(*pp)->next;
+  }
+  return NULL;
+}
+
+static void
+wake_poller(struct uring *r)
+{
+  char one = 1;
+  (void) !write(r->wake[1], &one, 1);
+}
+
+/*
+ * A counted timeout completes when enough *other* completions have been posted,
+ * whichever comes first with its deadline. Checked after every batch rather than
+ * inside post_cqe, so that a timeout cannot be completed by the very completion
+ * that is still being posted.
+ */
+static void
+check_counted_timeouts(struct uring *r)
+{
+  for (;;) {
+    struct pending **pp = &r->pending, *hit = NULL;
+    while (*pp) {
+      if ((*pp)->op == LINUX_IORING_OP_TIMEOUT && (*pp)->counted &&
+          r->completions >= (*pp)->target) {
+        hit = *pp;
+        *pp = hit->next;
+        break;
+      }
+      pp = &(*pp)->next;
+    }
+    if (!hit)
+      return;
+    post_cqe(r, hit->user_data, 0);   /* 0: the count was reached, not the clock */
+    free(hit);
+  }
+}
+
+static bool
+expired(const struct timespec *deadline, const struct timespec *now)
+{
+  return now->tv_sec > deadline->tv_sec ||
+         (now->tv_sec == deadline->tv_sec && now->tv_nsec >= deadline->tv_nsec);
+}
+
+/*
+ * The poller. One per ring, started the first time a ring is given something
+ * that has to wait, and running until the ring is destroyed.
+ */
+static void *
+poller(void *arg)
+{
+  struct uring *r = arg;
+  struct pollfd *fds = NULL;
+  struct pending **owner = NULL;
+  size_t cap = 0;
+
+  pthread_mutex_lock(&r->lock);
+  while (!r->stopping) {
+    /* Everything waiting on a descriptor, plus the pipe that says the set has
+     * changed - without which a poll armed during the wait would not be seen
+     * until the current one happened to return. */
+    size_t n = 1;
+    for (struct pending *p = r->pending; p; p = p->next)
+      if (p->op == LINUX_IORING_OP_POLL_ADD)
+        n++;
+    if (n > cap) {
+      struct pollfd *nf = realloc(fds, n * sizeof *nf);
+      struct pending **no = realloc(owner, n * sizeof *no);
+      if (!nf || !no) {
+        free(nf ? nf : fds); free(no ? no : owner);
+        fds = NULL; owner = NULL; cap = 0;
+        break;
+      }
+      fds = nf; owner = no; cap = n;
+    }
+    fds[0].fd = r->wake[0];
+    fds[0].events = POLLIN;
+    fds[0].revents = 0;
+    owner[0] = NULL;
+    size_t i = 1;
+    for (struct pending *p = r->pending; p; p = p->next) {
+      if (p->op != LINUX_IORING_OP_POLL_ADD)
+        continue;
+      fds[i].fd = p->fd;
+      fds[i].events = p->events;
+      fds[i].revents = 0;
+      owner[i] = p;
+      i++;
+    }
+
+    /* The nearest deadline decides how long to wait; nothing pending at all
+     * means wait for the pipe alone. */
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    int timeout = -1;
+    for (struct pending *p = r->pending; p; p = p->next) {
+      if (p->op != LINUX_IORING_OP_TIMEOUT)
+        continue;
+      long ms = (long) (p->deadline.tv_sec - now.tv_sec) * 1000 +
+                (p->deadline.tv_nsec - now.tv_nsec) / 1000000;
+      if (ms < 0)
+        ms = 0;
+      if (timeout < 0 || ms < timeout)
+        timeout = (int) ms;
+    }
+
+    pthread_mutex_unlock(&r->lock);
+    int ready = poll(fds, (nfds_t) i, timeout);
+    pthread_mutex_lock(&r->lock);
+    if (r->stopping)
+      break;
+
+    if (ready > 0 && (fds[0].revents & POLLIN)) {
+      char drain[64];
+      (void) !read(r->wake[0], drain, sizeof drain);
+    }
+
+    /* Ready descriptors: one-shot, so the registration goes with the answer. */
+    for (size_t j = 1; j < i && ready > 0; j++) {
+      if (fds[j].revents == 0)
+        continue;
+      struct pending *p = pending_take(r, owner[j]->user_data,
+                                       LINUX_IORING_OP_POLL_ADD);
+      if (!p)
+        continue;               /* removed while the poll was in flight */
+      post_cqe(r, p->user_data, (int32_t) (uint32_t) fds[j].revents);
+      free(p);
+    }
+
+    /* Expired deadlines. */
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    for (;;) {
+      struct pending **pp = &r->pending, *hit = NULL;
+      while (*pp) {
+        if ((*pp)->op == LINUX_IORING_OP_TIMEOUT &&
+            expired(&(*pp)->deadline, &now)) {
+          hit = *pp;
+          *pp = hit->next;
+          break;
+        }
+        pp = &(*pp)->next;
+      }
+      if (!hit)
+        break;
+      /* ETIME, which is how a caller tells "the clock ran out" from "the thing
+       * I was counting happened". */
+      post_cqe(r, hit->user_data, -LINUX_ETIME);
+      free(hit);
+    }
+  }
+  pthread_mutex_unlock(&r->lock);
+  free(fds);
+  free(owner);
+  return NULL;
+}
+
+/* Started on demand: a ring that only ever does file I/O never gets a thread. */
+static int
+poller_start(struct uring *r)
+{
+  if (r->polling)
+    return 0;
+  if (pipe(r->wake) < 0)
+    return -darwin_to_linux_errno(errno);
+  fcntl(r->wake[0], F_SETFL, O_NONBLOCK);
+  if (pthread_create(&r->poller, NULL, poller, r) != 0) {
+    close(r->wake[0]); close(r->wake[1]);
+    r->wake[0] = r->wake[1] = -1;
+    return -LINUX_EAGAIN;
+  }
+  r->polling = true;
+  return 0;
 }
 
 /* ------------------------------------------------------------------ setup */
@@ -192,6 +445,9 @@ DEFINE_SYSCALL(io_uring_setup, uint32_t, entries, gaddr_t, params_ptr)
   }
   r->sq_len = sq_len; r->cq_len = cq_len; r->sqes_len = sqes_len;
   r->eventfd = -1;
+  r->wake[0] = r->wake[1] = -1;
+  pthread_mutex_init(&r->lock, NULL);
+  pthread_cond_init(&r->posted, NULL);
   r->sq_entries = sq_entries; r->cq_entries = cq_entries;
 
   r->sq = mmap(NULL, sq_len, PROT_READ | PROT_WRITE, MAP_SHARED, fd,
@@ -275,6 +531,27 @@ uring_close(int fd)
     if ((*pp)->fd == fd) {
       struct uring *r = *pp;
       *pp = r->next;
+
+      /* The poller is stopped and joined before anything it looks at is freed;
+       * abandoning it would leave a thread polling a descriptor that is about
+       * to be closed and writing into a mapping about to go. */
+      if (r->polling) {
+        pthread_mutex_lock(&r->lock);
+        r->stopping = true;
+        pthread_mutex_unlock(&r->lock);
+        wake_poller(r);
+        pthread_join(r->poller, NULL);
+        close(r->wake[0]);
+        close(r->wake[1]);
+      }
+      for (struct pending *p = r->pending; p; ) {
+        struct pending *n = p->next;
+        free(p);
+        p = n;
+      }
+      pthread_cond_destroy(&r->posted);
+      pthread_mutex_destroy(&r->lock);
+
       munmap(r->sq, r->sq_len);
       munmap(r->cq, r->cq_len);
       munmap(r->sqes, r->sqes_len);
@@ -418,6 +695,118 @@ run_sqe(const struct l_io_uring_sqe *s)
   }
 }
 
+/*
+ * The three operations that cannot answer during the submitting call.
+ *
+ * Returns true if the entry was dealt with here - whether that meant putting it
+ * on the pending list to be answered later or posting a completion outright -
+ * and false if it is an ordinary operation for run_sqe. Posting is done here
+ * rather than reported back through an argument because these three do not
+ * agree on how many completions they produce: a poll makes none yet, a removal
+ * makes two, and a failure to arm makes one.
+ */
+static bool
+arm_async(struct uring *r, const struct l_io_uring_sqe *s)
+{
+  switch (s->opcode) {
+  case LINUX_IORING_OP_POLL_ADD: {
+    struct pending *p = calloc(1, sizeof *p);
+    if (!p) { post_cqe(r, s->user_data, -LINUX_ENOMEM); return true; }
+    p->op = LINUX_IORING_OP_POLL_ADD;
+    p->user_data = s->user_data;
+    p->fd = s->fd;
+    /*
+     * The events live in the same word as rw_flags; a caller may have written
+     * the 16-bit poll_events or the 32-bit poll32_events, and on a
+     * little-endian machine the low half is the mask either way.
+     */
+    p->events = (short) (s->rw_flags & 0xffff);
+    if (poller_start(r) < 0) {
+      free(p);
+      post_cqe(r, s->user_data, -LINUX_EAGAIN);
+      return true;
+    }
+    p->next = r->pending;
+    r->pending = p;
+    wake_poller(r);
+    return true;                /* nothing to report until it is ready */
+  }
+
+  case LINUX_IORING_OP_POLL_REMOVE: {
+    /* addr names the poll to cancel, by the user_data it was submitted with. */
+    struct pending *p = pending_take(r, s->addr, LINUX_IORING_OP_POLL_ADD);
+    if (!p) {
+      post_cqe(r, s->user_data, -LINUX_ENOENT);
+      return true;
+    }
+    /* Two completions: the cancelled poll gets its own, so a caller waiting on
+     * that user_data is not left waiting for something that will never arrive,
+     * and the removal reports whether it found anything. */
+    post_cqe(r, p->user_data, -LINUX_ECANCELED);
+    free(p);
+    wake_poller(r);
+    post_cqe(r, s->user_data, 0);
+    return true;
+  }
+
+  case LINUX_IORING_OP_TIMEOUT: {
+    if (s->len != 1) { post_cqe(r, s->user_data, -LINUX_EINVAL); return true; }
+    struct l_timespec ts;
+    if (copy_from_user(&ts, (gaddr_t) s->addr, sizeof ts)) {
+      post_cqe(r, s->user_data, -LINUX_EFAULT);
+      return true;
+    }
+    struct pending *p = calloc(1, sizeof *p);
+    if (!p) { post_cqe(r, s->user_data, -LINUX_ENOMEM); return true; }
+    p->op = LINUX_IORING_OP_TIMEOUT;
+    p->user_data = s->user_data;
+
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    if (s->rw_flags & LINUX_IORING_TIMEOUT_ABS) {
+      /*
+       * An absolute deadline is against the clock the caller named, and the
+       * poller measures against CLOCK_MONOTONIC - so it is converted here
+       * rather than compared across two different origins.
+       */
+      struct timespec real;
+      clock_gettime(CLOCK_REALTIME, &real);
+      int64_t delta = (int64_t) (ts.tv_sec - real.tv_sec) * 1000000000LL +
+                      (ts.tv_nsec - real.tv_nsec);
+      if (delta < 0)
+        delta = 0;
+      p->deadline.tv_sec = now.tv_sec + delta / 1000000000LL;
+      p->deadline.tv_nsec = now.tv_nsec + delta % 1000000000LL;
+    } else {
+      p->deadline.tv_sec = now.tv_sec + ts.tv_sec;
+      p->deadline.tv_nsec = now.tv_nsec + ts.tv_nsec;
+    }
+    if (p->deadline.tv_nsec >= 1000000000L) {
+      p->deadline.tv_sec++;
+      p->deadline.tv_nsec -= 1000000000L;
+    }
+
+    /* off is a number of completions to wait for; zero means the clock alone. */
+    if (s->off > 0) {
+      p->counted = true;
+      p->target = r->completions + s->off;
+    }
+    if (poller_start(r) < 0) {
+      free(p);
+      post_cqe(r, s->user_data, -LINUX_EAGAIN);
+      return true;
+    }
+    p->next = r->pending;
+    r->pending = p;
+    wake_poller(r);
+    return true;
+  }
+
+  default:
+    return false;
+  }
+}
+
 /* ------------------------------------------------------------------ enter */
 
 DEFINE_SYSCALL(io_uring_enter, int, fd, uint32_t, to_submit,
@@ -430,6 +819,8 @@ DEFINE_SYSCALL(io_uring_enter, int, fd, uint32_t, to_submit,
   if (flags & ~(LINUX_IORING_ENTER_GETEVENTS | LINUX_IORING_ENTER_SQ_WAKEUP))
     return -LINUX_EINVAL;
 
+  pthread_mutex_lock(&r->lock);
+
   /*
    * The guest wrote entries and advanced the tail; nabi consumes from the head.
    * Both live in the shared pages, so this is the whole handshake.
@@ -441,8 +832,6 @@ DEFINE_SYSCALL(io_uring_enter, int, fd, uint32_t, to_submit,
   if (to_submit > avail)
     to_submit = avail;
 
-  uint32_t cq_tail = ld(r->cq, CQ_OFF_TAIL);
-  uint32_t cq_mask = r->cq_entries - 1;
   uint32_t dropped = ld(r->sq, SQ_OFF_DROPPED);
 
   uint32_t done = 0;
@@ -462,28 +851,16 @@ DEFINE_SYSCALL(io_uring_enter, int, fd, uint32_t, to_submit,
 
     struct l_io_uring_sqe s;
     memcpy(&s, r->sqes + (size_t) slot * sizeof s, sizeof s);
-    int32_t res = run_sqe(&s);
-
-    struct l_io_uring_cqe c = {
-      .user_data = s.user_data,
-      .res = res,
-      .flags = 0,
-    };
-    memcpy(r->cq + CQ_OFF_CQES +
-           (size_t) (cq_tail & cq_mask) * sizeof c, &c, sizeof c);
-    cq_tail++;
     done++;
+
+    if (arm_async(r, &s))
+      continue;
+    post_cqe(r, s.user_data, run_sqe(&s));
   }
 
   st(r->sq, SQ_OFF_DROPPED, dropped);
   st(r->sq, SQ_OFF_HEAD, sq_head + done);
-  /*
-   * The completion tail is published last, after every entry it accounts for
-   * has been written. A caller that reads the tail and then reads the entries
-   * must not be able to see the second without the first.
-   */
-  __sync_synchronize();
-  st(r->cq, CQ_OFF_TAIL, cq_tail);
+  check_counted_timeouts(r);
 
   /*
    * IORING_ENTER_GETEVENTS asks to wait for min_complete. Everything submitted
@@ -492,26 +869,61 @@ DEFINE_SYSCALL(io_uring_enter, int, fd, uint32_t, to_submit,
    * and it shows through as the call returning promptly rather than as a
    * different answer.
    */
-  (void) min_complete;
-  (void) sig;
-  (void) sigsz;
+  /*
+   * IORING_ENTER_GETEVENTS asks to wait until min_complete completions are
+   * available. Everything run on this thread is already posted by now, so this
+   * only ever waits on the poller - which is exactly what a caller doing
+   * "submit a poll, then wait for it" needs, and is the path liburing takes
+   * when the completion ring is empty.
+   */
+  int err = 0;
+  if ((flags & LINUX_IORING_ENTER_GETEVENTS) && min_complete > 0) {
+    sigset_t saved;
+    bool have_mask = false;
+    if (sig) {
+      if (sigsz != sizeof(l_sigset_t)) {
+        pthread_mutex_unlock(&r->lock);
+        return -LINUX_EINVAL;
+      }
+      l_sigset_t lset;
+      if (copy_from_user(&lset, sig, sizeof lset)) {
+        pthread_mutex_unlock(&r->lock);
+        return -LINUX_EFAULT;
+      }
+      sigset_t dset;
+      linux_to_darwin_sigset(&lset, &dset);
+      sigprocmask(SIG_SETMASK, &dset, &saved);
+      have_mask = true;
+    }
 
-  /* A registered eventfd counts one per completion posted, which is what lets a
-   * guest wait on the ring inside an ordinary poll loop instead of spinning on
-   * the completion tail. */
-  if (r->eventfd >= 0 && done)
-    eventfd_signal(r->eventfd, done);
+    while (!r->stopping) {
+      uint32_t head = ld(r->cq, CQ_OFF_HEAD);
+      uint32_t tail = ld(r->cq, CQ_OFF_TAIL);
+      if (tail - head >= min_complete)
+        break;
+      /* Nothing pending and nothing ready is a wait that cannot end, so it is
+       * refused rather than entered - the guest asked for completions that
+       * nothing has been asked to produce. */
+      if (!r->pending) {
+        err = -LINUX_EAGAIN;
+        break;
+      }
+      pthread_cond_wait(&r->posted, &r->lock);
+    }
 
+    if (have_mask)
+      sigprocmask(SIG_SETMASK, &saved, NULL);
+  }
+
+  pthread_mutex_unlock(&r->lock);
+  if (err < 0 && done == 0)
+    return err;
   return (int) done;
 }
 
-DEFINE_SYSCALL(io_uring_register, int, fd, uint32_t, opcode, gaddr_t, arg,
-               uint32_t, nr_args)
+static int
+uring_register(struct uring *r, uint32_t opcode, gaddr_t arg, uint32_t nr_args)
 {
-  struct uring *r = ring_of(fd);
-  if (!r)
-    return -LINUX_EOPNOTSUPP;
-
   switch (opcode) {
   case LINUX_IORING_REGISTER_EVENTFD: {
     /* The one registration that is worth having here and costs nothing to
@@ -544,4 +956,17 @@ DEFINE_SYSCALL(io_uring_register, int, fd, uint32_t, opcode, gaddr_t, arg,
      */
     return -LINUX_EINVAL;
   }
+}
+
+DEFINE_SYSCALL(io_uring_register, int, fd, uint32_t, opcode, gaddr_t, arg,
+               uint32_t, nr_args)
+{
+  struct uring *r = ring_of(fd);
+  if (!r)
+    return -LINUX_EOPNOTSUPP;
+
+  pthread_mutex_lock(&r->lock);
+  int ret = uring_register(r, opcode, arg, nr_args);
+  pthread_mutex_unlock(&r->lock);
+  return ret;
 }
