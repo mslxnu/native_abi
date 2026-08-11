@@ -258,6 +258,16 @@ void fanotify_close(int fd);
  * expirations rather than with what is in the pipe underneath. */
 bool timerfd_read(int fd, char *out, size_t size, int *ret);
 void timerfd_close(int fd);
+
+/* tee (src/fs/tee.c). What tee removed from a pipe is held in front of it, so
+ * reads and readiness have to consult it before the pipe itself. */
+void    tee_note_pipe(int rfd, int wfd);
+bool    tee_pending(void);
+ssize_t tee_take(int fd, char *buf, size_t want);
+bool    tee_readable(int fd);
+bool    tee_any_readable(int nfds, const fd_set *want);
+int     tee_mark_readable(int nfds, fd_set *out, const fd_set *want);
+void    tee_sweep(void);
 bool procfs_pidns_path(const char *name, char *out, size_t outsz, bool *denied);
 bool procfs_stat(const char *path, uint32_t *mode, uint64_t *size, uint64_t *ino);
 bool procfs_refresh_fddir(int fd);

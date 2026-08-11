@@ -259,6 +259,16 @@ guest-code cache sync.
   `shmat` region is neither arena-backed nor file-backed, so the child panicked
   in `checkpoint_restore` rather than inheriting the segment.
 
+- `teetest` — `tee(2)`: what it copied is still there, unchanged and in order.
+  The check that matters is the partial tee with a writer behind it — four bytes
+  of `"ABCDEF"` copied, `"GH"` written while those four are still out, and the
+  source reading back `"ABCDEFGH"`. Copying is the easy half and every wrong
+  implementation passes it: one that appends what it read gives `"EFABCD"`, and
+  one that drains and restores under a lock gives `"GHABCDEF"` as soon as the
+  writer wins the race. `ppoll` and `select` are checked for the same reason a
+  timerfd's `poll` is — bytes only `read` can see are invisible to an event loop,
+  and a guest that polls first would wait forever on data it already has.
+
 The ELF binaries are committed prebuilt (as the x86 guest tests under
 `test/*/build/` are), so the check needs no cross-toolchain. The `.s` sources
 are here for reference; rebuild with an aarch64-linux clang + ld.lld:

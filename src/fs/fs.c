@@ -1927,6 +1927,23 @@ DEFINE_SYSCALL(read, int, fd, gaddr_t, buf_ptr, size_t, size)
     return r;
   }
 
+  /*
+   * Anything tee took out of this pipe is still owed to whoever reads it, and
+   * it is in front of what the pipe still holds - so it is served first, or the
+   * stream comes back out of order. Costs one load when no tee has happened,
+   * which is almost always.
+   */
+  if (buf != NULL && tee_pending()) {
+    ssize_t got = tee_take(fd, buf, size);
+    if (got >= 0) {
+      r = (int) got;
+      if (r > 0 && copy_to_user(buf_ptr, buf, (size_t) r))
+        r = -LINUX_EFAULT;
+      free(buf);
+      return r;
+    }
+  }
+
   struct file *file = get_file(fd);
   if (file == NULL) {
     r = -LINUX_EBADF;
@@ -1995,6 +2012,32 @@ DEFINE_SYSCALL(readv, int, fd, gaddr_t, iov_ptr, int, iovcnt)
   for (int i = 0; i < iovcnt; ++i) {
     iov[i].iov_base = alloca(liov[i].iov_len);
     iov[i].iov_len = liov[i].iov_len;
+  }
+
+  /* Pushback first here too - a reader that uses readv must not see a
+   * different stream from one that uses read. */
+  if (tee_pending()) {
+    size_t total = 0;
+    for (int i = 0; i < iovcnt; ++i)
+      total += liov[i].iov_len;
+    char *flat = total ? malloc(total) : NULL;
+    if (flat) {
+      ssize_t got = tee_take(fd, flat, total);
+      if (got >= 0) {
+        size_t left = (size_t) got;
+        for (int i = 0; i < iovcnt && left; ++i) {
+          size_t s = MIN(left, liov[i].iov_len);
+          if (copy_to_user(liov[i].iov_base, flat + (size_t) got - left, s)) {
+            free(flat);
+            return -LINUX_EFAULT;
+          }
+          left -= s;
+        }
+        free(flat);
+        return (int) got;
+      }
+      free(flat);
+    }
   }
 
   struct file *file = get_file(fd);
@@ -4043,36 +4086,6 @@ out:
   return r;
 }
 
-/*
- * tee(2): refused, and this is the reason rather than an omission.
- *
- * tee copies between two pipes *without consuming* what it copied - the whole
- * point is that the data is still there to be read afterwards. That needs a way
- * to look into a pipe without taking from it, and Darwin has none: a pipe here
- * is a real pipe, FIONREAD gives a byte count and not the bytes, and there is
- * no pread on one.
- *
- * What is left is to read the data and write it back, and that is not the same
- * operation. Reading part of what is queued and appending it returns it behind
- * whatever was left, so "ABCDEF" tee'd four bytes at a time comes back as
- * "EFABCD" - reordered in the single-threaded case this is normally used in,
- * before any question of concurrency arises. Draining and restoring the whole
- * queue fixes the order and leaves a window in which another writer can fill
- * the pipe so that the restore cannot complete, which loses data outright.
- * Either way it damages a stream while reporting success, which is worse than
- * not having the call.
- *
- * It becomes possible if a guest pipe stops being a Darwin pipe. A socketpair
- * supports MSG_PEEK, which is exactly tee's semantics - but pipe(2) is reached
- * by everything, a socket is not a FIFO to fstat or to S_ISFIFO, and changing
- * what every guest pipe *is* to gain one rarely used call is the wrong trade
- * until something needs it.
- */
-DEFINE_SYSCALL(tee, int, fd_in, int, fd_out, size_t, len, unsigned int, flags)
-{
-  return -LINUX_ENOSYS;
-}
-
 DEFINE_SYSCALL(pipe2, gaddr_t, fildes_ptr, int, flags)
 {
   if (flags & ~(LINUX_O_NONBLOCK | LINUX_O_CLOEXEC | LINUX_O_DIRECT)) {
@@ -4109,6 +4122,9 @@ DEFINE_SYSCALL(pipe2, gaddr_t, fildes_ptr, int, flags)
       goto close_by_fail;
     }
   }
+
+  /* Which end pairs with which, for tee - the only place both are known. */
+  tee_note_pipe(fildes[0], fildes[1]);
 
   err0 = register_fd(fildes[0], flags & LINUX_O_CLOEXEC);
   err1 = register_fd(fildes[1], flags & LINUX_O_CLOEXEC);
@@ -4289,9 +4305,21 @@ DEFINE_SYSCALL(select, int, nfds, gaddr_t, readfds_ptr, gaddr_t, writefds_ptr, g
     efds = &errorfds;
   }
 
-  int r = syswrap(select(nfds, rfds, wfds, efds, to));
+  /* As in poll: pushback makes a descriptor readable, and select has to be
+   * asked anyway - it just must not wait. */
+  fd_set asked;
+  bool pushed = false;
+  if (rfds) {
+    asked = *rfds;
+    pushed = tee_any_readable(nfds, &asked);
+  }
+  struct timeval now = { 0, 0 };
+
+  int r = syswrap(select(nfds, rfds, wfds, efds, pushed ? &now : to));
   if (r < 0)
     return r;
+  if (pushed)
+    r += tee_mark_readable(nfds, rfds, &asked);
 
   if (readfds_ptr != 0 && copy_to_user(readfds_ptr, &readfds, sizeof readfds))
     return -LINUX_EFAULT;
@@ -4346,9 +4374,18 @@ DEFINE_SYSCALL(pselect6, int, nfds, gaddr_t, readfds_ptr, gaddr_t, writefds_ptr,
   }
 
   // FIXME: Ignore sigmask now. Support it after implementing signal handling
-  int r = syswrap(pselect(nfds, rfds, wfds, efds, to, NULL));
+  fd_set asked;
+  bool pushed = false;
+  if (rfds) {
+    asked = *rfds;
+    pushed = tee_any_readable(nfds, &asked);
+  }
+  struct timespec now = { 0, 0 };
+  int r = syswrap(pselect(nfds, rfds, wfds, efds, pushed ? &now : to, NULL));
   if (r < 0)
     return r;
+  if (pushed)
+    r += tee_mark_readable(nfds, rfds, &asked);
 
   if (readfds_ptr != 0 && copy_to_user(readfds_ptr, &readfds, sizeof readfds))
     return -LINUX_EFAULT;
@@ -4397,6 +4434,28 @@ poll_common(gaddr_t fds_ptr, int nfds, int timeout)
     }
   }
 
+  /*
+   * A pipe holding tee'd bytes is readable even when the pipe itself is empty,
+   * and poll is where a reader finds that out. Missing it is not a slow read,
+   * it is a wait for data the guest has already been handed.
+   *
+   * Deciding first and marking after is not an optimisation: poll has to be
+   * asked anyway, for the other descriptors and for whatever else became ready
+   * meanwhile. All the pushback changes is that it must not block.
+   */
+  bool pushed = false;
+  if (tee_pending()) {
+    for (int i = 0; i < nfds; i++) {
+      if ((l_fds[i].events & POLLIN) && in_userfd(l_fds[i].fd) &&
+          tee_readable(l_fds[i].fd)) {
+        pushed = true;
+        break;
+      }
+    }
+    if (pushed)
+      timeout = 0;
+  }
+
   r = syswrap(poll(d_fds, nfds, timeout));
   if (r < 0)
     goto out;
@@ -4407,6 +4466,17 @@ poll_common(gaddr_t fds_ptr, int nfds, int timeout)
     } else {
       l_fds[i].revents = LINUX_POLLNVAL;
       r++;
+    }
+  }
+
+  if (pushed) {
+    for (int i = 0; i < nfds; i++) {
+      if ((l_fds[i].events & POLLIN) && !(l_fds[i].revents & POLLIN) &&
+          in_userfd(l_fds[i].fd) && tee_readable(l_fds[i].fd)) {
+        if (l_fds[i].revents == 0)
+          r++;                  /* poll counts descriptors, not events */
+        l_fds[i].revents |= POLLIN;
+      }
     }
   }
 

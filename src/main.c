@@ -232,6 +232,7 @@ init_first_proc(const char *root)
    * gone has no members and by Linux's rule no objects either.
    */
   sysv_sweep();
+  tee_sweep();
 
   /*
    * Clamp RLIMIT_NOFILE to what the OS can actually give a process.

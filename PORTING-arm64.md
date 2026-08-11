@@ -4158,25 +4158,50 @@ accepts, so all three questions it can ask come out of the same truth the mount
 table is built from. It has no aarch64 number at all; only x86-64 ever gave it
 one, so it lives in the compat tail.
 
-**`tee` is refused, and that is the finding rather than an omission.** It copies
-between two pipes *without consuming* what it copied — the whole point is that
-the data is still there afterwards — and that needs a way to look into a pipe
-without taking from it. Darwin has none: a guest pipe is a real pipe, `FIONREAD`
-gives a count and not the bytes, and there is no `pread` on one.
+**`tee` needed a peek into a pipe, and Darwin has none.** The call copies between
+two pipes *without consuming* what it copied — the whole point is that the data is
+still there afterwards — and there is no way to look into a Darwin pipe without
+taking from it: `FIONREAD` gives a count and not the bytes, and there is no
+`pread` on one.
 
-Read-and-write-back is not the same operation. Reading part of what is queued and
-appending it returns it *behind* what was left, so `"ABCDEF"` tee'd four bytes at
-a time comes back as `"EFABCD"` — reordered in the single-threaded case this is
-normally used in, before concurrency is even a question. Draining and restoring
-the whole queue fixes the order and opens a window where another writer can fill
-the pipe so the restore cannot complete, losing data outright. Either way it
-damages a stream while reporting success, which is worse than not having the
-call.
+Read-and-write-back is not the same operation, and it fails twice over. Reading
+part of what is queued and appending it returns it *behind* what was left, so
+`"ABCDEF"` tee'd four bytes at a time comes back as `"EFABCD"` — reordered in the
+single-threaded case, before concurrency is even a question. Draining the whole
+queue and restoring it fixes the order and opens a worse hole: the restore is not
+atomic against a writer, and a writer is not the exotic case here, it is the
+process feeding the pipe, which is the entire topology tee is used in. Anything
+written while the data is out lands in front of the restored bytes. A lock does
+not close it either — a writer would have to take that lock *before* deciding to
+write, which costs every pipe write in the system, and a writer blocked on a full
+pipe while holding it deadlocks the drain that would empty it.
 
-It becomes possible if a guest pipe stops being a Darwin pipe: a socketpair
-supports `MSG_PEEK`, which is exactly tee's semantics. But `pipe(2)` is reached by
-everything, a socket is not a FIFO to `fstat` or `S_ISFIFO`, and changing what
-every guest pipe *is* to gain one rarely used call is the wrong trade until
-something needs it.
+So nothing is ever restored. **The bytes tee removes are kept in front of the
+pipe rather than back in it**: a pushback that reads are served from first, and
+the pipe read only when it is empty. That has no writer hazard at all, because a
+writer appends to the pipe, which is exactly where its bytes belong — after
+everything tee is still holding. The order is preserved by construction instead
+of by exclusion, which is why this design works and the other two do not.
 
-228 of 396.
+It holds because NABI is the only thing that ever reads a guest pipe, so there is
+nowhere to bypass it from. Three paths had to learn about it: `read` and `readv`,
+which must serve pushback before the pipe or the stream comes back out of order;
+and readiness — `ppoll`, `select`, `pselect6` and `epoll_wait` — which must report
+a descriptor readable when bytes are held for it. That last half is the one a
+simpler implementation would skip and a real program would hang on, for the same
+reason a timerfd that only `read` could see is useless in an event loop.
+
+The pushback is shared rather than per-process, because a pipe is. It is keyed by
+the read end's inode, which macOS gives a 64-bit value that is identical in a
+forked child *and* across the exec NABI's fork is built on — measured, not
+assumed — so two processes sharing a pipe share its pushback. A guest with no
+pending pushback pays one load from a shared mapping to find that out, the same
+fast path `fanotify` uses.
+
+One thing Darwin does not provide is the pairing: `tee(p[0], p[1])` is `EINVAL` on
+Linux, where it is easy to detect because both ends of a pipe share one inode.
+Here they get unrelated ones, so nothing in `fstat` says two descriptors are the
+same pipe, and the pairing is remembered from `pipe2`, which is the one place that
+sees both.
+
+229 of 396.

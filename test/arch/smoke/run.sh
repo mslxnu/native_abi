@@ -584,6 +584,19 @@ else
     fail=1
 fi
 
+# teetest: tee(2), which needs a peek into a pipe that Darwin does not have.
+# The check that matters is the partial tee with a writer behind it - copying is
+# the easy half, and every scheme that reads and puts back passes a single-shot
+# test and returns the stream reordered as soon as anything else writes.
+cp "$here/teetest" "$root/"; chmod +x "$root/teetest"
+out=$("$NABI" -m "$root" /teetest); rc=$?
+if [ "$rc" -eq 0 ] && [ "$out" = "tee ok" ]; then
+    echo "  ok  teetest -> \"$out\", exit 0"
+else
+    echo "  FAIL teetest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 if [ "$fail" -eq 0 ]; then
     echo "smoke: PASS"
 else

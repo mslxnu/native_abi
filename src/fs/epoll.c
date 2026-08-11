@@ -233,6 +233,40 @@ epoll_wait_common(int epfd, gaddr_t events_ptr, int maxevents, int timeout)
     tsp = &ts;
   }
 
+  /*
+   * Descriptors that are readable because of pushback rather than because the
+   * pipe has anything in it. kqueue cannot know about those, so they are
+   * gathered from the registration table - which is keyed by (epfd, fd) and is
+   * therefore already the list of what this set is watching.
+   *
+   * Collected before the wait because finding one means not waiting: an event
+   * loop that blocks here is blocking on data the guest was handed by tee.
+   */
+  struct epoll_reg pb[64];
+  int npb = 0;
+  if (tee_pending()) {
+    pthread_mutex_lock(&epoll_lock);
+    epoll_regs_init();
+    for (khiter_t k = kh_begin(epoll_regs); k != kh_end(epoll_regs); k++) {
+      if (!kh_exist(epoll_regs, k))
+        continue;
+      uint64_t key = kh_key(epoll_regs, k);
+      if ((int) (key >> 32) != epfd)
+        continue;
+      struct epoll_reg reg = kh_value(epoll_regs, k);
+      if (!(reg.events & LINUX_EPOLLIN))
+        continue;
+      if (npb < (int) (sizeof pb / sizeof pb[0]) && tee_readable((int) (uint32_t) key))
+        pb[npb++] = reg;
+    }
+    pthread_mutex_unlock(&epoll_lock);
+    if (npb > 0) {
+      ts.tv_sec = 0;
+      ts.tv_nsec = 0;
+      tsp = &ts;
+    }
+  }
+
   int n = kevent(epfd, NULL, 0, kev, maxevents * 2, tsp);
   if (n < 0) {
     int e = errno;
@@ -285,6 +319,21 @@ epoll_wait_common(int epfd, gaddr_t events_ptr, int maxevents, int timeout)
      * side already disarmed itself via EV_ONESHOT. */
     if (reg.events & LINUX_EPOLLONESHOT)
       kh_del(epoll, epoll_regs, k);
+  }
+
+  /* Fold the pushback ones in, on the same terms: an entry per descriptor, and
+   * only if the wait did not already report it. */
+  for (int i = 0; i < npb && nout < maxevents; i++) {
+    int slot = -1;
+    for (int j = 0; j < nout; j++) {
+      if (out[j].data == pb[i].data) { slot = j; break; }
+    }
+    if (slot < 0) {
+      slot = nout++;
+      out[slot].data = pb[i].data;
+      out[slot].events = 0;
+    }
+    out[slot].events |= LINUX_EPOLLIN;
   }
 
   pthread_mutex_unlock(&epoll_lock);

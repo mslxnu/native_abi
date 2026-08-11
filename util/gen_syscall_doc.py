@@ -41,7 +41,7 @@ def refuses():
     implemented and deliberately is not - see src/proc/rseq.c.
     """
     import glob
-    out = {'rseq', 'tee'}
+    out = {'rseq'}
     for path in glob.glob('src/**/*.c', recursive=True):
         for m in re.finditer(r'DEFINE_NOT_IMPLEMENTED_SYSCALL\(\s*(\w+)',
                              open(path).read()):
