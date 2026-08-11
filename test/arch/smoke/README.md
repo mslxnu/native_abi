@@ -373,6 +373,14 @@ guest-code cache sync.
   handing over a whole flag word is the reason the call exists. `mbind` has one
   node to work with, so what is tested is the validation — a nodemask naming a
   node this machine does not have is refused rather than accepted and ignored.
+  It also drives the new mount API end to end — `fsopen`, `fsconfig`,
+  `fsmount`, `move_mount` — and proves the result is a mount by putting a
+  marker in the mount point first and requiring it to be *hidden*: writing
+  under `/newapi` would succeed whether or not anything was mounted, since it
+  is a real directory either way, but only a mount shadows what was there.
+  `open_tree` is checked the same way, by reading a file that exists only
+  through the clone. `statmount` is read at the offsets it reports rather
+  than at assumed ones.
 
 The ELF binaries are committed prebuilt (as the x86 guest tests under
 `test/*/build/` are), so the check needs no cross-toolchain. The `.s` sources

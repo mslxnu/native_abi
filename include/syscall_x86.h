@@ -433,11 +433,11 @@
   SYSCALL(425, io_uring_setup) \
   SYSCALL(426, io_uring_enter) \
   SYSCALL(427, io_uring_register) \
-  SYSCALL(428, unimplemented) \
-  SYSCALL(429, unimplemented) \
-  SYSCALL(430, unimplemented) \
-  SYSCALL(431, unimplemented) \
-  SYSCALL(432, unimplemented) \
+  SYSCALL(428, open_tree) \
+  SYSCALL(429, move_mount) \
+  SYSCALL(430, fsopen) \
+  SYSCALL(431, fsconfig) \
+  SYSCALL(432, fsmount) \
   SYSCALL(433, unimplemented) \
   SYSCALL(434, unimplemented) \
   SYSCALL(435, clone3) \
@@ -462,7 +462,7 @@
   SYSCALL(454, futex_wake) \
   SYSCALL(455, futex_wait) \
   SYSCALL(456, futex_requeue) \
-  SYSCALL(457, unimplemented) \
+  SYSCALL(457, statmount) \
   SYSCALL(458, listmount) \
   SYSCALL(459, unimplemented) \
   SYSCALL(460, unimplemented) \

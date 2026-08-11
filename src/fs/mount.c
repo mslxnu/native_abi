@@ -409,6 +409,61 @@ type_is(const char *type, const char *want)
   return type && strcmp(type, want) == 0;
 }
 
+/*
+ * What backs a mount of a given filesystem type.
+ *
+ * Split out because two callers ask it: mount(2), and fsmount() by way of the
+ * context fsopen() named a type on. A second answer here would be a second set
+ * of filesystems NABI claims to support.
+ */
+static int
+backing_for_type(const char *type, const char *source, struct mount_entry *e)
+{
+  if (type_is(type, "tmpfs")) {
+    char dirtpl[PATH_MAX];
+    const char *tmp = getenv("TMPDIR");
+    snprintf(dirtpl, sizeof dirtpl, "%s/nabi-tmpfs-XXXXXX",
+             tmp && *tmp ? tmp : "/tmp");
+    if (mkdtemp(dirtpl) == NULL)
+      return -darwin_to_linux_errno(errno);
+    snprintf(e->source, sizeof e->source, "tmpfs");
+    snprintf(e->hostdir, sizeof e->hostdir, "%s", dirtpl);
+    snprintf(e->type, sizeof e->type, "tmpfs");
+    return 0;
+  }
+  if (type_is(type, "cgroup2") || type_is(type, "cgroup")) {
+    /*
+     * The one hierarchy, wherever it is asked for. cgroups are not per-mount:
+     * mounting cgroup2 twice shows the same tree, which is what the mount is
+     * for - a place to see it from.
+     */
+    char host[PATH_MAX];
+    int cr = cgroup_hierarchy(host, sizeof host);
+    if (cr < 0)
+      return cr;
+    snprintf(e->source, sizeof e->source, "cgroup2");
+    snprintf(e->hostdir, sizeof e->hostdir, "%s", host);
+    snprintf(e->type, sizeof e->type, "cgroup2");
+    return 0;
+  }
+  if (type_is(type, "proc") || type_is(type, "sysfs") ||
+      type_is(type, "devtmpfs") || type_is(type, "devpts") ||
+      type_is(type, "mqueue") || type_is(type, "securityfs") ||
+      type_is(type, "debugfs")) {
+    /*
+     * Already served, or harmlessly absent. Recorded with no host directory,
+     * so resolution ignores it and only the listing changes - which is the
+     * point: a container that mounts /proc and cannot then find it in
+     * /proc/mounts decides the mount failed.
+     */
+    snprintf(e->source, sizeof e->source, "%s", source);
+    snprintf(e->type, sizeof e->type, "%s", type);
+    return 0;
+  }
+  /* A real filesystem, and there is no block layer here to give it. */
+  return -LINUX_ENODEV;
+}
+
 DEFINE_SYSCALL(mount, gstr_t, source_ptr, gstr_t, target_ptr, gstr_t, type_ptr,
                unsigned long, flags, gaddr_t, data_ptr)
 {
@@ -585,44 +640,13 @@ DEFINE_SYSCALL(mount, gstr_t, source_ptr, gstr_t, target_ptr, gstr_t, type_ptr,
     snprintf(e.source, sizeof e.source, "%s", source);
     snprintf(e.hostdir, sizeof e.hostdir, "%s", host);
     snprintf(e.type, sizeof e.type, "none");
-  } else if (type_is(type, "tmpfs")) {
-    char dirtpl[PATH_MAX];
-    const char *tmp = getenv("TMPDIR");
-    snprintf(dirtpl, sizeof dirtpl, "%s/nabi-tmpfs-XXXXXX",
-             tmp && *tmp ? tmp : "/tmp");
-    if (mkdtemp(dirtpl) == NULL)
-      return -darwin_to_linux_errno(errno);
-    snprintf(e.source, sizeof e.source, "tmpfs");
-    snprintf(e.hostdir, sizeof e.hostdir, "%s", dirtpl);
-    snprintf(e.type, sizeof e.type, "tmpfs");
-  } else if (type_is(type, "cgroup2") || type_is(type, "cgroup")) {
-    /*
-     * The one hierarchy, wherever it is asked for. cgroups are not per-mount:
-     * mounting cgroup2 twice shows the same tree, which is what the mount is
-     * for - a place to see it from.
-     */
-    char host[PATH_MAX];
-    int cr = cgroup_hierarchy(host, sizeof host);
-    if (cr < 0)
-      return cr;
-    snprintf(e.source, sizeof e.source, "cgroup2");
-    snprintf(e.hostdir, sizeof e.hostdir, "%s", host);
-    snprintf(e.type, sizeof e.type, "cgroup2");
-  } else if (type_is(type, "proc") || type_is(type, "sysfs") ||
-             type_is(type, "devtmpfs") || type_is(type, "devpts") ||
-             type_is(type, "mqueue") || type_is(type, "securityfs") ||
-             type_is(type, "debugfs")) {
-    /*
-     * Already served, or harmlessly absent. Recorded with no host directory,
-     * so resolution ignores it and only the listing changes - which is the
-     * point: a container that mounts /proc and cannot then find it in
-     * /proc/mounts decides the mount failed.
-     */
-    snprintf(e.source, sizeof e.source, "%s", source);
-    snprintf(e.type, sizeof e.type, "%s", type);
   } else {
-    /* A real filesystem, and there is no block layer here to give it. */
-    return -LINUX_ENODEV;
+    /* Everything a filesystem *type* can be here, which is also everything
+     * fsopen can name - so the two ask the same function rather than growing
+     * two answers that could disagree. */
+    int br = backing_for_type(type, source, &e);
+    if (br < 0)
+      return br;
   }
 
   uint32_t pp = parent_peer_of(&t, target);
@@ -870,4 +894,450 @@ DEFINE_SYSCALL(listmount, gaddr_t, req_ptr, gaddr_t, ids_ptr,
     n++;
   }
   return (int) n;
+}
+
+/* ======================================================== the new mount API */
+
+/*
+ * fsopen, fsconfig, fsmount, open_tree, move_mount - Linux's second way to
+ * mount something, and the reason it exists is worth stating because it decides
+ * how it is built here.
+ *
+ * mount(2) does everything in one call: name a filesystem, configure it, and
+ * attach it, with one errno to explain whichever part failed. The new API takes
+ * those apart. fsopen names a type and gives back a *context*; fsconfig
+ * configures it one parameter at a time, so a bad option is reported against
+ * that option; fsmount turns a configured context into a mount that exists but
+ * is attached nowhere; move_mount attaches it. open_tree is the same idea from
+ * the other end - it takes an existing mount and hands back a detached copy.
+ *
+ * So there are two new kinds of object a guest holds by descriptor: a context
+ * being configured, and a mount that exists but has no place yet. Both are
+ * files here, unlinked at once, with a magic in the header - the same shape as
+ * the POSIX message queues, and for the same reasons. The descriptor is the
+ * object, so it survives fork and the exec arm64's fork is built on, it goes
+ * when the guest closes it, and nothing here has to track which descriptors are
+ * live.
+ *
+ * fsconfig was not asked for and is implemented anyway, because without it the
+ * other two are unreachable: a context must be created before fsmount will take
+ * it, and FSCONFIG_CMD_CREATE is the only thing that creates one. Shipping
+ * fsopen and fsmount without it would be shipping a chain with a missing link.
+ */
+
+#define FSCTX_MAGIC    0x6673630au
+#define DETACHED_MAGIC 0x646d6e74u
+
+struct fsctx_hdr {
+  uint32_t magic;
+  uint32_t created;             /* FSCONFIG_CMD_CREATE has been issued */
+  char     type[16];
+  char     source[MOUNT_PATH_MAX];
+};
+
+struct detached_hdr {
+  uint32_t magic;
+  uint32_t pad;
+  struct mount_entry e;
+};
+
+/* A file nothing else can reach, whose descriptor is the object. */
+static int
+anon_file(const char *what)
+{
+  const char *tmp = getenv("TMPDIR");
+  char path[PATH_MAX];
+  snprintf(path, sizeof path, "%s/nabi-%s-%s-XXXXXX",
+           tmp && *tmp ? tmp : "/tmp", what, nabi_boot_tag());
+  int fd = mkstemp(path);
+  if (fd < 0)
+    return -darwin_to_linux_errno(errno);
+  unlink(path);
+  return fd;
+}
+
+static int
+read_hdr(int fd, void *hdr, size_t n, uint32_t magic)
+{
+  if (pread(fd, hdr, n, 0) != (ssize_t) n)
+    return -LINUX_EINVAL;
+  uint32_t got;
+  memcpy(&got, hdr, sizeof got);
+  if (got != magic)
+    return -LINUX_EINVAL;       /* a descriptor, but not this kind of object */
+  return 0;
+}
+
+static int
+give_to_guest(int fd, bool cloexec)
+{
+  pthread_rwlock_wrlock(&proc.fileinfo.fdtable_lock);
+  int err = register_fd(fd, cloexec);
+  pthread_rwlock_unlock(&proc.fileinfo.fdtable_lock);
+  if (err < 0) {
+    close(fd);
+    return err;
+  }
+  return fd;
+}
+
+DEFINE_SYSCALL(fsopen, gstr_t, fsname_ptr, unsigned int, flags)
+{
+  if (!may_mount())
+    return -LINUX_EPERM;
+  if (flags & ~(unsigned) LINUX_FSOPEN_CLOEXEC)
+    return -LINUX_EINVAL;
+
+  char type[16];
+  if (strncpy_from_user(type, fsname_ptr, sizeof type) < 0)
+    return -LINUX_EFAULT;
+
+  /*
+   * The type is checked now rather than at fsmount, which is the whole point of
+   * the split: a caller that names a filesystem this cannot provide finds out
+   * from the call that named it, not three calls later.
+   */
+  struct mount_entry probe;
+  memset(&probe, 0, sizeof probe);
+  int r = backing_for_type(type, type, &probe);
+  if (r < 0)
+    return r;
+  /* Nothing is allocated yet - that probe may have made a tmpfs directory, and
+   * the real one is made at fsmount. Undo it. */
+  if (strcmp(probe.type, "tmpfs") == 0 && probe.hostdir[0])
+    rmdir(probe.hostdir);
+
+  int fd = anon_file("fsctx");
+  if (fd < 0)
+    return fd;
+  struct fsctx_hdr h;
+  memset(&h, 0, sizeof h);
+  h.magic = FSCTX_MAGIC;
+  snprintf(h.type, sizeof h.type, "%s", type);
+  snprintf(h.source, sizeof h.source, "%s", type);
+  if (pwrite(fd, &h, sizeof h, 0) != (ssize_t) sizeof h) {
+    close(fd);
+    return -LINUX_EIO;
+  }
+  return give_to_guest(fd, (flags & LINUX_FSOPEN_CLOEXEC) != 0);
+}
+
+DEFINE_SYSCALL(fsconfig, int, fd, unsigned int, cmd, gstr_t, key_ptr,
+               gaddr_t, value, int, aux)
+{
+  struct fsctx_hdr h;
+  int r = read_hdr(fd, &h, sizeof h, FSCTX_MAGIC);
+  if (r < 0)
+    return r;
+
+  switch (cmd) {
+  case LINUX_FSCONFIG_SET_FLAG:
+  case LINUX_FSCONFIG_SET_STRING:
+  case LINUX_FSCONFIG_SET_BINARY:
+  case LINUX_FSCONFIG_SET_PATH:
+  case LINUX_FSCONFIG_SET_PATH_EMPTY:
+  case LINUX_FSCONFIG_SET_FD: {
+    if (h.created)
+      return -LINUX_EBUSY;      /* configured before creation, not after */
+    char key[64];
+    if (key_ptr == 0 || strncpy_from_user(key, key_ptr, sizeof key) < 0)
+      return -LINUX_EFAULT;
+    /*
+     * `source` is the one parameter that means something here - it is what
+     * /proc/mounts shows a mount as coming from. The rest are filesystem
+     * options, and the filesystems this can provide have none it could honour:
+     * a tmpfs here is a host directory, so a size= it cannot enforce would be
+     * a limit the guest believes in and nothing applies. They are accepted and
+     * dropped, which is what mount(2) here already does with its data argument.
+     */
+    if (strcmp(key, "source") == 0 && value != 0) {
+      if (strncpy_from_user(h.source, value, sizeof h.source) < 0)
+        return -LINUX_EFAULT;
+      if (pwrite(fd, &h, sizeof h, 0) != (ssize_t) sizeof h)
+        return -LINUX_EIO;
+    }
+    (void) aux;
+    return 0;
+  }
+
+  case LINUX_FSCONFIG_CMD_CREATE:
+    h.created = 1;
+    if (pwrite(fd, &h, sizeof h, 0) != (ssize_t) sizeof h)
+      return -LINUX_EIO;
+    return 0;
+
+  case LINUX_FSCONFIG_CMD_RECONFIGURE:
+    /* Reconfiguring an existing superblock through a context obtained from
+     * fspick, which is not implemented - so there is no context this can
+     * arrive on. */
+    return -LINUX_EOPNOTSUPP;
+
+  default:
+    return -LINUX_EINVAL;
+  }
+}
+
+/* Wrap a mount entry up as a detached mount and give the guest its descriptor. */
+static int
+detach(const struct mount_entry *e, bool cloexec)
+{
+  int fd = anon_file("detached");
+  if (fd < 0)
+    return fd;
+  struct detached_hdr d;
+  memset(&d, 0, sizeof d);
+  d.magic = DETACHED_MAGIC;
+  d.e = *e;
+  if (pwrite(fd, &d, sizeof d, 0) != (ssize_t) sizeof d) {
+    close(fd);
+    return -LINUX_EIO;
+  }
+  return give_to_guest(fd, cloexec);
+}
+
+DEFINE_SYSCALL(fsmount, int, fsfd, unsigned int, flags, unsigned int, attr_flags)
+{
+  if (!may_mount())
+    return -LINUX_EPERM;
+  if (flags & ~(unsigned) LINUX_FSMOUNT_CLOEXEC)
+    return -LINUX_EINVAL;
+
+  struct fsctx_hdr h;
+  int r = read_hdr(fsfd, &h, sizeof h, FSCTX_MAGIC);
+  if (r < 0)
+    return r;
+  if (!h.created)
+    return -LINUX_EINVAL;       /* nothing has been created to mount */
+
+  struct mount_entry e;
+  memset(&e, 0, sizeof e);
+  if ((r = backing_for_type(h.type, h.source, &e)) < 0)
+    return r;
+  snprintf(e.source, sizeof e.source, "%s", h.source);
+
+  /* The mount attributes, in the same words mount_setattr uses. */
+  if (attr_flags & ~(unsigned) (LINUX_MOUNT_ATTR_RDONLY | LINUX_MOUNT_ATTR_NOSUID |
+                                LINUX_MOUNT_ATTR_NODEV | LINUX_MOUNT_ATTR_NOEXEC |
+                                LINUX_MOUNT_ATTR__ATIME | LINUX_MOUNT_ATTR_NODIRATIME))
+    return -LINUX_EINVAL;
+  if (attr_flags & LINUX_MOUNT_ATTR_RDONLY) e.flags |= LINUX_MS_RDONLY;
+  if (attr_flags & LINUX_MOUNT_ATTR_NOSUID) e.flags |= LINUX_MS_NOSUID;
+  if (attr_flags & LINUX_MOUNT_ATTR_NODEV)  e.flags |= LINUX_MS_NODEV;
+  if (attr_flags & LINUX_MOUNT_ATTR_NOEXEC) e.flags |= LINUX_MS_NOEXEC;
+
+  return detach(&e, (flags & LINUX_FSMOUNT_CLOEXEC) != 0);
+}
+
+DEFINE_SYSCALL(open_tree, int, dfd, gstr_t, path_ptr, unsigned int, flags)
+{
+  char path[MOUNT_PATH_MAX];
+  if (strncpy_from_user(path, path_ptr, sizeof path) < 0)
+    return -LINUX_EFAULT;
+  if (path[0] != '/')
+    return -LINUX_EINVAL;       /* as elsewhere here: the table is keyed by
+                                 * absolute guest paths */
+  (void) dfd;
+
+  if (!(flags & LINUX_OPEN_TREE_CLONE)) {
+    /*
+     * Without CLONE this is a descriptor on the path and nothing more - which
+     * is what O_PATH already gives, so that is what it is.
+     */
+    return user_openat(LINUX_AT_FDCWD, path, LINUX_O_PATH |
+                       (flags & LINUX_OPEN_TREE_CLOEXEC ? LINUX_O_CLOEXEC : 0),
+                       0);
+  }
+
+  if (!may_mount())
+    return -LINUX_EPERM;
+
+  struct mount_table t;
+  if (!current_table(&t))
+    return -LINUX_EINVAL;
+  for (uint32_t i = 0; i < t.n; i++) {
+    if (strcmp(t.m[i].target, path) != 0)
+      continue;
+    if (t.m[i].propagation == LINUX_MS_UNBINDABLE)
+      return -LINUX_EINVAL;     /* refuses to be copied, which is its purpose */
+    struct mount_entry e = t.m[i];
+    e.target[0] = '\0';         /* detached: it is nowhere until move_mount */
+    e.id = 0;
+    return detach(&e, (flags & LINUX_OPEN_TREE_CLOEXEC) != 0);
+  }
+  return -LINUX_EINVAL;         /* not a mount point */
+}
+
+DEFINE_SYSCALL(move_mount, int, from_dfd, gstr_t, from_ptr, int, to_dfd,
+               gstr_t, to_ptr, unsigned int, flags)
+{
+  if (!may_mount())
+    return -LINUX_EPERM;
+  if (flags & ~(unsigned) LINUX_MOVE_MOUNT__MASK)
+    return -LINUX_EINVAL;
+  if (flags & LINUX_MOVE_MOUNT_SET_GROUP)
+    return -LINUX_EOPNOTSUPP;   /* shares a peer group between two mounts;
+                                 * propagation here is set through mount(2) */
+
+  char to[MOUNT_PATH_MAX];
+  if (strncpy_from_user(to, to_ptr, sizeof to) < 0)
+    return -LINUX_EFAULT;
+  if (to[0] != '/')
+    return -LINUX_EINVAL;
+  (void) to_dfd;
+
+  char from[MOUNT_PATH_MAX] = "";
+  if (from_ptr != 0 && strncpy_from_user(from, from_ptr, sizeof from) < 0)
+    return -LINUX_EFAULT;
+
+  struct mount_table t;
+  current_table(&t);
+
+  /*
+   * An empty from-path means the descriptor *is* the thing being moved, which
+   * is how a detached mount from fsmount or open_tree gets attached. That is
+   * the case the new API exists for.
+   */
+  if ((flags & LINUX_MOVE_MOUNT_F_EMPTY_PATH) && from[0] == '\0') {
+    struct detached_hdr d;
+    int r = read_hdr(from_dfd, &d, sizeof d, DETACHED_MAGIC);
+    if (r < 0)
+      return r;
+    if (d.e.target[0] != '\0')
+      return -LINUX_EINVAL;     /* already attached; a detached mount is used
+                                 * once, as on Linux */
+    if (t.n >= MOUNT_MAX)
+      return -LINUX_ENOMEM;
+
+    struct mount_entry e = d.e;
+    snprintf(e.target, sizeof e.target, "%s", to);
+    e.id = t.next_id++;
+    t.m[t.n++] = e;
+    table_store(ns_ino_of(NS_MNT), &t);
+
+    /* Mark the descriptor spent, so a second move cannot attach the same
+     * mount in two places. */
+    d.e.target[0] = 'x';
+    (void) !pwrite(from_dfd, &d, sizeof d, 0);
+    return 0;
+  }
+
+  /* Otherwise this is mount --move: the mount at `from` answers to `to` now. */
+  if (from[0] != '/')
+    return -LINUX_EINVAL;
+  for (uint32_t i = 0; i < t.n; i++) {
+    if (strcmp(t.m[i].target, from) != 0)
+      continue;
+    snprintf(t.m[i].target, sizeof t.m[i].target, "%s", to);
+    table_store(ns_ino_of(NS_MNT), &t);
+    return 0;
+  }
+  return -LINUX_EINVAL;         /* not a mount point */
+}
+
+/* ---------------------------------------------------------- statmount */
+
+/*
+ * statmount: everything about one mount, chosen by a mask.
+ *
+ * listmount says which mounts exist and this describes one, and together they
+ * are what /proc/mounts was doing badly - a text format that has to stay
+ * compatible forever, parsed by everyone. The mask is statx's idea: a caller
+ * asks for what it needs, and what came back is reported rather than assumed.
+ */
+DEFINE_SYSCALL(statmount, gaddr_t, req_ptr, gaddr_t, buf_ptr, size_t, bufsize,
+               unsigned int, flags)
+{
+  if (flags != 0)
+    return -LINUX_EINVAL;
+  if (bufsize < sizeof(struct l_statmount))
+    return -LINUX_EOVERFLOW;
+
+  uint32_t size;
+  if (copy_from_user(&size, req_ptr, sizeof size))
+    return -LINUX_EFAULT;
+  if (size < LINUX_MNT_ID_REQ_SIZE_VER0)
+    return -LINUX_EINVAL;
+  struct l_mnt_id_req req;
+  memset(&req, 0, sizeof req);
+  if (copy_from_user(&req, req_ptr, sizeof req > size ? size : sizeof req))
+    return -LINUX_EFAULT;
+
+  struct mount_table t;
+  if (!current_table(&t))
+    return -LINUX_ENOENT;
+  const struct mount_entry *m = NULL;
+  for (uint32_t i = 0; i < t.n; i++)
+    if (t.m[i].id == (uint32_t) req.mnt_id) {
+      m = &t.m[i];
+      break;
+    }
+  if (!m)
+    return -LINUX_ENOENT;
+
+  /* The strings go after the fixed part, each named by its offset into that
+   * run - so they are laid out first and the offsets recorded as they go. */
+  char strs[3 * MOUNT_PATH_MAX + 32];
+  size_t used = 0;
+  uint32_t off_root = 0, off_point = 0, off_type = 0, off_opts = 0;
+  uint64_t got = 0;
+
+#define PUT_STR(field, want, src)                                   \
+  do {                                                              \
+    if (req.param & (want)) {                                       \
+      size_t len = strlen(src) + 1;                                 \
+      if (used + len <= sizeof strs) {                              \
+        memcpy(strs + used, (src), len);                            \
+        (field) = (uint32_t) used;                                  \
+        used += len;                                                \
+        got |= (want);                                              \
+      }                                                             \
+    }                                                               \
+  } while (0)
+
+  PUT_STR(off_root,  LINUX_STATMOUNT_MNT_ROOT,  m->source);
+  PUT_STR(off_point, LINUX_STATMOUNT_MNT_POINT, m->target);
+  PUT_STR(off_type,  LINUX_STATMOUNT_FS_TYPE,   m->type);
+  PUT_STR(off_opts,  LINUX_STATMOUNT_MNT_OPTS,
+          (m->flags & LINUX_MS_RDONLY) ? "ro" : "rw");
+#undef PUT_STR
+
+  struct l_statmount st;
+  memset(&st, 0, sizeof st);
+  st.size = (uint32_t) (sizeof st + used);
+  st.mnt_root = off_root;
+  st.mnt_point = off_point;
+  st.fs_type = off_type;
+  st.mnt_opts = off_opts;
+
+  if (req.param & LINUX_STATMOUNT_MNT_BASIC) {
+    st.mnt_id = m->id;
+    st.mnt_id_old = m->id;
+    st.mnt_parent_id = 1;       /* the root, which is not itself a table row */
+    st.mnt_parent_id_old = 1;
+    st.mnt_attr = m->flags;
+    st.mnt_propagation = m->propagation;
+    st.mnt_peer_group = m->peer;
+    st.mnt_master = m->master;
+    got |= LINUX_STATMOUNT_MNT_BASIC;
+  }
+  if (req.param & LINUX_STATMOUNT_SB_BASIC) {
+    /* There is no superblock behind any of this - a mount here is a rewrite of
+     * a path prefix - so what is reported is the flags, which are real, and
+     * zeroes for the device and magic, which are not. */
+    st.sb_flags = m->flags;
+    got |= LINUX_STATMOUNT_SB_BASIC;
+  }
+  if (req.param & LINUX_STATMOUNT_MNT_NS_ID) {
+    st.mnt_ns_id = ns_ino_of(NS_MNT);
+    got |= LINUX_STATMOUNT_MNT_NS_ID;
+  }
+  /* What was actually filled in, which is not always what was asked for. */
+  st.mask = got;
+
+  if (bufsize < sizeof st + used)
+    return -LINUX_EOVERFLOW;
+  if (copy_to_user(buf_ptr, &st, sizeof st) ||
+      (used && copy_to_user(buf_ptr + sizeof st, strs, used)))
+    return -LINUX_EFAULT;
+  return 0;
 }

@@ -36,6 +36,12 @@ static long sys6(long n, long a, long b, long c, long d, long e, long f){
 #define SYS_kexec_file_load 294
 #define SYS_mount_setattr   442
 #define SYS_listmount       458
+#define SYS_open_tree       428
+#define SYS_move_mount      429
+#define SYS_fsopen          430
+#define SYS_fsconfig        431
+#define SYS_fsmount         432
+#define SYS_statmount       457
 
 #define AT_FDCWD    -100
 #define AT_REMOVEDIR 0x200
@@ -58,6 +64,19 @@ static long sys6(long n, long a, long b, long c, long d, long e, long f){
 #define MOUNT_ATTR_NOSUID 0x00000002
 #define MOUNT_ATTR_IDMAP  0x00100000
 
+#define OPEN_TREE_CLONE          1
+#define MOVE_MOUNT_F_EMPTY_PATH  4
+#define FSCONFIG_SET_STRING      1
+#define FSCONFIG_CMD_CREATE      6
+#define STATMOUNT_SB_BASIC       0x01
+#define STATMOUNT_MNT_BASIC      0x02
+#define STATMOUNT_MNT_ROOT       0x08
+#define STATMOUNT_MNT_POINT      0x10
+#define STATMOUNT_FS_TYPE        0x20
+#define ENODEV                  19
+#define EOVERFLOW               75
+#define ENOENT                   2
+
 #define MPOL_DEFAULT    0
 #define MPOL_PREFERRED  1
 #define MPOL_BIND       2
@@ -65,6 +84,12 @@ static long sys6(long n, long a, long b, long c, long d, long e, long f){
 
 struct mount_attr { unsigned long long attr_set, attr_clr, propagation, userns_fd; };
 struct mnt_id_req { unsigned size, spare; unsigned long long mnt_id, param; };
+/* struct statmount's fixed part and the offsets used below, measured rather
+ * than assumed - the string offsets are relative to the end of it. */
+#define sizeof_statmount   512
+#define STATMOUNT_OFF_MASK       8
+#define STATMOUNT_OFF_MNT_ID    40
+#define STATMOUNT_OFF_MNT_POINT 108
 
 static void put(const char*m){int i=0;while(m[i])i++;sys6(SYS_write, 1, (long)m, i, 0, 0, 0);}
 static void putd(long v){char b[24];int i=23;b[i--]=0;int g=v<0;if(g)v=-v;
@@ -194,6 +219,142 @@ void _start(void)
     req.size = 4;
     if ((r = sys6(SYS_listmount, (long) &req, (long) ids, 16, 0, 0, 0)) != -EINVAL)
       fail("listmount with a request smaller than the struct", r, -EINVAL); }
+
+  /*
+   * ---- statmount ----
+   *
+   * The partner of listmount: that one says which mounts exist, this describes
+   * one. The strings come back as offsets into a run after the fixed part, so
+   * an implementation that reported the wrong offset would still return
+   * success - which is why the point is compared rather than counted.
+   */
+  { struct mnt_id_req req;
+    unsigned long long ids[16];
+    req.size = sizeof req; req.spare = 0;
+    req.mnt_id = LSMT_ROOT; req.param = 0;
+    r = sys6(SYS_listmount, (long) &req, (long) ids, 16, 0, 0, 0);
+    if (r < 1)
+      fail("listmount before statmount", r, 1);
+
+    char buf[1024];
+    for (int i = 0; i < 1024; i++) buf[i] = 0;
+    req.mnt_id = ids[0];
+    req.param = STATMOUNT_MNT_BASIC | STATMOUNT_MNT_POINT |
+                STATMOUNT_FS_TYPE | STATMOUNT_SB_BASIC;
+    if ((r = sys6(SYS_statmount, (long) &req, (long) buf, sizeof buf, 0, 0, 0)) != 0)
+      fail("statmount of the mount listmount reported", r, 0);
+
+    unsigned mask_lo = *(unsigned *)(buf + STATMOUNT_OFF_MASK);
+    unsigned mnt_point_off = *(unsigned *)(buf + STATMOUNT_OFF_MNT_POINT);
+    unsigned long long got_id =
+        *(unsigned long long *)(buf + STATMOUNT_OFF_MNT_ID);
+    if (!(mask_lo & STATMOUNT_MNT_BASIC))
+      fail("statmount reporting what it filled in", mask_lo, STATMOUNT_MNT_BASIC);
+    if (got_id != ids[0])
+      fail("the id statmount reported", (long) got_id, (long) ids[0]);
+    /* The mount point string, at the offset it said. */
+    { const char *pt = buf + sizeof_statmount + mnt_point_off;
+      if (pt[0] != '/')
+        fail("the mount point statmount pointed at", pt[0], '/'); }
+
+    req.mnt_id = 999999;
+    if ((r = sys6(SYS_statmount, (long) &req, (long) buf, sizeof buf, 0, 0, 0)) != -ENOENT)
+      fail("statmount of a mount that does not exist", r, -ENOENT);
+    req.mnt_id = ids[0];
+    if ((r = sys6(SYS_statmount, (long) &req, (long) buf, 16, 0, 0, 0)) != -EOVERFLOW)
+      fail("statmount into a buffer too small for it", r, -EOVERFLOW); }
+
+  /*
+   * ---- the new mount API, end to end ----
+   *
+   * fsopen names a type, fsconfig creates it, fsmount makes a mount that is
+   * attached nowhere, and move_mount attaches it. The chain is the point: each
+   * step is useless alone, so what is tested is that a tmpfs mounted this way
+   * is a tmpfs that is really there.
+   */
+  { long ctx = sys6(SYS_fsopen, (long) "tmpfs", 0, 0, 0, 0, 0);
+    if (ctx < 0)
+      fail("fsopen of tmpfs", ctx, 0);
+
+    /* A filesystem this cannot provide is refused by the call that named it,
+     * rather than three calls later - which is why the API is split. */
+    { long bad = sys6(SYS_fsopen, (long) "ext4", 0, 0, 0, 0, 0);
+      if (bad != -ENODEV)
+        fail("fsopen of a filesystem there is no block layer for", bad, -ENODEV); }
+
+    /* fsmount before the context is created has nothing to mount. */
+    if ((r = sys6(SYS_fsmount, ctx, 0, 0, 0, 0, 0)) != -EINVAL)
+      fail("fsmount of a context that was never created", r, -EINVAL);
+
+    sys6(SYS_fsconfig, ctx, FSCONFIG_SET_STRING, (long) "source",
+         (long) "mysrc", 0, 0);
+    if ((r = sys6(SYS_fsconfig, ctx, FSCONFIG_CMD_CREATE, 0, 0, 0, 0)) != 0)
+      fail("fsconfig creating the context", r, 0);
+
+    long mfd = sys6(SYS_fsmount, ctx, 0, 0, 0, 0, 0);
+    if (mfd < 0)
+      fail("fsmount", mfd, 0);
+
+    sys6(SYS_mkdirat, AT_FDCWD, (long) "/newapi", 0755, 0, 0, 0);
+    /*
+     * A marker underneath, so the mount can be shown to have happened. Writing
+     * to /newapi afterwards would succeed whether or not anything was mounted -
+     * it is a real directory either way - but a tmpfs over it hides what was
+     * there, and only a mount can do that.
+     */
+    { long f = sys6(SYS_openat, AT_FDCWD, (long) "/newapi/under",
+                    O_RDWR | O_CREAT, 0644, 0, 0);
+      if (f < 0)
+        fail("a marker under the mount point", f, 0);
+      sys6(SYS_close, f, 0, 0, 0, 0, 0); }
+
+    if ((r = sys6(SYS_move_mount, mfd, (long) "", AT_FDCWD, (long) "/newapi",
+                  MOVE_MOUNT_F_EMPTY_PATH, 0)) != 0)
+      fail("move_mount attaching the detached mount", r, 0);
+
+    /* The marker is hidden, which is what says a mount is there. */
+    { long f = sys6(SYS_openat, AT_FDCWD, (long) "/newapi/under", O_RDONLY, 0, 0, 0);
+      if (f >= 0) {
+        sys6(SYS_close, f, 0, 0, 0, 0, 0);
+        fail("what was under the mount point is still visible", 0, -ENOENT);
+      } }
+    /* And the tmpfs itself works. */
+    { long f = sys6(SYS_openat, AT_FDCWD, (long) "/newapi/x", O_RDWR | O_CREAT, 0644, 0, 0);
+      if (f < 0)
+        fail("writing to the tmpfs mounted through the new API", f, 0);
+      sys6(SYS_close, f, 0, 0, 0, 0, 0); }
+
+    /* A detached mount is used once. */
+    if ((r = sys6(SYS_move_mount, mfd, (long) "", AT_FDCWD, (long) "/newapi",
+                  MOVE_MOUNT_F_EMPTY_PATH, 0)) != -EINVAL)
+      fail("attaching the same detached mount twice", r, -EINVAL);
+
+    sys6(SYS_close, mfd, 0, 0, 0, 0, 0);
+    sys6(SYS_close, ctx, 0, 0, 0, 0, 0);
+    sys6(SYS_unlinkat, AT_FDCWD, (long) "/newapi/x", 0, 0, 0, 0);
+    sys6(SYS_umount2, (long) "/newapi", 0, 0, 0, 0, 0);
+    sys6(SYS_unlinkat, AT_FDCWD, (long) "/newapi/under", 0, 0, 0, 0);
+    sys6(SYS_unlinkat, AT_FDCWD, (long) "/newapi", AT_REMOVEDIR, 0, 0, 0); }
+
+  /* ---- open_tree, the other way to get a detached mount ---- */
+  { long tfd = sys6(SYS_open_tree, AT_FDCWD, (long) "/mdst", OPEN_TREE_CLONE, 0, 0, 0);
+    if (tfd < 0)
+      fail("open_tree cloning an existing mount", tfd, 0);
+    sys6(SYS_mkdirat, AT_FDCWD, (long) "/mclone", 0755, 0, 0, 0);
+    if ((r = sys6(SYS_move_mount, tfd, (long) "", AT_FDCWD, (long) "/mclone",
+                  MOVE_MOUNT_F_EMPTY_PATH, 0)) != 0)
+      fail("move_mount attaching the cloned tree", r, 0);
+    /* The clone shows the same thing the original does. */
+    { long f = sys6(SYS_openat, AT_FDCWD, (long) "/mclone/f", O_RDONLY, 0, 0, 0);
+      if (f < 0)
+        fail("a file visible through the cloned mount", f, 0);
+      sys6(SYS_close, f, 0, 0, 0, 0, 0); }
+    sys6(SYS_close, tfd, 0, 0, 0, 0, 0);
+    sys6(SYS_umount2, (long) "/mclone", 0, 0, 0, 0, 0);
+    sys6(SYS_unlinkat, AT_FDCWD, (long) "/mclone", AT_REMOVEDIR, 0, 0, 0);
+
+    if ((r = sys6(SYS_open_tree, AT_FDCWD, (long) "/nowhere", OPEN_TREE_CLONE, 0, 0, 0)) != -EINVAL)
+      fail("open_tree of something that is not a mount", r, -EINVAL); }
 
   sys6(SYS_umount2, (long) "/mdst", 0, 0, 0, 0, 0);
   sys6(SYS_unlinkat, AT_FDCWD, (long) "/msrc/f", 0, 0, 0, 0);

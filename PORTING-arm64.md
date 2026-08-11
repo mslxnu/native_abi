@@ -4824,3 +4824,61 @@ path a mount answers to, so there is nothing for a relative name to match until
 that resolution exists.
 
 254 of 375.
+
+### 3.5.91 The new mount API, and the link that was not asked for
+
+`fsopen`, `fsconfig`, `fsmount`, `open_tree`, `move_mount` are Linux's second
+way to mount something, and why it exists decides how it is built here.
+`mount(2)` does everything in one call — name a filesystem, configure it, attach
+it — with one errno to explain whichever part failed. The new API takes those
+apart: `fsopen` names a type and returns a **context**, `fsconfig` configures it
+one parameter at a time so a bad option is reported against that option,
+`fsmount` turns a configured context into a mount that exists but is attached
+nowhere, and `move_mount` attaches it. `open_tree` is the same idea from the
+other end, handing back a detached copy of an existing mount.
+
+So a guest now holds two new kinds of object by descriptor: a context being
+configured, and a mount with no place yet. Both are unlinked files with a magic
+in the header — the shape the POSIX message queues use, for the same reasons. The
+descriptor *is* the object, so it survives fork and the exec arm64's fork is
+built on, it goes when the guest closes it, and nothing here tracks which
+descriptors are live.
+
+**`fsconfig` was not asked for and is implemented anyway**, because without it
+the other two are unreachable: `fsmount` refuses a context that was never
+created, and `FSCONFIG_CMD_CREATE` is the only thing that creates one. Shipping
+`fsopen` and `fsmount` without it would be shipping a chain with a missing link.
+Of its parameters only `source` means anything here — it is what `/proc/mounts`
+shows a mount as coming from. The rest are filesystem options, and the
+filesystems this can provide have none it could honour: a tmpfs here is a host
+directory, so a `size=` it cannot enforce would be a limit the guest believes in
+and nothing applies.
+
+The type is checked at `fsopen` rather than at `fsmount`, which is the whole
+point of the split — a caller naming a filesystem this cannot provide finds out
+from the call that named it, not three calls later. That meant extracting what
+backs a filesystem type out of `mount(2)`, so both ask one function rather than
+growing two answers about which filesystems NABI supports.
+
+**The test had to be made to prove something.** Its first version wrote a file
+under the new mount and checked it succeeded — which it would have whether or not
+anything was mounted, since the mount point is a real directory either way. It
+now puts a marker in the directory first and requires it to be **hidden**
+afterwards, because only a mount shadows what was underneath. With `move_mount`
+made not to attach, that check reports the marker still visible; the write check
+passed happily.
+
+`statmount` completes the pair `listmount` began. There is no superblock behind
+any of this — a mount here is a rewrite of a path prefix — so `sb_flags` is
+reported because it is real and the device and magic are zero because they are
+not, with the returned mask saying which is which. Its strings sit after the
+fixed part at the offsets it reports, and the test reads them at those offsets
+rather than at assumed ones; the struct's size and field positions were measured
+rather than guessed, the first guess having been 536 where it is 512.
+
+`MOVE_MOUNT_SET_GROUP` is refused: it shares a peer group between two mounts, and
+propagation here is established through `mount(2)`. `fspick` is not implemented,
+which is why `FSCONFIG_CMD_RECONFIGURE` answers `EOPNOTSUPP` — there is no
+context it could arrive on.
+
+260 of 375.

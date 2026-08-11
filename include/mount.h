@@ -85,6 +85,74 @@ struct l_mnt_id_req {
 #define LINUX_MNT_ID_REQ_SIZE_VER0 24
 #define LINUX_LSMT_ROOT 0xffffffffffffffffULL
 
+/*
+ * statmount's answer. A fixed part and a run of NUL-terminated strings after
+ * it, each named by its byte offset into that run - the same shape as any
+ * variable-length kernel reply, and the reason `size` is reported back.
+ */
+struct l_statmount {
+  uint32_t size;
+  uint32_t mnt_opts;
+  uint64_t mask;
+  uint32_t sb_dev_major;
+  uint32_t sb_dev_minor;
+  uint64_t sb_magic;
+  uint32_t sb_flags;
+  uint32_t fs_type;
+  uint64_t mnt_id;
+  uint64_t mnt_parent_id;
+  uint32_t mnt_id_old;
+  uint32_t mnt_parent_id_old;
+  uint64_t mnt_attr;
+  uint64_t mnt_propagation;
+  uint64_t mnt_peer_group;
+  uint64_t mnt_master;
+  uint64_t propagate_from;
+  uint32_t mnt_root;
+  uint32_t mnt_point;
+  uint64_t mnt_ns_id;
+  uint64_t __spare2[49];
+  char     str[];
+};
+
+#define LINUX_STATMOUNT_SB_BASIC       0x00000001
+#define LINUX_STATMOUNT_MNT_BASIC      0x00000002
+#define LINUX_STATMOUNT_PROPAGATE_FROM 0x00000004
+#define LINUX_STATMOUNT_MNT_ROOT       0x00000008
+#define LINUX_STATMOUNT_MNT_POINT      0x00000010
+#define LINUX_STATMOUNT_FS_TYPE        0x00000020
+#define LINUX_STATMOUNT_MNT_NS_ID      0x00000040
+#define LINUX_STATMOUNT_MNT_OPTS       0x00000080
+
+/* open_tree */
+#define LINUX_OPEN_TREE_CLONE   1
+#define LINUX_OPEN_TREE_CLOEXEC 02000000   /* O_CLOEXEC */
+
+/* move_mount */
+#define LINUX_MOVE_MOUNT_F_SYMLINKS   0x00000001
+#define LINUX_MOVE_MOUNT_F_AUTOMOUNTS 0x00000002
+#define LINUX_MOVE_MOUNT_F_EMPTY_PATH 0x00000004
+#define LINUX_MOVE_MOUNT_T_SYMLINKS   0x00000010
+#define LINUX_MOVE_MOUNT_T_AUTOMOUNTS 0x00000020
+#define LINUX_MOVE_MOUNT_T_EMPTY_PATH 0x00000040
+#define LINUX_MOVE_MOUNT_SET_GROUP    0x00000100
+#define LINUX_MOVE_MOUNT_BENEATH      0x00000200
+#define LINUX_MOVE_MOUNT__MASK        0x00000377
+
+/* fsopen, and fsconfig's commands. */
+#define LINUX_FSOPEN_CLOEXEC 0x00000001
+
+#define LINUX_FSCONFIG_SET_FLAG        0
+#define LINUX_FSCONFIG_SET_STRING      1
+#define LINUX_FSCONFIG_SET_BINARY      2
+#define LINUX_FSCONFIG_SET_PATH        3
+#define LINUX_FSCONFIG_SET_PATH_EMPTY  4
+#define LINUX_FSCONFIG_SET_FD          5
+#define LINUX_FSCONFIG_CMD_CREATE      6
+#define LINUX_FSCONFIG_CMD_RECONFIGURE 7
+
+#define LINUX_FSMOUNT_CLOEXEC 0x00000001
+
 #define MOUNT_MAX      64
 #define MOUNT_PATH_MAX 256
 
