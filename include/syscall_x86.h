@@ -108,7 +108,7 @@
   SYSCALL(100, unimplemented) \
   SYSCALL(101, ptrace) \
   SYSCALL(102, getuid) \
-  SYSCALL(103, unimplemented) \
+  SYSCALL(103, syslog) \
   SYSCALL(104, getgid) \
   SYSCALL(105, setuid) \
   SYSCALL(106, setgid) \
@@ -144,7 +144,7 @@
   SYSCALL(136, unimplemented) \
   SYSCALL(137, statfs) \
   SYSCALL(138, fstatfs) \
-  SYSCALL(139, unimplemented) \
+  SYSCALL(139, sysfs) \
   SYSCALL(140, getpriority) \
   SYSCALL(141, setpriority) \
   SYSCALL(142, sched_setparam) \
@@ -281,7 +281,7 @@
   SYSCALL(273, set_robust_list) \
   SYSCALL(274, get_robust_list) \
   SYSCALL(275, unimplemented) \
-  SYSCALL(276, unimplemented) \
+  SYSCALL(276, tee) \
   SYSCALL(277, sync_file_range) \
   SYSCALL(278, unimplemented) \
   SYSCALL(279, unimplemented) \

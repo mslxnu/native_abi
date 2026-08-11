@@ -4123,3 +4123,60 @@ routing through a Darwin signal that does not exist, and interrupting a thread
 that is blocked so it notices.
 
 226 of 398 now.
+
+### 3.5.80 `syslog`, `sysfs`, `tee` — and two rows that were never syscalls
+
+**`syscalls` is not a syscall.** `__NR_syscalls` is the *count* of them (463) and
+`__NR_arch_specific_syscall` is the base an architecture numbers its private ones
+from (244). The dispatch-table generator has always skipped both; the README's
+doc generator, added in §3.5.74, did not — so the table carried two invented
+rows claiming NABI had failed to implement things that do not exist, and
+inflated the denominator by two. **396, not 398.**
+
+**`syslog`** is klogctl, the kernel's ring buffer, not the libc `syslog()`. There
+is no kernel here and so no buffer, and the honest answer is an empty one rather
+than an error: an empty log is a state a real machine can be in, while ENOSYS is
+a state `dmesg` does not expect and reports as a failure of the tool. `dmesg` now
+prints nothing and exits 0 — which is true, nothing has been logged — instead of
+"klogctl failed: Function not implemented".
+
+What is deliberately *not* done is answering with NABI's own warning sink. That
+is the host's account of the guest, written for whoever is debugging NABI: it
+names host paths, host descriptors and host errno values, and handing it over as
+the guest's kernel log would be both a leak and a fiction.
+
+`SYSLOG_ACTION_READ` waits for a message that will never come, rather than
+returning nothing, because a caller that gets 0 from it loops — `dmesg -w` would
+spin a core on a machine with nothing to say. Blocking until a signal is what it
+does on a quiet Linux too.
+
+**`sysfs`** is the filesystem-type table and has nothing to do with `/sys`.
+Obsolete on Linux — its own manual says so and points at `/proc/filesystems` —
+but still implemented and still numbered there, so a guest that calls it deserves
+an answer about *this* machine. The list is exactly the set `mount(2)` here
+accepts, so all three questions it can ask come out of the same truth the mount
+table is built from. It has no aarch64 number at all; only x86-64 ever gave it
+one, so it lives in the compat tail.
+
+**`tee` is refused, and that is the finding rather than an omission.** It copies
+between two pipes *without consuming* what it copied — the whole point is that
+the data is still there afterwards — and that needs a way to look into a pipe
+without taking from it. Darwin has none: a guest pipe is a real pipe, `FIONREAD`
+gives a count and not the bytes, and there is no `pread` on one.
+
+Read-and-write-back is not the same operation. Reading part of what is queued and
+appending it returns it *behind* what was left, so `"ABCDEF"` tee'd four bytes at
+a time comes back as `"EFABCD"` — reordered in the single-threaded case this is
+normally used in, before concurrency is even a question. Draining and restoring
+the whole queue fixes the order and opens a window where another writer can fill
+the pipe so the restore cannot complete, losing data outright. Either way it
+damages a stream while reporting success, which is worse than not having the
+call.
+
+It becomes possible if a guest pipe stops being a Darwin pipe: a socketpair
+supports `MSG_PEEK`, which is exactly tee's semantics. But `pipe(2)` is reached by
+everything, a socket is not a FIFO to `fstat` or `S_ISFIFO`, and changing what
+every guest pipe *is* to gain one rarely used call is the wrong trade until
+something needs it.
+
+228 of 396.

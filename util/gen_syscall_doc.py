@@ -15,10 +15,19 @@ import sys
 
 
 def kernel_names(path):
+    """{name: number} for the real syscalls in a header.
+
+    Two of the __NR_ defines are not syscalls and have to be dropped, or the
+    table invents rows for them and inflates the denominator: __NR_syscalls is
+    the *count* of syscalls, and __NR_arch_specific_syscall is the base an
+    architecture numbers its private ones from. The dispatch-table generator has
+    always skipped them; this one did not, and listed 463 and 244 as calls NABI
+    had failed to implement.
+    """
     out = {}
     for line in open(path):
         m = re.match(r'#define\s+__NR_(\w+)\s+(\d+)\s*$', line)
-        if m:
+        if m and m.group(1) not in ('syscalls', 'arch_specific_syscall'):
             out[m.group(1)] = int(m.group(2))
     return out
 
@@ -32,7 +41,7 @@ def refuses():
     implemented and deliberately is not - see src/proc/rseq.c.
     """
     import glob
-    out = {'rseq'}
+    out = {'rseq', 'tee'}
     for path in glob.glob('src/**/*.c', recursive=True):
         for m in re.finditer(r'DEFINE_NOT_IMPLEMENTED_SYSCALL\(\s*(\w+)',
                              open(path).read()):

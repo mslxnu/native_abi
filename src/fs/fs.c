@@ -4043,6 +4043,36 @@ out:
   return r;
 }
 
+/*
+ * tee(2): refused, and this is the reason rather than an omission.
+ *
+ * tee copies between two pipes *without consuming* what it copied - the whole
+ * point is that the data is still there to be read afterwards. That needs a way
+ * to look into a pipe without taking from it, and Darwin has none: a pipe here
+ * is a real pipe, FIONREAD gives a byte count and not the bytes, and there is
+ * no pread on one.
+ *
+ * What is left is to read the data and write it back, and that is not the same
+ * operation. Reading part of what is queued and appending it returns it behind
+ * whatever was left, so "ABCDEF" tee'd four bytes at a time comes back as
+ * "EFABCD" - reordered in the single-threaded case this is normally used in,
+ * before any question of concurrency arises. Draining and restoring the whole
+ * queue fixes the order and leaves a window in which another writer can fill
+ * the pipe so that the restore cannot complete, which loses data outright.
+ * Either way it damages a stream while reporting success, which is worse than
+ * not having the call.
+ *
+ * It becomes possible if a guest pipe stops being a Darwin pipe. A socketpair
+ * supports MSG_PEEK, which is exactly tee's semantics - but pipe(2) is reached
+ * by everything, a socket is not a FIFO to fstat or to S_ISFIFO, and changing
+ * what every guest pipe *is* to gain one rarely used call is the wrong trade
+ * until something needs it.
+ */
+DEFINE_SYSCALL(tee, int, fd_in, int, fd_out, size_t, len, unsigned int, flags)
+{
+  return -LINUX_ENOSYS;
+}
+
 DEFINE_SYSCALL(pipe2, gaddr_t, fildes_ptr, int, flags)
 {
   if (flags & ~(LINUX_O_NONBLOCK | LINUX_O_CLOEXEC | LINUX_O_DIRECT)) {

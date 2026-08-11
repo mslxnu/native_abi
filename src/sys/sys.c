@@ -5,6 +5,9 @@
 #include "linux/misc.h"
 #include "linux/random.h"
 
+#include <string.h>
+#include <pthread.h>
+#include "linux/errno.h"
 #include <stdlib.h>
 #include <time.h>
 #include <unistd.h>
@@ -113,4 +116,131 @@ DEFINE_SYSCALL(getrandom, gaddr_t, buf_ptr, size_t, count, unsigned, flags)
 out:
   free(buf);
   return r;
+}
+
+/*
+ * syslog(2) - klogctl, the kernel's own ring buffer, not the libc syslog().
+ *
+ * There is no kernel here, so there is no ring buffer, and the honest answer is
+ * an empty one rather than an error. An empty log is a state a real machine can
+ * be in; ENOSYS is a state dmesg does not expect and reports as a failure of the
+ * tool. So `dmesg` prints nothing and exits 0, which is true - nothing has been
+ * logged - instead of "klogctl failed: Function not implemented".
+ *
+ * What is deliberately not done is answering with nabi's own warning sink. That
+ * is the host's account of the guest, written for whoever is debugging nabi; it
+ * names host paths, host descriptors and host errno values, and handing it to
+ * the guest as its kernel log would be both a leak and a fiction.
+ *
+ * SYSLOG_ACTION_READ waits for a message that will never come, and waits rather
+ * than returning nothing, because a caller that gets 0 from it loops - `dmesg
+ * -w` would spin a core on a machine with nothing to say. Blocking until a
+ * signal is what it does on a quiet Linux too.
+ */
+#define LINUX_SYSLOG_ACTION_CLOSE          0
+#define LINUX_SYSLOG_ACTION_OPEN           1
+#define LINUX_SYSLOG_ACTION_READ           2
+#define LINUX_SYSLOG_ACTION_READ_ALL       3
+#define LINUX_SYSLOG_ACTION_READ_CLEAR     4
+#define LINUX_SYSLOG_ACTION_CLEAR          5
+#define LINUX_SYSLOG_ACTION_CONSOLE_OFF    6
+#define LINUX_SYSLOG_ACTION_CONSOLE_ON     7
+#define LINUX_SYSLOG_ACTION_CONSOLE_LEVEL  8
+#define LINUX_SYSLOG_ACTION_SIZE_UNREAD    9
+#define LINUX_SYSLOG_ACTION_SIZE_BUFFER   10
+
+DEFINE_SYSCALL(syslog, int, type, gaddr_t, buf_ptr, int, len)
+{
+  pthread_rwlock_rdlock(&proc.cred.lock);
+  bool root = proc.cred.euid == 0;
+  pthread_rwlock_unlock(&proc.cred.lock);
+
+  switch (type) {
+  case LINUX_SYSLOG_ACTION_CLOSE:
+  case LINUX_SYSLOG_ACTION_OPEN:
+    return 0;                   /* both are no-ops on Linux as well */
+
+  case LINUX_SYSLOG_ACTION_READ_ALL:
+  case LINUX_SYSLOG_ACTION_READ_CLEAR:
+    if (len < 0)
+      return -LINUX_EINVAL;
+    return 0;                   /* nothing logged, so nothing read */
+
+  case LINUX_SYSLOG_ACTION_READ:
+    if (len < 0)
+      return -LINUX_EINVAL;
+    /* Nothing will arrive. Waiting for it is what this call means, and is
+     * cheaper for everyone than telling a caller "no messages" in a loop. */
+    for (;;) {
+      if (has_sigpending())
+        return -LINUX_EINTR;
+      struct timespec nap = { 0, 100 * 1000 * 1000 };
+      nanosleep(&nap, NULL);
+    }
+
+  case LINUX_SYSLOG_ACTION_CLEAR:
+  case LINUX_SYSLOG_ACTION_CONSOLE_OFF:
+  case LINUX_SYSLOG_ACTION_CONSOLE_ON:
+  case LINUX_SYSLOG_ACTION_CONSOLE_LEVEL:
+    /* Administrative, and CAP_SYS_ADMIN on Linux. There is nothing to clear and
+     * no console to set a level on, but the privilege is still the answer a
+     * caller checks. */
+    return root ? 0 : -LINUX_EPERM;
+
+  case LINUX_SYSLOG_ACTION_SIZE_UNREAD:
+    return 0;
+
+  case LINUX_SYSLOG_ACTION_SIZE_BUFFER:
+    /* What a buffer would be if there were one. Callers size an allocation
+     * from this, and zero makes some of them conclude the call is broken. */
+    return 1 << 17;
+
+  default:
+    return -LINUX_EINVAL;
+  }
+}
+
+/*
+ * sysfs(2) - the filesystem-type table, and nothing to do with /sys.
+ *
+ * Obsolete on Linux, which says so in its own manual and points at
+ * /proc/filesystems, but still implemented there and still numbered - so a
+ * guest that calls it should get an answer about *this* machine rather than
+ * ENOSYS. The list is exactly the set mount(2) here accepts, so the three
+ * questions it can ask - how many, what is number N, what number is this name -
+ * are all answered out of the same truth the mount table is built from.
+ *
+ * It has no aarch64 number at all; only x86-64 ever gave it one.
+ */
+static const char *const known_filesystems[] = {
+  "tmpfs", "proc", "sysfs", "devtmpfs", "devpts",
+  "cgroup", "cgroup2", "mqueue", "securityfs", "debugfs",
+};
+#define NR_KNOWN_FS (sizeof known_filesystems / sizeof known_filesystems[0])
+
+DEFINE_SYSCALL(sysfs, int, option, unsigned long, arg1, unsigned long, arg2)
+{
+  switch (option) {
+  case 1: {                     /* name -> index */
+    char name[64];
+    if (strncpy_from_user(name, (gstr_t) arg1, sizeof name) < 0)
+      return -LINUX_EFAULT;
+    for (size_t i = 0; i < NR_KNOWN_FS; i++)
+      if (strcmp(name, known_filesystems[i]) == 0)
+        return (int) i;
+    return -LINUX_EINVAL;
+  }
+  case 2: {                     /* index -> name */
+    if (arg1 >= NR_KNOWN_FS)
+      return -LINUX_EINVAL;
+    const char *name = known_filesystems[arg1];
+    if (copy_to_user((gaddr_t) arg2, name, strlen(name) + 1))
+      return -LINUX_EFAULT;
+    return 0;
+  }
+  case 3:
+    return (int) NR_KNOWN_FS;
+  default:
+    return -LINUX_EINVAL;
+  }
 }

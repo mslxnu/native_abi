@@ -83,7 +83,7 @@
   SYSCALL(74, unimplemented) \
   SYSCALL(75, unimplemented) \
   SYSCALL(76, unimplemented) \
-  SYSCALL(77, unimplemented) \
+  SYSCALL(77, tee) \
   SYSCALL(78, readlinkat) \
   SYSCALL(79, newfstatat) \
   SYSCALL(80, fstat) \
@@ -122,7 +122,7 @@
   SYSCALL(113, clock_gettime) \
   SYSCALL(114, clock_getres) \
   SYSCALL(115, clock_nanosleep) \
-  SYSCALL(116, unimplemented) \
+  SYSCALL(116, syslog) \
   SYSCALL(117, ptrace) \
   SYSCALL(118, sched_setparam) \
   SYSCALL(119, sched_setscheduler) \
@@ -1066,14 +1066,15 @@
   SYSCALL(1054, set_thread_area) \
   SYSCALL(1055, stat) \
   SYSCALL(1056, symlink) \
-  SYSCALL(1057, time) \
-  SYSCALL(1058, tuxcall) \
-  SYSCALL(1059, unimplemented) \
-  SYSCALL(1060, unlink) \
-  SYSCALL(1061, uselib) \
-  SYSCALL(1062, utime) \
-  SYSCALL(1063, utimes) \
-  SYSCALL(1064, vfork) \
-  SYSCALL(1065, vserver) \
+  SYSCALL(1057, sysfs) \
+  SYSCALL(1058, time) \
+  SYSCALL(1059, tuxcall) \
+  SYSCALL(1060, unimplemented) \
+  SYSCALL(1061, unlink) \
+  SYSCALL(1062, uselib) \
+  SYSCALL(1063, utime) \
+  SYSCALL(1064, utimes) \
+  SYSCALL(1065, vfork) \
+  SYSCALL(1066, vserver) \
 
-#define NR_SYSCALLS 1066
+#define NR_SYSCALLS 1067
