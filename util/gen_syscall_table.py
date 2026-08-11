@@ -21,8 +21,12 @@
 # "unimplemented"), and NABI handlers with no aarch64 number (x86 legacy, e.g.
 # open/stat/fork - dropped, since aarch64 glibc never calls them).
 
+import os
 import re
 import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import kernel_headers
 
 
 def implemented_names(x86_syscall_h):
@@ -54,8 +58,14 @@ def parse_generic_unistd(path):
     Two forms matter: plain `#define __NR_<name> <int>`, and the 32/64 split
     `#define __NR_<name> __NR3264_<name>` where `__NR3264_<name>` is defined to
     an int elsewhere. The latter has to be resolved one level.
+
+    The header is read as *this architecture* sees it rather than as text - see
+    util/kernel_headers.py. Reading both branches of every conditional is how
+    fifty-eight numbers that exist only on 32-bit architectures came to be listed
+    as aarch64 syscalls, and how `sync_file_range2` came to share 84 with the
+    spelling arm64 actually uses.
     """
-    text = open(path).read()
+    text = kernel_headers.resolve(path)
 
     nr3264 = {}
     for m in re.finditer(r'#define\s+__NR3264_(\w+)\s+(\d+)', text):

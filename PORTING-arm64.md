@@ -4716,3 +4716,53 @@ tables, which is a worse failure than the one being fixed, so it is left for a
 commit of its own where it can be verified rather than folded into this one.
 
 251 of 395.
+
+### 3.5.89 The header is a program, not a list
+
+The generators read `asm-generic/unistd.h` with a regex, and a regex reads
+*both* branches of every conditional. A third of that header is conditional, so
+the aarch64 table had been claiming syscalls aarch64 does not have: the twenty
+`*_time64` numbers from the 32-bit-only block, and `sync_file_range2` sharing 84
+with the spelling arm64 actually uses.
+
+Nothing malfunctioned. Those numbers are unassigned on aarch64, so a guest could
+never reach the `unimplemented` entries they produced - which is exactly why it
+went unnoticed. What it cost was the truth of the table: 395 calls listed where
+there are 375, and twenty of them counted as work still to do.
+
+The fix resolves the conditionals instead of ignoring them, in
+`util/kernel_headers.py`. **The risk in doing that is the reason it was left for
+its own commit**: resolving requires knowing which `__ARCH_WANT_*` symbols arm64
+defines, and a wrong entry there silently adds or removes real syscalls from both
+dispatch tables, which is a worse fault than the one being repaired. Three things
+hold it down.
+
+The symbol set is small, closed, and annotated with what each entry decides -
+`__ARCH_WANT_RENAMEAT` is renameat at 38, `__ARCH_WANT_SET_GET_RLIMIT` is 163 and
+164, `__ARCH_WANT_MEMFD_SECRET` is 447, and `__ARCH_WANT_SYNC_FILE_RANGE2` is
+which spelling 84 gets. Two more are listed and noted as unable to matter,
+because every condition using them is already true on a 64-bit architecture.
+
+Anything it cannot evaluate is fatal rather than assumed. An unknown symbol, an
+expression in an unhandled form, an unbalanced conditional - all stop the build,
+so a header that grows a new `#ifdef` cannot quietly drop whatever is inside it.
+The first version did not manage this: an unknown symbol in `#ifdef` was treated
+as undefined, which is what a preprocessor does but not what this needed, and the
+file's own docstring already claimed otherwise. That gap was found by testing the
+claim rather than by reading it.
+
+And the result is checked rather than trusted. Both dispatch tables come out
+**byte-identical** - the twenty numbers only ever produced `unimplemented`
+entries in slots that still exist - and every row of the README table keeps its
+numbers and its status. The only change is twenty rows removed, each verified to
+have been unimplemented and to have had no x86-64 number, which is what a
+32-bit-only syscall looks like.
+
+Two details of real preprocessor behaviour had to be honoured to get there.
+Conditions inside a branch that is not taken are **not evaluated**, only counted
+for nesting - the header asks `#ifdef __NR3264_stat` about a macro nothing has
+defined for years, and evaluating dead code strictly would have made that fatal.
+And a symbol in the header's own `__NR`/`__SC_` namespace is the header's
+business: absent means absent, not unknown.
+
+Still 251 implemented; the denominator is now 375.

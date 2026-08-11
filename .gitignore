@@ -9,3 +9,4 @@ out/
 
 # Scratch files the guest suite leaves behind in test/.
 test/noah-mv.*
+__pycache__/

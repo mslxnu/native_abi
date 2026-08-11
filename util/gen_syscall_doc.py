@@ -10,11 +10,15 @@ run against.
 
 Usage: util/gen_syscall_doc.py <asm-generic/unistd.h> <asm/unistd_64.h>
 """
+import os
 import re
 import sys
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import kernel_headers
 
-def kernel_names(path):
+
+def kernel_names(path, generic=False):
     """{name: number} for the real syscalls in a header.
 
     Two of the __NR_ defines are not syscalls and have to be dropped, or the
@@ -31,7 +35,7 @@ def kernel_names(path):
     no aarch64 number at all. The dispatch-table generator has always followed
     the indirection; this one now does too.
     """
-    text = open(path).read()
+    text = kernel_headers.resolve(path) if generic else open(path).read()
     nr3264 = {m.group(1): int(m.group(2))
               for m in re.finditer(r'#define\s+__NR3264_(\w+)\s+(\d+)', text)}
     out = {}
@@ -106,7 +110,7 @@ def implemented(path):
 def main():
     ia = implemented('include/syscall_arm64.h')
     ix = implemented('include/syscall_x86.h')
-    a64 = dedupe(kernel_names(sys.argv[1]), ia)
+    a64 = dedupe(kernel_names(sys.argv[1], generic=True), ia)
     x64 = kernel_names(sys.argv[2])
     no = refuses()
 
