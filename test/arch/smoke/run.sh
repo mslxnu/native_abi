@@ -546,6 +546,18 @@ else
     fail=1
 fi
 
+# xattrtest: extended attributes round-tripping, and nabi's own bookkeeping
+# attribute staying invisible, unwritable and unremovable while the ownership it
+# records keeps working. Needs guest root for the chown.
+cp "$here/xattrtest" "$root/"; chmod +x "$root/xattrtest"
+out=$(MSL_ROOT=1 "$NABI" -m "$root" /xattrtest); rc=$?
+if [ "$rc" -eq 0 ] && [ "$out" = "xattr ok" ]; then
+    echo "  ok  xattrtest -> \"$out\", exit 0"
+else
+    echo "  FAIL xattrtest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 if [ "$fail" -eq 0 ]; then
     echo "smoke: PASS"
 else

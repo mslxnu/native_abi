@@ -194,17 +194,17 @@
   SYSCALL(186, gettid) \
   SYSCALL(187, unimplemented) \
   SYSCALL(188, setxattr) \
-  SYSCALL(189, unimplemented) \
+  SYSCALL(189, lsetxattr) \
   SYSCALL(190, fsetxattr) \
   SYSCALL(191, getxattr) \
-  SYSCALL(192, unimplemented) \
+  SYSCALL(192, lgetxattr) \
   SYSCALL(193, fgetxattr) \
-  SYSCALL(194, unimplemented) \
-  SYSCALL(195, unimplemented) \
+  SYSCALL(194, listxattr) \
+  SYSCALL(195, llistxattr) \
   SYSCALL(196, flistxattr) \
-  SYSCALL(197, unimplemented) \
-  SYSCALL(198, unimplemented) \
-  SYSCALL(199, unimplemented) \
+  SYSCALL(197, removexattr) \
+  SYSCALL(198, lremovexattr) \
+  SYSCALL(199, fremovexattr) \
   SYSCALL(200, tkill) \
   SYSCALL(201, time) \
   SYSCALL(202, futex) \

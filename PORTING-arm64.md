@@ -3928,3 +3928,50 @@ Two consequences:
   The `#ifdef`s are not evaluated, so the tie is broken by which name NABI has a
   handler for — the other is, by construction, the variant this architecture
   does not use.
+
+### 3.5.75 Extended attributes — **implemented**, and one of them was saying yes
+
+The twelve entry points were four stubs and eight absent numbers, and
+`setxattr` was the bad kind of stub: it warned and returned **0**, so every
+attribute a guest stored was stored nowhere and reported as stored. dpkg and rpm
+set attributes while unpacking and `tar`, `cp -a` and `rsync -X` copy them, so
+all of that had been quietly doing nothing. `lgetxattr` and `llistxattr` were
+among the handful of calls a real workload still reached (see §3.5.77).
+
+Darwin has the whole family under the same names, with two differences: a
+`position` argument, which is for resource forks and is zero for everything
+else, and "do not follow the symlink" spelled as an option flag rather than as a
+separate `l`-prefixed call — so twelve Linux entry points are four Darwin ones
+with `XATTR_NOFOLLOW` set or not.
+
+**The part that is not a translation is hiding NABI's own attributes.** File
+ownership and the guest's mode bits live in `msl.nabi.owner` and `msl.nabi.mode`,
+because Darwin cannot hold a uid the host account has not got (see `struct
+cred`). They are bookkeeping, not the guest's data, and a guest that could see
+them could do three things it must not: read them, remove them — destroying the
+ownership of its own files — and, worst, **copy** them. `tar -p`, `cp -a` and
+`rsync -X` all read every attribute from one file and write them onto another, so
+a single archive extraction would stamp one file's owner across everything it
+touched. They are filtered from listings and refused by name.
+
+Darwin's own attributes are hidden too, for a different reason. `com.apple.provenance`
+is real and is the *host's*, and Linux has only the four namespaces `user`,
+`system`, `security` and `trusted` — `setxattr` refuses anything else — so a
+guest can neither create one nor make sense of one. The only thing it can do with
+them is copy them somewhere they do not belong.
+
+With `attr` installed from Debian:
+
+```
+set:    ok
+get:    world
+every attribute the guest can see: [user.k]      <- not com.apple.*, not msl.nabi.*
+owner:  4242                                     <- kept in msl.nabi.owner
+remove nabi attr: Operation not permitted
+write  nabi attr: Operation not permitted
+owner still: 4242
+```
+
+`xattrtest` guards the round trip and all four halves of the containment: absent
+from the listing, `ENODATA` on read, `EPERM` on write and remove, and the
+ownership still working afterwards.

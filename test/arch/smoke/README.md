@@ -227,6 +227,14 @@ guest-code cache sync.
   `open_by_handle_at`, then checking the *content* that comes back - a handle
   that opened the wrong file would pass any check of the return value alone.
 
+- `xattrtest` — extended attributes round-tripping, which they did not: `setxattr`
+  used to warn and return 0, so everything a guest stored was stored nowhere and
+  reported as stored. The rest is containment — nabi keeps a file's guest
+  ownership in `msl.nabi.owner`, and a guest that could read it could also copy
+  it, since `cp -a` and `tar --xattrs` read every attribute from one file and
+  write them onto another. It has to be absent from listings and refused by
+  name, with the ownership it records still working afterwards.
+
 - `ipctest` — System V IPC: a segment created, attached, shared across a fork,
   detached and removed; keys resolving to ids; semaphore values through
   `SETVAL`/`GETALL`/`semop`; and `unshare(CLONE_NEWIPC)` making the same key

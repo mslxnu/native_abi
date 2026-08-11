@@ -12,17 +12,17 @@
   SYSCALL(3, unimplemented) \
   SYSCALL(4, unimplemented) \
   SYSCALL(5, setxattr) \
-  SYSCALL(6, unimplemented) \
+  SYSCALL(6, lsetxattr) \
   SYSCALL(7, fsetxattr) \
   SYSCALL(8, getxattr) \
-  SYSCALL(9, unimplemented) \
+  SYSCALL(9, lgetxattr) \
   SYSCALL(10, fgetxattr) \
-  SYSCALL(11, unimplemented) \
-  SYSCALL(12, unimplemented) \
+  SYSCALL(11, listxattr) \
+  SYSCALL(12, llistxattr) \
   SYSCALL(13, flistxattr) \
-  SYSCALL(14, unimplemented) \
-  SYSCALL(15, unimplemented) \
-  SYSCALL(16, unimplemented) \
+  SYSCALL(14, removexattr) \
+  SYSCALL(15, lremovexattr) \
+  SYSCALL(16, fremovexattr) \
   SYSCALL(17, getcwd) \
   SYSCALL(18, unimplemented) \
   SYSCALL(19, eventfd2) \
