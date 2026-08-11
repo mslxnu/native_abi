@@ -127,17 +127,51 @@ start_c(unsigned long *sp)
     if (v == 0)
       fail("AT_PAGESZ", (long) v, 1); }
 
-  /* AT_RANDOM points at sixteen bytes the guest can read; glibc builds its
-   * stack canary out of them, so a pointer that is not readable is a crash
-   * before main. */
+  /*
+   * AT_RANDOM points at sixteen bytes glibc builds its stack canary and pointer
+   * guard out of, so an unreadable pointer is a crash before main - and bytes
+   * that are not random are a canary that can be guessed, which is worse than a
+   * crash because nothing reports it.
+   *
+   * A single run cannot show that sixteen bytes are random. What it can show is
+   * that they are not obviously *not*: all-zero is what an unwritten buffer
+   * looks like when the stack beneath happened to be clean, and all-identical
+   * covers the rest of that family. Whether they differ between runs is the
+   * real question, and only something outside one run can ask it - see the
+   * --random mode below, which run.sh uses for exactly that.
+   */
   { unsigned long v = 0;
     have(AT_RANDOM, &v);
     if (v == 0)
       fail("AT_RANDOM's pointer", (long) v, 1);
-    volatile unsigned char *r = (volatile unsigned char *) v;
-    unsigned long sum = 0;
-    for (int i = 0; i < 16; i++) sum += r[i];
-    (void) sum; }
+    const unsigned char *r = (const unsigned char *) v;
+    int zero = 1, same = 1;
+    for (int i = 0; i < 16; i++) {
+      if (r[i] != 0) zero = 0;
+      if (r[i] != r[0]) same = 0;
+    }
+    if (zero)
+      fail("AT_RANDOM's sixteen bytes, which are all zero", 0, 1);
+    if (same)
+      fail("AT_RANDOM's sixteen bytes, which are all the same", r[0], -1);
+
+    /*
+     * Dump them instead of the usual line when asked. run.sh runs this twice
+     * and requires the two to differ, which is the only way to catch bytes that
+     * are stable across execs - an uninitialised buffer reached by the same
+     * code path every time looks perfectly random within any one run.
+     */
+    if (argc > 1) {
+      const char *hex = "0123456789abcdef";
+      char out[33];
+      for (int i = 0; i < 16; i++) {
+        out[i * 2] = hex[r[i] >> 4];
+        out[i * 2 + 1] = hex[r[i] & 15];
+      }
+      out[32] = 0;
+      put(out); put("\n");
+      sys3(SYS_exit, 0, 0, 0);
+    } }
 
   must("AT_EXECFN",  AT_EXECFN);
   must("AT_PLATFORM", AT_PLATFORM);

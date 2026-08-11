@@ -328,7 +328,27 @@ init_userstack(int argc, char *argv[], char **envp, uint64_t exe_base,
   vmm_write_register(HV_X86_RBP, STACK_TOP);
 #endif
 
+  /*
+   * The sixteen bytes AT_RANDOM points at, and they have to be random.
+   *
+   * This was an uninitialised array - whatever happened to be on nabi's own
+   * stack at that moment - and what reads it is not a program asking politely
+   * for entropy. glibc builds the *stack canary* out of these bytes, and the
+   * pointer guard it mangles setjmp buffers and atexit handlers with. Leaving
+   * them to chance leaves both to chance: the same nabi running the same
+   * binary reaches this point by the same path, so the "random" value is
+   * substantially repeatable, and a canary that can be predicted is a canary
+   * that does not stop the overflow it exists to stop.
+   *
+   * arc4random_buf rather than the /dev/urandom read getrandom(2) does, because
+   * the two are answering different questions. getrandom has to honour a
+   * caller's choice of pool and its non-blocking flag, so it has to be a read
+   * from the source the caller named. Nothing chose anything here; this needs
+   * sixteen good bytes and has no way to report a failure - it is the middle of
+   * building a process image - and arc4random_buf is the one that cannot fail.
+   */
   char random[16];
+  arc4random_buf(random, sizeof random);
 
   uint64_t rand_ptr = push(random, sizeof random);
 

@@ -701,6 +701,20 @@ else
     fail=1
 fi
 
+# AT_RANDOM, which only two runs can judge. glibc builds the stack canary and
+# the pointer guard out of those sixteen bytes, and no single run can tell
+# random bytes from bytes that are simply the same every time - which is what
+# they were when the array was left uninitialised: the upper eight identical on
+# every run and the lower eight a host pointer with a few bits of ASLR in it.
+a=$("$NABI" -m "$root" /auxvtest --random)
+b=$("$NABI" -m "$root" /auxvtest --random)
+if [ -n "$a" ] && [ "$a" != "$b" ]; then
+    echo "  ok  auxvtest AT_RANDOM differs between runs"
+else
+    echo "  FAIL auxvtest AT_RANDOM -> \"$a\" then \"$b\""
+    fail=1
+fi
+
 if [ "$fail" -eq 0 ]; then
     echo "smoke: PASS"
 else

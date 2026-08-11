@@ -394,7 +394,10 @@ guest-code cache sync.
   `AT_PLATFORM` are pointers, so being present is only half of it — a pointer
   into memory the guest cannot read, or at a string that was never written,
   passes a presence check and fails everything after it. Both are followed and
-  read.
+  read. `AT_RANDOM` is judged across **two** runs rather than within one,
+  because no single run can tell random bytes from bytes that are simply the
+  same every time — which is what they were when the array was left
+  uninitialised.
 
 The ELF binaries are committed prebuilt (as the x86 guest tests under
 `test/*/build/` are), so the check needs no cross-toolchain. The `.s` sources

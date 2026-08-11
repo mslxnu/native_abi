@@ -4955,3 +4955,42 @@ presence check and fails everything after it — so `auxvtest` follows both and
 reads them. Against a build where `AT_EXECFN` is a valid pointer to the wrong
 thing it reports `240, wanted 47`, and against one claiming `x86_64` on an arm64
 guest, `120, wanted 97`.
+
+### 3.5.93 AT_RANDOM, which was not random
+
+`AT_RANDOM` had been there all along, and pointed at sixteen bytes that were
+never written — an uninitialised array, so whatever happened to be on NABI's own
+stack at that moment. It reads as a cosmetic omission and it is not one, because
+of what consumes those bytes: glibc builds the **stack canary** out of the first
+eight and the **pointer guard** it mangles `setjmp` buffers and `atexit` handlers
+with out of the next eight.
+
+Five runs of the old code, dumped:
+
+```
+e053586d01000000f02ec33102000000
+e0137f6d01000000f02ec33102000000
+e0d3e96e01000000f02ec33102000000
+e0134c6d01000000f02ec33102000000
+e093656d01000000f02ec33102000000
+```
+
+The upper eight bytes are **identical on every run**, so the pointer guard was a
+constant. The lower eight are a host pointer in which three bytes move with ASLR
+and the rest, including the low byte, do not — so a canary that is supposed to
+carry sixty-four bits of unknown carried perhaps twenty, in a known shape. A
+canary that can be guessed is a canary that does not stop the overflow it exists
+to stop, and nothing anywhere reports that it failed to.
+
+`arc4random_buf` fills it now, rather than the `/dev/urandom` read `getrandom(2)`
+does, because the two answer different questions. `getrandom` has to honour a
+caller's choice of pool and its non-blocking flag, so it must read from the
+source the caller named. Nothing chose anything here: this needs sixteen good
+bytes in the middle of building a process image, with no way to report a failure
+and nothing sensible to do about one — and `arc4random_buf` cannot fail.
+
+**The test for this had to be built differently from the others**, and the old
+values show why. They are not all-zero and not all-identical, so every check that
+looks at one run's bytes passes on them. What is wrong with them is only visible
+*between* runs, so `run.sh` runs the dump twice and requires the two to differ.
+No single run can tell random bytes from bytes that are merely always the same.
