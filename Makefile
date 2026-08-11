@@ -130,6 +130,7 @@ COMMON_SRCS := src/main.c \
                src/fs/xattr.c \
                src/fs/sync.c \
                src/fs/aio.c \
+               src/fs/io_uring.c \
                src/fs/copy.c \
                src/fs/splice.c \
                src/fs/tee.c \

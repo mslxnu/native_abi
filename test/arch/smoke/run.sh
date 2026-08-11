@@ -641,6 +641,21 @@ else
     fail=1
 fi
 
+# uringtest: io_uring, driven by hand rather than through liburing, because the
+# thing being tested is the layout NABI reports - the offsets come out of
+# io_uring_params and are used as a real caller would use them. The first check
+# is the one that matters: NABI writes ring_entries before the guest ever maps
+# the page, so reading it back proves the two are looking at the same memory.
+# That check is what caught the ring descriptor being returned wrong.
+cp "$here/uringtest" "$root/"; chmod +x "$root/uringtest"
+out=$("$NABI" -m "$root" /uringtest); rc=$?
+if [ "$rc" -eq 0 ] && [ "$out" = "uring ok" ]; then
+    echo "  ok  uringtest -> \"$out\", exit 0"
+else
+    echo "  FAIL uringtest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 if [ "$fail" -eq 0 ]; then
     echo "smoke: PASS"
 else

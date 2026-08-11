@@ -261,6 +261,9 @@ void timerfd_close(int fd);
 
 /* tee (src/fs/tee.c). What tee removed from a pipe is held in front of it, so
  * reads and readiness have to consult it before the pipe itself. */
+int     do_openat(int dirfd, const char *name, int flags, int mode);
+int     do_close(struct fdtable *table, int fd);
+void    uring_close(int fd);
 void    eventfd_signal(int fd, uint64_t add);
 
 bool    tee_pending(void);

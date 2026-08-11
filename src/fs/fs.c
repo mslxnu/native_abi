@@ -3014,7 +3014,7 @@ vfs_ungrab_dir(struct path *path)
   free(path->dir);
 }
 
-static int
+int
 do_openat(int dirfd, const char *name, int flags, int mode)
 {
   int lkflag = 0;
@@ -3330,6 +3330,7 @@ user_close(int fd)
   inotify_close(fd);
   fanotify_close(fd);
   timerfd_close(fd);
+  uring_close(fd);
 
   pthread_rwlock_wrlock(&proc.fileinfo.fdtable_lock);
   int ret = do_close(&proc.fileinfo.fdtable, fd);

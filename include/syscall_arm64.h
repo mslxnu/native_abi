@@ -431,9 +431,9 @@
   SYSCALL(422, unimplemented) \
   SYSCALL(423, unimplemented) \
   SYSCALL(424, unimplemented) \
-  SYSCALL(425, unimplemented) \
-  SYSCALL(426, unimplemented) \
-  SYSCALL(427, unimplemented) \
+  SYSCALL(425, io_uring_setup) \
+  SYSCALL(426, io_uring_enter) \
+  SYSCALL(427, io_uring_register) \
   SYSCALL(428, unimplemented) \
   SYSCALL(429, unimplemented) \
   SYSCALL(430, unimplemented) \

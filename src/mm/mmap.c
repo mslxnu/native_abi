@@ -138,6 +138,12 @@ do_mmap(gaddr_t addr, size_t len, int d_prot, int l_prot, int l_flags, int fd, o
   /* We ignore these currenlty */
   l_flags &= ~LINUX_MAP_NORESERVE;
 
+  /* A prefault hint, and nothing a caller can observe except as speed. It is
+   * ignored rather than rejected because the alternative here is exit(1), and
+   * liburing passes it on every one of the three ring mappings - so an io_uring
+   * guest would die at its first mmap over a flag that means "be quick". */
+  l_flags &= ~LINUX_MAP_POPULATE;
+
   /* the linux kernel does nothing for LINUX_MAP_STACK */
   l_flags &= ~LINUX_MAP_STACK;
 

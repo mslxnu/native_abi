@@ -298,6 +298,18 @@ guest-code cache sync.
   `IOCB_FLAG_RESFD` must be poked on completion — without that the test hangs
   rather than fails, which is what a guest folding aio into a poll loop would do.
 
+- `uringtest` — `io_uring`, driven by hand rather than through liburing, because
+  what is being checked is the layout NABI *reports*: the offsets come out of
+  `io_uring_params` and are used exactly as a real caller would use them, so a
+  wrong one shows up here rather than as a mystery inside somebody's library. The
+  first assertion is the load-bearing one — NABI writes `ring_entries` before the
+  guest ever maps the page, so reading it back proves the two are looking at the
+  same memory, and that check is what caught the ring descriptor being returned
+  wrong. Then a nop, a write and a read through the ring, two submissions in one
+  call (each completion must carry its own `user_data`; with one in flight a
+  mix-up is invisible), a vectored read, an unknown opcode failing per entry
+  rather than per batch, and a registered eventfd counting one per completion.
+
 The ELF binaries are committed prebuilt (as the x86 guest tests under
 `test/*/build/` are), so the check needs no cross-toolchain. The `.s` sources
 are here for reference; rebuild with an aarch64-linux clang + ld.lld:

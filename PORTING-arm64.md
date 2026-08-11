@@ -4362,3 +4362,61 @@ contexts nor its outstanding operations. arm64's fork is fork-plus-exec and this
 table is process memory, so the child gets none — which is what it is owed.
 
 239 of 395.
+
+### 3.5.84 `io_uring` — an interface that is a memory layout, not a syscall
+
+The three syscalls are the small part. io_uring's interface is *shared memory*: a
+guest asks for a ring, maps three regions of the descriptor it gets back, and
+from then on submits work by writing 64-byte entries into that memory and bumping
+a counter. Nothing arrives as syscall arguments.
+
+Which is why the first question was whether this was possible here at all. The
+regions have to be memory the guest and NABI both see, and NABI cannot hand the
+guest a pointer into its own heap — guest memory is a separate address space
+reached through stage-2. **The way in already existed**: `do_mmap` maps a shared
+file for real when a guest asks it to, precisely so `MAP_SHARED` means what it
+says, and the host mapping and the guest mapping are then the same pages. So the
+ring is a file — created, sized, and unlinked immediately, so the descriptor is
+the only way to it and it goes when the descriptor does — and the guest's own
+mmap of the ring is an ordinary mmap needing no special case.
+
+The file is enormous on paper and sparse in fact. `IORING_OFF_CQ_RING` is 128MiB
+and `IORING_OFF_SQES` is 256MiB; those are magic numbers rather than real
+offsets, but the cheapest way to make them work is to let them *be* real, so the
+file is sized past the largest and the regions sit where the constants say. No
+blocks are allocated for the gap. The alternative — intercepting mmap to
+translate the offsets — would put an io_uring special case in the middle of the
+memory manager.
+
+One thing had to change to get there. `MAP_POPULATE` was neither supported nor
+ignored by `do_mmap`; it fell through to `warnk` and `exit(1)`. liburing passes it
+on all three ring mappings, so every io_uring guest would have died at its first
+mmap over a flag that only means "be quick". It is now ignored, which is all it
+ever was.
+
+**What this does not do is run the work asynchronously.** A real io_uring hands
+anything that would block to a worker pool; here a submission is executed during
+`io_uring_enter`, on the thread that called it. Every visible rule still holds —
+completions carry the right `user_data`, the counters advance, a caller reading
+the completion ring finds its entries — and for file I/O the kernel very often
+completes inline too. What is lost is the guest that submits a blocking read and
+expects to work meanwhile: here it waits. That is a performance property, not a
+correctness one, and it is also what makes it *legal to touch guest memory in the
+handler at all*, which is the difficulty `src/fs/aio.c` had to design around.
+
+`SQPOLL` and `IOPOLL` are refused rather than ignored, and that distinction is
+the important one: both are promises about *how* the ring is serviced, and a
+guest granted `SQPOLL` would stop calling `io_uring_enter` — the only thing that
+makes this ring go. An unimplemented opcode fails per entry with `EINVAL`, as the
+kernel answers one it does not know, so a caller learns which submission it was
+without losing the batch.
+
+`io_uring_register` implements the eventfd registration and refuses the rest.
+Registering buffers or descriptors pre-attaches them so a submission can name one
+by index, which means honouring `IOSQE_FIXED_FILE` and the `*_FIXED` opcodes as
+well — a guest told its buffers were registered would submit an index into a
+table that does not exist and read whatever that index landed on. The eventfd is
+the one that costs nothing and is worth having, since it is what lets a guest
+wait on the ring inside an ordinary poll loop.
+
+242 of 395.
