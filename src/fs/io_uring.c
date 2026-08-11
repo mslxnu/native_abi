@@ -801,6 +801,27 @@ run_sqe(const struct l_io_uring_sqe *s)
     return do_openat(s->fd, guestpath, (int) s->rw_flags, (int) s->len);
   }
 
+  case LINUX_IORING_OP_STATX:
+    /*
+     * The same operation as the syscall of that name, answered by the same
+     * function - a second implementation here would be one more thing to keep
+     * in step with the first. The arguments are spread across the entry
+     * differently: the mask is in len and the buffer is in addr2, which shares
+     * its slot with off.
+     */
+    return (int32_t) sys_statx(s->fd, (gstr_t) s->addr, (int) s->rw_flags,
+                               s->len, (gaddr_t) s->off);
+
+  case LINUX_IORING_OP_UNLINKAT:
+    /* rw_flags is unlink_flags here, and carries AT_REMOVEDIR - which is the
+     * difference between removing a file and removing a directory, so it is
+     * passed through rather than dropped. */
+    return (int32_t) sys_unlinkat(s->fd, (gstr_t) s->addr, (int) s->rw_flags);
+
+  case LINUX_IORING_OP_MKDIRAT:
+    /* len is the mode, not a length. */
+    return (int32_t) sys_mkdirat(s->fd, (gstr_t) s->addr, (int) s->len);
+
   default:
     /* Every other opcode, including the ones this could grow into. An
      * unimplemented opcode is EINVAL per entry, exactly as the kernel answers

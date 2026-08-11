@@ -4508,5 +4508,27 @@ guessing at an index into a table that does not exist.
 started and cannot be called back; a pending entry here is either still waiting
 or already completed and off the list, with nothing in between.
 
+`STATX`, `UNLINKAT` and `MKDIRAT` came last and are the least interesting, which
+is the point: they are the same operations as the syscalls of those names, so
+they call the same functions. `DEFINE_SYSCALL` already generates `sys_<name>`,
+and a second implementation inside the ring would be one more thing to keep in
+step with the first.
+
+What does need care is that the arguments sit in different fields than they do
+in a syscall frame, and reading one out of the wrong slot is a mistake that still
+reports success. `STATX` takes its mask from `len` and its output buffer from
+`addr2`; `MKDIRAT` takes its mode from `len`; `UNLINKAT` takes `AT_REMOVEDIR`
+from the per-opcode flag word, which is the difference between removing a file
+and removing a directory. So `uringtest` reads the statx result *out of the
+buffer* rather than trusting `res` — a buffer pointer from the wrong field
+returns 0 and writes somewhere else entirely — and each of the three was checked
+against a build that reads the wrong field.
+
+One thing that check turned up was in the test rather than the code. These
+opcodes create and remove a directory in the shared test root, and a run that
+failed part-way left it behind, so every later run failed at `mkdirat` with
+`EEXIST` — including the run meant to confirm the fix. The test now removes it
+first: one that cannot be run twice is one that stops being run.
+
 Still 242 of 395: these are opcodes inside `io_uring_enter`, not syscalls of
 their own, so the table does not move for them.

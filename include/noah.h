@@ -261,6 +261,20 @@ void timerfd_close(int fd);
 
 /* tee (src/fs/tee.c). What tee removed from a pipe is held in front of it, so
  * reads and readiness have to consult it before the pipe itself. */
+/*
+ * Syscall bodies reached from somewhere other than the dispatch table.
+ *
+ * io_uring's opcodes are the same operations as the syscalls of those names, so
+ * they are answered by the same functions rather than by a second copy that
+ * could drift from the first. DEFINE_SYSCALL generates sys_<name>; declaring the
+ * few that are needed here keeps that a deliberate list rather than a header of
+ * everything.
+ */
+uint64_t sys_statx(int dirfd, gstr_t path_ptr, int flags, unsigned int mask,
+                   gaddr_t stx_ptr);
+uint64_t sys_unlinkat(int dirfd, gstr_t path_ptr, int flags);
+uint64_t sys_mkdirat(int dirfd, gstr_t path_ptr, int mode);
+
 int     do_openat(int dirfd, const char *name, int flags, int mode);
 int     do_close(struct fdtable *table, int fd);
 void    uring_close(int fd);

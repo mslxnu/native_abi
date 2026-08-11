@@ -72,6 +72,11 @@ static long sys6(long n, long a, long b, long c, long d, long e, long f){
 #define OP_TIMEOUT     11
 #define OP_TIMEOUT_REMOVE 12
 #define OP_ASYNC_CANCEL   14
+#define OP_STATX          21
+#define OP_UNLINKAT       36
+#define OP_MKDIRAT        37
+#define AT_REMOVEDIR   0x200
+#define STATX_BASIC_STATS 0x7ff
 #define CANCEL_ALL        1
 #define CANCEL_FD         2
 #define CANCEL_ANY        4
@@ -680,6 +685,82 @@ void _start(void)
 
     sys6(SYS_close, pfd[0], 0, 0, 0, 0, 0);
     sys6(SYS_close, pfd[1], 0, 0, 0, 0, 0); }
+
+  /*
+   * ---- statx, mkdirat and unlinkat through the ring ----
+   *
+   * These are the same operations as the syscalls of those names and are
+   * answered by the same code, so what is worth checking is that the entry is
+   * read correctly: the arguments sit in different fields here than they do in
+   * a syscall frame, and a mask read out of the wrong one is a plausible bug
+   * that still returns success.
+   */
+  /* A previous run that failed part-way could have left this behind, and a
+   * test that cannot be run twice is a test that stops being run. */
+  sys6(SYS_unlinkat, AT_FDCWD, (long) "/uringdir", AT_REMOVEDIR, 0, 0, 0);
+
+  { struct sqe *s = push();
+    s->opcode = OP_MKDIRAT;
+    s->fd = AT_FDCWD;
+    s->addr = (unsigned long long) (long) "/uringdir";
+    s->len = 0755;              /* the mode lives in len */
+    s->user_data = 0xF001;
+    if ((r = sys6(SYS_io_uring_enter, fd, 1, 1, IORING_ENTER_GETEVENTS, 0, 0)) != 1)
+      fail("io_uring_enter for a mkdirat", r, 1);
+    struct cqe c = pop("a completion for the mkdirat");
+    if (c.res != 0)
+      fail("what mkdirat through the ring reported", c.res, 0); }
+
+  /* statx of what mkdirat just made; the buffer is in addr2, the mask in len. */
+  { char stx[256]; clr(stx, sizeof stx);
+    struct sqe *s = push();
+    s->opcode = OP_STATX;
+    s->fd = AT_FDCWD;
+    s->addr = (unsigned long long) (long) "/uringdir";
+    s->len = STATX_BASIC_STATS; /* the mask lives in len */
+    s->off = (unsigned long long) (long) stx;   /* addr2: the buffer */
+    s->rw_flags = 0;
+    s->user_data = 0xF002;
+    if ((r = sys6(SYS_io_uring_enter, fd, 1, 1, IORING_ENTER_GETEVENTS, 0, 0)) != 1)
+      fail("io_uring_enter for a statx", r, 1);
+    struct cqe c = pop("a completion for the statx");
+    if (c.res != 0)
+      fail("what statx through the ring reported", c.res, 0);
+    /* stx_mode is a u16 at offset 28 of struct statx; S_IFDIR is 040000. An
+     * answer written into the wrong buffer, or not written at all, leaves this
+     * zero - which is the point of reading it rather than trusting res. */
+    unsigned short mode = *(unsigned short *)(stx + 28);
+    if ((mode & 0170000) != 0040000)
+      fail("what statx said the mode was", mode, 0040000); }
+
+  /* unlinkat needs AT_REMOVEDIR for a directory: without it the flag has been
+   * dropped somewhere and this comes back an error. */
+  { struct sqe *s = push();
+    s->opcode = OP_UNLINKAT;
+    s->fd = AT_FDCWD;
+    s->addr = (unsigned long long) (long) "/uringdir";
+    s->rw_flags = AT_REMOVEDIR;
+    s->user_data = 0xF003;
+    if ((r = sys6(SYS_io_uring_enter, fd, 1, 1, IORING_ENTER_GETEVENTS, 0, 0)) != 1)
+      fail("io_uring_enter for an unlinkat", r, 1);
+    struct cqe c = pop("a completion for the unlinkat");
+    if (c.res != 0)
+      fail("removing a directory needs AT_REMOVEDIR carried through", c.res, 0);
+
+    /* And it is really gone. */
+    struct sqe *s2 = push();
+    char stx[256];
+    s2->opcode = OP_STATX;
+    s2->fd = AT_FDCWD;
+    s2->addr = (unsigned long long) (long) "/uringdir";
+    s2->len = STATX_BASIC_STATS;
+    s2->off = (unsigned long long) (long) stx;
+    s2->user_data = 0xF004;
+    if ((r = sys6(SYS_io_uring_enter, fd, 1, 1, IORING_ENTER_GETEVENTS, 0, 0)) != 1)
+      fail("io_uring_enter for the statx after removal", r, 1);
+    struct cqe c2 = pop("a completion for the statx after removal");
+    if (c2.res == 0)
+      fail("the directory should be gone", c2.res, -1); }
 
   /* ---- what these refuse ---- */
   if ((r = sys6(SYS_io_uring_enter, f, 0, 0, 0, 0, 0)) != -EOPNOTSUPP)

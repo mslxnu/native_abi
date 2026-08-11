@@ -327,7 +327,13 @@ guest-code cache sync.
   clearing two polls off a descriptor with `CANCEL_FD | CANCEL_ALL`. Both flags
   are load-bearing: without `CANCEL_FD` the descriptor number is matched against
   user_data and nothing is found, and without `CANCEL_ALL` one of the two polls
-  is cancelled and success reported while the other stays armed.
+  is cancelled and success reported while the other stays armed. `STATX`,
+  `MKDIRAT` and `UNLINKAT` are the same operations as the syscalls of those
+  names and share their code, so what is checked is that the *entry* is read
+  correctly — the arguments sit in different fields here than in a syscall
+  frame. The statx result is read out of the buffer rather than trusted from
+  `res`, because a buffer pointer taken from the wrong field still reports
+  success and simply writes somewhere else.
 
 The ELF binaries are committed prebuilt (as the x86 guest tests under
 `test/*/build/` are), so the check needs no cross-toolchain. The `.s` sources
