@@ -558,6 +558,19 @@ else
     fail=1
 fi
 
+# futextest: the rest of the futex family - requeue moving waiters without
+# waking them, TRYLOCK_PI, and the futex2 syscalls. futex_waitv is the one that
+# needs a test of its own: it must report *which* of several futexes woke, so an
+# implementation that queued only the first would satisfy a weaker check.
+cp "$here/futextest" "$root/"; chmod +x "$root/futextest"
+out=$("$NABI" -m "$root" /futextest); rc=$?
+if [ "$rc" -eq 0 ] && [ "$out" = "futex ok" ]; then
+    echo "  ok  futextest -> \"$out\", exit 0"
+else
+    echo "  FAIL futextest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 if [ "$fail" -eq 0 ]; then
     echo "smoke: PASS"
 else

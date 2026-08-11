@@ -106,7 +106,7 @@
   SYSCALL(97, unshare) \
   SYSCALL(98, futex) \
   SYSCALL(99, set_robust_list) \
-  SYSCALL(100, unimplemented) \
+  SYSCALL(100, get_robust_list) \
   SYSCALL(101, nanosleep) \
   SYSCALL(102, getitimer) \
   SYSCALL(103, setitimer) \
@@ -455,14 +455,14 @@
   SYSCALL(446, unimplemented) \
   SYSCALL(447, unimplemented) \
   SYSCALL(448, unimplemented) \
-  SYSCALL(449, unimplemented) \
+  SYSCALL(449, futex_waitv) \
   SYSCALL(450, unimplemented) \
   SYSCALL(451, unimplemented) \
   SYSCALL(452, unimplemented) \
   SYSCALL(453, unimplemented) \
-  SYSCALL(454, unimplemented) \
-  SYSCALL(455, unimplemented) \
-  SYSCALL(456, unimplemented) \
+  SYSCALL(454, futex_wake) \
+  SYSCALL(455, futex_wait) \
+  SYSCALL(456, futex_requeue) \
   SYSCALL(457, unimplemented) \
   SYSCALL(458, unimplemented) \
   SYSCALL(459, unimplemented) \

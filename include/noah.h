@@ -161,6 +161,15 @@ struct pfutex_entry {
   pthread_cond_t cond;
   gaddr_t uaddr;
   uint32_t bitset;
+  /*
+   * futex_waitv waits on several futexes at once and must be woken by whichever
+   * fires first, so its entries - one per futex, on one list each - share a
+   * single condition variable and record which of them it was. An ordinary
+   * waiter points condp at its own cond and leaves the rest alone.
+   */
+  pthread_cond_t *condp;
+  int  index;
+  int *woken;
 };
 
 /* TODO: collect garbage entries */

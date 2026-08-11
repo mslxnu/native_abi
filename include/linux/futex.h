@@ -140,3 +140,11 @@ struct linux_robust_list_head {
 #define LINIX_PR_CAP_AMBIENT                  47
 
 #endif	/* !_LINUX_FUTEX_H */
+
+/* One futex in a futex_waitv array. */
+struct l_futex_waitv {
+  uint64_t val;
+  uint64_t uaddr;
+  uint32_t flags;
+  uint32_t __reserved;
+};

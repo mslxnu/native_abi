@@ -279,7 +279,7 @@
   SYSCALL(271, ppoll) \
   SYSCALL(272, unshare) \
   SYSCALL(273, set_robust_list) \
-  SYSCALL(274, unimplemented) \
+  SYSCALL(274, get_robust_list) \
   SYSCALL(275, unimplemented) \
   SYSCALL(276, unimplemented) \
   SYSCALL(277, sync_file_range) \
@@ -454,14 +454,14 @@
   SYSCALL(446, unimplemented) \
   SYSCALL(447, unimplemented) \
   SYSCALL(448, unimplemented) \
-  SYSCALL(449, unimplemented) \
+  SYSCALL(449, futex_waitv) \
   SYSCALL(450, unimplemented) \
   SYSCALL(451, unimplemented) \
   SYSCALL(452, unimplemented) \
   SYSCALL(453, unimplemented) \
-  SYSCALL(454, unimplemented) \
-  SYSCALL(455, unimplemented) \
-  SYSCALL(456, unimplemented) \
+  SYSCALL(454, futex_wake) \
+  SYSCALL(455, futex_wait) \
+  SYSCALL(456, futex_requeue) \
   SYSCALL(457, unimplemented) \
   SYSCALL(458, unimplemented) \
   SYSCALL(459, unimplemented) \

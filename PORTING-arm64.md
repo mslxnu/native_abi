@@ -4022,3 +4022,62 @@ choose the child's pid — which is the pid namespace's to allocate, and comes
 from the host besides.
 
 With this, a full `apt` reinstall reaches **no unimplemented syscall at all**.
+
+### 3.5.78 The rest of the futex family — **implemented**
+
+`futex()` served WAIT, WAKE, the bitset pair, WAKE_OP and the PI operations.
+What was missing was the half that moves waiters *without* waking them, the
+non-blocking end of LOCK_PI, and the futex2 syscalls a program written today
+reaches for.
+
+**REQUEUE and CMP_REQUEUE** are what a broadcast is built on. `pthread_cond_broadcast`
+has to hand every waiter to the mutex they will contend for next, and waking them
+all so each can queue itself again is the thundering herd requeue exists to
+avoid. The compare form checks the word has not changed underneath first, which
+is how a caller learns the condition it read is already stale. One trap in the
+ABI: `val2` arrives in the *timeout* slot — the one place `futex` reuses a
+register for two types.
+
+**TRYLOCK_PI** is LOCK_PI without the wait: the same exchange, and not taking the
+lock is the whole difference.
+
+**FUTEX_FD** is refused explicitly. It handed out a descriptor that became
+readable when the futex was woken, was racy by construction, and Linux removed
+it in 2.6.26 — saying so beats pretending to something that exists nowhere.
+
+**`get_robust_list`** reports what `set_robust_list` was told. What this pair
+provides is the bookkeeping and not the recovery: NABI does not walk the list
+when a thread dies, because a guest thread is a host thread and dies without
+passing through here. Reporting the pointer is still the truth about what was
+registered.
+
+**The futex2 syscalls** — `futex_wake`, `futex_wait`, `futex_requeue`,
+`futex_waitv` — are the same operations with the arguments untangled: a mask
+instead of a bitset packed into `val3`, a width in the flags instead of an
+assumption, and no register doing double duty. Only 32-bit futexes are served;
+a width Linux's flags can name but this does not implement is EINVAL rather than
+four bytes read where two were meant.
+
+`futex_waitv` is the one with real structure behind it: one sleep and many
+queues. Each futex gets an entry of its own, because that is what a wake walks,
+and they share the condition variable and a slot to record *which* index fired —
+so the first waker to arrive says which futex it was and the others find their
+entries already unlinked.
+
+**The panic that had become reachable.** A futex in shared memory used to
+`panic("Non-private futex is unsupported!")`, killing the guest for doing
+something ordinary — and it became reachable the moment §3.5.57 made System V
+shared memory work, since a `PTHREAD_PROCESS_SHARED` mutex in a segment is
+exactly this. The wait queue is one process's, so a waiter here cannot be woken
+by another process; within a single process — which is most uses of a shared
+mapping, and all of the ones that were panicking — that is exactly right. Across
+processes it would be a missed wakeup, so the wait is bounded and re-checks the
+word rather than sleeping on it forever. A cross-process wake becomes a short
+delay instead of a hang, and neither becomes a dead machine. The look-again
+return is reported as a spurious wake, which every futex caller already loops
+around; `EAGAIN` would have claimed the word did not match when it did.
+
+Worth noting what this depended on: `futex_wake`, `futex_wait` and
+`futex_requeue` are **454, 455 and 456** — exactly the numbers the compat tail
+was squatting on before §3.5.74 pinned it at 1024. Wired into the old table,
+`futex_wake` would have dispatched to `afs_syscall`.

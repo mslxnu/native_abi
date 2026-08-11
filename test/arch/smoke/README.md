@@ -235,6 +235,14 @@ guest-code cache sync.
   write them onto another. It has to be absent from listings and refused by
   name, with the ownership it records still working afterwards.
 
+- `futextest` — the rest of the futex family: `REQUEUE` and `CMP_REQUEUE`, which
+  move waiters without waking them and are what a broadcast is built on;
+  `TRYLOCK_PI`; `get_robust_list` round-tripping what was registered; and the
+  futex2 syscalls. `futex_waitv` is the one needing its own check — it waits on
+  several futexes and must report *which* woke, so an implementation that
+  queued only the first, or woke correctly but reported the wrong index, would
+  satisfy a test that merely saw the call return.
+
 - `ipctest` — System V IPC: a segment created, attached, shared across a fork,
   detached and removed; keys resolving to ids; semaphore values through
   `SETVAL`/`GETALL`/`semop`; and `unshare(CLONE_NEWIPC)` making the same key
