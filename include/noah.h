@@ -274,8 +274,12 @@ uint64_t sys_statx(int dirfd, gstr_t path_ptr, int flags, unsigned int mask,
                    gaddr_t stx_ptr);
 uint64_t sys_unlinkat(int dirfd, gstr_t path_ptr, int flags);
 uint64_t sys_mkdirat(int dirfd, gstr_t path_ptr, int mode);
+uint64_t sys_openat2(int dirfd, gstr_t path_ptr, gaddr_t how_ptr, size_t size);
+uint64_t sys_sendto(int socket, gaddr_t buf_ptr, int length, int flags,
+                    gaddr_t addr_ptr, unsigned int addrlen);
+uint64_t sys_recvfrom(int socket, gaddr_t buf_ptr, int length, int flags,
+                      gaddr_t addr_ptr, gaddr_t addrlen_ptr);
 
-int     do_openat(int dirfd, const char *name, int flags, int mode);
 int     do_close(struct fdtable *table, int fd);
 void    uring_close(int fd);
 void    eventfd_signal(int fd, uint64_t add);

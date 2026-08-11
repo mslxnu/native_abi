@@ -798,8 +798,38 @@ run_sqe(const struct l_io_uring_sqe *s)
     char guestpath[LINUX_PATH_MAX];
     if (strncpy_from_user(guestpath, (gaddr_t) s->addr, sizeof guestpath) < 0)
       return -LINUX_EFAULT;
-    return do_openat(s->fd, guestpath, (int) s->rw_flags, (int) s->len);
+    /*
+     * user_openat rather than do_openat: the latter opens a file and hands back
+     * a host descriptor, and everything that makes it the *guest's* - the entry
+     * in the guest's descriptor table, the /proc redirect, the fanotify open
+     * permission - happens above it. An opcode that skipped all that returned a
+     * number that looked like a descriptor and was EBADF on first use.
+     */
+    return user_openat(s->fd, guestpath, (int) s->rw_flags, (int) s->len);
   }
+
+  case LINUX_IORING_OP_SEND:
+    /*
+     * send(2) on a connected socket, and sendto(2) when the entry carries a
+     * destination - which lives in addr2, with its length in the low half of
+     * the slot splice_fd_in occupies. A zero there is the connected case, and
+     * sendto with a null address is send.
+     */
+    return (int32_t) sys_sendto(s->fd, (gaddr_t) s->addr, (int) s->len,
+                                (int) s->rw_flags, (gaddr_t) s->off,
+                                (unsigned int) (uint16_t) s->splice_fd_in);
+
+  case LINUX_IORING_OP_RECV:
+    /* The plain form, which does not report where the data came from - that is
+     * RECVMSG's job, and it is a different opcode. */
+    return (int32_t) sys_recvfrom(s->fd, (gaddr_t) s->addr, (int) s->len,
+                                  (int) s->rw_flags, 0, 0);
+
+  case LINUX_IORING_OP_OPENAT2:
+    /* how is at addr2 and its size is in len, which is the one place len is
+     * neither a length of data nor a mode. */
+    return (int32_t) sys_openat2(s->fd, (gstr_t) s->addr, (gaddr_t) s->off,
+                                 s->len);
 
   case LINUX_IORING_OP_STATX:
     /*

@@ -333,7 +333,13 @@ guest-code cache sync.
   correctly — the arguments sit in different fields here than in a syscall
   frame. The statx result is read out of the buffer rather than trusted from
   `res`, because a buffer pointer taken from the wrong field still reports
-  success and simply writes somewhere else.
+  success and simply writes somewhere else. `SEND` and `RECV` go over a
+  socketpair. `OPENAT` and `OPENAT2` are checked by **reading from the
+  descriptor they hand back** — an open that produced a raw host descriptor
+  without entering it in the guest's table looks entirely successful until first
+  use, which is exactly the bug that check found. `OPENAT2` is also checked to
+  refuse a mode with nothing to create and to refuse a resolve restriction it
+  cannot enforce.
 
 The ELF binaries are committed prebuilt (as the x86 guest tests under
 `test/*/build/` are), so the check needs no cross-toolchain. The `.s` sources

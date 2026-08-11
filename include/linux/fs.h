@@ -31,6 +31,7 @@
 #define	_LINUX_FILE_H_
 
 #include <fcntl.h>
+#include <stdint.h>
 
 #define LINUX_AT(_)\
   DECL_LINUX(_,AT_FDCWD,             -100)\
@@ -118,6 +119,29 @@ DECLARE_CENUM(at, LINUX_AT);
 #define	LINUX_O_NOATIME		01000000
 #define	LINUX_O_CLOEXEC		02000000
 #define	LINUX_O_PATH		010000000
+#define	LINUX_O_TMPFILE		(020000000 | LINUX_O_DIRECTORY)
+
+/*
+ * openat2's third argument. Fixed ABI: a caller passes its size, and the kernel
+ * uses that to tell an old caller from a new one.
+ */
+struct l_open_how {
+  uint64_t flags;
+  uint64_t mode;
+  uint64_t resolve;
+};
+
+/*
+ * resolve flags. Every one of these is a *restriction* on how a path may be
+ * resolved - the reason a program reaches for openat2 rather than openat - so
+ * see the note in sys_openat2 about why none of them are accepted here.
+ */
+#define LINUX_RESOLVE_NO_XDEV       0x01
+#define LINUX_RESOLVE_NO_MAGICLINKS 0x02
+#define LINUX_RESOLVE_NO_SYMLINKS   0x04
+#define LINUX_RESOLVE_BENEATH       0x08
+#define LINUX_RESOLVE_IN_ROOT       0x10
+#define LINUX_RESOLVE_CACHED        0x20
 
 #define	LINUX_F_DUPFD		0
 #define	LINUX_F_GETFD		1

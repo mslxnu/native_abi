@@ -75,6 +75,14 @@ static long sys6(long n, long a, long b, long c, long d, long e, long f){
 #define OP_STATX          21
 #define OP_UNLINKAT       36
 #define OP_MKDIRAT        37
+#define OP_OPENAT         18
+#define OP_SEND           26
+#define OP_RECV           27
+#define OP_OPENAT2        28
+#define SYS_socketpair    199
+#define AF_UNIX            1
+#define SOCK_STREAM        1
+#define E2BIG              7
 #define AT_REMOVEDIR   0x200
 #define STATX_BASIC_STATS 0x7ff
 #define CANCEL_ALL        1
@@ -761,6 +769,136 @@ void _start(void)
     struct cqe c2 = pop("a completion for the statx after removal");
     if (c2.res == 0)
       fail("the directory should be gone", c2.res, -1); }
+
+  /*
+   * ---- openat through the ring, and the descriptor it hands back ----
+   *
+   * The completion carries a descriptor, and the only way to know it is a
+   * descriptor the *guest* can use is to use it: an open that produced a raw
+   * host descriptor without entering it in the guest's table looks perfectly
+   * successful right up until the first read.
+   */
+  { struct sqe *s = push();
+    s->opcode = OP_OPENAT;
+    s->fd = AT_FDCWD;
+    s->addr = (unsigned long long) (long) "/uringfile";
+    s->rw_flags = O_RDWR;       /* open_flags */
+    s->len = 0;                 /* mode */
+    s->user_data = 0xE001;
+    if ((r = sys6(SYS_io_uring_enter, fd, 1, 1, IORING_ENTER_GETEVENTS, 0, 0)) != 1)
+      fail("io_uring_enter for an openat", r, 1);
+    struct cqe c = pop("a completion for the openat");
+    if (c.res < 0)
+      fail("what openat through the ring reported", c.res, 0);
+
+    char buf[16]; clr(buf, sizeof buf);
+    long got = sys6(SYS_read, c.res, (long) buf, 5, 0, 0, 0);
+    if (got != 5)
+      fail("reading the descriptor openat handed back", got, 5);
+    if (!eq(buf, "hello"))
+      fails("what that descriptor read", buf, "hello");
+    sys6(SYS_close, c.res, 0, 0, 0, 0, 0); }
+
+  /* ---- send and recv over a socketpair ---- */
+  { int sv[2];
+    if (sys6(SYS_socketpair, AF_UNIX, SOCK_STREAM, 0, (long) sv, 0, 0) != 0)
+      fail("socketpair", -1, 0);
+
+    struct sqe *s1 = push();
+    s1->opcode = OP_SEND;
+    s1->fd = sv[0];
+    s1->addr = (unsigned long long) (long) "ring send";
+    s1->len = 9;
+    s1->rw_flags = 0;           /* msg_flags */
+    s1->off = 0;                /* no destination: a connected socket */
+    s1->user_data = 0xD001;
+    if ((r = sys6(SYS_io_uring_enter, fd, 1, 1, IORING_ENTER_GETEVENTS, 0, 0)) != 1)
+      fail("io_uring_enter for a send", r, 1);
+    struct cqe c1 = pop("a completion for the send");
+    if (c1.res != 9)
+      fail("what send through the ring reported", c1.res, 9);
+
+    char buf[32]; clr(buf, sizeof buf);
+    struct sqe *s2 = push();
+    s2->opcode = OP_RECV;
+    s2->fd = sv[1];
+    s2->addr = (unsigned long long) (long) buf;
+    s2->len = sizeof buf;
+    s2->rw_flags = 0;
+    s2->user_data = 0xD002;
+    if ((r = sys6(SYS_io_uring_enter, fd, 1, 1, IORING_ENTER_GETEVENTS, 0, 0)) != 1)
+      fail("io_uring_enter for a recv", r, 1);
+    struct cqe c2 = pop("a completion for the recv");
+    if (c2.res != 9)
+      fail("what recv through the ring reported", c2.res, 9);
+    if (!eq(buf, "ring send"))
+      fails("what recv delivered", buf, "ring send");
+
+    sys6(SYS_close, sv[0], 0, 0, 0, 0, 0);
+    sys6(SYS_close, sv[1], 0, 0, 0, 0, 0); }
+
+  /*
+   * ---- openat2, whose point is that it checks ----
+   *
+   * The struct is the visible difference and the validation is the real one.
+   * openat ignores a mode that cannot apply and bits it does not know; openat2
+   * refuses both, which is how a caller finds out it did not get what it asked
+   * for instead of quietly not getting it.
+   */
+  { struct { unsigned long long flags, mode, resolve; } how;
+
+    how.flags = O_RDWR; how.mode = 0; how.resolve = 0;
+    struct sqe *s = push();
+    s->opcode = OP_OPENAT2;
+    s->fd = AT_FDCWD;
+    s->addr = (unsigned long long) (long) "/uringfile";
+    s->off = (unsigned long long) (long) &how;   /* addr2 */
+    s->len = sizeof how;                         /* its size, not a length */
+    s->user_data = 0xD101;
+    if ((r = sys6(SYS_io_uring_enter, fd, 1, 1, IORING_ENTER_GETEVENTS, 0, 0)) != 1)
+      fail("io_uring_enter for an openat2", r, 1);
+    struct cqe c = pop("a completion for the openat2");
+    if (c.res < 0)
+      fail("what openat2 through the ring reported", c.res, 0);
+    /* Again: a descriptor is only a descriptor if the guest can use it. */
+    char buf[16]; clr(buf, sizeof buf);
+    if (sys6(SYS_read, c.res, (long) buf, 5, 0, 0, 0) != 5)
+      fail("reading the descriptor openat2 handed back", -1, 5);
+    if (!eq(buf, "hello"))
+      fails("what that descriptor read", buf, "hello");
+    sys6(SYS_close, c.res, 0, 0, 0, 0, 0);
+
+    /* A mode with nothing to create is refused, where openat would ignore it. */
+    how.flags = O_RDWR; how.mode = 0644; how.resolve = 0;
+    struct sqe *s2 = push();
+    s2->opcode = OP_OPENAT2;
+    s2->fd = AT_FDCWD;
+    s2->addr = (unsigned long long) (long) "/uringfile";
+    s2->off = (unsigned long long) (long) &how;
+    s2->len = sizeof how;
+    s2->user_data = 0xD102;
+    if ((r = sys6(SYS_io_uring_enter, fd, 1, 1, IORING_ENTER_GETEVENTS, 0, 0)) != 1)
+      fail("io_uring_enter for an openat2 with a stray mode", r, 1);
+    struct cqe c2 = pop("a completion for that openat2");
+    if (c2.res != -EINVAL)
+      fail("a mode with no O_CREAT must be refused, not ignored", c2.res,
+           -EINVAL);
+
+    /* A resolve restriction that cannot be enforced is refused rather than
+     * accepted, because a caller sets one because it is relying on it. */
+    how.flags = O_RDWR; how.mode = 0; how.resolve = 0x08;  /* RESOLVE_BENEATH */
+    struct sqe *s3 = push();
+    s3->opcode = OP_OPENAT2;
+    s3->fd = AT_FDCWD;
+    s3->addr = (unsigned long long) (long) "/uringfile";
+    s3->off = (unsigned long long) (long) &how;
+    s3->len = sizeof how;
+    s3->user_data = 0xD103;
+    if ((r = sys6(SYS_io_uring_enter, fd, 1, 1, IORING_ENTER_GETEVENTS, 0, 0)) != 1)
+      fail("io_uring_enter for an openat2 with RESOLVE_BENEATH", r, 1);
+    struct cqe c3 = pop("a completion for that openat2");
+    if (c3.res != -EINVAL)
+      fail("an unenforceable resolve flag must be refused", c3.res, -EINVAL); }
 
   /* ---- what these refuse ---- */
   if ((r = sys6(SYS_io_uring_enter, f, 0, 0, 0, 0, 0)) != -EOPNOTSUPP)

@@ -443,7 +443,7 @@
   SYSCALL(434, unimplemented) \
   SYSCALL(435, clone3) \
   SYSCALL(436, unimplemented) \
-  SYSCALL(437, unimplemented) \
+  SYSCALL(437, openat2) \
   SYSCALL(438, unimplemented) \
   SYSCALL(439, faccessat2) \
   SYSCALL(440, unimplemented) \

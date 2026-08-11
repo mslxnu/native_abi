@@ -4530,5 +4530,43 @@ failed part-way left it behind, so every later run failed at `mkdirat` with
 `EEXIST` — including the run meant to confirm the fix. The test now removes it
 first: one that cannot be run twice is one that stops being run.
 
-Still 242 of 395: these are opcodes inside `io_uring_enter`, not syscalls of
-their own, so the table does not move for them.
+`SEND` and `RECV` are the socket pair of the file operations above, and go the
+same way: `sys_sendto` and `sys_recvfrom` already exist, so the opcodes call
+them. A destination address, when the entry carries one, is in `addr2` with its
+length in the low half of the slot `splice_fd_in` occupies; zero there is the
+connected case, and `sendto` with a null address is `send`.
+
+`OPENAT2` did not exist as a syscall at all, so it was implemented as one and the
+opcode calls it — which is the honest way round, and moves the table to **243 of
+395**.
+
+**The point of openat2 is not the struct, it is that it checks.** `openat`
+ignores bits it does not know and ignores a mode that cannot apply; `openat2`
+refuses both, and that is the only reason to call it — a caller finds out that
+what it asked for is unavailable instead of quietly not getting it. Implementing
+it and then ignoring the same things would defeat the whole exercise. So an
+unknown flag is `EINVAL`, a mode without `O_CREAT` or `O_TMPFILE` is `EINVAL`,
+trailing bytes from a future larger struct must be zero or it is `E2BIG`.
+
+Every `resolve` flag is refused, and that is deliberate rather than lazy. They
+are restrictions — `RESOLVE_BENEATH` says a path may not escape the directory it
+starts from, `RESOLVE_NO_SYMLINKS` says no component may be a link — and a caller
+sets one *because it is relying on it*. Enforcing them needs a resolver that
+inspects every component, which this does not have. Accepting them anyway would
+hand back a file the caller believes was proven safe. `EINVAL` is the worse
+answer to receive and the better one to give: a caller can handle `EINVAL` and
+cannot handle being lied to.
+
+**One bug found, and it was mine.** Writing the test for `OPENAT2` meant reading
+from the descriptor it returns, and doing the same for `OPENAT` showed the
+`OPENAT` opcode added two commits earlier was broken: it called `do_openat`,
+which opens a file and hands back a *host* descriptor, while everything that
+makes it the guest's — the entry in the guest's descriptor table, the `/proc`
+redirect, the fanotify open permission — happens in `user_openat` above it. The
+completion carried a plausible small integer that was `EBADF` on first use. It
+now goes through `user_openat`, and `do_openat` is `static` again, since exposing
+it was what made the mistake reachable.
+
+The lesson is in the test rather than the fix: a completion carrying a descriptor
+was checked for being non-negative, and a descriptor is only a descriptor if the
+guest can use it. Both opens now read a byte back through what they returned.

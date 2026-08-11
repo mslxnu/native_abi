@@ -56,6 +56,7 @@
 #define LINUX_IORING_OP_FADVISE        24
 #define LINUX_IORING_OP_SEND           26
 #define LINUX_IORING_OP_RECV           27
+#define LINUX_IORING_OP_OPENAT2        28
 #define LINUX_IORING_OP_FALLOCATE      33
 #define LINUX_IORING_OP_UNLINKAT       36
 #define LINUX_IORING_OP_MKDIRAT        37

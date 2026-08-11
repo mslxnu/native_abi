@@ -3014,7 +3014,7 @@ vfs_ungrab_dir(struct path *path)
   free(path->dir);
 }
 
-int
+static int
 do_openat(int dirfd, const char *name, int flags, int mode)
 {
   int lkflag = 0;
@@ -3363,6 +3363,75 @@ close_cloexec()
     }
   }
   pthread_rwlock_unlock(&proc.fileinfo.fdtable_lock);
+}
+
+/*
+ * openat2: openat with its arguments in a struct, so that new ones can be added
+ * without a new syscall - and with the validation openat never had.
+ *
+ * The difference that matters is not the struct, it is that openat2 *checks*.
+ * openat ignores bits it does not know and ignores a mode that cannot apply;
+ * openat2 refuses both, which is what lets a caller find out that the kernel it
+ * is running on does not support something rather than silently not getting it.
+ * Implementing it and then ignoring the same things would defeat the only reason
+ * to call it.
+ *
+ * Which is also why every resolve flag is refused. They are restrictions -
+ * RESOLVE_BENEATH says a path may not escape the directory it starts from,
+ * RESOLVE_NO_SYMLINKS says no component may be a link - and a caller sets one
+ * because it is relying on it. Enforcing them needs a resolver that inspects
+ * every component, which this does not have. Accepting them regardless would
+ * hand back a file the caller believes was proven safe, which is a worse answer
+ * than EINVAL: the caller can handle EINVAL, and cannot handle being lied to.
+ */
+DEFINE_SYSCALL(openat2, int, dirfd, gstr_t, path_ptr, gaddr_t, how_ptr,
+               size_t, size)
+{
+  /* The kernel's own bound on this argument, and the way a caller finds out it
+   * passed something absurd rather than having it truncated. */
+  if (size > 4096)
+    return -LINUX_E2BIG;
+  if (size < sizeof(struct l_open_how))
+    return -LINUX_EINVAL;
+
+  struct l_open_how how;
+  if (copy_from_user(&how, how_ptr, sizeof how))
+    return -LINUX_EFAULT;
+
+  /* A caller from a future with more fields must not be told its extra request
+   * was honoured. Anything past what is understood has to be zero. */
+  for (size_t i = sizeof how; i < size; i++) {
+    char pad;
+    if (copy_from_user(&pad, how_ptr + i, 1))
+      return -LINUX_EFAULT;
+    if (pad != 0)
+      return -LINUX_E2BIG;
+  }
+
+  if (how.resolve != 0)
+    return -LINUX_EINVAL;       /* see above: a guarantee that cannot be kept */
+
+  static const uint64_t known =
+      LINUX_O_ACCMODE | LINUX_O_CREAT | LINUX_O_EXCL | LINUX_O_NOCTTY |
+      LINUX_O_TRUNC | LINUX_O_APPEND | LINUX_O_NONBLOCK | LINUX_O_SYNC |
+      LINUX_O_DIRECTORY | LINUX_O_NOFOLLOW | LINUX_O_DIRECT |
+      LINUX_O_LARGEFILE | LINUX_O_NOATIME | LINUX_O_CLOEXEC | LINUX_O_PATH |
+      LINUX_O_TMPFILE;
+  if (how.flags & ~known)
+    return -LINUX_EINVAL;
+
+  /* A mode is only meaningful for a call that can create something. openat
+   * would ignore one that was not; this is the check that makes openat2 worth
+   * calling. */
+  bool creates = (how.flags & LINUX_O_CREAT) ||
+                 ((how.flags & LINUX_O_TMPFILE) == LINUX_O_TMPFILE);
+  if (how.mode != 0 && !creates)
+    return -LINUX_EINVAL;
+
+  char path[LINUX_PATH_MAX];
+  if (strncpy_from_user(path, path_ptr, sizeof path) < 0)
+    return -LINUX_EFAULT;
+  return user_openat(dirfd, path, (int) how.flags, (int) how.mode);
 }
 
 DEFINE_SYSCALL(openat, int, dirfd, gstr_t, path_ptr, int, flags, int, mode)
