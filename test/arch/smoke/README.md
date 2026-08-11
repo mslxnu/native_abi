@@ -222,7 +222,10 @@ guest-code cache sync.
   reported the open after allowing it would pass a notification test and be
   worthless. The last case is the one the feature rests on - a listener that
   dies *without* answering must release whoever is waiting, or a guest that ran
-  a guard once could never open a file again.
+  a guard once could never open a file again. `FAN_REPORT_FID` is covered by
+  taking the handle out of an event and handing it straight to
+  `open_by_handle_at`, then checking the *content* that comes back - a handle
+  that opened the wrong file would pass any check of the return value alone.
 
 - `ipctest` — System V IPC: a segment created, attached, shared across a fork,
   detached and removed; keys resolving to ids; semaphore values through

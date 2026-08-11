@@ -270,8 +270,8 @@
   SYSCALL(261, prlimit64) \
   SYSCALL(262, fanotify_init) \
   SYSCALL(263, fanotify_mark) \
-  SYSCALL(264, unimplemented) \
-  SYSCALL(265, unimplemented) \
+  SYSCALL(264, name_to_handle_at) \
+  SYSCALL(265, open_by_handle_at) \
   SYSCALL(266, unimplemented) \
   SYSCALL(267, syncfs) \
   SYSCALL(268, setns) \

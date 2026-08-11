@@ -69,6 +69,23 @@ struct l_fanotify_event_metadata {
   int32_t  pid;
 };
 
+/* What follows the metadata when an instance reports handles. */
+#define LINUX_FAN_EVENT_INFO_TYPE_FID      1
+#define LINUX_FAN_EVENT_INFO_TYPE_DFID_NAME 2
+#define LINUX_FAN_EVENT_INFO_TYPE_DFID     3
+
+struct l_fanotify_event_info_header {
+  uint8_t  info_type;
+  uint8_t  pad;
+  uint16_t len;
+};
+
+struct l_fanotify_event_info_fid {
+  struct l_fanotify_event_info_header hdr;
+  int32_t  fsid[2];
+  /* a struct l_file_handle and its bytes follow */
+};
+
 struct l_fanotify_response {
   int32_t  fd;
   uint32_t response;

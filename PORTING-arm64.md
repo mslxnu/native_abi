@@ -3792,3 +3792,42 @@ FAN_OPEN_PERM on a notification instance -> -22
 denied open in another process -> child exited 7 (open failed)
 listener killed mid-guard; next open -> 4 (released, not hung)
 ```
+
+### 3.5.72 `FAN_REPORT_FID`, and the file handles under it — **implemented**
+
+§3.5.70 refused `FAN_REPORT_FID` because it changes the record format, and a
+listener given the wrong shape parses whatever the bytes happen to be. That was
+a reason to implement it carefully, not a reason to leave it out.
+
+**A handle is only worth reporting if it can be resolved**, so
+`name_to_handle_at` and `open_by_handle_at` came first. They were ENOSYS, and
+the reason recorded for that was wrong: the note on statx's `STATX_MNT_ID` says
+software falls back to `name_to_handle_at`, "which Darwin has nothing to
+implement". **Darwin does have it, under another name.** A volume supporting
+volfs — HFS+ and APFS both do — resolves `/.vol/<device>/<inode>` to the file,
+which is `open_by_handle_at` with the handle spelled as a path. So the handle
+here is that pair, and resolving one is an open.
+
+`FAN_REPORT_FID` then reports `FAN_NOFD` in the metadata and a fid record after
+it. Two pairings stay refused, each for a reason rather than for effort:
+
+- **`FAN_REPORT_DIR_FID` and `FAN_REPORT_NAME`** describe `FAN_CREATE`,
+  `FAN_DELETE` and the moves, which this does not produce. A listener asking for
+  them would get a record shape promising names for events that never arrive.
+- **Handles with a permission class**, which Linux refuses too. A verdict names
+  the descriptor it answers, and an instance reporting handles was never given
+  one — there would be nothing to answer with and nothing here to route by.
+
+**The bug worth recording is a struct-padding one.** Linux's info record ends in
+`unsigned char handle[]`, so the file handle and its bytes are packed straight
+after the fsid with no alignment of their own. Describing that with a C struct
+puts four bytes of padding in front of the 64-bit inode — the compiler aligning
+a field Linux never aligned — so a listener reading at the offsets the ABI
+specifies took the number four bytes to its left. It resolved to
+`/.vol/0/39371965202432`, which is not a file. The record is laid out by offset
+now.
+
+The test takes the handle out of an event and hands it straight to
+`open_by_handle_at`, then checks the **content** that comes back. A handle that
+opened the wrong file would pass any check of the return value alone — which is
+exactly what the padding bug did until the content was compared.

@@ -30,6 +30,8 @@ static long sys6(long n,long a,long b,long c,long d,long e,long f){
 #define SYS_exit_group 94
 #define SYS_fanotify_init 262
 #define SYS_fanotify_mark 263
+#define SYS_name_to_handle_at 264
+#define SYS_open_by_handle_at 265
 #define AT_FDCWD -100
 #define O_RDONLY 0
 #define O_WRONLY 1
@@ -47,16 +49,23 @@ static long sys6(long n,long a,long b,long c,long d,long e,long f){
 #define FAN_OPEN_PERM 0x10000
 #define FAN_ALLOW 1
 #define FAN_DENY 2
+#define FAN_REPORT_FID 0x200
+#define FAN_NOFD (-1)
+#define EOVERFLOW 75
 #define EPERM 1
 #define EINVAL 22
 
 struct fan_md { unsigned event_len; unsigned char vers, res; unsigned short mdlen;
                 unsigned long long mask; int fd; int pid; };
+struct fid_hdr { unsigned char info_type, pad; unsigned short len; int fsid[2]; };
+struct fhandle { unsigned bytes; int type; unsigned char h[32]; };
 struct tspec { long tv_sec, tv_nsec; };
 
 static void put(const char*m){int i=0;while(m[i])i++;sys6(SYS_write,1,(long)m,i,0,0,0);}
 static void putd(long v){char b[24];int i=23;b[i--]=0;int g=v<0;if(g)v=-v;
   if(v==0)b[i--]='0';while(v>0){b[i--]='0'+(v%10);v/=10;}if(g)b[i--]='-';put(b+i+1);}
+static int eqs(const char *a, const char *b)
+{ while (*a && *a == *b) { a++; b++; } return *a == *b; }
 static void fail(const char *what, long got, long want)
 { put("fan FAIL: "); put(what); put(" -> "); putd(got); put(", wanted ");
   putd(want); put("\n"); sys6(SYS_exit, 1, 0,0,0,0,0); }
@@ -214,8 +223,85 @@ void _start(void){
       fail("an open guarded by a dead listener was not released", f3, 0);
     sys6(SYS_close, f3, 0,0,0,0,0); }
 
+  /*
+   * FAN_REPORT_FID: the record names the object with a handle instead of
+   * handing over a descriptor. A handle that cannot be turned back into the
+   * file would be a number to compare and nothing else, so the check is that it
+   * opens, and opens the *right* file - which is why the content is verified
+   * rather than the call's return value.
+   */
+  long ffd = sys6(SYS_fanotify_init, FAN_CLASS_NOTIF|FAN_NONBLOCK|FAN_REPORT_FID,
+                  O_RDONLY, 0,0,0,0);
+  if (ffd < 0)
+    fail("fanotify_init(FAN_REPORT_FID)", ffd, 0);
+
+  /* Handles and permission events cannot be combined, as on Linux: a verdict
+   * names a descriptor, and this mode never hands one out. */
+  if ((r = sys6(SYS_fanotify_init, FAN_CLASS_CONTENT|FAN_REPORT_FID,
+                O_RDONLY, 0,0,0,0)) != -EINVAL)
+    fail("FAN_REPORT_FID with a permission class", r, -EINVAL);
+
+  if ((r = sys6(SYS_fanotify_mark, ffd, FAN_MARK_ADD|FAN_MARK_MOUNT, FAN_OPEN,
+                AT_FDCWD, (long)"/fan-dir", 0)) != 0)
+    fail("marking a FID instance", r, 0);
+
+  /* Something for the handle to name, with content only it has. */
+  { long h = sys6(SYS_openat, AT_FDCWD, (long)"/fan-dir/h", O_WRONLY|O_CREAT, 0644, 0,0);
+    if (h < 0) fail("creating h", h, 0);
+    sys6(SYS_write, h, (long)"fid\n", 4, 0,0,0);
+    sys6(SYS_close, h, 0,0,0,0,0); }
+
+  long hpid = sys6(SYS_clone, SIGCHLD, 0, 0, 0, 0, 0);
+  if (hpid < 0) fail("clone for the fid test", hpid, 0);
+  if (hpid == 0) {
+    long f4 = sys6(SYS_openat, AT_FDCWD, (long)"/fan-dir/h", O_RDONLY, 0, 0,0);
+    if (f4 >= 0) sys6(SYS_close, f4, 0,0,0,0,0);
+    sys6(SYS_exit, 0, 0,0,0,0,0);
+  }
+  { int st4=0; sys6(SYS_wait4, hpid, (long)&st4, 0, 0,0,0); }
+
+  int resolved = 0;
+  for (int i=0;i<60 && !resolved;i++){
+    struct tspec ts={0,20000000}; sys6(SYS_nanosleep,(long)&ts,0,0,0,0,0);
+    char buf[4096];
+    long n = sys6(SYS_read, ffd, (long)buf, sizeof buf, 0,0,0);
+    for (long off=0; n>0 && off+(long)sizeof(struct fan_md)<=n; ){
+      struct fan_md *m=(struct fan_md*)(buf+off);
+      if (m->fd != FAN_NOFD)
+        fail("a FID event carried a descriptor", m->fd, FAN_NOFD);
+      if (m->event_len > sizeof *m) {
+        /* The handle follows the metadata; hand it straight back. */
+        char *info = buf + off + m->mdlen;
+        struct fhandle *fh = (struct fhandle *)(info + sizeof(struct fid_hdr));
+        long o = sys6(SYS_open_by_handle_at, AT_FDCWD, (long)fh, O_RDONLY, 0,0,0);
+        if (o < 0)
+          fail("open_by_handle_at on a reported handle", o, 0);
+        char c[8] = {0};
+        long got = sys6(SYS_read, o, (long)c, 4, 0,0,0);
+        sys6(SYS_close, o, 0,0,0,0,0);
+        if (got != 4 || !eqs(c, "fid\n"))
+          fail("the handle opened the wrong file", got, 4);
+        resolved = 1;
+      }
+      off += m->event_len;
+    }
+  }
+  if (!resolved)
+    fail("no FID event arrived", 0, 1);
+  sys6(SYS_close, ffd, 0,0,0,0,0);
+
+  /* name_to_handle_at answers the size before it answers the handle, which is
+   * the whole of how a caller sizes its buffer. */
+  { struct fhandle small; small.bytes = 0;
+    if ((r = sys6(SYS_name_to_handle_at, AT_FDCWD, (long)"/fan-dir/h",
+                  (long)&small, 0, 0, 0)) != -EOVERFLOW)
+      fail("name_to_handle_at with too small a buffer", r, -EOVERFLOW);
+    if (small.bytes == 0)
+      fail("it did not say how much was wanted", small.bytes, 16); }
+
   sys6(SYS_unlinkat, AT_FDCWD, (long)"/fan-dir/f", 0, 0,0,0);
   sys6(SYS_unlinkat, AT_FDCWD, (long)"/fan-dir/g", 0, 0,0,0);
+  sys6(SYS_unlinkat, AT_FDCWD, (long)"/fan-dir/h", 0, 0,0,0);
   put("fan ok\n");
   sys6(SYS_exit, 0, 0,0,0,0,0);
 }

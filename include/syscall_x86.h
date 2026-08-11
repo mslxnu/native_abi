@@ -306,8 +306,8 @@
   SYSCALL(300, fanotify_init)                   \
   SYSCALL(301, fanotify_mark)                   \
   SYSCALL(302, prlimit64)                        \
-  SYSCALL(303, unimplemented)                   \
-  SYSCALL(304, unimplemented)                   \
+  SYSCALL(303, name_to_handle_at)               \
+  SYSCALL(304, open_by_handle_at)               \
   SYSCALL(305, unimplemented)                   \
   SYSCALL(306, syncfs)                          \
   SYSCALL(307, sendmmsg)                        \

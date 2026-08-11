@@ -71,6 +71,7 @@
 #include "linux/common.h"
 #include "linux/errno.h"
 #include "linux/fanotify.h"
+#include "linux/handle.h"
 
 #define FAN_MARKS_MAX 256
 #define FAN_PATH      400
@@ -116,7 +117,7 @@ static pthread_mutex_t reg_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* The guest's fanotify descriptors, so read can be recognised as a fanotify
  * read. Small and linear: a guest has one or two of these, never many. */
-static struct { int fd; uint32_t inst; unsigned cls; } inst_fds[16];
+static struct { int fd; uint32_t inst; unsigned cls; bool fid; } inst_fds[16];
 static int n_inst_fds;
 
 /*
@@ -417,16 +418,28 @@ DEFINE_SYSCALL(fanotify_init, unsigned int, flags, unsigned int, event_f_flags)
     return -LINUX_EINVAL;
 
   /*
-   * The reporting flags change the record format into one carrying file
-   * handles instead of descriptors. Refused rather than ignored: a listener
-   * given the wrong shape would parse whatever the bytes happened to be.
+   * FAN_REPORT_FID changes the record: no descriptor, and a file handle after
+   * the metadata instead. The two directory-entry forms are still refused, and
+   * for a reason rather than for effort - DFID and NAME exist to describe
+   * FAN_CREATE, FAN_DELETE and the moves, which this does not produce, so a
+   * listener asking for them would get a record shape promising names for
+   * events that never arrive.
    */
-  if (flags & (LINUX_FAN_REPORT_FID | LINUX_FAN_REPORT_DIR_FID |
-               LINUX_FAN_REPORT_NAME))
+  if (flags & (LINUX_FAN_REPORT_DIR_FID | LINUX_FAN_REPORT_NAME))
+    return -LINUX_EINVAL;
+
+  /*
+   * Handles and permission events cannot be combined, as on Linux. A verdict
+   * names the descriptor it answers, and an instance reporting handles was
+   * never given one - so there would be nothing for the listener to answer
+   * with, and nothing here to route the answer by.
+   */
+  if ((flags & LINUX_FAN_REPORT_FID) && cls != LINUX_FAN_CLASS_NOTIF)
     return -LINUX_EINVAL;
   if (flags & ~(unsigned) (LINUX_FAN_CLOEXEC | LINUX_FAN_NONBLOCK |
                            LINUX_FAN_CLASS_BITS | LINUX_FAN_UNLIMITED_QUEUE |
-                           LINUX_FAN_UNLIMITED_MARKS | LINUX_FAN_REPORT_TID))
+                           LINUX_FAN_UNLIMITED_MARKS | LINUX_FAN_REPORT_TID |
+                           LINUX_FAN_REPORT_FID))
     return -LINUX_EINVAL;
 
   struct fan_registry *r = registry_map(true);
@@ -473,6 +486,7 @@ DEFINE_SYSCALL(fanotify_init, unsigned int, flags, unsigned int, event_f_flags)
   inst_fds[n_inst_fds].fd = fd;
   inst_fds[n_inst_fds].inst = inst;
   inst_fds[n_inst_fds].cls = cls;
+  inst_fds[n_inst_fds].fid = (flags & LINUX_FAN_REPORT_FID) != 0;
   n_inst_fds++;
   return fd;
 }
@@ -627,6 +641,11 @@ fanotify_read(int fd, char *out, size_t size, int *ret)
   if (inst < 0)
     return false;
 
+  bool fid = false;
+  for (int i = 0; i < n_inst_fds; i++)
+    if (inst_fds[i].fd == fd)
+      fid = inst_fds[i].fid;
+
   size_t produced = 0;
   for (;;) {
     if (size - produced < sizeof(struct l_fanotify_event_metadata))
@@ -643,6 +662,70 @@ fanotify_read(int fd, char *out, size_t size, int *ret)
       break;
     }
     w.path[sizeof w.path - 1] = '\0';
+
+    /*
+     * Reporting a handle rather than a descriptor.
+     *
+     * The record says which *object* the event was about and leaves opening it
+     * to the listener, which is what the mode is for: a handle can be compared,
+     * stored and resolved later, where a descriptor has to be closed and is
+     * only good in the process that was given it. FAN_NOFD is what Linux puts
+     * in the fd field when there is no descriptor, and it is the flag a
+     * listener checks.
+     */
+    if (fid) {
+      struct stat st;
+      if (stat(w.path, &st) < 0) {
+        release(w.reqid, LINUX_FAN_ALLOW);
+        continue;
+      }
+
+      /*
+       * Laid out by offset rather than by struct.
+       *
+       * Linux's info record ends in `unsigned char handle[]`, so the file
+       * handle and its bytes are packed straight after the fsid with no
+       * alignment of their own. Describing that with a C struct puts four
+       * bytes of padding in front of the 64-bit inode - the compiler aligning
+       * a field Linux never aligned - and a listener reading at the offsets
+       * the ABI specifies got the number four bytes to its left. It resolved
+       * to /.vol/0/39371965202432, which is not a file.
+       */
+      unsigned char fidrec[36];
+      memset(fidrec, 0, sizeof fidrec);
+      uint16_t ilen = (uint16_t) sizeof fidrec;
+      int32_t  fsid0 = (int32_t) st.st_dev, fsid1 = 0;
+      uint32_t hbytes = 16;
+      int32_t  htype = 0x81;    /* the encoding src/fs/handle.c reads */
+      uint64_t hino = (uint64_t) st.st_ino;
+      uint32_t hdev = (uint32_t) st.st_dev;
+
+      fidrec[0] = LINUX_FAN_EVENT_INFO_TYPE_FID;
+      memcpy(fidrec + 2,  &ilen,   sizeof ilen);
+      memcpy(fidrec + 4,  &fsid0,  sizeof fsid0);
+      memcpy(fidrec + 8,  &fsid1,  sizeof fsid1);
+      memcpy(fidrec + 12, &hbytes, sizeof hbytes);
+      memcpy(fidrec + 16, &htype,  sizeof htype);
+      memcpy(fidrec + 20, &hino,   sizeof hino);
+      memcpy(fidrec + 28, &hdev,   sizeof hdev);
+
+      if (size - produced < sizeof(struct l_fanotify_event_metadata) +
+                            sizeof fidrec)
+        break;
+
+      struct l_fanotify_event_metadata md;
+      memset(&md, 0, sizeof md);
+      md.event_len = (uint32_t) (sizeof md + sizeof fidrec);
+      md.vers = LINUX_FANOTIFY_METADATA_VERSION;
+      md.metadata_len = sizeof md;
+      md.mask = w.mask;
+      md.fd = LINUX_FAN_NOFD;
+      md.pid = w.pid;
+      memcpy(out + produced, &md, sizeof md);
+      memcpy(out + produced + sizeof md, fidrec, sizeof fidrec);
+      produced += sizeof md + sizeof fidrec;
+      continue;
+    }
 
     /*
      * A request that cannot be presented has to be answered anyway.
