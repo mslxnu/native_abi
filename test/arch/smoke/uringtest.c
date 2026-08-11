@@ -79,6 +79,17 @@ static long sys6(long n, long a, long b, long c, long d, long e, long f){
 #define OP_SEND           26
 #define OP_RECV           27
 #define OP_OPENAT2        28
+#define OP_READ_FIXED      4
+#define OP_WRITE_FIXED     5
+#define IOSQE_FIXED_FILE   1
+#define REG_BUFFERS        0
+#define UNREG_BUFFERS      1
+#define REG_FILES          2
+#define UNREG_FILES        3
+#define REG_FILES_UPDATE   6
+#define EBADF              9
+#define EBUSY             16
+#define EFAULT            14
 #define SYS_socketpair    199
 #define AF_UNIX            1
 #define SOCK_STREAM        1
@@ -900,13 +911,162 @@ void _start(void)
     if (c3.res != -EINVAL)
       fail("an unenforceable resolve flag must be refused", c3.res, -EINVAL); }
 
+  /*
+   * ---- registered files ----
+   *
+   * A registered descriptor is named by its index, and IOSQE_FIXED_FILE is what
+   * says the fd field is that index. The check that matters is that an index
+   * and a descriptor are told apart: index 0 here holds the real file, and a
+   * submission naming index 0 *without* the flag means descriptor 0, which is
+   * stdin - so an implementation that resolved the table regardless would read
+   * the file and look correct.
+   */
+  { int files[2] = { (int) f, -1 };
+    if ((r = sys6(SYS_io_uring_register, fd, REG_FILES, (long) files, 2, 0, 0)) != 0)
+      fail("registering files", r, 0);
+
+    char buf[16]; clr(buf, sizeof buf);
+    struct sqe *s = push();
+    s->opcode = OP_READ;
+    s->flags = IOSQE_FIXED_FILE;
+    s->fd = 0;                  /* an index, not a descriptor */
+    s->addr = (unsigned long long) (long) buf;
+    s->len = 5; s->off = 0;
+    s->user_data = 0xB001;
+    if ((r = sys6(SYS_io_uring_enter, fd, 1, 1, IORING_ENTER_GETEVENTS, 0, 0)) != 1)
+      fail("io_uring_enter for a fixed-file read", r, 1);
+    struct cqe c = pop("a completion for the fixed-file read");
+    if (c.res != 5)
+      fail("what a fixed-file read reported", c.res, 5);
+    if (!eq(buf, "hello"))
+      fails("what a fixed-file read delivered", buf, "hello");
+
+    /* An empty slot is EBADF, which is what the caller is really holding. */
+    struct sqe *s2 = push();
+    s2->opcode = OP_READ;
+    s2->flags = IOSQE_FIXED_FILE;
+    s2->fd = 1;                 /* registered as -1 */
+    s2->addr = (unsigned long long) (long) buf;
+    s2->len = 5; s2->off = 0;
+    s2->user_data = 0xB002;
+    if ((r = sys6(SYS_io_uring_enter, fd, 1, 1, IORING_ENTER_GETEVENTS, 0, 0)) != 1)
+      fail("io_uring_enter for an empty slot", r, 1);
+    struct cqe c2 = pop("a completion for the empty slot");
+    if (c2.res != -EBADF)
+      fail("reading an unregistered slot", c2.res, -EBADF);
+
+    /* Past the end of the table, likewise. */
+    struct sqe *s3 = push();
+    s3->opcode = OP_READ;
+    s3->flags = IOSQE_FIXED_FILE;
+    s3->fd = 99;
+    s3->addr = (unsigned long long) (long) buf;
+    s3->len = 5; s3->off = 0;
+    s3->user_data = 0xB003;
+    if ((r = sys6(SYS_io_uring_enter, fd, 1, 1, IORING_ENTER_GETEVENTS, 0, 0)) != 1)
+      fail("io_uring_enter for an index past the table", r, 1);
+    struct cqe c3 = pop("a completion for the index past the table");
+    if (c3.res != -EBADF)
+      fail("an index past the end of the table", c3.res, -EBADF);
+
+    /* Filling the empty slot through an update makes it usable. */
+    struct { unsigned offset, resv; unsigned long long data; } up;
+    int newfd = (int) f;
+    up.offset = 1; up.resv = 0;
+    up.data = (unsigned long long) (long) &newfd;
+    if ((r = sys6(SYS_io_uring_register, fd, REG_FILES_UPDATE, (long) &up, 1, 0, 0)) != 1)
+      fail("updating one registered file", r, 1);
+
+    clr(buf, sizeof buf);
+    struct sqe *s4 = push();
+    s4->opcode = OP_READ;
+    s4->flags = IOSQE_FIXED_FILE;
+    s4->fd = 1;                 /* now filled in */
+    s4->addr = (unsigned long long) (long) buf;
+    s4->len = 5; s4->off = 0;
+    s4->user_data = 0xB004;
+    if ((r = sys6(SYS_io_uring_enter, fd, 1, 1, IORING_ENTER_GETEVENTS, 0, 0)) != 1)
+      fail("io_uring_enter after the update", r, 1);
+    struct cqe c4 = pop("a completion after the update");
+    if (c4.res != 5 || !eq(buf, "hello"))
+      fails("what the updated slot read", buf, "hello");
+
+    /* Registering twice over the top is refused rather than leaking. */
+    if ((r = sys6(SYS_io_uring_register, fd, REG_FILES, (long) files, 2, 0, 0)) != -EBUSY)
+      fail("registering files twice", r, -EBUSY);
+    if ((r = sys6(SYS_io_uring_register, fd, UNREG_FILES, 0, 0, 0, 0)) != 0)
+      fail("unregistering files", r, 0);
+    if ((r = sys6(SYS_io_uring_register, fd, UNREG_FILES, 0, 0, 0, 0)) != -ENXIO)
+      fail("unregistering files twice", r, -ENXIO); }
+
+  /*
+   * ---- registered buffers ----
+   *
+   * READ_FIXED names its memory by index and points somewhere inside it, and
+   * the range is checked against the registration. That bound is the one
+   * promise registration carries here, so it is the one thing tested besides
+   * the transfer itself.
+   */
+  { char area[64]; clr(area, sizeof area);
+    struct iov regv[1] = { { area, sizeof area } };
+    if ((r = sys6(SYS_io_uring_register, fd, REG_BUFFERS, (long) regv, 1, 0, 0)) != 0)
+      fail("registering buffers", r, 0);
+
+    struct sqe *s = push();
+    s->opcode = OP_READ_FIXED;
+    s->fd = f;
+    s->buf_index = 0;
+    s->addr = (unsigned long long) (long) (area + 8);   /* inside it */
+    s->len = 5; s->off = 0;
+    s->user_data = 0xB101;
+    if ((r = sys6(SYS_io_uring_enter, fd, 1, 1, IORING_ENTER_GETEVENTS, 0, 0)) != 1)
+      fail("io_uring_enter for a fixed-buffer read", r, 1);
+    struct cqe c = pop("a completion for the fixed-buffer read");
+    if (c.res != 5)
+      fail("what a fixed-buffer read reported", c.res, 5);
+    if (!eq(area + 8, "hello"))
+      fails("where a fixed-buffer read landed", area + 8, "hello");
+
+    /* A range that runs off the end of the registration is refused, even
+     * though the memory either side of it is perfectly valid. */
+    struct sqe *s2 = push();
+    s2->opcode = OP_READ_FIXED;
+    s2->fd = f;
+    s2->buf_index = 0;
+    s2->addr = (unsigned long long) (long) (area + 60);
+    s2->len = 16;               /* 60 + 16 > 64 */
+    s2->off = 0;
+    s2->user_data = 0xB102;
+    if ((r = sys6(SYS_io_uring_enter, fd, 1, 1, IORING_ENTER_GETEVENTS, 0, 0)) != 1)
+      fail("io_uring_enter for an overrunning fixed read", r, 1);
+    struct cqe c2 = pop("a completion for the overrunning read");
+    if (c2.res != -EFAULT)
+      fail("a fixed read past the end of its buffer", c2.res, -EFAULT);
+
+    /* An index with no buffer behind it, likewise. */
+    struct sqe *s3 = push();
+    s3->opcode = OP_READ_FIXED;
+    s3->fd = f;
+    s3->buf_index = 7;
+    s3->addr = (unsigned long long) (long) area;
+    s3->len = 5; s3->off = 0;
+    s3->user_data = 0xB103;
+    if ((r = sys6(SYS_io_uring_enter, fd, 1, 1, IORING_ENTER_GETEVENTS, 0, 0)) != 1)
+      fail("io_uring_enter for an unregistered buffer index", r, 1);
+    struct cqe c3 = pop("a completion for the unregistered index");
+    if (c3.res != -EFAULT)
+      fail("a fixed read naming a buffer that was never registered", c3.res,
+           -EFAULT);
+
+    if ((r = sys6(SYS_io_uring_register, fd, UNREG_BUFFERS, 0, 0, 0, 0)) != 0)
+      fail("unregistering buffers", r, 0); }
+
   /* ---- what these refuse ---- */
   if ((r = sys6(SYS_io_uring_enter, f, 0, 0, 0, 0, 0)) != -EOPNOTSUPP)
     fail("io_uring_enter on a descriptor that is not a ring", r, -EOPNOTSUPP);
-  /* Registering buffers would mean honouring the fixed-buffer opcodes too, so
-   * it is refused rather than accepted and ignored. */
-  if ((r = sys6(SYS_io_uring_register, fd, 0, 0, 0, 0, 0)) != -EINVAL)
-    fail("registering buffers, which is not implemented", r, -EINVAL);
+  /* Probing and the rest stay refused. */
+  if ((r = sys6(SYS_io_uring_register, fd, 8 /* PROBE */, 0, 0, 0, 0)) != -EINVAL)
+    fail("a registration that is not implemented", r, -EINVAL);
 
   sys6(SYS_close, f, 0, 0, 0, 0, 0);
   sys6(SYS_close, fd, 0, 0, 0, 0, 0);

@@ -4570,3 +4570,37 @@ it was what made the mistake reachable.
 The lesson is in the test rather than the fix: a completion carrying a descriptor
 was checked for being non-negative, and a descriptor is only a descriptor if the
 guest can use it. Both opens now read a byte back through what they returned.
+
+### 3.5.86 Fixed files and buffers — registration without anything to pin
+
+Registration pre-attaches descriptors or memory to a ring so a submission can
+name one by index. On Linux that buys two things: the kernel holds a reference
+and resolves the descriptor once instead of per operation, and it pins the pages
+so I/O can go straight to them. **Neither exists here.** There is nothing to pin,
+and a descriptor lookup that costs nothing is not worth saving.
+
+What is left is the naming, and the naming is the part a guest can observe — so
+it is the part that has to be right. `IOSQE_FIXED_FILE` makes the `fd` field an
+index into the ring's table, and that resolution happens once in the submit loop
+rather than in each operation, so every opcode taking a descriptor gets it and
+there is a single place for it to be wrong. An index with nothing behind it
+answers `EBADF`, which is what the caller is really holding.
+
+`READ_FIXED` and `WRITE_FIXED` name their memory by `buf_index` and point
+somewhere inside it, and **the range is checked against the registration**. That
+check is worth keeping even without pinning behind it. The kernel makes it
+because it has pinned those pages and will touch nothing else; a caller that
+relies on the bound should get the bound whether or not that is the reason for
+it, and a fixed read running off the end of its buffer is a bug the caller wants
+told about rather than quietly served.
+
+Both were checked against builds that drop them. Without the flag check the
+fixed-file read reports 0 where 5 was wanted — slot 0 holds the real file, so a
+submission naming 0 as a *descriptor* means stdin, which is what makes that test
+tell an index from a descriptor at all. Without the bound check the overrunning
+read succeeds and returns 10.
+
+The first attempt at that first check proved nothing: the edit that was supposed
+to disable the flag never matched, so the test ran against correct code and
+passed. A verification that silently does not verify is worse than none, because
+it is recorded as evidence. It is asserted now.

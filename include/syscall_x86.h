@@ -45,7 +45,7 @@
   SYSCALL(37, alarm) \
   SYSCALL(38, setitimer) \
   SYSCALL(39, getpid) \
-  SYSCALL(40, unimplemented) \
+  SYSCALL(40, sendfile) \
   SYSCALL(41, socket) \
   SYSCALL(42, connect) \
   SYSCALL(43, accept) \
@@ -211,11 +211,11 @@
   SYSCALL(203, sched_setaffinity) \
   SYSCALL(204, sched_getaffinity) \
   SYSCALL(205, set_thread_area) \
-  SYSCALL(206, unimplemented) \
-  SYSCALL(207, unimplemented) \
-  SYSCALL(208, unimplemented) \
-  SYSCALL(209, unimplemented) \
-  SYSCALL(210, unimplemented) \
+  SYSCALL(206, io_setup) \
+  SYSCALL(207, io_destroy) \
+  SYSCALL(208, io_getevents) \
+  SYSCALL(209, io_submit) \
+  SYSCALL(210, io_cancel) \
   SYSCALL(211, get_thread_area) \
   SYSCALL(212, unimplemented) \
   SYSCALL(213, unimplemented) \
@@ -280,10 +280,10 @@
   SYSCALL(272, unshare) \
   SYSCALL(273, set_robust_list) \
   SYSCALL(274, get_robust_list) \
-  SYSCALL(275, unimplemented) \
+  SYSCALL(275, splice) \
   SYSCALL(276, tee) \
   SYSCALL(277, sync_file_range) \
-  SYSCALL(278, unimplemented) \
+  SYSCALL(278, vmsplice) \
   SYSCALL(279, unimplemented) \
   SYSCALL(280, utimensat) \
   SYSCALL(281, epoll_pwait) \
@@ -331,14 +331,14 @@
   SYSCALL(323, unimplemented) \
   SYSCALL(324, unimplemented) \
   SYSCALL(325, unimplemented) \
-  SYSCALL(326, unimplemented) \
+  SYSCALL(326, copy_file_range) \
   SYSCALL(327, unimplemented) \
   SYSCALL(328, unimplemented) \
   SYSCALL(329, unimplemented) \
   SYSCALL(330, unimplemented) \
   SYSCALL(331, unimplemented) \
   SYSCALL(332, statx) \
-  SYSCALL(333, unimplemented) \
+  SYSCALL(333, io_pgetevents) \
   SYSCALL(334, rseq) \
   SYSCALL(335, unimplemented) \
   SYSCALL(336, unimplemented) \
@@ -430,9 +430,9 @@
   SYSCALL(422, unimplemented) \
   SYSCALL(423, unimplemented) \
   SYSCALL(424, unimplemented) \
-  SYSCALL(425, unimplemented) \
-  SYSCALL(426, unimplemented) \
-  SYSCALL(427, unimplemented) \
+  SYSCALL(425, io_uring_setup) \
+  SYSCALL(426, io_uring_enter) \
+  SYSCALL(427, io_uring_register) \
   SYSCALL(428, unimplemented) \
   SYSCALL(429, unimplemented) \
   SYSCALL(430, unimplemented) \
@@ -442,7 +442,7 @@
   SYSCALL(434, unimplemented) \
   SYSCALL(435, clone3) \
   SYSCALL(436, unimplemented) \
-  SYSCALL(437, unimplemented) \
+  SYSCALL(437, openat2) \
   SYSCALL(438, unimplemented) \
   SYSCALL(439, faccessat2) \
   SYSCALL(440, unimplemented) \

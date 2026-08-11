@@ -132,6 +132,19 @@ struct uring {
   pthread_cond_t   posted;      /* a completion has been added */
   struct pending  *pending;
   uint64_t         completions; /* posted since setup; what a counted timeout waits on */
+  /*
+   * Registered files and buffers. On Linux these are pre-attached so that a
+   * submission can name one by index instead of by descriptor or address, and
+   * the kernel can hold a reference and pin the pages once rather than resolve
+   * them per operation. Here there is nothing to pin and no descriptor lookup
+   * worth saving, so what is left is the naming - and the naming is the part a
+   * guest can observe, so it is the part that has to be right.
+   */
+  int             *files;
+  uint32_t         nfiles;
+  struct l_iovec  *bufs;
+  uint32_t         nbufs;
+
   pthread_t        poller;
   bool             polling;     /* the thread exists */
   bool             stopping;
@@ -664,6 +677,8 @@ uring_close(int fd)
         free(p);
         p = n;
       }
+      free(r->files);
+      free(r->bufs);
       pthread_cond_destroy(&r->posted);
       pthread_mutex_destroy(&r->lock);
 
@@ -685,7 +700,7 @@ uring_close(int fd)
  * operation blocks the caller. See the note at the top.
  */
 static int32_t
-run_sqe(const struct l_io_uring_sqe *s)
+run_sqe(struct uring *r, const struct l_io_uring_sqe *s)
 {
   ssize_t n;
 
@@ -707,6 +722,50 @@ run_sqe(const struct l_io_uring_sqe *s)
     }
     /* An offset of -1 means "use the file's own position", which is how the
      * non-vectored forms stand in for read(2) and write(2). */
+    bool at_off = (s->off != (uint64_t) -1);
+    if (writing)
+      n = at_off ? pwrite(s->fd, buf, s->len, (off_t) s->off)
+                 : write(s->fd, buf, s->len);
+    else
+      n = at_off ? pread(s->fd, buf, s->len, (off_t) s->off)
+                 : read(s->fd, buf, s->len);
+    int e = errno;
+    if (!writing && n > 0 && copy_to_user((gaddr_t) s->addr, buf, (size_t) n)) {
+      free(buf);
+      return -LINUX_EFAULT;
+    }
+    free(buf);
+    return n < 0 ? -darwin_to_linux_errno(e) : (int32_t) n;
+  }
+
+  case LINUX_IORING_OP_READ_FIXED:
+  case LINUX_IORING_OP_WRITE_FIXED: {
+    /*
+     * The same transfer as READ and WRITE, except the memory was named ahead of
+     * time: buf_index picks a registered buffer and addr points somewhere inside
+     * it. The range is checked against that buffer, which is the one guarantee
+     * registration actually carries here - the kernel checks it because it has
+     * pinned those pages and will touch nothing else, and a caller that relies
+     * on the check should get it whether or not there is pinning behind it.
+     */
+    if (!r->bufs || s->buf_index >= r->nbufs)
+      return -LINUX_EFAULT;
+    const struct l_iovec *b = &r->bufs[s->buf_index];
+    uint64_t base = (uint64_t) b->iov_base;
+    if (s->addr < base || s->addr - base > b->iov_len ||
+        s->len > b->iov_len - (s->addr - base))
+      return -LINUX_EFAULT;
+    if (s->len == 0)
+      return 0;
+
+    char *buf = malloc(s->len);
+    if (!buf)
+      return -LINUX_ENOMEM;
+    bool writing = (s->opcode == LINUX_IORING_OP_WRITE_FIXED);
+    if (writing && copy_from_user(buf, (gaddr_t) s->addr, s->len)) {
+      free(buf);
+      return -LINUX_EFAULT;
+    }
     bool at_off = (s->off != (uint64_t) -1);
     if (writing)
       n = at_off ? pwrite(s->fd, buf, s->len, (off_t) s->off)
@@ -859,6 +918,27 @@ run_sqe(const struct l_io_uring_sqe *s)
      * the batch failing. */
     return -LINUX_EINVAL;
   }
+}
+
+/*
+ * IOSQE_FIXED_FILE: the fd field is an index into the ring's registered table
+ * rather than a descriptor.
+ *
+ * Done once here rather than in each operation, so that every opcode taking a
+ * descriptor gets it and there is a single place for it to be wrong. An index
+ * with nothing behind it is EBADF - the same answer a bad descriptor would get,
+ * which is what the caller is really holding.
+ */
+static int
+resolve_fixed_file(struct uring *r, struct l_io_uring_sqe *s)
+{
+  if (!(s->flags & LINUX_IOSQE_FIXED_FILE))
+    return 0;
+  uint32_t i = (uint32_t) s->fd;
+  if (!r->files || i >= r->nfiles || r->files[i] < 0)
+    return -LINUX_EBADF;
+  s->fd = r->files[i];
+  return 0;
 }
 
 /*
@@ -1064,9 +1144,15 @@ DEFINE_SYSCALL(io_uring_enter, int, fd, uint32_t, to_submit,
     memcpy(&s, r->sqes + (size_t) slot * sizeof s, sizeof s);
     done++;
 
+    int fixed = resolve_fixed_file(r, &s);
+    if (fixed < 0) {
+      post_cqe(r, s.user_data, fixed);
+      continue;
+    }
+
     if (arm_async(r, &s))
       continue;
-    post_cqe(r, s.user_data, run_sqe(&s));
+    post_cqe(r, s.user_data, run_sqe(r, &s));
   }
 
   st(r->sq, SQ_OFF_DROPPED, dropped);
@@ -1155,15 +1241,78 @@ uring_register(struct uring *r, uint32_t opcode, gaddr_t arg, uint32_t nr_args)
     r->eventfd = -1;
     return 0;
 
+  case LINUX_IORING_REGISTER_FILES: {
+    if (r->files)
+      return -LINUX_EBUSY;      /* replacing is an update, or unregister first */
+    if (nr_args == 0 || nr_args > 4096)
+      return -LINUX_EINVAL;
+    int *t = calloc(nr_args, sizeof *t);
+    if (!t)
+      return -LINUX_ENOMEM;
+    if (copy_from_user(t, arg, (size_t) nr_args * sizeof *t)) {
+      free(t);
+      return -LINUX_EFAULT;
+    }
+    r->files = t;
+    r->nfiles = nr_args;
+    return 0;
+  }
+
+  case LINUX_IORING_UNREGISTER_FILES:
+    if (!r->files)
+      return -LINUX_ENXIO;
+    free(r->files);
+    r->files = NULL;
+    r->nfiles = 0;
+    return 0;
+
+  case LINUX_IORING_REGISTER_FILES_UPDATE: {
+    if (!r->files)
+      return -LINUX_ENXIO;
+    struct l_io_uring_rsrc_update up;
+    if (copy_from_user(&up, arg, sizeof up))
+      return -LINUX_EFAULT;
+    /* The replacement has to fit inside the table that is already there;
+     * growing it would move slots a caller has already been handed. */
+    if (nr_args == 0 || up.offset > r->nfiles ||
+        nr_args > r->nfiles - up.offset)
+      return -LINUX_EINVAL;
+    if (copy_from_user(r->files + up.offset, (gaddr_t) up.data,
+                       (size_t) nr_args * sizeof *r->files))
+      return -LINUX_EFAULT;
+    return (int) nr_args;
+  }
+
+  case LINUX_IORING_REGISTER_BUFFERS: {
+    if (r->bufs)
+      return -LINUX_EBUSY;
+    if (nr_args == 0 || nr_args > 1024)
+      return -LINUX_EINVAL;
+    struct l_iovec *t = calloc(nr_args, sizeof *t);
+    if (!t)
+      return -LINUX_ENOMEM;
+    if (copy_from_user(t, arg, (size_t) nr_args * sizeof *t)) {
+      free(t);
+      return -LINUX_EFAULT;
+    }
+    r->bufs = t;
+    r->nbufs = nr_args;
+    return 0;
+  }
+
+  case LINUX_IORING_UNREGISTER_BUFFERS:
+    if (!r->bufs)
+      return -LINUX_ENXIO;
+    free(r->bufs);
+    r->bufs = NULL;
+    r->nbufs = 0;
+    return 0;
+
   default:
     /*
-     * Registering buffers or descriptors pre-attaches them to a ring so a later
-     * submission can name one by index instead of by address. That is an
-     * optimisation over what a submission can already express, and honouring it
-     * means honouring IOSQE_FIXED_FILE and the *_FIXED opcodes as well - so it
-     * is refused rather than accepted and ignored. A guest told its buffers were
-     * registered would submit an index into a table that does not exist, and
-     * read whatever that index landed on.
+     * What is left - probing, personalities, restricting a ring - is refused on
+     * the same terms as before: a guest told a thing was registered and then
+     * submitting against it would be submitting against nothing.
      */
     return -LINUX_EINVAL;
   }

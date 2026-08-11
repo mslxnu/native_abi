@@ -339,7 +339,14 @@ guest-code cache sync.
   without entering it in the guest's table looks entirely successful until first
   use, which is exactly the bug that check found. `OPENAT2` is also checked to
   refuse a mode with nothing to create and to refuse a resolve restriction it
-  cannot enforce.
+  cannot enforce. Registered files are checked so that an *index* and a
+  *descriptor* are told apart: slot 0 holds the real file, so a submission naming
+  0 without `IOSQE_FIXED_FILE` means descriptor 0 — stdin — and an
+  implementation that ignored the flag reads nothing and reports 0 where 5 was
+  wanted. Registered buffers are checked on their bound, which is the one
+  guarantee registration carries here: a read that runs off the end of its
+  registration is refused even though the memory either side of it is perfectly
+  valid.
 
 The ELF binaries are committed prebuilt (as the x86 guest tests under
 `test/*/build/` are), so the check needs no cross-toolchain. The `.s` sources

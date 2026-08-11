@@ -61,6 +61,27 @@
 #define LINUX_IORING_OP_UNLINKAT       36
 #define LINUX_IORING_OP_MKDIRAT        37
 
+/*
+ * sqe->flags. FIXED_FILE turns the fd field into an index into the ring's
+ * registered-file table rather than a descriptor.
+ */
+#define LINUX_IOSQE_FIXED_FILE  (1U << 0)
+
+/* Fixed-buffer transfers: the buffer is named by buf_index, and addr points
+ * somewhere inside it. */
+#define LINUX_IORING_OP_READ_FIXED   4
+#define LINUX_IORING_OP_WRITE_FIXED  5
+
+/*
+ * Replacing part of a registered table: offset says where, and the new values
+ * are at data. Used for both files and buffers.
+ */
+struct l_io_uring_rsrc_update {
+  uint32_t offset;
+  uint32_t resv;
+  uint64_t data;
+};
+
 /* io_uring_register opcodes. */
 #define LINUX_IORING_REGISTER_BUFFERS      0
 #define LINUX_IORING_UNREGISTER_BUFFERS    1
