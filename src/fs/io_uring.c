@@ -226,6 +226,75 @@ wake_poller(struct uring *r)
 }
 
 /*
+ * What a cancellation is looking for.
+ *
+ * The three cancelling opcodes differ only in this. POLL_REMOVE and
+ * TIMEOUT_REMOVE name one kind of pending work and match a user_data within it;
+ * ASYNC_CANCEL matches across kinds, and its flags let it match on a descriptor
+ * or on nothing at all. Keeping the difference in a predicate means the part
+ * that actually cancels is written once.
+ */
+#define CANCEL_ANY_OP 0xff      /* not an opcode; "whatever kind" */
+
+struct cancel_match {
+  uint8_t  op;                  /* CANCEL_ANY_OP to ignore the kind */
+  bool     any;                 /* match everything pending */
+  bool     by_fd;               /* key is a descriptor, not a user_data */
+  uint64_t key;
+};
+
+static bool
+matches(const struct pending *p, const struct cancel_match *m)
+{
+  if (m->op != CANCEL_ANY_OP && p->op != m->op)
+    return false;
+  if (m->any)
+    return true;
+  if (m->by_fd)
+    /* Only work that waits on a descriptor can be matched by one; a timeout
+     * has none, and would otherwise match every fd number of zero. */
+    return p->op == LINUX_IORING_OP_POLL_ADD && p->fd == (int) m->key;
+  return p->user_data == m->key;
+}
+
+/*
+ * Cancel pending work, answering each cancelled request on its *own* user_data
+ * before the cancelling request answers on its. Without that a caller waiting on
+ * the request it just cancelled waits for something that will never arrive.
+ *
+ * Returns how many were cancelled. Nothing here can be half-done - a pending
+ * entry is either still waiting or already completed and off the list - so
+ * EALREADY, which the kernel uses for work that has started and cannot be
+ * called back, has no case to arise from.
+ */
+static int
+cancel_matching(struct uring *r, const struct cancel_match *m, bool all)
+{
+  int n = 0;
+  for (;;) {
+    struct pending **pp = &r->pending, *hit = NULL;
+    while (*pp) {
+      if (matches(*pp, m)) {
+        hit = *pp;
+        *pp = hit->next;
+        break;
+      }
+      pp = &(*pp)->next;
+    }
+    if (!hit)
+      break;
+    post_cqe(r, hit->user_data, -LINUX_ECANCELED);
+    free(hit);
+    n++;
+    if (!all)
+      break;
+  }
+  if (n)
+    wake_poller(r);             /* the set it is waiting on has changed */
+  return n;
+}
+
+/*
  * A counted timeout completes when enough *other* completions have been posted,
  * whichever comes first with its deadline. Checked after every batch rather than
  * inside post_cqe, so that a timeout cannot be completed by the very completion
@@ -780,18 +849,9 @@ arm_async(struct uring *r, const struct l_io_uring_sqe *s)
 
   case LINUX_IORING_OP_POLL_REMOVE: {
     /* addr names the poll to cancel, by the user_data it was submitted with. */
-    struct pending *p = pending_take(r, s->addr, LINUX_IORING_OP_POLL_ADD);
-    if (!p) {
-      post_cqe(r, s->user_data, -LINUX_ENOENT);
-      return true;
-    }
-    /* Two completions: the cancelled poll gets its own, so a caller waiting on
-     * that user_data is not left waiting for something that will never arrive,
-     * and the removal reports whether it found anything. */
-    post_cqe(r, p->user_data, -LINUX_ECANCELED);
-    free(p);
-    wake_poller(r);
-    post_cqe(r, s->user_data, 0);
+    struct cancel_match m = { .op = LINUX_IORING_OP_POLL_ADD, .key = s->addr };
+    int n = cancel_matching(r, &m, false);
+    post_cqe(r, s->user_data, n ? 0 : -LINUX_ENOENT);
     return true;
   }
 
@@ -827,17 +887,48 @@ arm_async(struct uring *r, const struct l_io_uring_sqe *s)
       return true;
     }
 
-    struct pending *p = pending_take(r, s->addr, LINUX_IORING_OP_TIMEOUT);
-    if (!p) {
-      post_cqe(r, s->user_data, -LINUX_ENOENT);
+    struct cancel_match m = { .op = LINUX_IORING_OP_TIMEOUT, .key = s->addr };
+    int n = cancel_matching(r, &m, false);
+    post_cqe(r, s->user_data, n ? 0 : -LINUX_ENOENT);
+    return true;
+  }
+
+  case LINUX_IORING_OP_ASYNC_CANCEL: {
+    /*
+     * The general form of the two removes above: it does not care what kind of
+     * work it is cancelling, and its flags decide what "matching" means.
+     *
+     * Ignoring those flags would cancel the wrong thing. CANCEL_FD says addr is
+     * a descriptor rather than a user_data, so matching on user_data would
+     * compare a descriptor against a cookie; CANCEL_ALL says cancel every match
+     * rather than the first, so a caller clearing out an fd would be left with
+     * all but one still armed and told it had succeeded.
+     */
+    uint32_t cf = s->rw_flags;
+    if (cf & LINUX_IORING_ASYNC_CANCEL_FD_FIXED) {
+      /* Names a registered descriptor, and registration is refused here - so
+       * the index would mean nothing. Refused rather than guessed at. */
+      post_cqe(r, s->user_data, -LINUX_EINVAL);
       return true;
     }
-    /* Two completions, as for POLL_REMOVE: the cancelled timeout answers on its
-     * own user_data so a caller waiting on it is not left waiting forever. */
-    post_cqe(r, p->user_data, -LINUX_ECANCELED);
-    free(p);
-    wake_poller(r);
-    post_cqe(r, s->user_data, 0);
+    if (cf & ~(uint32_t) (LINUX_IORING_ASYNC_CANCEL_ALL |
+                          LINUX_IORING_ASYNC_CANCEL_FD |
+                          LINUX_IORING_ASYNC_CANCEL_ANY)) {
+      post_cqe(r, s->user_data, -LINUX_EINVAL);
+      return true;
+    }
+
+    struct cancel_match m = {
+      .op = CANCEL_ANY_OP,
+      .any = (cf & LINUX_IORING_ASYNC_CANCEL_ANY) != 0,
+      .by_fd = (cf & LINUX_IORING_ASYNC_CANCEL_FD) != 0,
+      .key = s->addr,
+    };
+    bool all = (cf & LINUX_IORING_ASYNC_CANCEL_ALL) != 0;
+    int n = cancel_matching(r, &m, all);
+    /* Cancelling several reports how many; cancelling one reports that it did.
+     * Nothing found is ENOENT either way. */
+    post_cqe(r, s->user_data, n == 0 ? -LINUX_ENOENT : (all ? n : 0));
     return true;
   }
 

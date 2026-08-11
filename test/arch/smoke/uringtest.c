@@ -71,6 +71,11 @@ static long sys6(long n, long a, long b, long c, long d, long e, long f){
 #define OP_POLL_REMOVE  7
 #define OP_TIMEOUT     11
 #define OP_TIMEOUT_REMOVE 12
+#define OP_ASYNC_CANCEL   14
+#define CANCEL_ALL        1
+#define CANCEL_FD         2
+#define CANCEL_ANY        4
+#define CANCEL_FD_FIXED   8
 #define TIMEOUT_UPDATE  2
 
 struct sqe {
@@ -564,6 +569,117 @@ void _start(void)
     if (t1.sec - t0.sec >= 2)
       fail("the update did not shorten the wait; seconds elapsed",
            (long) (t1.sec - t0.sec), 0); }
+
+  /*
+   * ---- async cancel, which does not care what it is cancelling ----
+   *
+   * The two removes above each know one kind of pending work. This one matches
+   * across kinds, so the check that matters is that the *same* opcode cancels a
+   * poll and a timeout - a typed implementation would answer ENOENT for one of
+   * them.
+   */
+  { int pfd[2];
+    if (sys6(SYS_pipe2, (long) pfd, 0, 0, 0, 0, 0) != 0)
+      fail("pipe2", -1, 0);
+
+    /* a poll */
+    struct sqe *s1 = push();
+    s1->opcode = OP_POLL_ADD; s1->fd = pfd[0]; s1->rw_flags = POLLIN;
+    s1->user_data = 0xC001;
+    if ((r = sys6(SYS_io_uring_enter, fd, 1, 0, 0, 0, 0)) != 1)
+      fail("submitting a poll to cancel", r, 1);
+    struct sqe *s2 = push();
+    s2->opcode = OP_ASYNC_CANCEL; s2->addr = 0xC001; s2->user_data = 0xC002;
+    if ((r = sys6(SYS_io_uring_enter, fd, 1, 0, 0, 0, 0)) != 1)
+      fail("cancelling a poll", r, 1);
+    struct cqe c1 = pop("the cancelled poll's completion");
+    struct cqe c2 = pop("the cancellation's completion");
+    if (c1.user_data != 0xC001 || c1.res != -ECANCELED)
+      fail("what the cancelled poll reported", c1.res, -ECANCELED);
+    if (c2.res != 0)
+      fail("what cancelling a poll reported", c2.res, 0);
+
+    /* a timeout, through the same opcode */
+    struct { long long sec, nsec; } ts = { 10, 0 };
+    struct sqe *s3 = push();
+    s3->opcode = OP_TIMEOUT; s3->addr = (unsigned long long) (long) &ts;
+    s3->len = 1; s3->off = 0; s3->user_data = 0xC003;
+    if ((r = sys6(SYS_io_uring_enter, fd, 1, 0, 0, 0, 0)) != 1)
+      fail("submitting a timeout to cancel", r, 1);
+    struct sqe *s4 = push();
+    s4->opcode = OP_ASYNC_CANCEL; s4->addr = 0xC003; s4->user_data = 0xC004;
+    if ((r = sys6(SYS_io_uring_enter, fd, 1, 0, 0, 0, 0)) != 1)
+      fail("cancelling a timeout", r, 1);
+    struct cqe c3 = pop("the cancelled timeout's completion");
+    struct cqe c4 = pop("the cancellation's completion");
+    if (c3.user_data != 0xC003 || c3.res != -ECANCELED)
+      fail("what the cancelled timeout reported", c3.res, -ECANCELED);
+    if (c4.res != 0)
+      fail("what cancelling a timeout reported", c4.res, 0);
+
+    /* nothing to cancel */
+    struct sqe *s5 = push();
+    s5->opcode = OP_ASYNC_CANCEL; s5->addr = 0xDEAD; s5->user_data = 0xC005;
+    if ((r = sys6(SYS_io_uring_enter, fd, 1, 0, 0, 0, 0)) != 1)
+      fail("cancelling nothing", r, 1);
+    struct cqe c5 = pop("the completion for cancelling nothing");
+    if (c5.res != -ENOENT)
+      fail("cancelling something that was never armed", c5.res, -ENOENT);
+
+    /*
+     * ---- by descriptor, and all of them ----
+     *
+     * Two polls on one pipe, each with its own user_data, cleared out by naming
+     * the descriptor. Ignoring CANCEL_FD would match a descriptor number
+     * against a user_data and find nothing; ignoring CANCEL_ALL would cancel
+     * one of the two and report success, leaving the other armed.
+     */
+    struct sqe *s6 = push();
+    s6->opcode = OP_POLL_ADD; s6->fd = pfd[0]; s6->rw_flags = POLLIN;
+    s6->user_data = 0xC101;
+    struct sqe *s7 = push();
+    s7->opcode = OP_POLL_ADD; s7->fd = pfd[0]; s7->rw_flags = POLLIN;
+    s7->user_data = 0xC102;
+    if ((r = sys6(SYS_io_uring_enter, fd, 2, 0, 0, 0, 0)) != 2)
+      fail("submitting two polls on one descriptor", r, 2);
+
+    struct sqe *s8 = push();
+    s8->opcode = OP_ASYNC_CANCEL;
+    s8->rw_flags = CANCEL_FD | CANCEL_ALL;
+    s8->addr = pfd[0];          /* a descriptor, not a user_data */
+    s8->user_data = 0xC103;
+    if ((r = sys6(SYS_io_uring_enter, fd, 1, 0, 0, 0, 0)) != 1)
+      fail("cancelling everything on a descriptor", r, 1);
+
+    struct cqe d1 = pop("the first cancelled poll");
+    struct cqe d2 = pop("the second cancelled poll");
+    struct cqe d3 = pop("the cancellation's own completion");
+    if (d1.res != -ECANCELED || d2.res != -ECANCELED)
+      fail("what the polls cancelled by descriptor reported", d1.res,
+           -ECANCELED);
+    if ((d1.user_data == d2.user_data) ||
+        (d1.user_data != 0xC101 && d1.user_data != 0xC102) ||
+        (d2.user_data != 0xC101 && d2.user_data != 0xC102))
+      fail("the two cancellations must name the two polls",
+           (long) d1.user_data, 0xC101);
+    /* Cancelling several reports how many, which is how a caller knows the
+     * descriptor is now clear. */
+    if (d3.res != 2)
+      fail("how many CANCEL_ALL reported", d3.res, 2);
+
+    /* A registered-descriptor cancel names a table that does not exist here. */
+    struct sqe *s9 = push();
+    s9->opcode = OP_ASYNC_CANCEL; s9->rw_flags = CANCEL_FD_FIXED;
+    s9->addr = 0; s9->user_data = 0xC104;
+    if ((r = sys6(SYS_io_uring_enter, fd, 1, 0, 0, 0, 0)) != 1)
+      fail("cancelling by registered descriptor", r, 1);
+    struct cqe d4 = pop("the completion for a fixed-descriptor cancel");
+    if (d4.res != -EINVAL)
+      fail("cancelling by a descriptor that was never registered", d4.res,
+           -EINVAL);
+
+    sys6(SYS_close, pfd[0], 0, 0, 0, 0, 0);
+    sys6(SYS_close, pfd[1], 0, 0, 0, 0, 0); }
 
   /* ---- what these refuse ---- */
   if ((r = sys6(SYS_io_uring_enter, f, 0, 0, 0, 0, 0)) != -EOPNOTSUPP)

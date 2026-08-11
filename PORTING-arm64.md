@@ -4484,5 +4484,29 @@ the poller has genuinely settled onto the old deadline rather than racing to pic
 up the new one. Without that sleep the check passed with the wake deleted, which
 is to say it was proving nothing.
 
+`ASYNC_CANCEL` is the general form of both removes, and adding it was mostly a
+factoring job. The three differ only in what they are looking for: `POLL_REMOVE`
+and `TIMEOUT_REMOVE` each name one kind of pending work and match a `user_data`
+within it, while `ASYNC_CANCEL` matches across kinds and its flags let it match
+on a descriptor or on nothing at all. That difference now lives in a predicate,
+so the part that actually cancels — detach, answer the cancelled request on its
+*own* `user_data`, then answer the cancelling one — is written once instead of
+three times.
+
+Its `cancel_flags` are the same trap `IORING_TIMEOUT_UPDATE` was. `CANCEL_FD`
+says `addr` is a descriptor rather than a `user_data`, so ignoring it compares a
+descriptor against a cookie and finds nothing; `CANCEL_ALL` says cancel every
+match rather than the first, so ignoring it leaves a caller clearing out a
+descriptor with all but one still armed and a success in hand. Both are
+implemented, and `uringtest` was checked against an implementation that drops
+each — one reports a poll that was never cancelled, the other reports one
+cancellation where two were asked for. `CANCEL_FD_FIXED` names a registered
+descriptor, and registration is refused here, so it answers `EINVAL` rather than
+guessing at an index into a table that does not exist.
+
+`EALREADY` has no case to arise from. The kernel uses it for work that has
+started and cannot be called back; a pending entry here is either still waiting
+or already completed and off the list, with nothing in between.
+
 Still 242 of 395: these are opcodes inside `io_uring_enter`, not syscalls of
 their own, so the table does not move for them.

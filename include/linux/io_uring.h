@@ -47,6 +47,7 @@
 #define LINUX_IORING_OP_SYNC_FILE_RANGE 8
 #define LINUX_IORING_OP_TIMEOUT        11
 #define LINUX_IORING_OP_TIMEOUT_REMOVE 12
+#define LINUX_IORING_OP_ASYNC_CANCEL   14
 #define LINUX_IORING_OP_OPENAT         18
 #define LINUX_IORING_OP_CLOSE          19
 #define LINUX_IORING_OP_STATX          21
@@ -67,6 +68,18 @@
 #define LINUX_IORING_REGISTER_EVENTFD      4
 #define LINUX_IORING_UNREGISTER_EVENTFD    5
 #define LINUX_IORING_REGISTER_FILES_UPDATE 6
+
+/*
+ * cancel_flags, which decide what ASYNC_CANCEL matches on. They share the slot
+ * every other per-opcode flag word uses. Like IORING_TIMEOUT_UPDATE these change
+ * the meaning of the operation rather than decorate it, so an implementation
+ * that ignores them cancels the wrong thing - or one thing where the caller
+ * asked for all of them.
+ */
+#define LINUX_IORING_ASYNC_CANCEL_ALL      (1U << 0)
+#define LINUX_IORING_ASYNC_CANCEL_FD       (1U << 1)
+#define LINUX_IORING_ASYNC_CANCEL_ANY      (1U << 2)
+#define LINUX_IORING_ASYNC_CANCEL_FD_FIXED (1U << 3)
 
 /* fsync_flags */
 #define LINUX_IORING_FSYNC_DATASYNC (1U << 0)

@@ -322,6 +322,12 @@ guest-code cache sync.
   still arrives with the right result, ten seconds late. The test sleeps briefly
   before updating so the poller has actually settled onto the old deadline,
   without which the update races ahead of it and the timing proves nothing.
+  `ASYNC_CANCEL` is checked cancelling a poll *and* a timeout through the one
+  opcode — a typed implementation answers `ENOENT` for one of them — and then
+  clearing two polls off a descriptor with `CANCEL_FD | CANCEL_ALL`. Both flags
+  are load-bearing: without `CANCEL_FD` the descriptor number is matched against
+  user_data and nothing is found, and without `CANCEL_ALL` one of the two polls
+  is cancelled and success reported while the other stays armed.
 
 The ELF binaries are committed prebuilt (as the x86 guest tests under
 `test/*/build/` are), so the check needs no cross-toolchain. The `.s` sources
