@@ -3996,3 +3996,29 @@ which is the promise they asked for.
 Reaching it at all needed the generator tie-break from §3.5.74: the header offers
 `sync_file_range2` at 84 for architectures that set `__ARCH_WANT_SYNC_FILE_RANGE2`,
 and aarch64 does not.
+
+### 3.5.77 `clone3` — **implemented**
+
+glibc 2.34 and later reach for this first when starting a thread and fall back
+to `clone` on ENOSYS, so refusing it cost a failed syscall per thread and
+nothing else — but the fallback is glibc's courtesy rather than a rule, and
+anything written against `clone3` directly had no second try. It was one of the
+four calls a real workload still reached.
+
+It is the same call with its arguments in a struct rather than in registers,
+which is what lets it carry what `clone`'s had no room for. Two differences
+matter here:
+
+- **The exit signal is a field of its own.** `clone` packs it into the low byte
+  of its flags, which is exactly why `CLONE_NEWTIME` — bit 7 — cannot be
+  expressed there and is refused (§3.5.60). Here the collision does not exist,
+  so a time namespace *can* be asked for at clone time, as on Linux.
+- **The stack is a base and a length**, where `clone` takes the pointer. A stack
+  that grows down starts at the far end of what it was given.
+
+`CLONE_PIDFD` and `set_tid` are refused rather than dropped: the first wants a
+descriptor written back that nothing here can produce, and the second asks to
+choose the child's pid — which is the pid namespace's to allocate, and comes
+from the host besides.
+
+With this, a full `apt` reinstall reaches **no unimplemented syscall at all**.

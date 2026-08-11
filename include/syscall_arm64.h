@@ -441,7 +441,7 @@
   SYSCALL(432, unimplemented) \
   SYSCALL(433, unimplemented) \
   SYSCALL(434, unimplemented) \
-  SYSCALL(435, unimplemented) \
+  SYSCALL(435, clone3) \
   SYSCALL(436, unimplemented) \
   SYSCALL(437, unimplemented) \
   SYSCALL(438, unimplemented) \

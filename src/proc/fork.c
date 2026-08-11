@@ -400,6 +400,83 @@ do_clone(unsigned long clone_flags, unsigned long newsp, gaddr_t parent_tid, gad
   }
 }
 
+/*
+ * clone3: the same call with its arguments in a struct rather than in
+ * registers, which is what lets it carry things clone's had no room for.
+ *
+ * glibc 2.34 and later reach for this first when starting a thread and fall
+ * back to clone on ENOSYS, so refusing it cost a failed syscall per thread and
+ * nothing else - but the fallback is glibc's courtesy rather than a rule, and
+ * anything written against clone3 directly had no second try.
+ *
+ * The exit signal is the interesting difference. clone packs it into the low
+ * byte of its flags, which is why CLONE_NEWTIME - bit 7 - cannot be expressed
+ * there and is refused (see below). Here it is a field of its own, so the
+ * collision does not exist and a time namespace *can* be asked for at clone
+ * time, exactly as on Linux.
+ */
+struct l_clone_args {
+  uint64_t flags;
+  uint64_t pidfd;
+  uint64_t child_tid;
+  uint64_t parent_tid;
+  uint64_t exit_signal;
+  uint64_t stack;
+  uint64_t stack_size;
+  uint64_t tls;
+  uint64_t set_tid;
+  uint64_t set_tid_size;
+  uint64_t cgroup;
+};
+
+#define CLONE_ARGS_SIZE_VER0 64
+#define CLONE_ARGS_SIZE_VER1 80
+#define CLONE_ARGS_SIZE_VER2 88
+
+DEFINE_SYSCALL(clone3, gaddr_t, args_ptr, size_t, size)
+{
+  if (size < CLONE_ARGS_SIZE_VER0 || size > sizeof(struct l_clone_args))
+    return -LINUX_EINVAL;
+
+  struct l_clone_args a;
+  memset(&a, 0, sizeof a);
+  if (copy_from_user(&a, args_ptr, size))
+    return -LINUX_EFAULT;
+
+  if (a.exit_signal > 0xff)
+    return -LINUX_EINVAL;
+
+  /*
+   * Things this cannot do, refused rather than dropped. CLONE_PIDFD wants a
+   * descriptor written back that nothing here can produce, and set_tid asks to
+   * choose the child's pid - which is the pid namespace's to allocate, and here
+   * comes from the host besides.
+   */
+  if (a.flags & LINUX_CLONE_PIDFD)
+    return -LINUX_EINVAL;
+  if (a.set_tid_size != 0)
+    return -LINUX_EINVAL;
+
+  unsigned long clone_flags = (unsigned long) a.flags |
+                              (unsigned long) (a.exit_signal & 0xff);
+
+  if (clone_flags & (LINUX_CLONE_NEWNS | LINUX_CLONE_NEWUTS |
+                     LINUX_CLONE_NEWIPC | LINUX_CLONE_NEWPID |
+                     LINUX_CLONE_NEWNET | LINUX_CLONE_NEWUSER |
+                     LINUX_CLONE_NEWCGROUP | LINUX_CLONE_NEWTIME)) {
+    int nsr = nsproxy_clone(clone_flags);
+    if (nsr < 0)
+      return nsr;
+  }
+
+  /* clone takes the stack *pointer*; clone3 takes the base and the size, and a
+   * stack that grows down starts at the far end of what it was given. */
+  gaddr_t sp = a.stack ? (gaddr_t) (a.stack + a.stack_size) : 0;
+
+  return do_clone(clone_flags, sp, (gaddr_t) a.parent_tid,
+                  (gaddr_t) a.child_tid, (gaddr_t) a.tls);
+}
+
 DEFINE_SYSCALL(clone, unsigned long, clone_flags, unsigned long, newsp, gaddr_t, parent_tid, gaddr_t, arg4, gaddr_t, arg5)
 {
   /*
