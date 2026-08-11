@@ -87,7 +87,17 @@ def main():
 
     by_nr = {}
     for name, nr in aa.items():
-        by_nr.setdefault(nr, name)
+        # Two names can share a number when the header offers an
+        # architecture a choice - sync_file_range and sync_file_range2 are both
+        # 84, behind __ARCH_WANT_SYNC_FILE_RANGE2, which aarch64 does not set.
+        # The #ifdefs are not evaluated here, so the tie is broken by which name
+        # NABI has a handler for: the other one is, by construction, the variant
+        # this architecture does not use.
+        if nr in by_nr:
+            if name in impl and by_nr[nr] not in impl:
+                by_nr[nr] = name
+        else:
+            by_nr[nr] = name
     max_nr = max(by_nr)
     count = max_nr + 1
 

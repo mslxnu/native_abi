@@ -3638,13 +3638,6 @@ DEFINE_SYSCALL(faccessat, int, dirfd, gstr_t, path_ptr, int, mode)
 }
 
 /*
- * Defined only where the syscall table reaches it. x86-64 numbers faccessat2
- * 439 and this tree's x86 table stops at 332; padding a hundred unimplemented
- * rows into a build that exists as a reference (see PORTING-arm64.md §7) buys
- * nothing. The body is arch-neutral and moves over with the table when it grows.
- */
-#if defined(__arm64__) || defined(__aarch64__)
-/*
  * faccessat2 is faccessat with the flags the older call could not carry, and
  * glibc reaches for it first for anything that needs AT_EACCESS - "may the
  * *effective* user do this", which is what a program asks when it has changed
@@ -3667,7 +3660,6 @@ DEFINE_SYSCALL(faccessat2, int, dirfd, gstr_t, path_ptr, int, mode, int, flags)
     return -LINUX_EINVAL;
   return do_faccessat(dirfd, path, mode, flags);
 }
-#endif
 
 DEFINE_SYSCALL(access, gstr_t, path_ptr, int, mode)
 {

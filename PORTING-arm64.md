@@ -3902,3 +3902,29 @@ of those limits comes from intercepting *above* the syscall boundary. NABI is on
 the other side of it: path translation happens where the guest's `svc` is
 handled, so static binaries, listings and the guest's own `ld.so` are all covered
 for the same reason.
+
+### 3.5.74 Both syscall tables generated, and the frontier they were drifting into
+
+The x86-64 table was maintained by hand and stopped at **332**, because that was
+the last number anyone had needed. That is not a harmless place to stop: a
+handler for a syscall numbered above it has nowhere to live, so the x86 build
+fails to link it while aarch64 builds fine — and the break shows up in the arch
+nobody here can run. `clone3` is 435 and `faccessat2` 439.
+
+Both tables come from a kernel header and the set of `DEFINE_SYSCALL` handlers in
+the sources now (`util/gen_syscall_table_x86.py` alongside the existing aarch64
+one), so a new handler is wired into both by rebuilding rather than by
+remembering to. `make syscalls` regenerates both and writes the README's table
+out beside them.
+
+Two consequences:
+
+- **`faccessat2`'s `#if defined(__arm64__)` guard has gone.** Its comment said
+  the guard was there because "this tree's x86 table stops at 332" and that the
+  body "moves over with the table when it grows". The table has grown.
+- **The aarch64 generator picked the wrong name where two share a number.** The
+  header offers `sync_file_range2` at 84 behind `__ARCH_WANT_SYNC_FILE_RANGE2`,
+  which aarch64 does not set, and `setdefault` took whichever appeared first.
+  The `#ifdef`s are not evaluated, so the tie is broken by which name NABI has a
+  handler for — the other is, by construction, the variant this architecture
+  does not use.

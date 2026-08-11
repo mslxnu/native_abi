@@ -439,9 +439,13 @@ require-built:
 # generated include/syscall_arm64.h is committed and audited (see the report
 # the generator prints). Point UNISTD at the header for your target kernel.
 UNISTD ?= /tmp/unistd_generic.h
+UNISTD_X86 ?= /tmp/unistd_64.h
 syscalls:
+	python3 util/gen_syscall_table_x86.py $(UNISTD_X86) > include/syscall_x86.h
 	python3 util/gen_syscall_table.py $(UNISTD) include/syscall_x86.h \
 	    > include/syscall_arm64.h
+	python3 util/gen_syscall_doc.py $(UNISTD) $(UNISTD_X86) > /tmp/nabi-syscalls.md
+	@echo "syscall table for README.md written to /tmp/nabi-syscalls.md"
 
 clean:
 	rm -rf $(OUT)
