@@ -34,7 +34,7 @@ replaced or omitted:
 | **Syscall translation** | Linux system calls onto Darwin's, over `Hypervisor.framework` | **this repository** |
 | **Filesystem Hierarchy Standard** | The Linux filesystem layout, natively | [mSL/FHS](https://github.com/mslxnu/fhs) |
 | **procfs** | `/proc`, as a real filesystem | [mSL/ProcFS](https://github.com/mslxnu/procfs) |
-| **sysfs** | `/sys`, likewise | [mSL/SysFS](https://github.com/mslxnu/sysfs) |
+| **sysfs** | `/sys`, as a real filesystem | [mSL/SysFS](https://github.com/mslxnu/sysfs) |
 | **devfs** | `/dev` — already part of macOS | XNU |
 
 **This repository is the ABI piece.** The rest of this document describes it.
