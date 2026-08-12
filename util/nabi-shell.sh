@@ -90,8 +90,6 @@ for v in $(env | sed -n 's/^\(NABI_[A-Za-z0-9_]*\)=.*/\1/p'); do
     eval "set -- \"\$@\" \"$v=\${$v}\""
 done
 
-set -- "$@" "$NABI" -m "$ROOT" /bin/bash -lc
-
 # Who to be inside the guest.
 #
 # The guest starts as root - NABI maps the host account to uid 0 - and stays
@@ -102,21 +100,59 @@ set -- "$@" "$NABI" -m "$ROOT" /bin/bash -lc
 #
 # MSL_ROOT=1 keeps the root shell, for the times when that is what is wanted.
 as_user=
-if [ -z "${MSL_ROOT:-}" ] && [ "$user" != root ] &&
-   awk -F: -v u="$user" '$1 == u { found = 1 } END { exit !found }' \
-       "$ROOT/etc/passwd" 2>/dev/null &&
+ent=
+if [ -z "${MSL_ROOT:-}" ] && [ "$user" != root ]; then
+    ent=$(awk -F: -v u="$user" '$1 == u { print; exit }' \
+              "$ROOT/etc/passwd" 2>/dev/null)
+fi
+if [ -n "$ent" ] &&
    { [ -x "$ROOT/bin/su" ] || [ -x "$ROOT/usr/bin/su" ]; }; then
     as_user=$user
 fi
 
-# Without su there is no way in: Fedora's minimal container image does not ship
-# util-linux, and `exec su - <user>` in a tree that has no su takes the shell
-# down with "exec: su: not found" rather than logging anybody in. A root shell
-# is the honest fallback, said once so it is not a mystery.
-if [ -z "$as_user" ] && [ -z "${MSL_ROOT:-}" ] && [ "$user" != root ] &&
-   awk -F: -v u="$user" '$1 == u { found = 1 } END { exit !found }' \
-       "$ROOT/etc/passwd" 2>/dev/null; then
-    echo "$me: this image has no su, so this is a root shell." >&2
+# Without su, NABI is asked to start as the account itself.
+#
+# `su -` is preferred and is what the branch below uses, because it builds the
+# environment, the working directory and the supplementary groups from the
+# guest's own login path rather than from an approximation made out here. But a
+# tree with no su used to fall back to a *root shell*, and that is the wrong
+# floor. Running as root by default is how a tree accumulates root-owned files
+# the account cannot then touch - and it hides every fault only a normal user
+# meets, which is not hypothetical: the mode records that stopped Python
+# importing `encodings` were invisible for exactly as long as everything ran as
+# root.
+#
+# Fedora's base image is the case that needs this. It ships util-linux-core,
+# which has no su, so msl-mkrootfs installs util-linux afterwards - and when
+# that step does not take, this is what stands between the account and a root
+# shell.
+#
+# What is lost against su, stated so it is not discovered: --user sets the uid
+# and the gid and nothing else, so there are no *supplementary* groups. An
+# account that is in `wheel` or `video` in the guest's /etc/group is not in them
+# here, and anything checking one of those will refuse. su reads the group file
+# and joins them; this does not.
+as_uid=
+if [ -z "$as_user" ] && [ -n "$ent" ]; then
+    as_uid=$(printf '%s' "$ent" | cut -d: -f3):$(printf '%s' "$ent" | cut -d: -f4)
+    echo "$me: this image has no su; starting as $user through NABI." >&2
+fi
+
+# NABI's own arguments end here; everything after -lc is the guest's.
+if [ -n "$as_uid" ]; then
+    set -- "$@" "$NABI" --user "$as_uid" -m "$ROOT" /bin/bash -lc
+else
+    set -- "$@" "$NABI" -m "$ROOT" /bin/bash -lc
+fi
+
+if [ -n "$as_uid" ]; then
+    # NABI has already been told which credentials to start with, so there is
+    # nothing to become - only the login shell to start and the working
+    # directory to set, which su would otherwise have done.
+    if [ "$CMD" = no ]; then
+        exec "$@" 'cd "$HOME" 2>/dev/null; exec bash -l'
+    fi
+    exec "$@" "cd \"\$HOME\" 2>/dev/null; $ARGS"
 fi
 
 if [ -n "$as_user" ]; then

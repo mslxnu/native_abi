@@ -5204,3 +5204,45 @@ answers `ESRCH` for a process that has gone. Code no test can distinguish is
 weight without evidence, so it went.
 
 267 of 375.
+
+### 3.5.98 --user, so that a missing package cannot put a guest back on root
+
+A fresh Fedora tree logged in as root:
+
+```
+$ msl login fedora
+msl-shell: this image has no su, so this is a root shell.
+[root@redstar ~]#
+```
+
+That message was working as designed, and the design was wrong. NABI starts
+every guest at uid 0 — the account it runs as is what the guest sees as root —
+and had no way to start as anyone else, so becoming a user meant running `su`
+*inside* the guest. Fedora's base image ships `util-linux-core`, which has no
+`su`, because containers are entered with `docker exec -u` and nothing there
+needs one. `msl-mkrootfs` knows this and installs `util-linux` afterwards; when
+that step does not take, there was no way in and the fallback was a root shell.
+
+**A root shell is the wrong floor**, and `nabi-shell.sh` says so itself a few
+lines above: running as root by default is how a tree accumulates root-owned
+files the account cannot then touch. It also hides every fault only a normal
+user meets — the `0200` mode records that stopped Python importing `encodings`
+were invisible for exactly as long as everything ran as root, which is most of
+why they survived to be found by `waydroid`.
+
+So NABI grew `--user uid[:gid]`, and it is deliberately the *floor* rather than
+the preferred path. `su -` is still tried first, because it builds the
+environment, the working directory and the supplementary groups from the guest's
+own login path rather than from an approximation made outside. `--user` sets the
+credentials and nothing else, which is why `nabi-shell.sh` supplies the
+environment itself when it uses it — and why the one thing it cannot supply is
+written down where it will be read: there are **no supplementary groups**, so an
+account in `wheel` or `video` in the guest's `/etc/group` is not in them here.
+
+The second half is the builder. Its failure printed two quiet lines and left a
+tree that logged in as root — a shape of failure nobody investigates, because
+the consequence appears at first login and looks like how the thing works. It
+now says what happened, what still works, what does not, and the one command
+that fixes it.
+
+No new syscalls: `--user` is an option, not a call.

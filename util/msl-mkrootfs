@@ -993,8 +993,24 @@ if [ -n "$latecomers" ]; then
             "$NABI" -m "$ROOT" /bin/bash -lc "$latecomers"; then
         echo "    ok"
     else
+        #
+        # Said loudly, because the consequence is not visible until first login
+        # and is easy to mistake for how the thing works. This used to print two
+        # quiet lines and leave a tree that logged in as root, which is exactly
+        # the shape of failure nobody investigates.
+        #
         tail -2 "$work/step.log" | sed 's/^/    /'
-        echo "    could not add them - the image's own set is what you get"
+        echo
+        echo "!!  sudo and su could not be installed."
+        echo "!!"
+        echo "!!  Logging in still works - NABI is asked to start as your"
+        echo "!!  account directly - but without su there are no supplementary"
+        echo "!!  groups, and without sudo there is no way to become root"
+        echo "!!  inside the guest at all."
+        echo "!!"
+        echo "!!  To fix, once the tree is built:"
+        echo "!!      MSL_ROOT=1 msl login $DISTRO -c '$latecomers'"
+        echo
     fi
 fi
 

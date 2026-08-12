@@ -211,6 +211,14 @@ main_loop(int return_on_sigret)
   __builtin_unreachable();
 }
 
+/*
+ * Who the guest starts as, set by --user and read by init_first_proc, which
+ * runs after the arguments are parsed. Zero is root, which is what the guest
+ * has always been and remains when nothing asks otherwise.
+ */
+static uint32_t initial_uid = 0;
+static uint32_t initial_gid = 0;
+
 static void
 init_first_proc(const char *root)
 {
@@ -284,8 +292,8 @@ init_first_proc(const char *root)
   init_host_ids();
   proc.cred = (struct cred) {
     .lock = PTHREAD_RWLOCK_INITIALIZER,
-    .uid = 0, .euid = 0, .suid = 0,
-    .gid = 0, .egid = 0, .sgid = 0,
+    .uid = initial_uid, .euid = initial_uid, .suid = initial_uid,
+    .gid = initial_gid, .egid = initial_gid, .sgid = initial_gid,
   };
 
   task.tid = getpid();
@@ -518,6 +526,7 @@ main(int argc, char *argv[], char **envp)
   int c;
   char debug_paths[MAX_DEBUG_PATH][PATH_MAX] = {};
   struct option long_options[] = {
+    { "user", required_argument, NULL, 'u'},
     { "output", required_argument, NULL, 'o'},
     { "strace", required_argument, NULL, 's'},
     { "warning", required_argument, NULL, 'w'},
@@ -526,7 +535,7 @@ main(int argc, char *argv[], char **envp)
     { 0, 0, 0, 0 }
   };
 
-  while ((c = getopt_long(argc, argv, "+ho:w:s:m:", long_options, NULL)) != -1) {
+  while ((c = getopt_long(argc, argv, "+ho:w:s:m:u:", long_options, NULL)) != -1) {
     switch (c) {
     case 'o':
       strncpy(debug_paths[PRINTK_PATH], optarg, PATH_MAX);
@@ -537,6 +546,53 @@ main(int argc, char *argv[], char **envp)
     case 's':
       strncpy(debug_paths[STRACE_PATH], optarg, PATH_MAX);
       break;
+    case 'u': {
+      /*
+       * Start the guest as somebody other than root.
+       *
+       * A guest has always started at uid 0, because the account nabi runs as
+       * is what the guest sees as root, and there was no way to be anyone
+       * else. Becoming a user therefore meant running `su` *inside* the guest -
+       * which works, and is better than this when it is available, because su
+       * builds the environment, the working directory and the supplementary
+       * groups from the guest's own login path rather than from an
+       * approximation made out here.
+       *
+       * The trouble is what happens when it is not available. Fedora's base
+       * image ships util-linux-core, which has no su, so a tree built from one
+       * had no way in and fell back to a root shell - and running as root by
+       * default is how a tree accumulates root-owned files the account cannot
+       * then touch. It also hides every bug that only a normal user meets: the
+       * mode records that stopped Python importing `encodings` were invisible
+       * for exactly as long as everything ran as root.
+       *
+       * So this is the floor rather than the preferred path. It sets the
+       * credentials and nothing else; whoever passes it is responsible for the
+       * environment, which is why msl-shell reaches for su first and only comes
+       * here when there is none.
+       */
+      char *end;
+      long v = strtol(optarg, &end, 10);
+      if (end == optarg || v < 0 || v > 0x7fffffff) {
+        fprintf(stderr, "nabi: --user wants a uid, or uid:gid\n");
+        exit(1);
+      }
+      initial_uid = (uint32_t) v;
+      initial_gid = initial_uid;    /* the common case, and what login does */
+      if (*end == ':') {
+        char *g = end + 1;
+        v = strtol(g, &end, 10);
+        if (end == g || *end != '\0' || v < 0 || v > 0x7fffffff) {
+          fprintf(stderr, "nabi: --user wants a uid, or uid:gid\n");
+          exit(1);
+        }
+        initial_gid = (uint32_t) v;
+      } else if (*end != '\0') {
+        fprintf(stderr, "nabi: --user wants a uid, or uid:gid\n");
+        exit(1);
+      }
+      break;
+    }
     case 'm':
       if (realpath(optarg, root) == NULL) {
         perror("Invalid --mnt flag: ");
@@ -546,7 +602,7 @@ main(int argc, char *argv[], char **envp)
       break;
     case 'h':
     default:
-      printf("Usage: nabi -h | [-o output] [-w warning] [-s strace] -m /virtual/filesystem/root executable ...\n");
+      printf("Usage: nabi -h | [-o output] [-w warning] [-s strace] [-u uid[:gid]] -m /virtual/filesystem/root executable ...\n");
       exit(0);
     }
   }
