@@ -8,13 +8,17 @@
 **macOS Subsystem for Linux / Native ABI** — Linux binaries running as ordinary
 macOS processes.
 
-One module of **mSL/XNU**, a modular macOS Subsystem for Linux.
+This is the main module of **mSL/XNU**, a modular macOS Subsystem for Linux.
 
 ## The larger project
 
-mSL/XNU — *macOS Subsystem for Linux / X is Now UNIX* — aims at **native, seamless
-execution of Linux ELF binaries on macOS**: not in a container and not in a virtual
-machine, but as ordinary processes on the running system.
+mSL/XNU — *macOS Subsystem for Linux / X is Now UNIX* — is a set of compatibility
+layers and utilities for macOS that aim at improving system compatibility with
+ported Linux, BSD and other Unix-like code.
+
+It also aims at **native, seamless execution of Linux ELF binaries on macOS**:
+not in a container and not in a virtual machine, but as ordinary processes on
+the running system.
 
 Reaching that needs several independent pieces, which is why the project is modular
 rather than one monolith. Each is useful on its own, and each can be installed,
@@ -128,12 +132,12 @@ process may touch.
 | | Approach | Guest processes | Filesystem | Kernel |
 |---|---|---|---|---|
 | **mSL/NABI** | Syscall translation; hypervisor as a privilege boundary | Host processes, one to one | Host files, directly | Darwin |
-| hyper-linux | The same: syscall translation, `Hypervisor.framework`, EL1 shim | Host processes, one to one | Host files, directly | Darwin |
-| hylyx | Full VM (`Virtualization.framework`) | Inside the guest | Guest disk image | Linux |
-| Docker Desktop / OrbStack / Lima | Full VM, containers inside it | Inside the guest | Guest disk image, shared over virtiofs | Linux |
-| QEMU user-mode | Instruction emulation + syscall translation | Host processes | Host files | Host |
-| WSL 1 | Syscall translation in the NT kernel | Host processes | Host files, via a driver | NT |
-| WSL 2 | Full VM | Inside the guest | Guest disk image | Linux |
+| [hyper-linux](https://github.com/zw3rk/hyper-linux) | The same: syscall translation, `Hypervisor.framework`, EL1 shim | Host processes, one to one | Host files, directly | Darwin |
+| [hylyx](https://github.com/origon/hylyx) | Full VM (`Virtualization.framework`) | Inside the guest | Guest disk image | Linux |
+| [Docker](https://www.docker.com) / [OrbStack](https://orbstack.dev) / [Lima](https://github.com/lima-vm/lima) | Full VM, containers inside it | Inside the guest | Guest disk image, shared over virtiofs | Linux |
+| [QEMU](https://www.qemu.org) user-mode | Instruction emulation + syscall translation | Host processes | Host files | Host |
+| [WSL 1](https://learn.microsoft.com/en-us/windows/wsl/install-manual) | Syscall translation in the NT kernel | Host processes | Host files, via a driver | NT |
+| [WSL 2](https://learn.microsoft.com/en-us/windows/wsl/) | Full VM | Inside the guest | Guest disk image | Linux |
 
 The closest comparison is **WSL 1**, and the ambition is the same: Linux programs as
 first-class citizens of the host rather than guests behind a boundary. WSL 1 had the
@@ -205,8 +209,8 @@ the tree comes out with `/etc/shadow`, an `ld.so` cache and working
 everything.
 
 ```console
-sunneva@host:~$ sudo apt install gcc
-sunneva@host:~$ gcc -O2 -o hello hello.c && ./hello
+user@host:~$ sudo apt install gcc
+user@host:~$ gcc -O2 -o hello hello.c && ./hello
 ```
 
 ## Status
