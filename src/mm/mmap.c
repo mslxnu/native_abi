@@ -525,6 +525,79 @@ linux_mprot_to_hv_mflag(int mprot)
   (LINUX_MPOL_F_STATIC_NODES | LINUX_MPOL_F_RELATIVE_NODES | \
    LINUX_MPOL_F_NUMA_BALANCING)
 
+/*
+ * How many nodes a mask names, or a negative error.
+ *
+ * Shared with mbind's reasoning: node 0 is the only one this machine has, so a
+ * bit anywhere else names a node that cannot exist and is refused rather than
+ * ignored. Ignoring it would let a caller ask to move pages somewhere and be
+ * told it worked.
+ */
+static int
+read_nodemask(gaddr_t nodemask, unsigned long maxnode, bool *node0)
+{
+  *node0 = false;
+  if (nodemask == 0 || maxnode == 0)
+    return 0;
+  unsigned long words = (maxnode + 63) / 64;
+  for (unsigned long i = 0; i < words; i++) {
+    uint64_t w;
+    if (copy_from_user(&w, nodemask + i * sizeof w, sizeof w))
+      return -LINUX_EFAULT;
+    if (i == 0) {
+      *node0 = (w & 1) != 0;
+      if (w & ~1ULL)
+        return -LINUX_EINVAL;
+    } else if (w) {
+      return -LINUX_EINVAL;
+    }
+  }
+  return 0;
+}
+
+/*
+ * migrate_pages: move a process's pages between NUMA nodes.
+ *
+ * There is one node, so every page is already on every node a caller can name,
+ * and the number that could not be moved is zero. That is the truthful answer
+ * rather than a convenient one - migrate_pages returns the count it failed to
+ * migrate, and nothing failed because nothing had anywhere else to go.
+ *
+ * What is not waved through is a mask naming a node that does not exist. A
+ * caller asking to move pages to node 1 has misunderstood the machine, and
+ * saying "moved, none left behind" would confirm the misunderstanding.
+ *
+ * Another process is out of reach for the reason process_vm_readv documents,
+ * and gets EPERM once it is known to exist.
+ */
+DEFINE_SYSCALL(migrate_pages, l_pid_t, pid, unsigned long, maxnode,
+               gaddr_t, old_nodes, gaddr_t, new_nodes)
+{
+  if (maxnode > 1024 * 1024)
+    return -LINUX_EINVAL;
+  if (pid < 0)
+    return -LINUX_EINVAL;
+
+  int32_t host = pidns_to_host(pid == 0 ? (l_pid_t) pidns_to_ns(getpid()) : pid);
+  if (host < 0)
+    return -LINUX_ESRCH;
+  if (host != getpid()) {
+    if (kill(host, 0) < 0 && errno == ESRCH)
+      return -LINUX_ESRCH;
+    return -LINUX_EPERM;
+  }
+
+  bool from_node0, to_node0;
+  int r;
+  if ((r = read_nodemask(old_nodes, maxnode, &from_node0)) < 0)
+    return r;
+  if ((r = read_nodemask(new_nodes, maxnode, &to_node0)) < 0)
+    return r;
+
+  /* Nothing was left behind, because there was nowhere else for it to be. */
+  return 0;
+}
+
 DEFINE_SYSCALL(mbind, gaddr_t, addr, unsigned long, len, int, mode,
                gaddr_t, nodemask, unsigned long, maxnode, unsigned int, flags)
 {

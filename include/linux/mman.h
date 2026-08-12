@@ -46,4 +46,12 @@
 #define LINUX_MS_SYNC          2
 #define LINUX_MS_INVALIDATE    4
 
+
+/* mlock2 and mlockall. ONFAULT is the "do not populate now" variant. */
+#define LINUX_MLOCK_ONFAULT   0x01
+
+#define LINUX_MCL_CURRENT     1
+#define LINUX_MCL_FUTURE      2
+#define LINUX_MCL_ONFAULT     4
+
 #endif

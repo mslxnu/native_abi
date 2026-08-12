@@ -198,16 +198,152 @@ DEFINE_SYSCALL(madvise, gaddr_t, addr, size_t, length, int, advice)
 
 }
 
+/*
+ * Locking guest memory into RAM, which turns out to mean something here.
+ *
+ * mlock and munlock were stubs: they printed a line and returned 0, and the
+ * syscall table said they worked. That is the shape of failure that matters
+ * most for these two, because the callers are gpg, ssh-agent and the like,
+ * locking a buffer so a passphrase cannot reach swap. Success without locking
+ * is precisely the answer that leaves the secret swappable while the program
+ * believes it is not.
+ *
+ * The lock is real. Guest memory is host memory - a private mapping of the
+ * arena, on arm64 - so a guest range translates to a host range, and Darwin's
+ * mlock wires it. A guest asking not to be paged out gets a process that is not
+ * paged out over those addresses.
+ *
+ * What it is not is a promise about the *guest's* view of physical memory,
+ * which nabi does not own: the hypervisor's stage-2 mapping is what makes a
+ * host page a guest page, and this pins the host page underneath it. That is
+ * the meaningful half, and it is the half mlock exists for.
+ */
+static int
+mlock_range(gaddr_t addr, size_t length, bool lock)
+{
+  size_t ps = PAGE_SIZEOF(PAGE_4KB);
+  if (length == 0)
+    return 0;
+  /* Linux rounds the range out to whole pages rather than refusing an
+   * unaligned start, which is why this is not an EINVAL. */
+  gaddr_t end = addr + length;
+  if (end < addr)
+    return -LINUX_ENOMEM;
+  addr = addr & ~(gaddr_t) (ps - 1);
+  end = roundup(end, ps);
+
+  int ret = 0;
+  pthread_rwlock_rdlock(&proc.mm->alloc_lock);
+  for (gaddr_t p = addr; p < end; ) {
+    struct mm_region *region = find_region(p, proc.mm);
+    if (region == NULL) {
+      /* Linux answers ENOMEM for a range that is not all mapped, and it does
+       * so having locked nothing - so this stops rather than locking the part
+       * it could reach. */
+      ret = -LINUX_ENOMEM;
+      break;
+    }
+    gaddr_t rend = region->gaddr + region->size;
+    gaddr_t stop = rend < end ? rend : end;
+    void *haddr = (char *) region->haddr + (p - region->gaddr);
+    size_t len = (size_t) (stop - p);
+    int r = lock ? mlock(haddr, len) : munlock(haddr, len);
+    if (r < 0) {
+      ret = syswrap(r);
+      break;
+    }
+    p = stop;
+  }
+  pthread_rwlock_unlock(&proc.mm->alloc_lock);
+  return ret;
+}
+
 DEFINE_SYSCALL(mlock, gaddr_t, addr, size_t, length)
 {
-  printk("mlock is not implemented\n");
-  return 0;
+  return mlock_range(addr, length, true);
 }
 
 DEFINE_SYSCALL(munlock, gaddr_t, addr, size_t, length)
 {
-  printk("munlock is not implemented\n");
-  return 0;
+  return mlock_range(addr, length, false);
+}
+
+/*
+ * mlock2 is mlock with a flag, and the flag is the interesting part.
+ *
+ * MLOCK_ONFAULT says: do not fault the range in now, but keep whatever of it
+ * does get faulted in. It exists because plain mlock populates the whole range
+ * eagerly, which for a large sparse allocation is a lot of memory a program
+ * never wanted resident.
+ *
+ * Darwin's mlock has no such mode - it wires what it is given - so honouring
+ * the flag by ignoring it would populate exactly the range the caller asked not
+ * to be populated, which is the cost it called mlock2 to avoid. Refused
+ * instead, and a caller that gets EINVAL for a flag falls back to mlock and
+ * gets what it would have got anyway, knowingly.
+ */
+DEFINE_SYSCALL(mlock2, gaddr_t, addr, size_t, length, int, flags)
+{
+  if (flags & ~LINUX_MLOCK_ONFAULT)
+    return -LINUX_EINVAL;
+  if (flags & LINUX_MLOCK_ONFAULT)
+    return -LINUX_EINVAL;       /* see above: not silently the other thing */
+  return mlock_range(addr, length, true);
+}
+
+/*
+ * mlockall and munlockall, over the guest's mappings rather than the host's.
+ *
+ * Darwin has mlockall, and calling it would be the wrong thing: it would lock
+ * nabi's entire address space - its own heap, its stacks, the whole arena
+ * including memory belonging to no live mapping - when what was asked for was
+ * the guest's. So this walks the guest's regions instead, which is the same set
+ * Linux would act on.
+ *
+ * MCL_FUTURE is refused rather than accepted, and this is the same judgement
+ * mlock2's flag gets. It promises that mappings made *later* are locked too, and
+ * nothing here would do that - do_mmap knows nothing about it. Accepting it
+ * would mean a program that locks everything and then allocates its secret
+ * buffer finds the buffer unlocked, which is the case MCL_FUTURE is for.
+ */
+DEFINE_SYSCALL(mlockall, int, flags)
+{
+  if (flags & ~(LINUX_MCL_CURRENT | LINUX_MCL_FUTURE | LINUX_MCL_ONFAULT))
+    return -LINUX_EINVAL;
+  if (flags == 0)
+    return -LINUX_EINVAL;       /* neither current nor future is nothing */
+  if (flags & (LINUX_MCL_FUTURE | LINUX_MCL_ONFAULT))
+    return -LINUX_EINVAL;       /* see above */
+
+  int ret = 0;
+  pthread_rwlock_rdlock(&proc.mm->alloc_lock);
+  struct mm_region *region;
+  list_for_each_entry (region, &proc.mm->mm_regions, list) {
+    if (mlock(region->haddr, region->size) < 0) {
+      ret = syswrap(-1);
+      break;
+    }
+  }
+  pthread_rwlock_unlock(&proc.mm->alloc_lock);
+  return ret;
+}
+
+DEFINE_SYSCALL(munlockall)
+{
+  /*
+   * Unlocking cannot half-fail into something a caller must undo, so unlike
+   * mlockall this keeps going and reports the first complaint. Leaving later
+   * regions locked because an earlier one objected is the worse outcome.
+   */
+  int ret = 0;
+  pthread_rwlock_rdlock(&proc.mm->alloc_lock);
+  struct mm_region *region;
+  list_for_each_entry (region, &proc.mm->mm_regions, list) {
+    if (munlock(region->haddr, region->size) < 0 && ret == 0)
+      ret = syswrap(-1);
+  }
+  pthread_rwlock_unlock(&proc.mm->alloc_lock);
+  return ret;
 }
 
 DEFINE_SYSCALL(brk, unsigned long, brk)

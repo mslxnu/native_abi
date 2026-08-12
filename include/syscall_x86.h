@@ -156,8 +156,8 @@
   SYSCALL(148, sched_rr_get_interval) \
   SYSCALL(149, mlock) \
   SYSCALL(150, munlock) \
-  SYSCALL(151, unimplemented) \
-  SYSCALL(152, unimplemented) \
+  SYSCALL(151, mlockall) \
+  SYSCALL(152, munlockall) \
   SYSCALL(153, unimplemented) \
   SYSCALL(154, unimplemented) \
   SYSCALL(155, unimplemented) \
@@ -217,7 +217,7 @@
   SYSCALL(209, io_submit) \
   SYSCALL(210, io_cancel) \
   SYSCALL(211, get_thread_area) \
-  SYSCALL(212, unimplemented) \
+  SYSCALL(212, lookup_dcookie) \
   SYSCALL(213, epoll_create) \
   SYSCALL(214, epoll_ctl_old) \
   SYSCALL(215, epoll_wait_old) \
@@ -261,7 +261,7 @@
   SYSCALL(253, inotify_init) \
   SYSCALL(254, inotify_add_watch) \
   SYSCALL(255, inotify_rm_watch) \
-  SYSCALL(256, unimplemented) \
+  SYSCALL(256, migrate_pages) \
   SYSCALL(257, openat) \
   SYSCALL(258, mkdirat) \
   SYSCALL(259, mknodat) \
@@ -324,13 +324,13 @@
   SYSCALL(316, unimplemented) \
   SYSCALL(317, unimplemented) \
   SYSCALL(318, getrandom) \
-  SYSCALL(319, unimplemented) \
+  SYSCALL(319, memfd_create) \
   SYSCALL(320, kexec_file_load) \
   SYSCALL(321, bpf) \
   SYSCALL(322, execveat) \
   SYSCALL(323, unimplemented) \
-  SYSCALL(324, unimplemented) \
-  SYSCALL(325, unimplemented) \
+  SYSCALL(324, membarrier) \
+  SYSCALL(325, mlock2) \
   SYSCALL(326, copy_file_range) \
   SYSCALL(327, unimplemented) \
   SYSCALL(328, unimplemented) \
@@ -449,16 +449,16 @@
   SYSCALL(441, epoll_pwait2) \
   SYSCALL(442, mount_setattr) \
   SYSCALL(443, unimplemented) \
-  SYSCALL(444, unimplemented) \
-  SYSCALL(445, unimplemented) \
-  SYSCALL(446, unimplemented) \
-  SYSCALL(447, unimplemented) \
+  SYSCALL(444, landlock_create_ruleset) \
+  SYSCALL(445, landlock_add_rule) \
+  SYSCALL(446, landlock_restrict_self) \
+  SYSCALL(447, memfd_secret) \
   SYSCALL(448, process_mrelease) \
   SYSCALL(449, futex_waitv) \
   SYSCALL(450, unimplemented) \
   SYSCALL(451, cachestat) \
   SYSCALL(452, fchmodat2) \
-  SYSCALL(453, unimplemented) \
+  SYSCALL(453, map_shadow_stack) \
   SYSCALL(454, futex_wake) \
   SYSCALL(455, futex_wait) \
   SYSCALL(456, futex_requeue) \

@@ -24,7 +24,7 @@
   SYSCALL(15, lremovexattr) \
   SYSCALL(16, fremovexattr) \
   SYSCALL(17, getcwd) \
-  SYSCALL(18, unimplemented) \
+  SYSCALL(18, lookup_dcookie) \
   SYSCALL(19, eventfd2) \
   SYSCALL(20, epoll_create1) \
   SYSCALL(21, epoll_ctl) \
@@ -236,15 +236,15 @@
   SYSCALL(227, msync) \
   SYSCALL(228, mlock) \
   SYSCALL(229, munlock) \
-  SYSCALL(230, unimplemented) \
-  SYSCALL(231, unimplemented) \
+  SYSCALL(230, mlockall) \
+  SYSCALL(231, munlockall) \
   SYSCALL(232, unimplemented) \
   SYSCALL(233, madvise) \
   SYSCALL(234, unimplemented) \
   SYSCALL(235, mbind) \
   SYSCALL(236, get_mempolicy) \
   SYSCALL(237, unimplemented) \
-  SYSCALL(238, unimplemented) \
+  SYSCALL(238, migrate_pages) \
   SYSCALL(239, unimplemented) \
   SYSCALL(240, unimplemented) \
   SYSCALL(241, unimplemented) \
@@ -285,12 +285,12 @@
   SYSCALL(276, unimplemented) \
   SYSCALL(277, unimplemented) \
   SYSCALL(278, getrandom) \
-  SYSCALL(279, unimplemented) \
+  SYSCALL(279, memfd_create) \
   SYSCALL(280, bpf) \
   SYSCALL(281, execveat) \
   SYSCALL(282, unimplemented) \
-  SYSCALL(283, unimplemented) \
-  SYSCALL(284, unimplemented) \
+  SYSCALL(283, membarrier) \
+  SYSCALL(284, mlock2) \
   SYSCALL(285, copy_file_range) \
   SYSCALL(286, unimplemented) \
   SYSCALL(287, unimplemented) \
@@ -450,16 +450,16 @@
   SYSCALL(441, epoll_pwait2) \
   SYSCALL(442, mount_setattr) \
   SYSCALL(443, unimplemented) \
-  SYSCALL(444, unimplemented) \
-  SYSCALL(445, unimplemented) \
-  SYSCALL(446, unimplemented) \
-  SYSCALL(447, unimplemented) \
+  SYSCALL(444, landlock_create_ruleset) \
+  SYSCALL(445, landlock_add_rule) \
+  SYSCALL(446, landlock_restrict_self) \
+  SYSCALL(447, memfd_secret) \
   SYSCALL(448, process_mrelease) \
   SYSCALL(449, futex_waitv) \
   SYSCALL(450, unimplemented) \
   SYSCALL(451, cachestat) \
   SYSCALL(452, fchmodat2) \
-  SYSCALL(453, unimplemented) \
+  SYSCALL(453, map_shadow_stack) \
   SYSCALL(454, futex_wake) \
   SYSCALL(455, futex_wait) \
   SYSCALL(456, futex_requeue) \

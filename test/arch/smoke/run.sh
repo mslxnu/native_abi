@@ -819,6 +819,21 @@ else
     fail=1
 fi
 
+# memtest: memfd_create, the mlock family, migrate_pages, membarrier and the six
+# that answer ENOSYS. The memfd is checked by round-tripping its contents and by
+# writing through a shared mapping and reading it back off the descriptor, so a
+# merely-open descriptor cannot pass. mlock is checked on its *failures* - a
+# guest cannot observe a successful lock, and the stub this replaces returned 0
+# for every address in the machine, including ones that are not mapped.
+cp "$here/memtest" "$root/"; chmod +x "$root/memtest"
+out=$("$NABI" -m "$root" /memtest); rc=$?
+if [ "$rc" -eq 0 ] && [ "$out" = "mem ok" ]; then
+    echo "  ok  memtest -> \"$out\", exit 0"
+else
+    echo "  FAIL memtest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 if [ "$fail" -eq 0 ]; then
     echo "smoke: PASS"
 else

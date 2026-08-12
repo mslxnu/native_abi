@@ -980,6 +980,48 @@ DEFINE_SYSCALL(lsm_set_self_attr, uint32_t, attr, gaddr_t, ctx_ptr,
 }
 
 /*
+ * membarrier: implemented as far as it can be answered, which is the query.
+ *
+ * membarrier moves a barrier out of a program's fast path and into a syscall on
+ * its slow path: after it returns, every other thread of the process must have
+ * executed a full memory barrier. liburcu, Go's runtime and .NET all use it,
+ * and all of them ask MEMBARRIER_CMD_QUERY first and fall back when a command
+ * is absent - which is the protocol this uses.
+ *
+ * The query is answered exactly: no command is available, so the mask is zero
+ * and every command is EINVAL, which is what Linux says for a command its
+ * kernel does not support. A caller reads that and takes its fallback, which is
+ * the correct outcome and one it already has code for.
+ *
+ * The expedited commands are the ones that could be built. nabi already has the
+ * mechanism - vmm_kick_other_vcpus forces every other thread out of
+ * hv_vcpu_run, and leaving and re-entering the hypervisor is a full barrier on
+ * that core - but it is fire-and-forget, and membarrier may not return until
+ * the barrier has actually happened everywhere. That needs a per-vCPU
+ * acknowledgement in the run loop of both backends, and a decision about
+ * threads that are inside a nabi syscall rather than inside guest code at the
+ * moment of the kick. It is exactly the kind of change whose bugs are rare,
+ * silent and about memory ordering, so it is not being tacked onto the end of a
+ * batch. Reporting nothing until then is the answer that cannot mislead: a
+ * membarrier that returns 0 without ordering anything is undebuggable from
+ * inside the guest.
+ */
+DEFINE_SYSCALL(membarrier, int, cmd, unsigned int, flags, int, cpu_id)
+{
+  enum { MEMBARRIER_CMD_QUERY = 0 };
+
+  if (cmd == MEMBARRIER_CMD_QUERY) {
+    if (flags != 0)
+      return -LINUX_EINVAL;
+    return 0;                   /* the set of commands available, which is none */
+  }
+  if (cmd < 0)
+    return -LINUX_EINVAL;
+  (void) cpu_id;
+  return -LINUX_EINVAL;         /* not supported, and QUERY said so */
+}
+
+/*
  * getcpu: which CPU, in the guest's numbering rather than the host's.
  *
  * The host will answer this - pthread_cpu_number_np is real and returns a real

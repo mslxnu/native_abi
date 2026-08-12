@@ -279,6 +279,83 @@ DEFINE_NOT_IMPLEMENTED_SYSCALL(kexec_file_load)
  * ENOSYS is what modprobe and the udev/kmod stack expect from a kernel built
  * without module support, and they degrade the way they were written to.
  */
+/*
+ * Landlock, refused - and this is the refusal in this tree that is least about
+ * what Darwin can do.
+ *
+ * Landlock lets an ordinary program lock itself out of most of the filesystem
+ * before it handles untrusted input: build a ruleset, add the few paths it will
+ * need, restrict itself, and from then on the kernel refuses everything else,
+ * for it and every child, irreversibly. nabi is in the right position to
+ * enforce that - every guest path goes through its own lookup, which is exactly
+ * the chokepoint Landlock hooks.
+ *
+ * It is refused because a partial one is worse than none, and not by a little.
+ * landlock_restrict_self returning 0 is a program's signal that it is now
+ * confined, and what it does next is handle the input it did not trust. There
+ * are on the order of fifty path-taking syscalls here; a ruleset enforced at
+ * forty-nine of them is not a sandbox with a gap, it is a sandbox that reports
+ * success and does not hold. Every caller checks that return value, and none of
+ * them can check whether the confinement is real.
+ *
+ * ENOSYS is also what the API is designed to be told. The documented way to
+ * detect Landlock is landlock_create_ruleset with LANDLOCK_CREATE_RULESET_VERSION,
+ * and ENOSYS from it means "this kernel has no Landlock" - which callers
+ * already handle, by refusing to run or by carrying on unsandboxed knowingly.
+ *
+ * Implementing it properly would mean the ruleset living in nabi's lookup, an
+ * inheritance rule across fork-by-exec, and a way to prove the enumeration of
+ * entry points is complete. That is a feature, not a line in a table.
+ */
+DEFINE_NOT_IMPLEMENTED_SYSCALL(landlock_create_ruleset)
+DEFINE_NOT_IMPLEMENTED_SYSCALL(landlock_add_rule)
+DEFINE_NOT_IMPLEMENTED_SYSCALL(landlock_restrict_self)
+
+/*
+ * lookup_dcookie: the other half of oprofile's identification scheme.
+ *
+ * A dcookie was an opaque handle the kernel handed a profiler for a dentry, so
+ * that samples could name a file without holding a reference to it, and this
+ * turned one back into a path. oprofile is gone and so is the cookie jar;
+ * Linux removed the call in 6.6 and answers ENOSYS for it, so this agrees with
+ * the kernel rather than merely with the hardware.
+ */
+DEFINE_NOT_IMPLEMENTED_SYSCALL(lookup_dcookie)
+
+/*
+ * map_shadow_stack: allocate a hardware shadow stack.
+ *
+ * A shadow stack is a second, hardware-maintained copy of the return addresses,
+ * which the CPU writes on every call and checks on every return - x86 CET, and
+ * GCS on newer arm64. It cannot be emulated by allocating memory: the point is
+ * that the *processor* enforces it and ordinary stores cannot reach the pages.
+ * Apple Silicon has no GCS, the Hypervisor.framework exposes nothing that
+ * would, and a mapping returned from here would be a stack the guest believed
+ * was protected and nothing was checking.
+ *
+ * glibc enables shadow stacks only when the kernel says the hardware has them,
+ * so ENOSYS leaves a guest running with ordinary returns, which is what it is
+ * doing anyway.
+ */
+DEFINE_NOT_IMPLEMENTED_SYSCALL(map_shadow_stack)
+
+/*
+ * memfd_secret: memory the kernel itself cannot read.
+ *
+ * It returns a descriptor whose pages are removed from the kernel's direct map,
+ * so that a kernel bug, or code that has taken the kernel, still cannot reach
+ * the secret. The guarantee is made *by* the kernel *against* the kernel.
+ *
+ * There is no such boundary here to remove anything from. nabi is a userspace
+ * process and guest memory is a file it has mapped; anything it handed back
+ * would sit in the same address space as the program asking, readable by the
+ * same code that would have read it anyway - which is the same reason add_key
+ * is refused, and the same reason approximating it would be a security claim
+ * that is false. Callers already treat it as optional: it is off by default on
+ * most distributions and needs secretmem.enable=1 to exist at all.
+ */
+DEFINE_NOT_IMPLEMENTED_SYSCALL(memfd_secret)
+
 DEFINE_NOT_IMPLEMENTED_SYSCALL(init_module)
 DEFINE_NOT_IMPLEMENTED_SYSCALL(finit_module)
 DEFINE_NOT_IMPLEMENTED_SYSCALL(delete_module)

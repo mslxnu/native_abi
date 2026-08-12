@@ -5482,3 +5482,101 @@ whichever path happened to look supported. Three of them (`create_module`,
 for, so on those this agrees with the kernel exactly.
 
 287 of 375.
+
+### 3.5.102 memfd, real memory locking, and a sandbox that is refused
+
+Twelve calls, and the theme is which of them can be told the truth.
+
+**memfd_create is the one desktop software needs.** It is the unlinked-file
+pattern again — create, unlink immediately, hand back the descriptor — the same
+one behind message queues, io_uring rings, mount contexts and pidfds. The
+descriptor *is* the object: it survives fork and exec, it goes over a unix
+socket with `SCM_RIGHTS`, two holders share one file, and the storage goes when
+the last one closes. That is memfd's contract exactly, so it needs no side table
+and no cleanup path. `wl_shm` passes one of these for every Wayland buffer and
+dbus uses them for large messages, so its absence is felt well before anything
+exotic is.
+
+Sealing is what it cannot do. `F_ADD_SEALS` is how a sender promises a receiver
+that a shared buffer will not change underneath it, and a seal is enforced by the
+kernel on every write — there is none here to enforce it. So `MFD_ALLOW_SEALING`
+is accepted, because all it does is permit a later seal, and the later seal is
+what fails: `fcntl` answers `EINVAL`, which is what Linux answers for a file that
+does not support sealing. The caller finds out at the point where it still has a
+choice — decline to trust the buffer — rather than being told a seal was applied
+that nothing honours.
+
+**mlock and munlock were stubs, and of everything in this tree they were the
+worst ones to be.** They printed a line and returned 0 while the table said they
+worked. The callers are gpg and ssh-agent, locking a buffer so a passphrase
+cannot reach swap; success without locking is precisely the answer that leaves
+the secret swappable while the program believes otherwise.
+
+The lock is real now, and that was checked rather than assumed: guest memory is
+host memory — a private mapping of the arena — so a guest range translates to a
+host range, and Darwin's `mlock` wires it. Measured directly, a 4MiB anonymous
+mapping goes from 0 of 256 pages resident to 256 of 256 across the call. It does
+not promise anything about the guest's view of physical memory, which nabi does
+not own; it pins the host page under the stage-2 mapping, which is the half
+mlock exists for.
+
+Two flags are refused rather than approximated, and it is the same judgement
+each time. `MLOCK_ONFAULT` says *do not populate now*, and Darwin's mlock wires
+what it is given — so honouring it by ignoring it would populate exactly the
+range the caller paid a syscall to avoid populating. `MCL_FUTURE` promises that
+later mappings are locked too, and `do_mmap` knows nothing about it, so
+accepting it would mean a program that locks everything and then allocates its
+secret buffer finds the buffer unlocked. In both cases `EINVAL` sends the caller
+to plain mlock, which is what it would have got — knowingly.
+
+`mlockall` walks the guest's regions rather than calling Darwin's `mlockall`,
+which would lock nabi's own heap, its stacks and the whole arena including
+memory belonging to no live mapping.
+
+**The smoke test checks mlock on its failures**, because a guest cannot observe
+that a lock took effect. A range that is not mapped must be `ENOMEM`, and the
+stub returned 0 for every address in the machine — so that one check is the
+whole discriminator, and a range that starts inside a mapping and runs off its
+end covers the per-region walk.
+
+**migrate_pages has one node**, so nothing was left behind and zero is the
+truthful count rather than a convenient one. A mask naming node 1 is refused: a
+caller asking to move pages somewhere that does not exist has misunderstood the
+machine, and confirming the move would confirm the misunderstanding.
+
+**membarrier is answered only as far as it can be.** Its query reports no
+commands, and every command then says `EINVAL` — which is what Linux says for a
+command its kernel does not support, and what liburcu, Go and .NET all check
+before using one. The expedited commands *could* be built here:
+`vmm_kick_other_vcpus` already forces every other thread out of `hv_vcpu_run`,
+and leaving and re-entering the hypervisor is a full barrier on that core. But
+it is fire-and-forget, and membarrier may not return until the barrier has
+happened everywhere. That needs a per-vCPU acknowledgement in the run loop of
+both backends and a decision about threads sitting in a nabi syscall rather than
+in guest code at the moment of the kick. Bugs there would be rare, silent and
+about memory ordering — undebuggable from inside the guest — so it is a change
+that deserves its own commit rather than the end of a batch.
+
+**Landlock is refused, and this is the refusal here that is least about Darwin.**
+nabi is in the right position to enforce it: every guest path goes through its
+own lookup, which is the chokepoint Landlock hooks. It is refused because a
+partial one is worse than none by a wide margin. `landlock_restrict_self`
+returning 0 is a program's signal that it is now confined, and what it does next
+is handle the input it did not trust. There are on the order of fifty
+path-taking syscalls here, and a ruleset enforced at forty-nine of them is not a
+sandbox with a gap — it is a sandbox that reports success and does not hold, and
+no caller can check which it got. `ENOSYS` is also what the API expects: the
+documented probe is `landlock_create_ruleset` with
+`LANDLOCK_CREATE_RULESET_VERSION`, and callers already handle its absence.
+
+**And three more that cannot exist.** `memfd_secret` returns memory removed from
+the kernel's own direct map — a guarantee made by the kernel against the kernel,
+and there is no such boundary here to remove anything from. `map_shadow_stack`
+wants a return-address stack the *processor* maintains and checks; Apple Silicon
+has no GCS and the Hypervisor.framework exposes nothing that would, so a mapping
+from here would be a stack the guest believed was protected. `lookup_dcookie`
+was oprofile's way of naming a file without holding a reference to it, and Linux
+removed it in 6.6 — so this agrees with the kernel and not merely with the
+hardware.
+
+293 of 375.
