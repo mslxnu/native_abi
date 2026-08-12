@@ -420,7 +420,14 @@ DEFINE_SYSCALL(get_mempolicy, gaddr_t, policy, gaddr_t, nmask, unsigned long, ma
     printk("get_mempolicy: unsupported flags: 0x%lx\n", flags);
     return -LINUX_ENOSYS;
   }
-  assert(addr == 0);
+  /*
+   * MPOL_F_ADDR asks about the policy at an address rather than the process's
+   * own, and this used to assert on it - a guest passing an address took the
+   * whole machine down with an abort. The answer is the same either way, since
+   * there is one node and nothing can have a different policy on it, so the
+   * argument is simply not the discriminator it is on Linux.
+   */
+  (void) addr;
   int policy_val = LINUX_MPOL_DEFAULT;
   if (copy_to_user(policy, &policy_val, sizeof policy_val))
     return -LINUX_EFAULT;

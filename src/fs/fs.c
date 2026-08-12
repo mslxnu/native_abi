@@ -1828,8 +1828,14 @@ cred_may(const struct l_newstat *st, int want, bool real)
   l_uid_t uid;
   l_gid_t gid;
   pthread_rwlock_rdlock(&proc.cred.lock);
-  uid = real ? proc.cred.uid : proc.cred.euid;
-  gid = real ? proc.cred.gid : proc.cred.egid;
+  /*
+   * The filesystem ids, not the effective ones. They are the same until a
+   * process calls setfsuid, which is the entire point of that call - so this
+   * changes nothing for anything that does not. `real` is access(2)'s
+   * different question and still reads the real ids.
+   */
+  uid = real ? proc.cred.uid : proc.cred.fsuid;
+  gid = real ? proc.cred.gid : proc.cred.fsgid;
   pthread_rwlock_unlock(&proc.cred.lock);
 
   if (uid == 0) {
@@ -1859,7 +1865,7 @@ cred_is_root(void)
 {
   bool r;
   pthread_rwlock_rdlock(&proc.cred.lock);
-  r = proc.cred.euid == 0;
+  r = proc.cred.fsuid == 0;     /* a filesystem question, so the filesystem id */
   pthread_rwlock_unlock(&proc.cred.lock);
   return r;
 }

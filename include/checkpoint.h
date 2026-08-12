@@ -26,7 +26,7 @@
 #include "linux/signal.h"
 
 #define CHECKPOINT_MAGIC   0x4E414249434B5031ULL  /* "NABICKP1" */
-#define CHECKPOINT_VERSION 7
+#define CHECKPOINT_VERSION 9
 
 /* One guest memory region, as src/mm/mmap.c tracks it, with the host address
  * replaced by the arena offset that names the same bytes elsewhere. */
@@ -115,7 +115,20 @@ struct checkpoint_header {
    */
   uint32_t uid, euid, suid;
   uint32_t gid, egid, sgid;
+  /* As of version 8: the filesystem ids. They follow euid/egid on every other
+   * change, so a child that lost them would look right until it called
+   * setfsuid - and then differ from its parent with nothing saying why. */
+  uint32_t fsuid, fsgid;
   uint32_t nr_groups;       /* the list itself is a trailing blob */
+  /*
+   * As of version 9: the seccomp mode and the filter chain, which is another
+   * trailing blob. A fork on arm64 is a fork plus an exec, so a child that
+   * rebuilt itself without these would run unfiltered while its parent believed
+   * it was confined - the one failure of that feature nothing in the guest can
+   * detect.
+   */
+  uint32_t seccomp_mode;
+  uint32_t seccomp_bytes;
   uint32_t _pad3;
 
   /* the task: what a resumed thread has to believe about itself */

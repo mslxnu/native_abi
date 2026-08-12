@@ -118,8 +118,8 @@
   SYSCALL(110, getppid) \
   SYSCALL(111, getpgrp) \
   SYSCALL(112, setsid) \
-  SYSCALL(113, unimplemented) \
-  SYSCALL(114, unimplemented) \
+  SYSCALL(113, setreuid) \
+  SYSCALL(114, setregid) \
   SYSCALL(115, getgroups) \
   SYSCALL(116, setgroups) \
   SYSCALL(117, setresuid) \
@@ -127,8 +127,8 @@
   SYSCALL(119, setresgid) \
   SYSCALL(120, getresgid) \
   SYSCALL(121, getpgid) \
-  SYSCALL(122, unimplemented) \
-  SYSCALL(123, unimplemented) \
+  SYSCALL(122, setfsuid) \
+  SYSCALL(123, setfsgid) \
   SYSCALL(124, getsid) \
   SYSCALL(125, capget) \
   SYSCALL(126, capset) \
@@ -243,7 +243,7 @@
   SYSCALL(235, utimes) \
   SYSCALL(236, vserver) \
   SYSCALL(237, mbind) \
-  SYSCALL(238, unimplemented) \
+  SYSCALL(238, set_mempolicy) \
   SYSCALL(239, get_mempolicy) \
   SYSCALL(240, mq_open) \
   SYSCALL(241, mq_unlink) \
@@ -322,7 +322,7 @@
   SYSCALL(314, unimplemented) \
   SYSCALL(315, unimplemented) \
   SYSCALL(316, unimplemented) \
-  SYSCALL(317, unimplemented) \
+  SYSCALL(317, seccomp) \
   SYSCALL(318, getrandom) \
   SYSCALL(319, memfd_create) \
   SYSCALL(320, kexec_file_load) \
@@ -455,7 +455,7 @@
   SYSCALL(447, memfd_secret) \
   SYSCALL(448, process_mrelease) \
   SYSCALL(449, futex_waitv) \
-  SYSCALL(450, unimplemented) \
+  SYSCALL(450, set_mempolicy_home_node) \
   SYSCALL(451, cachestat) \
   SYSCALL(452, fchmodat2) \
   SYSCALL(453, map_shadow_stack) \

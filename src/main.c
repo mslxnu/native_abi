@@ -70,7 +70,18 @@ handle_syscall(void)
   vmm_get_reg(VREG_ARG3, &a3);
   vmm_get_reg(VREG_ARG4, &a4);
   vmm_get_reg(VREG_ARG5, &a5);
-  uint64_t retval = sc_handler_table[nr](a0, a1, a2, a3, a4, a5);
+  /*
+   * The single place a seccomp filter has to be consulted, which is what makes
+   * the feature enforceable here at all: nabi is the system call interface, so
+   * there is no path into a handler that does not come through this line.
+   */
+  uint64_t retval;
+  uint64_t sc_args[6] = { a0, a1, a2, a3, a4, a5 };
+  if (!seccomp_check(nr, sc_args, &retval)) {
+    vmm_set_reg(VREG_RET, retval);
+    return 0;
+  }
+  retval = sc_handler_table[nr](a0, a1, a2, a3, a4, a5);
   vmm_set_reg(VREG_RET, retval);
 
   if (nr == LSYS_rt_sigreturn) {
@@ -294,6 +305,7 @@ init_first_proc(const char *root)
     .lock = PTHREAD_RWLOCK_INITIALIZER,
     .uid = initial_uid, .euid = initial_uid, .suid = initial_uid,
     .gid = initial_gid, .egid = initial_gid, .sgid = initial_gid,
+    .fsuid = initial_uid, .fsgid = initial_gid,
   };
 
   task.tid = getpid();

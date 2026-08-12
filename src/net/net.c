@@ -414,6 +414,25 @@ DEFINE_SYSCALL(sendto, int, socket, gaddr_t, buf_ptr, int, length, int, flags, g
   return ret;
 }
 
+/*
+ * The flags recvmsg reports back, which is a different set from the ones it is
+ * given: only MSG_OOB, MSG_EOR, MSG_TRUNC and MSG_CTRUNC can come out. The two
+ * operating systems number them differently - Linux has CTRUNC at 0x08 and EOR
+ * at 0x80, Darwin has EOR at 0x08 and CTRUNC at 0x20 - so passing the word
+ * through would tell a guest its control data was truncated whenever the record
+ * simply ended.
+ */
+static l_int
+darwin_to_linux_msg_flags(int flags)
+{
+  l_int ret = 0;
+  if (flags & MSG_OOB)    ret |= LINUX_MSG_OOB;
+  if (flags & MSG_EOR)    ret |= LINUX_MSG_EOR;
+  if (flags & MSG_TRUNC)  ret |= LINUX_MSG_TRUNC;
+  if (flags & MSG_CTRUNC) ret |= LINUX_MSG_CTRUNC;
+  return ret;
+}
+
 int
 linux_to_darwin_msg_flags(l_int flags)
 {
@@ -488,6 +507,194 @@ DEFINE_SYSCALL(recvfrom, int, socket, gaddr_t, buf_ptr, int, length, int, flags,
   return ret;
 }
 
+/* ---------------------------------------------------------------------------
+ * Ancillary data
+ *
+ * Passing a descriptor over a unix socket is not a corner of the socket API
+ * here, it is the thing Wayland is built out of: every buffer a client shows is
+ * a memfd sent with SCM_RIGHTS, and wl_display_connect itself is followed
+ * immediately by one. Refusing ancillary data - which is what this did, with
+ * "we do not support ancillary data yet" - means a client can connect to a
+ * compositor and then never put a pixel on the screen.
+ *
+ * Two things have to be got right, and the second is the one that bites.
+ *
+ * The layouts differ. Linux's cmsghdr starts with a size_t, so its header is 16
+ * bytes; Darwin's starts with a socklen_t and is 12. A control buffer copied
+ * across verbatim - which is what recvmsg used to do - hands the guest headers
+ * whose length and level fields are read from the wrong offsets. It looked like
+ * it worked because a buffer with nothing in it is the same either way.
+ *
+ * And a received descriptor is a *host* descriptor that nabi has never seen. It
+ * has to be registered, or the guest holds a number its own fd table says is
+ * closed - which fails at the next close or dup rather than here, so the
+ * report would name the wrong call. MSG_CMSG_CLOEXEC decides how it is
+ * registered, and it is applied on the way in rather than afterwards for the
+ * same reason accept4 sets its flags on the way in.
+ */
+
+/* One Linux cmsghdr as the guest lays it out. */
+struct l_cmsg_wire {
+  uint64_t cmsg_len;
+  int32_t  cmsg_level;
+  int32_t  cmsg_type;
+};
+
+#define L_CMSG_ALIGN(n)  (((n) + 7u) & ~7u)
+
+/*
+ * The guest's control buffer, translated into one Darwin will accept.
+ *
+ * Only SCM_RIGHTS is carried. SCM_CREDENTIALS is Linux's struct ucred and
+ * Darwin's SCM_CREDS is a different structure with different contents, so
+ * translating it would mean inventing the parts Darwin does not send;
+ * everything else is dropped rather than passed through as bytes. Dropping is
+ * visible to the receiver, which is the right way round - a receiver that needs
+ * credentials finds none, instead of finding something made up.
+ */
+static int
+cmsg_to_host(gaddr_t control, size_t controllen, struct msghdr *hdr, void **buf_out)
+{
+  *buf_out = NULL;
+  hdr->msg_control = NULL;
+  hdr->msg_controllen = 0;
+  if (control == 0 || controllen < sizeof(struct l_cmsg_wire))
+    return 0;
+  if (controllen > 64 * 1024)
+    return -LINUX_ENOBUFS;
+
+  char *in = malloc(controllen);
+  if (in == NULL)
+    return -LINUX_ENOMEM;
+  if (copy_from_user(in, control, controllen)) {
+    free(in);
+    return -LINUX_EFAULT;
+  }
+
+  /* The Darwin buffer is never larger than the Linux one it came from: the
+   * header is 4 bytes smaller and the payload is the same. */
+  char *out = calloc(1, controllen);
+  if (out == NULL) {
+    free(in);
+    return -LINUX_ENOMEM;
+  }
+
+  size_t off = 0, outlen = 0;
+  while (off + sizeof(struct l_cmsg_wire) <= controllen) {
+    struct l_cmsg_wire c;
+    memcpy(&c, in + off, sizeof c);
+    if (c.cmsg_len < sizeof c || off + c.cmsg_len > controllen)
+      break;                    /* malformed, and Linux stops rather than errors */
+    size_t payload = c.cmsg_len - sizeof c;
+
+    if (c.cmsg_level == LINUX_SOL_SOCKET && c.cmsg_type == LINUX_SCM_RIGHTS) {
+      int nfd = (int) (payload / sizeof(int));
+      struct cmsghdr *dc = (struct cmsghdr *) (out + outlen);
+      dc->cmsg_len = (socklen_t) CMSG_LEN(payload);
+      dc->cmsg_level = SOL_SOCKET;
+      dc->cmsg_type = SCM_RIGHTS;
+      /*
+       * A guest descriptor number is the host one here, so the fds go across
+       * as they are - but they are checked first, because sendmsg with a
+       * descriptor that is not open must be EBADF and not a message the peer
+       * receives with a hole in it.
+       */
+      const int *src = (const int *) (in + off + sizeof c);
+      int *dst = (int *) CMSG_DATA(dc);
+      for (int i = 0; i < nfd; i++) {
+        if (fcntl(src[i], F_GETFD) < 0) {
+          free(in); free(out);
+          return -LINUX_EBADF;
+        }
+        dst[i] = src[i];
+      }
+      outlen += CMSG_SPACE(payload);
+    }
+    off += L_CMSG_ALIGN(c.cmsg_len);
+  }
+
+  free(in);
+  if (outlen == 0) {
+    free(out);
+    return 0;
+  }
+  hdr->msg_control = out;
+  hdr->msg_controllen = (socklen_t) outlen;
+  *buf_out = out;
+  return 0;
+}
+
+/*
+ * What came back, in the guest's layout, with every descriptor registered.
+ *
+ * Returns the number of bytes of control data written, or a negative errno.
+ * Sets *truncated when the guest's buffer could not hold it all, which the
+ * caller reports as MSG_CTRUNC - a receiver that ignores that and reads the
+ * count would otherwise walk off the end of what it was given.
+ */
+static int
+cmsg_to_guest(const struct msghdr *hdr, gaddr_t control, size_t controllen,
+              int flags, bool *truncated)
+{
+  *truncated = false;
+  if (control == 0 || hdr->msg_controllen == 0)
+    return 0;
+
+  char *out = calloc(1, controllen ? controllen : 1);
+  if (out == NULL)
+    return -LINUX_ENOMEM;
+
+  size_t outlen = 0;
+  int ret = 0;
+  for (struct cmsghdr *dc = CMSG_FIRSTHDR((struct msghdr *) hdr); dc != NULL;
+       dc = CMSG_NXTHDR((struct msghdr *) hdr, dc)) {
+    if (dc->cmsg_level != SOL_SOCKET || dc->cmsg_type != SCM_RIGHTS)
+      continue;
+    size_t payload = dc->cmsg_len - CMSG_LEN(0);
+    int nfd = (int) (payload / sizeof(int));
+    const int *fds = (const int *) CMSG_DATA(dc);
+
+    /*
+     * Registered first, and unconditionally: these descriptors are already open
+     * in this process whether or not the guest ends up being told about them,
+     * so anything not handed over has to be closed rather than leaked.
+     */
+    size_t need = L_CMSG_ALIGN(sizeof(struct l_cmsg_wire)) + payload;
+    bool room = outlen + need <= controllen;
+    for (int i = 0; i < nfd; i++) {
+      if (!room) {
+        close(fds[i]);
+        *truncated = true;
+        continue;
+      }
+      int e = register_fd(fds[i], (flags & LINUX_MSG_CMSG_CLOEXEC) != 0);
+      if (e < 0) {
+        close(fds[i]);
+        ret = e;
+        continue;
+      }
+      if (flags & LINUX_MSG_CMSG_CLOEXEC)
+        fcntl(fds[i], F_SETFD, FD_CLOEXEC);
+    }
+    if (!room)
+      continue;
+
+    struct l_cmsg_wire c = {
+      .cmsg_len = sizeof(struct l_cmsg_wire) + payload,
+      .cmsg_level = LINUX_SOL_SOCKET,
+      .cmsg_type = LINUX_SCM_RIGHTS,
+    };
+    memcpy(out + outlen, &c, sizeof c);
+    memcpy(out + outlen + sizeof c, fds, payload);
+    outlen += L_CMSG_ALIGN(c.cmsg_len);
+  }
+
+  if (ret == 0 && outlen > 0 && copy_to_user(control, out, outlen))
+    ret = -LINUX_EFAULT;
+  free(out);
+  return ret < 0 ? ret : (int) outlen;
+}
+
 static int
 do_sendmsg(int sockfd, const struct l_msghdr *msg, int flags)
 {
@@ -515,12 +722,10 @@ do_sendmsg(int sockfd, const struct l_msghdr *msg, int flags)
       return -LINUX_EFAULT;
   }
 
-  if (LINUX_CMSG_FIRSTHDR(msg) != 0) {
-    warnk("we do not support ancillary data yet\n");
-    return -LINUX_EINVAL;
-  }
-  hdr.msg_control = NULL;
-  hdr.msg_controllen = 0;
+  void *ctl = NULL;
+  int cr = cmsg_to_host(msg->msg_control, msg->msg_controllen, &hdr, &ctl);
+  if (cr < 0)
+    return cr;
 
   /*
     On Mac OS X MSG_NOSIGNAL is not supported, so we need to set SO_NOSIGPIPE
@@ -541,7 +746,9 @@ do_sendmsg(int sockfd, const struct l_msghdr *msg, int flags)
     }
   }
 
-  return syswrap(sendmsg(sockfd, &hdr, msg_flags));
+  int sr = syswrap(sendmsg(sockfd, &hdr, msg_flags));
+  free(ctl);
+  return sr;
 }
 
 DEFINE_SYSCALL(sendmsg, int, sockfd, gaddr_t, msg_ptr, int, flags)
@@ -633,13 +840,40 @@ DEFINE_SYSCALL(recvmsg, int, sockfd, gaddr_t, msg_ptr, int, flags)
       goto out;
     }
   }
-  if (copy_to_user(lmsg.msg_control, dmsg.msg_control, lmsg.msg_controllen)) {
-    r = -LINUX_EFAULT;
-    goto out;
-  }
-  if (copy_to_user(msg_ptr + offsetof(struct l_msghdr, msg_controllen), &dmsg.msg_controllen, sizeof dmsg.msg_controllen)) {
-    r = -LINUX_EFAULT;
-    goto out;
+  /*
+   * Translated rather than copied. The two cmsghdr layouts differ by the size
+   * of their first field, so the bytes Darwin produced describe nothing the
+   * guest's macros can walk - and any descriptors inside are host descriptors
+   * this process has just acquired without its own fd table knowing.
+   */
+  {
+    bool truncated = false;
+    /* The syscall's flags, not the header's: MSG_CMSG_CLOEXEC is an argument
+     * to recvmsg and never appears in msg_flags, which carries what came
+     * *back*. Reading it from the wrong one leaves every passed descriptor
+     * inheritable across exec. */
+    int n = cmsg_to_guest(&dmsg, lmsg.msg_control, lmsg.msg_controllen,
+                          flags, &truncated);
+    if (n < 0) {
+      r = n;
+      goto out;
+    }
+    l_size_t got = (l_size_t) n;
+    if (copy_to_user(msg_ptr + offsetof(struct l_msghdr, msg_controllen),
+                     &got, sizeof got)) {
+      r = -LINUX_EFAULT;
+      goto out;
+    }
+    /* Say so when it did not fit, or a receiver reads the count it was given
+     * and walks past the end of what was written. */
+    l_uint mflags = darwin_to_linux_msg_flags(dmsg.msg_flags);
+    if (truncated)
+      mflags |= LINUX_MSG_CTRUNC;
+    if (copy_to_user(msg_ptr + offsetof(struct l_msghdr, msg_flags),
+                     &mflags, sizeof mflags)) {
+      r = -LINUX_EFAULT;
+      goto out;
+    }
   }
 out:
   free(msg_name);

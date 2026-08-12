@@ -149,16 +149,16 @@
   SYSCALL(140, setpriority) \
   SYSCALL(141, getpriority) \
   SYSCALL(142, unimplemented) \
-  SYSCALL(143, unimplemented) \
+  SYSCALL(143, setregid) \
   SYSCALL(144, setgid) \
-  SYSCALL(145, unimplemented) \
+  SYSCALL(145, setreuid) \
   SYSCALL(146, setuid) \
   SYSCALL(147, setresuid) \
   SYSCALL(148, getresuid) \
   SYSCALL(149, setresgid) \
   SYSCALL(150, getresgid) \
-  SYSCALL(151, unimplemented) \
-  SYSCALL(152, unimplemented) \
+  SYSCALL(151, setfsuid) \
+  SYSCALL(152, setfsgid) \
   SYSCALL(153, unimplemented) \
   SYSCALL(154, setpgid) \
   SYSCALL(155, getpgid) \
@@ -243,7 +243,7 @@
   SYSCALL(234, unimplemented) \
   SYSCALL(235, mbind) \
   SYSCALL(236, get_mempolicy) \
-  SYSCALL(237, unimplemented) \
+  SYSCALL(237, set_mempolicy) \
   SYSCALL(238, migrate_pages) \
   SYSCALL(239, move_pages) \
   SYSCALL(240, unimplemented) \
@@ -283,7 +283,7 @@
   SYSCALL(274, unimplemented) \
   SYSCALL(275, unimplemented) \
   SYSCALL(276, unimplemented) \
-  SYSCALL(277, unimplemented) \
+  SYSCALL(277, seccomp) \
   SYSCALL(278, getrandom) \
   SYSCALL(279, memfd_create) \
   SYSCALL(280, bpf) \
@@ -456,7 +456,7 @@
   SYSCALL(447, memfd_secret) \
   SYSCALL(448, process_mrelease) \
   SYSCALL(449, futex_waitv) \
-  SYSCALL(450, unimplemented) \
+  SYSCALL(450, set_mempolicy_home_node) \
   SYSCALL(451, cachestat) \
   SYSCALL(452, fchmodat2) \
   SYSCALL(453, map_shadow_stack) \

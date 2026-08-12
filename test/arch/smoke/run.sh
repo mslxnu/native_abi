@@ -854,6 +854,35 @@ else
     fail=1
 fi
 
+# scmtest: passing a descriptor over a unix socket with SCM_RIGHTS, which is
+# what Wayland is built out of - a client sends the compositor a memfd for every
+# buffer. Checked by writing through the sent descriptor and reading it back
+# through the received one, so a number in a buffer cannot pass for a
+# descriptor, and by closing the received one, which only works if nabi
+# registered it.
+cp "$here/scmtest" "$root/"; chmod +x "$root/scmtest"
+out=$("$NABI" -m "$root" /scmtest); rc=$?
+if [ "$rc" -eq 0 ] && [ "$out" = "scm ok" ]; then
+    echo "  ok  scmtest -> \"$out\", exit 0"
+else
+    echo "  FAIL scmtest -> \"$out\", exit $rc"
+    fail=1
+fi
+
+# seccomptest: seccomp, the setre*/setfs* credential calls and set_mempolicy.
+# seccomp is checked on syscalls actually being stopped, on a later filter being
+# unable to loosen an earlier one, and on the chain surviving a fork - which on
+# arm64 means surviving the checkpoint, the one failure of the feature that
+# nothing inside the guest could detect.
+cp "$here/seccomptest" "$root/"; chmod +x "$root/seccomptest"
+out=$("$NABI" -m "$root" /seccomptest); rc=$?
+if [ "$rc" -eq 0 ] && [ "$out" = "seccomp ok" ]; then
+    echo "  ok  seccomptest -> \"$out\", exit 0"
+else
+    echo "  FAIL seccomptest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 if [ "$fail" -eq 0 ]; then
     echo "smoke: PASS"
 else

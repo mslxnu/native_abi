@@ -144,6 +144,15 @@ struct cred {
   l_gid_t gid;
   l_gid_t egid;
   l_gid_t sgid;
+  /*
+   * The ids the *filesystem* checks use, which are the effective ones until
+   * setfsuid says otherwise. Linux keeps them in step with euid/egid on every
+   * other credential change, so a program that never calls setfsuid cannot tell
+   * they exist - which is why routing cred_may through them changes nothing
+   * except for the programs that ask.
+   */
+  l_uid_t fsuid;
+  l_gid_t fsgid;
 };
 
 /* The host account the guest sees as root, and the mapping in both directions.
@@ -223,6 +232,16 @@ void report_host_passthrough(void);
 void report_rootfs_case(void);
 void init_host_ids(void);
 bool guest_in_group(l_gid_t gid);
+
+/* seccomp; see src/proc/seccomp.c. */
+bool   seccomp_check(uint64_t nr, const uint64_t *args, uint64_t *ret);
+int    seccomp_prctl_set(unsigned long mode, gaddr_t prog);
+int    seccomp_mode_get(void);
+int    seccomp_no_new_privs_get(void);
+int    seccomp_no_new_privs_set(void);
+size_t seccomp_snapshot_size(void);
+int    seccomp_snapshot(void *buf, size_t len, int *mode_out);
+void   seccomp_restore(const void *buf, size_t len, int mode);
 int  guest_groups_get(l_gid_t *out);
 const l_gid_t *guest_groups_ptr(void);
 void guest_groups_set(const l_gid_t *g, int n);

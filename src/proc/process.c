@@ -211,6 +211,10 @@ do_setresuid(l_uid_t ruid, l_uid_t euid, l_uid_t suid)
   if (ruid != (l_uid_t) -1) proc.cred.uid  = ruid;
   if (euid != (l_uid_t) -1) proc.cred.euid = euid;
   if (suid != (l_uid_t) -1) proc.cred.suid = suid;
+  /* Every change to the effective id carries the filesystem id with it. Linux
+   * does this so that setfsuid is the only way the two can differ, which is
+   * what makes it safe for the filesystem checks to consult fsuid alone. */
+  proc.cred.fsuid = proc.cred.euid;
   return 0;
 }
 
@@ -222,6 +226,7 @@ do_setresgid(l_gid_t rgid, l_gid_t egid, l_gid_t sgid)
   if (rgid != (l_gid_t) -1) proc.cred.gid  = rgid;
   if (egid != (l_gid_t) -1) proc.cred.egid = egid;
   if (sgid != (l_gid_t) -1) proc.cred.sgid = sgid;
+  proc.cred.fsgid = proc.cred.egid;
   return 0;
 }
 
@@ -231,6 +236,115 @@ DEFINE_SYSCALL(setresuid, l_uid_t, ruid, l_uid_t, euid, l_uid_t, suid)
   int ret = do_setresuid(ruid, euid, suid);
   pthread_rwlock_unlock(&proc.cred.lock);
   return ret;
+}
+
+/*
+ * setreuid and setregid: the older pair, with the rule that is easy to get
+ * wrong.
+ *
+ * Setting the real id to something other than what it was, or setting the
+ * effective id to something other than the old *real* id, also moves the saved
+ * id to the new effective one. That is what stops a program from dropping
+ * privilege and then picking it back up: without it, the saved id still holds
+ * the old value and a later setuid restores it. Linux has the rule and so does
+ * POSIX, and it is the whole reason setreuid is not just two assignments.
+ */
+DEFINE_SYSCALL(setreuid, l_uid_t, ruid, l_uid_t, euid)
+{
+  int ret;
+  pthread_rwlock_wrlock(&proc.cred.lock);
+  l_uid_t old_ruid = proc.cred.uid;
+
+  if (!may_become(ruid) || !may_become(euid)) {
+    ret = -LINUX_EPERM;
+    goto out;
+  }
+  /* An unprivileged caller may set the real id only to the one it already has
+   * as real or effective - narrower than may_become, which allows the saved
+   * one too. */
+  if (ruid != (l_uid_t) -1 && proc.cred.euid != 0 &&
+      ruid != proc.cred.uid && ruid != proc.cred.euid) {
+    ret = -LINUX_EPERM;
+    goto out;
+  }
+
+  l_uid_t new_suid = (l_uid_t) -1;
+  if (ruid != (l_uid_t) -1 || (euid != (l_uid_t) -1 && euid != old_ruid))
+    new_suid = euid != (l_uid_t) -1 ? euid : proc.cred.euid;
+
+  ret = do_setresuid(ruid, euid, new_suid);
+out:
+  pthread_rwlock_unlock(&proc.cred.lock);
+  return ret;
+}
+
+DEFINE_SYSCALL(setregid, l_gid_t, rgid, l_gid_t, egid)
+{
+  int ret;
+  pthread_rwlock_wrlock(&proc.cred.lock);
+  l_gid_t old_rgid = proc.cred.gid;
+
+  if (!may_become_gid(rgid) || !may_become_gid(egid)) {
+    ret = -LINUX_EPERM;
+    goto out;
+  }
+  if (rgid != (l_gid_t) -1 && proc.cred.euid != 0 &&
+      rgid != proc.cred.gid && rgid != proc.cred.egid) {
+    ret = -LINUX_EPERM;
+    goto out;
+  }
+
+  l_gid_t new_sgid = (l_gid_t) -1;
+  if (rgid != (l_gid_t) -1 || (egid != (l_gid_t) -1 && egid != old_rgid))
+    new_sgid = egid != (l_gid_t) -1 ? egid : proc.cred.egid;
+
+  ret = do_setresgid(rgid, egid, new_sgid);
+out:
+  pthread_rwlock_unlock(&proc.cred.lock);
+  return ret;
+}
+
+/*
+ * setfsuid and setfsgid: the id the filesystem checks use, and nothing else.
+ *
+ * They exist because an NFS server, or Samba, wants to act as a user for one
+ * file access without becoming that user - which would let a signal from
+ * outside reach it, and would change what a later getuid reports. Splitting the
+ * filesystem id off keeps the change to exactly the checks that read it.
+ *
+ * The odd part of the interface is that they cannot fail. Both return the
+ * *previous* value whether or not the change was allowed, so the way to find
+ * out whether it took is to call twice and compare - which is what libc's
+ * wrappers document and what callers do. Returning an error instead would be a
+ * kinder interface and the wrong one.
+ *
+ * Here they are real rather than recorded: cred_may consults fsuid for the
+ * effective case, so a process that lowers its filesystem id genuinely loses
+ * access to files it could read a moment earlier. The rest of the credentials
+ * keep fsuid in step, so nothing that does not call these can tell.
+ */
+DEFINE_SYSCALL(setfsuid, l_uid_t, fsuid)
+{
+  pthread_rwlock_wrlock(&proc.cred.lock);
+  l_uid_t old = proc.cred.fsuid;
+  if (fsuid != (l_uid_t) -1 &&
+      (proc.cred.euid == 0 || fsuid == proc.cred.uid || fsuid == proc.cred.euid ||
+       fsuid == proc.cred.suid || fsuid == proc.cred.fsuid))
+    proc.cred.fsuid = fsuid;
+  pthread_rwlock_unlock(&proc.cred.lock);
+  return (int) old;             /* never an error; see above */
+}
+
+DEFINE_SYSCALL(setfsgid, l_gid_t, fsgid)
+{
+  pthread_rwlock_wrlock(&proc.cred.lock);
+  l_gid_t old = proc.cred.fsgid;
+  if (fsgid != (l_gid_t) -1 &&
+      (proc.cred.euid == 0 || fsgid == proc.cred.gid || fsgid == proc.cred.egid ||
+       fsgid == proc.cred.sgid || fsgid == proc.cred.fsgid))
+    proc.cred.fsgid = fsgid;
+  pthread_rwlock_unlock(&proc.cred.lock);
+  return (int) old;
 }
 
 DEFINE_SYSCALL(getresuid, gaddr_t, ruid, gaddr_t, euid, gaddr_t, suid)
@@ -1226,6 +1340,24 @@ DEFINE_SYSCALL(prctl, int, option, unsigned long, arg1, unsigned long, arg2, uns
     pthread_setname_np(buf);
     return 0;
   }
+  /*
+   * The seccomp options, which are prctl's older door into the same thing.
+   * PR_SET_SECCOMP predates the seccomp syscall and is still what a program
+   * built against older headers emits, so it goes to the same place rather than
+   * to a second implementation that could drift from it.
+   */
+  case LINIX_PR_SET_NO_NEW_PRIVS:
+    if (arg1 != 1 || arg2 || arg3 || arg4 || arg5)
+      return -LINUX_EINVAL;     /* it can only be set, and only to one */
+    return seccomp_no_new_privs_set();
+  case LINIX_PR_GET_NO_NEW_PRIVS:
+    if (arg1 || arg2 || arg3 || arg4 || arg5)
+      return -LINUX_EINVAL;
+    return seccomp_no_new_privs_get();
+  case LINIX_PR_SET_SECCOMP:
+    return seccomp_prctl_set(arg1, (gaddr_t) arg2);
+  case LINIX_PR_GET_SECCOMP:
+    return seccomp_mode_get();
   default:
     warnk("unkown prctl cmd: %d\n", option);
     return -LINUX_EINVAL;

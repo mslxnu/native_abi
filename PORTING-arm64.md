@@ -5752,3 +5752,111 @@ satisfied systemd completely and left every file it touched at the temporary
 0600 - which is a worse failure than the EINVAL, because nothing reports it.
 
 No new syscalls: 303 of 375.
+
+### 3.5.105 seccomp, credentials, and the first step towards Wayland
+
+Seven syscalls and the beginning of a feature.
+
+**seccomp is implemented, and Landlock is still refused.** These two look alike
+- both are hardening primitives, both are believed the moment they return 0 -
+and the batch that refused Landlock gave the reason: whether the enforcement
+surface can be enumerated. Landlock's is on the order of fifty path-taking
+syscalls scattered across this tree. seccomp's is *one line*, the dispatch in
+`src/main.c`, because nabi is the system call interface and there is no way into
+a handler that does not pass through it. That is a stronger position than a real
+kernel is in, and it is why this one could be done honestly.
+
+The filter language is classic BPF over `struct seccomp_data`, interpreted here,
+and programs are verified when they are installed the way Linux's verifier does
+- every jump lands inside the program, every load is a form this understands,
+and the last instruction is a return. A filter that would run off its own end is
+refused at `SECCOMP_SET_MODE_FILTER` rather than misbehaving at some later
+syscall, which for a security filter is the difference between a program that
+will not start and one that is not confined.
+
+Three properties are load-bearing and each has its own check:
+
+  - a filter that answers `ERRNO` for one call makes *that* call fail and leaves
+    its neighbours alone, so the number in `seccomp_data` is the call being made
+    and not a constant;
+  - a later filter cannot loosen an earlier one, which is what makes a chain
+    safe to inherit and is what a naive "last one wins" gets wrong;
+  - and the chain survives a fork. On arm64 a fork is a fork plus an exec, so
+    that means it travels in the checkpoint - version 9 carries it as a trailing
+    blob. A child that rebuilt itself unfiltered while its parent believed it
+    was confined is the one failure of this feature that nothing inside the
+    guest could detect, and it is exactly the trap mseal's seal had. The
+    checkpoint's own round-trip test carries a filter now too.
+
+`USER_NOTIF` and `TRACE` need a supervisor and a tracer respectively, and
+neither can be attached. Linux runs the call as though it returned `ENOSYS` when
+nobody is listening, and so does this - the filter asked to defer the decision
+to somebody who is not there.
+
+**setfsuid and setfsgid are real rather than recorded.** `cred_may` is the one
+place file permission decisions are made, so routing its effective case through
+the filesystem ids was a one-line change - and a process that lowers its
+filesystem id genuinely loses access to files it could read a moment earlier.
+Every other credential change carries fsuid along with euid, as Linux does, so
+nothing that never calls these can tell they exist. They also cannot fail: both
+return the *previous* value whether or not the change was allowed, which is a
+worse interface than an error and is the one callers are written against.
+
+`setreuid` and `setregid` carry the rule that is easy to miss - changing the
+real id, or setting the effective id to anything but the old real id, also moves
+the saved id. Without it a program that drops privilege can pick it straight
+back up, and the test checks exactly that by dropping to 1000 in a child and
+confirming root is gone for good.
+
+`set_mempolicy` and `set_mempolicy_home_node` follow mbind: one node, so a
+policy naming it is satisfiable and one naming another is refused rather than
+confirmed. Nothing is recorded, because `get_mempolicy` reports `MPOL_DEFAULT`
+and the two should agree. While adding them, `get_mempolicy`'s `assert(addr == 0)`
+came out - `MPOL_F_ADDR` is an ordinary call, and a guest passing an address was
+taking the whole machine down with an abort.
+
+#### Wayland: what was actually in the way
+
+Wawona is a native Wayland compositor for macOS, so the question for nabi is
+narrow and answerable: can a Linux Wayland client inside a guest talk to a
+compositor outside it? Two things are needed and one of them was missing
+outright.
+
+The socket was never the problem. `/tmp`, `/private` and `/Users` are already
+host passthrough, and `connect()` translates an AF_UNIX path through
+`guest_to_host_path`, so a guest pointed at a host socket reaches it.
+
+**Passing descriptors was the problem**, and `do_sendmsg` said so in as many
+words: `"we do not support ancillary data yet"`, then `EINVAL`. That is not a
+corner of the socket API for this workload - it is the mechanism Wayland is
+built out of. Every buffer a client shows is a memfd sent with `SCM_RIGHTS`, so
+a client could connect to a compositor and then never put a pixel on the screen.
+
+Both directions are translated now, and there were two distinct faults to fix.
+The layouts differ: Linux's `cmsghdr` begins with a `size_t` and is 16 bytes,
+Darwin's begins with a `socklen_t` and is 12, so the control buffer `recvmsg`
+used to copy across verbatim gave the guest headers whose lengths and levels
+were read at the wrong offsets. It looked like it worked because an empty
+control buffer is the same either way. And a received descriptor is a *host*
+descriptor nabi has never seen; it has to be registered, or the guest holds a
+number its own fd table says is closed, and the failure surfaces at the next
+`close` or `dup` rather than where it was caused.
+
+The test writes through the sent descriptor and reads it back through the
+received one, so a number sitting in a buffer cannot pass for a descriptor.
+Writing it found a real slip: `MSG_CMSG_CLOEXEC` is an argument to `recvmsg` and
+never appears in `msg_flags`, and reading it from the header left every passed
+descriptor inheritable across exec.
+
+`memfd_create` arrived two batches ago, so with fd passing in place the pieces a
+Wayland client needs from the kernel are present.
+
+**Waydroid specifically is not reachable, and that should be said plainly.** It
+is not a Wayland client with unusual needs; it is Android in an LXC container
+talking to the host over binder. `/dev/binder` is a kernel driver with no macOS
+equivalent and nothing here could supply one - it is the same wall `bpf` meets,
+one level deeper. LXC needs `pivot_root`, which is refused a section above
+because `chroot` is a stub that accepts only `/`. Ordinary Wayland clients are
+now a question of trying them; Waydroid is a different project.
+
+310 of 375.

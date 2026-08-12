@@ -113,6 +113,7 @@ COMMON_SRCS := src/main.c \
                src/proc/fork.c \
                src/proc/pidfd.c \
                src/proc/kcmp.c \
+               src/proc/seccomp.c \
                src/proc/process.c \
                src/proc/namespace.c \
                src/proc/pidns.c \

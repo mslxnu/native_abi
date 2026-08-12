@@ -878,6 +878,98 @@ DEFINE_SYSCALL(migrate_pages, l_pid_t, pid, unsigned long, maxnode,
   return 0;
 }
 
+/*
+ * set_mempolicy: the process's own default allocation policy.
+ *
+ * mbind's reasoning applied to the whole process rather than to a range, and
+ * the same answer: node 0 is the only node, so a policy that names it or names
+ * nothing is satisfiable and one that names another node is not. get_mempolicy
+ * reports MPOL_DEFAULT with an empty mask, and this is written so the two agree
+ * - a caller that sets a policy and reads it back gets a consistent story
+ * rather than the one it set.
+ *
+ * Which is why nothing is recorded. Recording it would mean get_mempolicy
+ * reporting MPOL_BIND over a set of one node, which is true in a sense and
+ * misleading in the way that matters: it suggests placement is being honoured,
+ * and there is nowhere for placement to differ.
+ */
+DEFINE_SYSCALL(set_mempolicy, int, mode, gaddr_t, nodemask, unsigned long, maxnode)
+{
+  int bare = mode & ~LINUX_MPOL_MODE_FLAGS;
+  int mflags = mode & LINUX_MPOL_MODE_FLAGS;
+  if (bare < LINUX_MPOL_DEFAULT || bare > LINUX_MPOL_PREFERRED_MANY)
+    return -LINUX_EINVAL;
+  if ((mflags & LINUX_MPOL_F_STATIC_NODES) && (mflags & LINUX_MPOL_F_RELATIVE_NODES))
+    return -LINUX_EINVAL;
+  if (maxnode > 1024 * 1024)
+    return -LINUX_EINVAL;
+
+  bool node0;
+  int r = read_nodemask(nodemask, maxnode, &node0);
+  if (r < 0)
+    return r;
+
+  switch (bare) {
+  case LINUX_MPOL_DEFAULT:
+    if (node0)
+      return -LINUX_EINVAL;     /* "no policy" with a set is a contradiction */
+    break;
+  case LINUX_MPOL_BIND:
+  case LINUX_MPOL_INTERLEAVE:
+  case LINUX_MPOL_PREFERRED_MANY:
+    if (!node0)
+      return -LINUX_EINVAL;     /* an empty set constrains allocation to nowhere */
+    break;
+  case LINUX_MPOL_LOCAL:
+    if (node0)
+      return -LINUX_EINVAL;     /* local is where the thread is, not a set */
+    break;
+  case LINUX_MPOL_PREFERRED:
+    break;                      /* an empty mask means no preference */
+  }
+  return 0;
+}
+
+/*
+ * set_mempolicy_home_node: which node a range should prefer to be near.
+ *
+ * A hint about where to fault pages in for a range that already has a policy,
+ * added so that a large interleaved mapping could still keep each thread's
+ * working set close to it. With one node every page is already home, so the
+ * only thing to check is that the caller is not naming a node that does not
+ * exist - and that the range is one it actually has, because Linux answers
+ * EFAULT for a hole rather than accepting a hint about nothing.
+ */
+DEFINE_SYSCALL(set_mempolicy_home_node, gaddr_t, start, unsigned long, len,
+               unsigned long, home_node, unsigned long, flags)
+{
+  size_t ps = PAGE_SIZEOF(PAGE_4KB);
+  if (flags != 0)
+    return -LINUX_EINVAL;
+  if (start & (ps - 1))
+    return -LINUX_EINVAL;
+  if (home_node != 0 && home_node != (unsigned long) -1)
+    return -LINUX_EINVAL;       /* a node this machine does not have */
+  if (len == 0)
+    return 0;
+  if (start + len < start)
+    return -LINUX_EINVAL;
+
+  gaddr_t end = roundup(start + len, ps);
+  int ret = 0;
+  pthread_rwlock_rdlock(&proc.mm->alloc_lock);
+  for (gaddr_t p = start; p < end; ) {
+    struct mm_region *r = find_region(p, proc.mm);
+    if (r == NULL) {
+      ret = -LINUX_EFAULT;
+      break;
+    }
+    p = r->gaddr + r->size;
+  }
+  pthread_rwlock_unlock(&proc.mm->alloc_lock);
+  return ret;
+}
+
 DEFINE_SYSCALL(mbind, gaddr_t, addr, unsigned long, len, int, mode,
                gaddr_t, nodemask, unsigned long, maxnode, unsigned int, flags)
 {

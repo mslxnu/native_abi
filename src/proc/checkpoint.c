@@ -114,6 +114,8 @@ checkpoint_write(int fd)
    * that Darwin will not let it set freely (see struct cred), so they have to be
    * carried across rather than re-read from the process.
    */
+  hdr.fsuid = proc.cred.fsuid;
+  hdr.fsgid = proc.cred.fsgid;
   hdr.uid  = proc.cred.uid;
   hdr.euid = proc.cred.euid;
   hdr.suid = proc.cred.suid;
@@ -169,6 +171,17 @@ checkpoint_write(int fd)
   hdr.nr_pt_chunks  = (uint32_t) nr_chunks;
   hdr.nr_fds        = (uint32_t) nr_fds;
   hdr.nr_sigactions = LINUX_NSIG;
+  size_t seccomp_bytes = seccomp_snapshot_size();
+  void *seccomp_blob = seccomp_bytes ? malloc(seccomp_bytes) : NULL;
+  int seccomp_mode = 0;
+  if (seccomp_bytes && seccomp_blob == NULL)
+    return -1;
+  if (seccomp_snapshot(seccomp_blob, seccomp_bytes, &seccomp_mode) < 0) {
+    free(seccomp_blob);
+    return -1;
+  }
+  hdr.seccomp_mode  = (uint32_t) seccomp_mode;
+  hdr.seccomp_bytes = (uint32_t) seccomp_bytes;
   hdr.exe_len       = proc.ident.exe ? (uint32_t)(strlen(proc.ident.exe) + 1) : 0;
   hdr.cmdline_len   = (uint32_t) proc.ident.cmdline_len;
 
@@ -184,9 +197,11 @@ checkpoint_write(int fd)
       write_all(fd, proc.ident.exe, hdr.exe_len) == 0 &&
       write_all(fd, proc.ident.cmdline, hdr.cmdline_len) == 0 &&
       (hdr.nr_groups == 0 ||
-       write_all(fd, guest_groups_ptr(), hdr.nr_groups * sizeof(l_gid_t)) == 0))
+       write_all(fd, guest_groups_ptr(), hdr.nr_groups * sizeof(l_gid_t)) == 0) &&
+      (seccomp_bytes == 0 || write_all(fd, seccomp_blob, seccomp_bytes) == 0))
     rc = 0;
 
+  free(seccomp_blob);
   free(regions); free(s2); free(chunks); free(fds);
   return rc;
 }
@@ -258,6 +273,25 @@ checkpoint_read(int fd, struct checkpoint_header *hdr,
     free(groups);
   } else if (hdr->nr_groups == 0) {
     guest_groups_set(NULL, 0);
+  }
+
+  /* The seccomp chain, applied here for the same reason the groups are: it has
+   * no other owner, and a caller inspecting a checkpoint has the count. */
+  if (hdr->seccomp_bytes) {
+    void *blob = malloc(hdr->seccomp_bytes);
+    if (blob == NULL || read_all(fd, blob, hdr->seccomp_bytes) < 0) {
+      free(blob);
+      free(regions); free(s2); free(chunks); free(fds); free(sigactions);
+      free(exe); free(cmdline);
+      errno = errno ? errno : ENOMEM;
+      return -1;
+    }
+    seccomp_restore(blob, hdr->seccomp_bytes, (int) hdr->seccomp_mode);
+    free(blob);
+  } else if (hdr->seccomp_mode != 0) {
+    /* Says filtered and carries nothing: seccomp_restore refuses this, and it
+     * is reached here rather than left to chance. */
+    seccomp_restore(NULL, 0, (int) hdr->seccomp_mode);
   }
 
   /* The namespaces the parent was in, identities included. */

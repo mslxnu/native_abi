@@ -76,6 +76,31 @@ void guest_groups_set(const l_gid_t *g, int n)
     memcpy(stub_groups, g, n * sizeof stub_groups[0]);
   stub_ngroups = n;
 }
+/*
+ * The same shape of stub for the seccomp chain, and real for the same reason:
+ * the filters travel as a trailing blob, and a round trip that did not carry
+ * them would leave a forked child unfiltered while its parent believed it was
+ * confined. That is checked below rather than assumed.
+ */
+static unsigned char stub_seccomp[64];
+static size_t stub_seccomp_len;
+static int stub_seccomp_mode;
+size_t seccomp_snapshot_size(void) { return stub_seccomp_len; }
+int seccomp_snapshot(void *buf, size_t len, int *mode_out)
+{
+  *mode_out = stub_seccomp_mode;
+  if (len > stub_seccomp_len) len = stub_seccomp_len;
+  memcpy(buf, stub_seccomp, len);
+  return 0;
+}
+void seccomp_restore(const void *buf, size_t len, int mode)
+{
+  stub_seccomp_mode = mode;
+  stub_seccomp_len = len > sizeof stub_seccomp ? sizeof stub_seccomp : len;
+  if (buf && stub_seccomp_len)
+    memcpy(stub_seccomp, buf, stub_seccomp_len);
+}
+
 _Thread_local struct task task;
 
 #define FAKE_S2     3
@@ -200,6 +225,10 @@ main(void)
    * every child came back with gid 0 and no groups at all. */
   proc.cred.gid = 1000; proc.cred.egid = 1001; proc.cred.sgid = 1002;
   { l_gid_t g[] = { 4, 27, 100 }; guest_groups_set(g, 3); }
+  proc.cred.fsuid = 1234; proc.cred.fsgid = 5678;
+  /* A filter chain to carry, with contents that could not arise by accident. */
+  { unsigned char f[] = { 0xaa, 0xbb, 0xcc, 0xdd, 0x01, 0x02, 0x03, 0x04 };
+    seccomp_restore(f, sizeof f, 2 /* SECCOMP_MODE_FILTER */); }
   task.tid = 4242;
   task.set_child_tid = 0xc0ffee; task.clear_child_tid = 0xdeadbe;
   task.robust_list = 0xb0b; task.sigmask.__mask = 0x8000000000000042ULL;
@@ -245,6 +274,8 @@ main(void)
   struct checkpoint_fd *fds = NULL;
   l_sigaction_t *sigactions = NULL;
   char *exe = NULL, *cmdline = NULL;
+  memset(stub_seccomp, 0, sizeof stub_seccomp);
+  stub_seccomp_len = 0; stub_seccomp_mode = 0;
   CHECK(checkpoint_read(fd, &hdr, &regions, &s2, &chunks, &fds, &sigactions,
                         &exe, &cmdline) == 0,
         "checkpoint_read failed: %s", strerror(errno));
@@ -337,9 +368,23 @@ main(void)
      * read out of the stub - which is exactly where a resumed guest gets it. */
     l_gid_t g[8] = { 0 };
     int n = guest_groups_get(g);
+    CHECK(stub_seccomp_mode == 2 && stub_seccomp_len == 8 &&
+          stub_seccomp[0] == 0xaa && stub_seccomp[7] == 0x04,
+          "the seccomp chain did not come back: mode %d, %zu bytes",
+          stub_seccomp_mode, stub_seccomp_len);
     CHECK(n == 3 && g[0] == 4 && g[1] == 27 && g[2] == 100,
           "group list did not survive: n=%d %u,%u,%u", n, g[0], g[1], g[2]);
   }
+  CHECK(hdr.fsuid == 1234 && hdr.fsgid == 5678,
+        "the filesystem ids did not survive: %u/%u", hdr.fsuid, hdr.fsgid);
+  /*
+   * The seccomp chain. Cleared before reading so that "it survived" cannot be
+   * satisfied by the value that was already there - the same trap a round-trip
+   * check falls into whenever the source and the destination are one variable.
+   */
+  CHECK(hdr.seccomp_mode == 2 && hdr.seccomp_bytes == 8,
+        "the seccomp header did not survive: mode %u, %u bytes",
+        hdr.seccomp_mode, hdr.seccomp_bytes);
   CHECK(hdr.uid == 501 && hdr.euid == 0 && hdr.suid == 0,
         "credentials did not survive");
   CHECK(hdr.tid == 4242 && hdr.set_child_tid == 0xc0ffee &&
