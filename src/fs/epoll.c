@@ -85,6 +85,37 @@ epoll_close(int epfd)
   pthread_mutex_unlock(&epoll_lock);
 }
 
+/*
+ * Which descriptors are registered on an epoll instance, for kcmp.
+ *
+ * kcmp asks whether a *file* is in the set, not whether a descriptor number is,
+ * so the caller has to compare identities rather than numbers - and identity is
+ * decided in one place, in kcmp.c, which is why this hands back the list instead
+ * of answering the question itself.
+ *
+ * Returns the number written, or the number that would have been needed if that
+ * is more than max, so a caller can tell a full buffer from a complete one.
+ */
+int
+epoll_registered_fds(int epfd, int *out, int max)
+{
+  int n = 0;
+  pthread_mutex_lock(&epoll_lock);
+  if (epoll_regs) {
+    for (khiter_t k = kh_begin(epoll_regs); k != kh_end(epoll_regs); k++) {
+      if (!kh_exist(epoll_regs, k))
+        continue;
+      if ((int) (kh_key(epoll_regs, k) >> 32) != epfd)
+        continue;
+      if (n < max)
+        out[n] = (int) (uint32_t) kh_key(epoll_regs, k);
+      n++;
+    }
+  }
+  pthread_mutex_unlock(&epoll_lock);
+  return n;
+}
+
 static uint64_t
 reg_key(int epfd, int fd)
 {

@@ -655,7 +655,18 @@ DEFINE_SYSCALL(listen, int, socket, int, backlog)
   return syswrap(listen(socket, backlog));
 }
 
-DEFINE_SYSCALL(accept, int, sockfd, gaddr_t, addr_ptr, gaddr_t, addrlen_ptr)
+/*
+ * accept, with the flags accept4 adds.
+ *
+ * Written as one function taking them rather than as accept4 fixing up what
+ * accept returned, because SOCK_CLOEXEC exists precisely to close the window
+ * between a descriptor appearing and being marked - and setting it afterwards
+ * reopens that window for any other thread that execs in between. The flag
+ * would then be doing nothing except in the single-threaded case, where it was
+ * never needed.
+ */
+static int
+do_accept(int sockfd, gaddr_t addr_ptr, gaddr_t addrlen_ptr, int flags)
 {
   socklen_t *socklen_ptr = NULL;
   struct sockaddr *sock_ptr = NULL;
@@ -672,7 +683,27 @@ DEFINE_SYSCALL(accept, int, sockfd, gaddr_t, addr_ptr, gaddr_t, addrlen_ptr)
   if (ret < 0) {
     goto err;
   }
-  int e = register_fd(ret, false);
+  /*
+   * Both flags are set to the asked-for state rather than only turned on,
+   * because BSD and Linux disagree about what an accepted socket starts as.
+   * Linux hands back a blocking descriptor whatever the listening socket was,
+   * and leaves inheriting to SOCK_NONBLOCK; the BSD lineage has historically
+   * passed the listening socket's flags down. Saying so outright means the
+   * answer does not depend on which of those this host turns out to do.
+   */
+  int e = syswrap(fcntl(ret, F_SETFL, (flags & LINUX_SOCK_NONBLOCK) ? O_NONBLOCK : 0));
+  if (e < 0) {
+    close(ret);
+    ret = e;
+    goto err;
+  }
+  e = syswrap(fcntl(ret, F_SETFD, (flags & LINUX_SOCK_CLOEXEC) ? FD_CLOEXEC : 0));
+  if (e < 0) {
+    close(ret);
+    ret = e;
+    goto err;
+  }
+  e = register_fd(ret, (flags & LINUX_SOCK_CLOEXEC) != 0);
   if (e < 0) {
     close(ret);
     ret = e;
@@ -694,6 +725,23 @@ DEFINE_SYSCALL(accept, int, sockfd, gaddr_t, addr_ptr, gaddr_t, addrlen_ptr)
 err:
   pthread_rwlock_unlock(&proc.fileinfo.fdtable_lock);
   return ret;
+}
+
+DEFINE_SYSCALL(accept, int, sockfd, gaddr_t, addr_ptr, gaddr_t, addrlen_ptr)
+{
+  return do_accept(sockfd, addr_ptr, addrlen_ptr, 0);
+}
+
+DEFINE_SYSCALL(accept4, int, sockfd, gaddr_t, addr_ptr, gaddr_t, addrlen_ptr, int, flags)
+{
+  /*
+   * Only the two flags exist. Anything else is refused rather than dropped,
+   * because a caller that asked for something this does not do is better told
+   * so than handed a descriptor that quietly is not what it wanted.
+   */
+  if (flags & ~(LINUX_SOCK_NONBLOCK | LINUX_SOCK_CLOEXEC))
+    return -LINUX_EINVAL;
+  return do_accept(sockfd, addr_ptr, addrlen_ptr, flags);
 }
 
 DEFINE_SYSCALL(bind, int, sockfd, gaddr_t, addr_ptr, int, addrlen)

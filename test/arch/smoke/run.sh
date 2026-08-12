@@ -785,6 +785,23 @@ else
     fail=1
 fi
 
+# acc4test: accept4, kcmp and keyctl. The listening socket is put into
+# non-blocking mode first, because macOS passes that down to the accepted socket
+# and Linux does not - so a plain accept4(..., 0) producing a *blocking*
+# descriptor is the thing being checked, not that the flags can be turned on.
+# kcmp is checked on the distinction it exists for: a dup compares equal to its
+# original and the two ends of one pipe do not, which is the pair that stat
+# cannot tell apart, and two opens of one directory are refused rather than
+# guessed at.
+cp "$here/acc4test" "$root/"; chmod +x "$root/acc4test"
+out=$("$NABI" -m "$root" /acc4test); rc=$?
+if [ "$rc" -eq 0 ] && [ "$out" = "acc4 ok" ]; then
+    echo "  ok  acc4test -> \"$out\", exit 0"
+else
+    echo "  FAIL acc4test -> \"$out\", exit $rc"
+    fail=1
+fi
+
 if [ "$fail" -eq 0 ]; then
     echo "smoke: PASS"
 else

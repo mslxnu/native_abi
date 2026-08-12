@@ -202,6 +202,45 @@ DEFINE_NOT_IMPLEMENTED_SYSCALL(bpf)
 DEFINE_NOT_IMPLEMENTED_SYSCALL(add_key)
 
 /*
+ * keyctl: the rest of the keyring, and absent for the reason above.
+ *
+ * Worth saying separately only because keyctl is the half programs actually
+ * call. Much of it - KEYCTL_GET_KEYRING_ID, KEYCTL_JOIN_SESSION_KEYRING,
+ * KEYCTL_SESSION_TO_PARENT - is about the *rings* rather than the keys, and
+ * those are per-process kernel state inherited across fork and reshaped on
+ * exec. There is no such state here for the same reason there is nowhere safe
+ * to put a payload, so a ring cannot be joined, described or moved either.
+ *
+ * A caller told ENOSYS from the first keyctl falls back to whatever it does
+ * without a kernel keyring, which is the outcome that matches this host.
+ * request_key completes the family and is absent alongside them.
+ */
+DEFINE_NOT_IMPLEMENTED_SYSCALL(keyctl)
+
+/*
+ * ioperm and iopl: direct access to x86 I/O ports.
+ *
+ * These grant a process the right to run `in` and `out` against the port
+ * space - ioperm for a range of it, iopl by raising the privilege level far
+ * enough that the whole space is open. Both are x86-only calls, and neither has
+ * an aarch64 number at all: aarch64 has no I/O port space to be granted, so
+ * there is nothing the arm64 build could be asked for.
+ *
+ * They are here for the x86_64 table, where the number exists and a guest can
+ * therefore reach them. Refused there too, and not as a policy decision: nabi's
+ * guests run in EL0/ring 3 under a hypervisor, and what these ask for is a
+ * change to the privilege state of the *host* kernel's view of a task. macOS
+ * does not offer it to anybody. A guest driver poking at ports would be talking
+ * to hardware that this machine does not have even when it is an x86 one.
+ *
+ * ENOSYS rather than EPERM, because EPERM is what a caller sees when it lacks
+ * the privilege and would send a well-written one off to acquire it and try
+ * again. There is nothing to acquire.
+ */
+DEFINE_NOT_IMPLEMENTED_SYSCALL(ioperm)
+DEFINE_NOT_IMPLEMENTED_SYSCALL(iopl)
+
+/*
  * acct: BSD process accounting.
  *
  * Turning this on asks the kernel to append a record for every process that

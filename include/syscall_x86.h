@@ -177,8 +177,8 @@
   SYSCALL(169, unimplemented) \
   SYSCALL(170, sethostname) \
   SYSCALL(171, setdomainname) \
-  SYSCALL(172, unimplemented) \
-  SYSCALL(173, unimplemented) \
+  SYSCALL(172, iopl) \
+  SYSCALL(173, ioperm) \
   SYSCALL(174, unimplemented) \
   SYSCALL(175, unimplemented) \
   SYSCALL(176, unimplemented) \
@@ -255,7 +255,7 @@
   SYSCALL(247, unimplemented) \
   SYSCALL(248, add_key) \
   SYSCALL(249, unimplemented) \
-  SYSCALL(250, unimplemented) \
+  SYSCALL(250, keyctl) \
   SYSCALL(251, ioprio_set) \
   SYSCALL(252, ioprio_get) \
   SYSCALL(253, inotify_init) \
@@ -293,7 +293,7 @@
   SYSCALL(285, fallocate) \
   SYSCALL(286, timerfd_settime) \
   SYSCALL(287, timerfd_gettime) \
-  SYSCALL(288, unimplemented) \
+  SYSCALL(288, accept4) \
   SYSCALL(289, unimplemented) \
   SYSCALL(290, eventfd2) \
   SYSCALL(291, epoll_create1) \
@@ -317,7 +317,7 @@
   SYSCALL(309, unimplemented) \
   SYSCALL(310, process_vm_readv) \
   SYSCALL(311, process_vm_writev) \
-  SYSCALL(312, unimplemented) \
+  SYSCALL(312, kcmp) \
   SYSCALL(313, unimplemented) \
   SYSCALL(314, unimplemented) \
   SYSCALL(315, unimplemented) \

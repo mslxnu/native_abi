@@ -5305,3 +5305,78 @@ answering `EOPNOTSUPP` with a note that no context could arrive on it. There is
 one now.
 
 278 of 375.
+
+### 3.5.100 accept4 and kcmp; ioperm, iopl and keyctl
+
+Five, and one of them turned up a bug in a call that was already there.
+
+**`accept4` is `accept` plus two flags**, and the obvious way to add it — call
+`accept`, then set what was asked for — is wrong twice over.
+
+The first reason is the one `SOCK_CLOEXEC` exists for. Setting close-on-exec
+after the descriptor already exists reopens exactly the window the flag was
+invented to close: another thread can `exec` in between, and the descriptor
+leaks. The flag would then be doing nothing except in the single-threaded case,
+where it was never needed. So the flags are threaded into `do_accept` and
+applied on the way, and both entry points go through it.
+
+The second reason is that macOS and Linux disagree about what an accepted socket
+starts as, and this was measured rather than assumed. Linux hands back a
+blocking descriptor whatever the listening socket was; the BSD lineage passes
+the listening socket's status flags down. A listening socket put into
+non-blocking mode, accepted from with no flags at all, produced `F_GETFL` of
+`0x802` — `O_RDWR|O_NONBLOCK`. That is not an `accept4` gap, it is what plain
+`accept` had been doing since it was written: a server that set its listener
+non-blocking got non-blocking connections, and every read on one returned
+`EAGAIN` where Linux would have blocked. Both flags are now *set to* the
+asked-for state rather than turned on, which makes the answer the same
+whichever way the host would have gone, and fixes `accept` as a side effect.
+
+**`kcmp` asks a question only a kernel can answer**, and the honest reply here
+is in two halves.
+
+The process-wide types — `KCMP_VM`, `KCMP_FILES`, `KCMP_FS`, `KCMP_SIGHAND`,
+`KCMP_IO`, `KCMP_SYSVSEM` — are answered exactly when both sides are the calling
+process, because a process shares all of those with itself. That is the true
+answer and not a shortcut. Anything naming another process meets the wall
+`process_vm_readv` documents, and gets `EPERM` — after `kill(pid, 0)`, so that
+"no such process" stays distinguishable from "not allowed".
+
+`KCMP_FILE` is the type callers actually use, and it is about the open file
+description rather than the file. Darwin will say which *file* a descriptor
+names and usually not which description, so two independent opens of one path
+and one descriptor duplicated look identical — which is precisely the pair the
+call is asked to tell apart. Pipes and sockets are the exception:
+`proc_pidfdinfo` hands back the kernel's own handle for the object, and the only
+ways to get two descriptors onto one pipe end or one socket — `dup`, `fork`,
+`SCM_RIGHTS` — all share the description. Those are answered exactly, with
+Linux's 1/2 ordering so a caller sorting descriptors gets a stable result.
+Everything else is refused with `EOPNOTSUPP`.
+
+Refused rather than answered from `st_dev` and `st_ino`, and the smoke test
+checks that specifically: two opens of the same directory must not compare
+equal. A caller told the wrong answer acts on it somewhere further away; a
+caller told the question cannot be answered here takes its fallback.
+
+`KCMP_EPOLL_TFD` is answerable, because NABI's epoll registrations are its own
+and are where the truth lives. The set is walked and each entry compared by
+description — and when none matched but one comparison was undecidable, the
+answer is `EOPNOTSUPP` rather than "absent", because a negative built out of a
+comparison that failed is a guess.
+
+**Three cannot exist.** `keyctl` is the rest of `add_key`'s family and absent
+for the same reason: much of it is about the keyring rather than the keys, and
+those rings are per-process kernel state inherited across `fork` and reshaped on
+`exec`. There is no such state here, so a ring cannot be joined or described
+either.
+
+`ioperm` and `iopl` grant access to the x86 I/O port space. Neither has an
+aarch64 number — aarch64 has no port space to be granted — so they are here for
+the x86_64 table, where a guest can reach them. Refused there too, and not as
+policy: they ask for a change to the privilege state of a task, macOS does not
+offer it to anybody, and a guest driver poking at ports would be addressing
+hardware this machine does not have. `ENOSYS` rather than `EPERM`, because
+`EPERM` sends a well-written caller off to acquire the privilege and try again,
+and there is nothing to acquire.
+
+280 of 375.
