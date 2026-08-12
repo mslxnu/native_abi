@@ -438,4 +438,13 @@ struct l_flock {
   l_pid_t l_pid;
 };
 
+
+/* preadv2 / pwritev2 flags. */
+#define LINUX_RWF_HIPRI     0x00000001
+#define LINUX_RWF_DSYNC     0x00000002
+#define LINUX_RWF_SYNC      0x00000004
+#define LINUX_RWF_NOWAIT    0x00000008
+#define LINUX_RWF_APPEND    0x00000010
+#define LINUX_RWF_NOAPPEND  0x00000020
+
 #endif	/* !_LINUX_FILE_H_ */

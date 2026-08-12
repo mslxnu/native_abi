@@ -54,6 +54,14 @@ struct mm_region {
   gaddr_t gaddr;
   size_t size;
   int prot;            /* Access permission that consists of LINUX_PROT_* */
+  /*
+   * mseal: this range's layout is frozen for the life of the mapping. Set once
+   * and never cleared - the call is deliberately irreversible - and checked by
+   * mmap, mprotect, mremap and munmap in src/mm/mmap.c. It travels in the
+   * checkpoint, because a fork here is a fork plus an exec and a child that
+   * lost its seals would be quietly less protected than its parent.
+   */
+  bool sealed;
   int mm_flags;        /* mm flags in the form of LINUX_MAP_* */
   int mm_fd;
   /*

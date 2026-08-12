@@ -156,6 +156,7 @@ checkpoint_write(int fd)
       .mm_fd     = r->mm_fd,
       .pgoff     = r->pgoff,
       .shm_id    = r->shm_id,
+      .sealed    = r->sealed,
     };
   }
 

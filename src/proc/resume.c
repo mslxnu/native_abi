@@ -124,6 +124,7 @@ checkpoint_restore(int ckpt_fd, int arena_fd)
                                         regions[i].pgoff);
     r->arena_off = regions[i].arena_off;
     r->shm_id = regions[i].shm_id;
+    r->sealed = regions[i].sealed != 0;
   }
   free(region_hva);
 

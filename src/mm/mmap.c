@@ -259,10 +259,246 @@ do_mmap(gaddr_t addr, size_t len, int d_prot, int l_prot, int l_flags, int fd, o
   return addr;
 }
 
+/*
+ * mseal: freeze a range's layout, permanently.
+ *
+ * A sealed range cannot be unmapped, moved, re-protected, or mapped over. The
+ * point is that an attacker who has reached the point of calling mprotect - to
+ * make the relocation table writable again, or to turn a data page into code -
+ * finds the call refused, and the process keeps the layout it was linked with.
+ * glibc seals its own relocated sections after applying RELRO, so this is
+ * something a guest gets for free rather than something it has to ask for.
+ *
+ * Unlike Landlock, which is refused a few hundred lines away for the opposite
+ * reason, the enforcement surface here is small enough to enumerate and to
+ * check. Everything that can change a mapping's layout goes through this file:
+ *
+ *   sys_mmap      - a MAP_FIXED mapping placed over the range
+ *   sys_mprotect  - and pkey_mprotect, which delegates to it
+ *   sys_mremap    - moving or resizing the range
+ *   sys_munmap    - and do_munmap, which mmap and mremap call internally
+ *
+ * That is the whole list, and it is four functions in one file rather than
+ * fifty across the tree. The seal also travels in the checkpoint, because a
+ * fork here is a fork plus an exec, and a child that came back unsealed would
+ * be quietly less protected than the parent with nothing saying so.
+ *
+ * A caller can only ever add seals. There is no unseal, on Linux or here, and
+ * that is the feature: a call to undo it is a call an attacker can make too.
+ */
+static bool
+range_is_sealed(gaddr_t addr, size_t size)
+{
+  struct mm_region *r;
+  list_for_each_entry (r, &proc.mm->mm_regions, list) {
+    if (!r->sealed)
+      continue;
+    if (r->gaddr < addr + size && addr < r->gaddr + r->size)
+      return true;
+  }
+  return false;
+}
+
+/*
+ * mincore: which pages of a range are resident.
+ *
+ * Guest memory is host memory, so this is Darwin's mincore over the host
+ * address the region translates to. The unit is a page and the guest's page is
+ * the host's in both builds - the same equality cachestat depends on - so a
+ * residency byte maps one to one.
+ *
+ * Only the low bit is written. Linux defines the rest of the byte as reserved
+ * and requires it to be zero, and Darwin has bits up there of its own
+ * (MINCORE_REFERENCED and friends) that mean something different; passing them
+ * through would hand a guest flags from another operating system in a field its
+ * headers call reserved.
+ */
+DEFINE_SYSCALL(mincore, gaddr_t, addr, size_t, length, gaddr_t, vec_ptr)
+{
+  size_t ps = PAGE_SIZEOF(PAGE_4KB);
+  if (addr & (ps - 1))
+    return -LINUX_EINVAL;
+  if (length == 0)
+    return 0;
+  if (addr + length < addr)
+    return -LINUX_ENOMEM;
+
+  size_t npages = (length + ps - 1) / ps;
+  char *out = calloc(npages, 1);
+  if (out == NULL)
+    return -LINUX_ENOMEM;
+
+  int ret = 0;
+  pthread_rwlock_rdlock(&proc.mm->alloc_lock);
+  for (size_t done = 0; done < npages; ) {
+    gaddr_t p = addr + done * ps;
+    struct mm_region *r = find_region(p, proc.mm);
+    if (r == NULL) {
+      /* Linux answers ENOMEM for a range that is not all mapped, and says
+       * nothing about the part it could have reported. */
+      ret = -LINUX_ENOMEM;
+      break;
+    }
+    gaddr_t rend = r->gaddr + r->size;
+    size_t n = (size_t) ((rend - p) / ps);
+    if (n > npages - done)
+      n = npages - done;
+    void *haddr = (char *) r->haddr + (p - r->gaddr);
+    char *tmp = calloc(n, 1);
+    if (tmp == NULL) {
+      ret = -LINUX_ENOMEM;
+      break;
+    }
+    if (mincore(haddr, n * ps, tmp) < 0) {
+      ret = syswrap(-1);
+      free(tmp);
+      break;
+    }
+    for (size_t i = 0; i < n; i++)
+      out[done + i] = tmp[i] & MINCORE_INCORE ? 1 : 0;
+    free(tmp);
+    done += n;
+  }
+  pthread_rwlock_unlock(&proc.mm->alloc_lock);
+
+  if (ret == 0 && copy_to_user(vec_ptr, out, npages))
+    ret = -LINUX_EFAULT;
+  free(out);
+  return ret;
+}
+
+/*
+ * move_pages: where each page is, and where it should go.
+ *
+ * With a nodes array it asks for a move, and with a NULL one it only asks where
+ * the pages are - which is the mode `numastat`-style tools and most libraries
+ * actually use, and which can be answered exactly. Every page that exists is on
+ * node 0, because node 0 is the only node; a page that is not mapped answers
+ * -ENOENT in its own status slot, which is Linux's way of saying so per page
+ * rather than failing the whole call.
+ *
+ * A move to node 0 is already done. A move anywhere else names a node this
+ * machine does not have, and is refused per page rather than confirmed - the
+ * same judgement mbind and migrate_pages make.
+ */
+DEFINE_SYSCALL(move_pages, l_pid_t, pid, unsigned long, count, gaddr_t, pages_ptr,
+               gaddr_t, nodes_ptr, gaddr_t, status_ptr, int, flags)
+{
+  if (flags & ~(LINUX_MPOL_MF_MOVE | LINUX_MPOL_MF_MOVE_ALL))
+    return -LINUX_EINVAL;
+  if (count > (1UL << 20))
+    return -LINUX_EINVAL;
+  if (status_ptr == 0)
+    return -LINUX_EFAULT;
+  if (pid < 0)
+    return -LINUX_EINVAL;
+
+  int32_t host = pidns_to_host(pid == 0 ? (l_pid_t) pidns_to_ns(getpid()) : pid);
+  if (host < 0)
+    return -LINUX_ESRCH;
+  if (host != getpid()) {
+    if (kill(host, 0) < 0 && errno == ESRCH)
+      return -LINUX_ESRCH;
+    return -LINUX_EPERM;
+  }
+  if (count == 0)
+    return 0;
+
+  gaddr_t *pages = calloc(count, sizeof *pages);
+  int32_t *status = calloc(count, sizeof *status);
+  int32_t *nodes = nodes_ptr ? calloc(count, sizeof *nodes) : NULL;
+  int ret = 0;
+  if (pages == NULL || status == NULL || (nodes_ptr && nodes == NULL)) {
+    ret = -LINUX_ENOMEM;
+    goto out;
+  }
+  if (copy_from_user(pages, pages_ptr, count * sizeof *pages) ||
+      (nodes && copy_from_user(nodes, nodes_ptr, count * sizeof *nodes))) {
+    ret = -LINUX_EFAULT;
+    goto out;
+  }
+
+  pthread_rwlock_rdlock(&proc.mm->alloc_lock);
+  for (unsigned long i = 0; i < count; i++) {
+    if (nodes && nodes[i] != 0) {
+      status[i] = -LINUX_EINVAL;        /* a node that does not exist */
+      continue;
+    }
+    struct mm_region *r = find_region(pages[i], proc.mm);
+    status[i] = r == NULL ? -LINUX_ENOENT : 0;
+  }
+  pthread_rwlock_unlock(&proc.mm->alloc_lock);
+
+  if (copy_to_user(status_ptr, status, count * sizeof *status))
+    ret = -LINUX_EFAULT;
+
+out:
+  free(pages); free(status); free(nodes);
+  return ret;
+}
+
+DEFINE_SYSCALL(mseal, gaddr_t, addr, size_t, len, unsigned long, flags)
+{
+  size_t ps = PAGE_SIZEOF(PAGE_4KB);
+  if (flags != 0)
+    return -LINUX_EINVAL;       /* none are defined, and none are ignored */
+  if (addr & (ps - 1))
+    return -LINUX_EINVAL;
+  if (len == 0)
+    return 0;
+  if (addr + len < addr)
+    return -LINUX_EINVAL;
+
+  gaddr_t end = roundup(addr + len, ps);
+
+  int ret = 0;
+  pthread_rwlock_wrlock(&proc.mm->alloc_lock);
+
+  /*
+   * The whole range has to be mapped before any of it is sealed. Linux checks
+   * this first for a reason worth keeping: sealing what it could reach and then
+   * reporting ENOMEM would leave a caller believing nothing happened while part
+   * of its address space had become permanently immovable.
+   */
+  for (gaddr_t p = addr; p < end; ) {
+    struct mm_region *r = find_region(p, proc.mm);
+    if (r == NULL) {
+      ret = -LINUX_ENOMEM;
+      goto out;
+    }
+    p = r->gaddr + r->size;
+  }
+
+  for (gaddr_t p = addr; p < end; ) {
+    struct mm_region *r = find_region(p, proc.mm);
+    /* Seal exactly what was asked for: a region that runs past either end is
+     * split so the parts outside the range stay as they were. */
+    if (r->gaddr < p) {
+      split_region(proc.mm, r, p);
+      r = list_entry(r->list.next, struct mm_region, list);
+    }
+    if (r->gaddr + r->size > end)
+      split_region(proc.mm, r, end);
+    r->sealed = true;
+    p = r->gaddr + r->size;
+  }
+
+out:
+  pthread_rwlock_unlock(&proc.mm->alloc_lock);
+  return ret;
+}
+
 DEFINE_SYSCALL(mmap, gaddr_t, addr, size_t, len, int, prot, int, flags, int, fd, off_t, offset)
 {
   uint64_t ret;
   pthread_rwlock_wrlock(&proc.mm->alloc_lock);
+  /* Only a fixed mapping can land on an existing range; anything else is
+   * placed where nothing is. */
+  if ((flags & LINUX_MAP_FIXED) && len > 0 &&
+      range_is_sealed(addr, roundup(len, GUEST_MMAP_GRANULE))) {
+    pthread_rwlock_unlock(&proc.mm->alloc_lock);
+    return -LINUX_EPERM;
+  }
   ret = do_mmap(addr, len, prot, prot, flags, fd, offset);
   pthread_rwlock_unlock(&proc.mm->alloc_lock);
   return  ret;
@@ -298,6 +534,12 @@ DEFINE_SYSCALL(mremap, gaddr_t, old_addr, size_t, old_size, size_t, new_size, in
   gaddr_t ret = old_addr;
 
   pthread_rwlock_wrlock(&proc.mm->alloc_lock);
+  /* Both ends: a sealed range cannot be moved away, and cannot be moved onto. */
+  if (range_is_sealed(old_addr, old_size) ||
+      ((flags & LINUX_MREMAP_FIXED) && range_is_sealed(new_addr, new_size))) {
+    pthread_rwlock_unlock(&proc.mm->alloc_lock);
+    return -LINUX_EPERM;
+  }
 
   struct mm_region *region = find_region(old_addr, proc.mm);
   /* Linux requires old_addr is the exact address of start of vm_area  */
@@ -398,6 +640,11 @@ DEFINE_SYSCALL(mprotect, gaddr_t, addr, size_t, len, int, prot)
 
   pthread_rwlock_wrlock(&proc.mm->alloc_lock);
 
+  if (range_is_sealed(addr, len)) {
+    pthread_rwlock_unlock(&proc.mm->alloc_lock);
+    return -LINUX_EPERM;
+  }
+
   struct mm_region *region = find_region(addr, proc.mm);
   if (!region) {
     ret = -LINUX_ENOMEM;
@@ -465,9 +712,42 @@ DEFINE_SYSCALL(munmap, gaddr_t, gaddr, size_t, size)
 {
   uint64_t ret;
   pthread_rwlock_wrlock(&proc.mm->alloc_lock);
+  if (size > 0 && range_is_sealed(gaddr, roundup(size, GUEST_MMAP_GRANULE))) {
+    pthread_rwlock_unlock(&proc.mm->alloc_lock);
+    return -LINUX_EPERM;
+  }
   ret = do_munmap(gaddr, size);
   pthread_rwlock_unlock(&proc.mm->alloc_lock);
   return ret;
+}
+
+/*
+ * Memory protection keys, which need hardware that is not here.
+ *
+ * A key is a few bits in the page table entry and a register the process writes
+ * to say what those bits currently permit - PKU on x86, POE on newer arm64 -
+ * so that a whole class of pages can be made unreadable and readable again
+ * without a syscall. Apple Silicon has no POE, and the Hypervisor.framework
+ * exposes nothing that would let a guest own such a register.
+ *
+ * So no key can be allocated, and pkey_alloc says so. That makes the rest
+ * consistent rather than arbitrary: since a caller cannot hold a key, every
+ * pkey it could pass to pkey_mprotect is one that was never allocated, and
+ * EINVAL is the right answer for it.
+ *
+ * The exception is the one that matters. pkey_mprotect with a pkey of -1 means
+ * "no key", and is defined to behave exactly as mprotect - which is what code
+ * that calls it unconditionally relies on. That case is served, so a program
+ * built to use pkey_mprotect everywhere and keys only when it has them works
+ * here without a second code path.
+ */
+DEFINE_SYSCALL(pkey_mprotect, gaddr_t, addr, size_t, len, int, prot, int, pkey)
+{
+  if (pkey == -1)
+    return sys_mprotect(addr, len, prot);
+  if (pkey < 0)
+    return -LINUX_EINVAL;
+  return -LINUX_EINVAL;         /* no key was allocated, so none is valid */
 }
 
 int

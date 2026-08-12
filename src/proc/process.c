@@ -980,6 +980,78 @@ DEFINE_SYSCALL(lsm_set_self_attr, uint32_t, attr, gaddr_t, ctx_ptr,
 }
 
 /*
+ * personality: which execution domain, and which of the quirk bits.
+ *
+ * The domain part is easy and almost always PER_LINUX: the others named
+ * SVr4, BSD, SunOS and the rest were for running foreign binaries under
+ * emulation layers Linux dropped long ago, and a guest asking for one is asking
+ * for something no current kernel provides either.
+ *
+ * The bits are the part still in use, and they are treated differently
+ * depending on whether nabi can honour them.
+ *
+ * ADDR_NO_RANDOMIZE is accepted, and this is not a courtesy: nabi does not
+ * randomize the layout it builds. current_mmap_top walks down from a fixed
+ * address and the ELF loader places segments where the file says. A guest that
+ * asks for a predictable address space is asking for what it already has, which
+ * is why `setarch -R` works here - and why AT_RANDOM had to be fixed
+ * separately, since that is entropy for a canary rather than for placement.
+ *
+ * The rest are refused rather than recorded and ignored. READ_IMPLIES_EXEC
+ * would have to reach do_mmap and change what PROT_READ produces; UNAME26 would
+ * have to reach uname and make it lie about the version; MMAP_PAGE_ZERO would
+ * have to map a page at address zero. Recording any of them would let a caller
+ * read its own request back and conclude it took effect - which is exactly what
+ * a query is for, and the reason the value is stored at all.
+ */
+static uint32_t personality_bits;   /* what was last accepted, for the query */
+
+DEFINE_SYSCALL(personality, unsigned int, persona)
+{
+  enum {
+    PER_LINUX          = 0x0000,
+    PER_MASK           = 0x00ff,
+    UNAME26            = 0x0020000,
+    ADDR_NO_RANDOMIZE  = 0x0040000,
+    FDPIC_FUNCPTRS     = 0x0080000,
+    MMAP_PAGE_ZERO     = 0x0100000,
+    ADDR_COMPAT_LAYOUT = 0x0200000,
+    READ_IMPLIES_EXEC  = 0x0400000,
+    ADDR_LIMIT_32BIT   = 0x0800000,
+    SHORT_INODE        = 0x1000000,
+    WHOLE_SECONDS      = 0x2000000,
+    STICKY_TIMEOUTS    = 0x4000000,
+    ADDR_LIMIT_3GB     = 0x8000000,
+  };
+
+  uint32_t old = personality_bits;
+
+  /* 0xffffffff is the query, and is documented as leaving the value alone. */
+  if (persona == 0xffffffffU)
+    return (int) old;
+
+  if ((persona & PER_MASK) != PER_LINUX)
+    return -LINUX_EINVAL;       /* a domain no kernel still provides */
+
+  uint32_t bits = persona & ~(uint32_t) PER_MASK;
+  /*
+   * What can be honoured, plus the ones that ask for nothing here.
+   * ADDR_COMPAT_LAYOUT and ADDR_LIMIT_* describe where mmap places things in a
+   * 32-bit address space, and this guest is 64-bit with a fixed layout;
+   * STICKY_TIMEOUTS and WHOLE_SECONDS are select() quirks from the SVr4 days
+   * that Linux itself no longer varies.
+   */
+  uint32_t honoured = ADDR_NO_RANDOMIZE | ADDR_COMPAT_LAYOUT |
+                      ADDR_LIMIT_32BIT | ADDR_LIMIT_3GB |
+                      STICKY_TIMEOUTS | WHOLE_SECONDS | SHORT_INODE;
+  if (bits & ~honoured)
+    return -LINUX_EINVAL;       /* see above: not recorded and then ignored */
+
+  personality_bits = bits;
+  return (int) old;
+}
+
+/*
  * membarrier: implemented as far as it can be answered, which is the query.
  *
  * membarrier moves a barrier out of a program's fast path and into a syscall on

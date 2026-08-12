@@ -358,6 +358,29 @@ DEFINE_SYSCALL(rt_sigsuspend, gaddr_t, nset, size_t, size)
   return -LINUX_EINTR;          /* returns -EINTR when its execution ends NORMALLY */
 }
 
+/*
+ * pause: wait until a signal arrives.
+ *
+ * It is sigsuspend with the mask left alone, and it is written beside it rather
+ * than out of it because the waiting is the whole call and that loop is where
+ * the waiting is understood. sleep() is what nabi waits in - macOS builds it on
+ * nanosleep, so an alarm cannot be swallowed by it - and has_sigpending is what
+ * ends it.
+ *
+ * It only ever returns -EINTR. There is no success: a pause that returned would
+ * mean a signal arrived, and that is the interrupted case.
+ */
+DEFINE_SYSCALL(pause)
+{
+  while (1) {
+    sleep(114514);
+    if (has_sigpending())
+      break;
+  }
+  handle_signal();
+  return -LINUX_EINTR;
+}
+
 DEFINE_SYSCALL(rt_sigpending, gaddr_t, set, size_t, size)
 {
   if (size > sizeof(l_sigset_t)) {

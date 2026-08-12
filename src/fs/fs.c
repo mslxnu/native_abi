@@ -4367,6 +4367,201 @@ out:
   return ret;
 }
 
+/*
+ * preadv, pwritev and their v2 forms.
+ *
+ * The offset arrives split in two, and on a 64-bit architecture only the low
+ * half carries it. The kernel builds it with a double shift - ((high << 32) <<
+ * 32) | low - which on a 64-bit word shifts `high` clean out and leaves `low`,
+ * and glibc knows it: LO_HI_LONG expands to a single argument here, so the
+ * fifth register holds whatever the caller happened to leave in it. Reading it
+ * would turn a correct call into a wild offset, so it is deliberately ignored
+ * and named for what it is.
+ */
+static off_t
+pos_from_hilo(unsigned long pos_l, unsigned long pos_h)
+{
+  (void) pos_h;                 /* see above: 32-bit only, garbage here */
+  return (off_t) pos_l;
+}
+
+/*
+ * The iovec, copied in and back out.
+ *
+ * Bounce buffers rather than pointing the host at guest memory, which is the
+ * same reason aio uses them: guest addresses are the guest's, and a host call
+ * that faults halfway through has already written what it wrote.
+ */
+static int
+iov_in(gaddr_t iov_ptr, int iovcnt, struct l_iovec **liov_out,
+       struct iovec **iov_out, bool fill)
+{
+  if (iovcnt < 0 || iovcnt > 1024)      /* UIO_MAXIOV */
+    return -LINUX_EINVAL;
+  struct l_iovec *liov = calloc((size_t) iovcnt ?: 1, sizeof *liov);
+  struct iovec *iov = calloc((size_t) iovcnt ?: 1, sizeof *iov);
+  if (liov == NULL || iov == NULL) {
+    free(liov); free(iov);
+    return -LINUX_ENOMEM;
+  }
+  if (iovcnt > 0 && copy_from_user(liov, iov_ptr, sizeof *liov * (size_t) iovcnt)) {
+    free(liov); free(iov);
+    return -LINUX_EFAULT;
+  }
+  for (int i = 0; i < iovcnt; i++) {
+    iov[i].iov_len = liov[i].iov_len;
+    iov[i].iov_base = liov[i].iov_len ? malloc(liov[i].iov_len) : NULL;
+    if (liov[i].iov_len && iov[i].iov_base == NULL) {
+      for (int j = 0; j < i; j++) free(iov[j].iov_base);
+      free(liov); free(iov);
+      return -LINUX_ENOMEM;
+    }
+    if (fill && liov[i].iov_len &&
+        copy_from_user(iov[i].iov_base, liov[i].iov_base, liov[i].iov_len)) {
+      for (int j = 0; j <= i; j++) free(iov[j].iov_base);
+      free(liov); free(iov);
+      return -LINUX_EFAULT;
+    }
+  }
+  *liov_out = liov;
+  *iov_out = iov;
+  return 0;
+}
+
+static void
+iov_free(struct l_iovec *liov, struct iovec *iov, int iovcnt)
+{
+  for (int i = 0; i < iovcnt; i++)
+    free(iov[i].iov_base);
+  free(liov); free(iov);
+}
+
+static int
+do_preadv(int fd, gaddr_t iov_ptr, int iovcnt, off_t pos)
+{
+  if (!in_userfd(fd))
+    return -LINUX_EBADF;
+  struct l_iovec *liov; struct iovec *iov;
+  int r = iov_in(iov_ptr, iovcnt, &liov, &iov, false);
+  if (r < 0)
+    return r;
+
+  r = syswrap((int) preadv(fd, iov, iovcnt, pos));
+  if (r > 0) {
+    /* Only what was actually read goes back, so a short read leaves the rest
+     * of the caller's buffers as they were. */
+    size_t left = (size_t) r;
+    for (int i = 0; i < iovcnt && left; i++) {
+      size_t n = left < liov[i].iov_len ? left : liov[i].iov_len;
+      if (copy_to_user(liov[i].iov_base, iov[i].iov_base, n)) {
+        r = -LINUX_EFAULT;
+        break;
+      }
+      left -= n;
+    }
+  }
+  iov_free(liov, iov, iovcnt);
+  return r;
+}
+
+static int
+do_pwritev(int fd, gaddr_t iov_ptr, int iovcnt, off_t pos)
+{
+  if (!in_userfd(fd))
+    return -LINUX_EBADF;
+  struct l_iovec *liov; struct iovec *iov;
+  int r = iov_in(iov_ptr, iovcnt, &liov, &iov, true);
+  if (r < 0)
+    return r;
+  r = syswrap((int) pwritev(fd, iov, iovcnt, pos));
+  iov_free(liov, iov, iovcnt);
+  return r;
+}
+
+DEFINE_SYSCALL(preadv, unsigned long, fd, gaddr_t, iov_ptr, unsigned long, iovcnt,
+               unsigned long, pos_l, unsigned long, pos_h)
+{
+  return do_preadv((int) fd, iov_ptr, (int) iovcnt, pos_from_hilo(pos_l, pos_h));
+}
+
+DEFINE_SYSCALL(pwritev, unsigned long, fd, gaddr_t, iov_ptr, unsigned long, iovcnt,
+               unsigned long, pos_l, unsigned long, pos_h)
+{
+  return do_pwritev((int) fd, iov_ptr, (int) iovcnt, pos_from_hilo(pos_l, pos_h));
+}
+
+/*
+ * The v2 forms add flags and an offset of -1.
+ *
+ * An offset of -1 means "use and advance the file position", which is readv and
+ * writev - and it has to be *those*, not a pread at the current offset, because
+ * the stream forms go through file->ops and pick up tee's pushback. A reader
+ * that switches to preadv2(-1) must not see a different stream.
+ *
+ * Of the flags, only RWF_APPEND and the two sync ones can be honoured, and each
+ * is refused rather than dropped. RWF_HIPRI asks for polled completion on a
+ * device queue that is not here; RWF_NOWAIT asks for EAGAIN rather than a block
+ * on a file that is not cached, which Darwin will not promise for a regular
+ * file - and answering it by blocking is exactly what a caller using it to keep
+ * an event loop responsive cannot afford.
+ */
+DEFINE_SYSCALL(preadv2, unsigned long, fd, gaddr_t, iov_ptr, unsigned long, iovcnt,
+               unsigned long, pos_l, unsigned long, pos_h, int, flags)
+{
+  if (flags & ~(LINUX_RWF_HIPRI | LINUX_RWF_DSYNC | LINUX_RWF_SYNC |
+                LINUX_RWF_NOWAIT | LINUX_RWF_APPEND | LINUX_RWF_NOAPPEND))
+    return -LINUX_EINVAL;
+  if (flags & (LINUX_RWF_HIPRI | LINUX_RWF_NOWAIT))
+    return -LINUX_EOPNOTSUPP;
+  if (flags & (LINUX_RWF_APPEND | LINUX_RWF_NOAPPEND))
+    return -LINUX_EINVAL;       /* they mean nothing on a read */
+
+  off_t pos = pos_from_hilo(pos_l, pos_h);
+  if ((long) pos_l == -1 && (long) pos_h == -1)
+    return sys_readv((int) fd, iov_ptr, (int) iovcnt);
+  return do_preadv((int) fd, iov_ptr, (int) iovcnt, pos);
+}
+
+DEFINE_SYSCALL(pwritev2, unsigned long, fd, gaddr_t, iov_ptr, unsigned long, iovcnt,
+               unsigned long, pos_l, unsigned long, pos_h, int, flags)
+{
+  if (flags & ~(LINUX_RWF_HIPRI | LINUX_RWF_DSYNC | LINUX_RWF_SYNC |
+                LINUX_RWF_NOWAIT | LINUX_RWF_APPEND | LINUX_RWF_NOAPPEND))
+    return -LINUX_EINVAL;
+  if (flags & (LINUX_RWF_HIPRI | LINUX_RWF_NOWAIT))
+    return -LINUX_EOPNOTSUPP;
+  if ((flags & LINUX_RWF_APPEND) && (flags & LINUX_RWF_NOAPPEND))
+    return -LINUX_EINVAL;
+
+  bool stream = (long) pos_l == -1 && (long) pos_h == -1;
+  off_t pos = pos_from_hilo(pos_l, pos_h);
+
+  /*
+   * RWF_APPEND is per-call O_APPEND: the write goes to the end whatever offset
+   * was passed. Done by finding the end rather than by setting O_APPEND on the
+   * descriptor, which is shared state another thread would see.
+   */
+  if (flags & LINUX_RWF_APPEND) {
+    if (!in_userfd((int) fd))
+      return -LINUX_EBADF;
+    struct stat st;
+    if (fstat((int) fd, &st) < 0)
+      return syswrap(-1);
+    pos = st.st_size;
+    stream = false;
+  }
+
+  int r = stream ? sys_writev((int) fd, iov_ptr, (int) iovcnt)
+                 : do_pwritev((int) fd, iov_ptr, (int) iovcnt, pos);
+  if (r >= 0 && (flags & (LINUX_RWF_DSYNC | LINUX_RWF_SYNC))) {
+    /* The data is on the device before this returns, which is what both flags
+     * ask for; Darwin has one call for it and no weaker form. */
+    if (fsync((int) fd) < 0)
+      return syswrap(-1);
+  }
+  return r;
+}
+
 DEFINE_SYSCALL(pread64, unsigned int, fd, gstr_t, buf_ptr, size_t, count, off_t, pos)
 {
   if (!in_userfd(fd)) {

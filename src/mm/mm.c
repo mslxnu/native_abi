@@ -123,6 +123,8 @@ split_region(struct mm *mm, struct mm_region *region, gaddr_t gaddr)
   tail->mm_fd = region->mm_fd;
   tail->pgoff = region->pgoff;
   tail->shm_id = region->shm_id;
+  /* Both halves of a sealed region stay sealed; splitting is not a way out. */
+  tail->sealed = region->sealed;
 
   region->size = offset;
   list_add(&tail->list, &region->list);

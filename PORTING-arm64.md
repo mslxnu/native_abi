@@ -5580,3 +5580,104 @@ removed it in 6.6 — so this agrees with the kernel and not merely with the
 hardware.
 
 293 of 375.
+
+### 3.5.103 mseal, and the difference between refusing and enforcing
+
+Fifteen calls, and the one that matters most is the one that had to be argued
+against the previous batch.
+
+**mseal is implemented, and Landlock was refused, for the same reason.** Both
+are hardening primitives whose whole value is that they hold; both return 0 to
+tell a program it is now safer than it was; and a program's next act is to rely
+on it. The difference is whether the enforcement surface can be enumerated.
+Landlock's is on the order of fifty path-taking syscalls spread across the tree,
+and forty-nine of fifty is not a sandbox with a gap. mseal's is four functions
+in one file — `mmap` with `MAP_FIXED`, `mprotect`, `mremap`, `munmap` — and
+`do_munmap` underneath them, which is the list in full and short enough to check
+by reading it. `pkey_mprotect` is a fifth only because it delegates to
+`mprotect`, and the smoke test confirms the seal reaches it that way rather than
+assuming it.
+
+The seal travels in the checkpoint, and that is not bookkeeping. A fork here is
+a fork plus an exec: the child rebuilds its address space from the record, so a
+seal left out of it comes back cleared and the child is quietly less protected
+than its parent with nothing in either of them saying so. The test forks and has
+the child try to unmap the sealed page, reporting through its exit code —
+and dropping the restore line does make it fail, which is the only way to know
+the record is doing anything.
+
+It also has to *not* over-reach. Sealing splits the region so that the pages
+either side stay ordinary; a check written against the whole region instead of
+the requested range passes every "does the seal hold" test and breaks the
+program in a way nobody would look for. That is its own case in the test.
+
+**mincore is the same measurement cachestat makes, one level down** — Darwin's
+mincore over the host address a region translates to, since guest memory is host
+memory. Only the low bit is written: Linux calls the rest of the byte reserved
+and Darwin has flags of its own up there, and passing those through would hand a
+guest another operating system's bits in a field its headers say is zero. The
+test touches four pages of eight and requires the answer to move, which is the
+discrimination cachestat needed a second attempt to get.
+
+**The preadv family has a trap in its calling convention.** The offset arrives
+in two halves, and on a 64-bit machine only the low one carries it — the kernel
+builds it with a *double* shift, `((high << 32) << 32) | low`, which shifts the
+high word clean out. glibc knows this and passes a single argument, so the fifth
+register holds whatever was left in it. An implementation that reads it turns a
+correct call into a wild offset.
+
+Worth recording: the first attempt to test this failed to test anything. Breaking
+the code to use the kernel's own double-shift expression changed nothing,
+because on a 64-bit word that expression *is* just the low half — which is the
+point of writing it that way. The break that discriminates is the naive single
+shift, and only after switching to it did the check start catching anything.
+
+`preadv2` and `pwritev2` add flags and an offset of -1. The -1 form is `readv`
+and `writev`, and it has to be those rather than a positional read at the
+current offset, because the stream calls go through `file->ops` and pick up
+tee's pushback — a reader that switches to `preadv2(-1)` must not see a
+different stream. `RWF_APPEND` finds the end with `fstat` rather than setting
+`O_APPEND` on the descriptor, which is shared state another thread would see.
+`RWF_HIPRI` and `RWF_NOWAIT` are refused: the first wants polled completion on a
+device queue that is not here, and the second wants `EAGAIN` instead of a block,
+which Darwin will not promise for a regular file — and answering it by blocking
+is precisely what a caller using it to keep an event loop responsive cannot
+afford.
+
+**move_pages answers the question it is usually asked.** With a NULL nodes array
+it only wants to know where the pages are, and every page that exists is on node
+0 because that is the only node; one that is not mapped gets `-ENOENT` in its
+own status slot rather than failing the call. A move to node 0 is already done,
+and a move anywhere else is refused per page.
+
+**personality records only what it can honour.** `ADDR_NO_RANDOMIZE` is accepted
+and that is not a courtesy — nabi does not randomize the layout it builds, so a
+guest asking for a predictable address space is asking for what it already has,
+and `setarch -R` works. `READ_IMPLIES_EXEC`, `UNAME26` and `MMAP_PAGE_ZERO` are
+refused rather than stored, because storing them would let a caller read its own
+request back and conclude it took effect, which is what the query is for.
+
+**Protection keys need a register that is not here** — PKU on x86, POE on newer
+arm64, neither exposed by the Hypervisor.framework. So `pkey_alloc` fails, and
+that makes the rest consistent rather than arbitrary: no caller can hold a key,
+so every key passed to `pkey_mprotect` is one that was never allocated. The
+exception is the one that matters — `pkey_mprotect` with a pkey of -1 means "no
+key" and is defined to be exactly `mprotect`, so code that calls it
+unconditionally works here without a second path.
+
+**pivot_root is refused for a specific reason worth writing down.** nabi does
+have a root and resolves every guest path against it, but `proc.fileinfo.rootfd`
+is opened once at startup from `-m`, and `chroot` already refuses anything but
+`/` for exactly that reason. pivot_root cannot be more capable than chroot when
+both need the thing chroot has not got — and it needs more besides, since
+container runtimes pivot and then unmount the old root through `put_old`.
+Satisfying the call while losing the old filesystem would move the failure to
+the unmount. The order of work is a real changeable root first, then this.
+
+`perf_event_open` wants a PMU macOS does not expose to unprivileged userspace at
+all, and `modify_ldt` wants descriptor tables that belong to the VMCS nabi
+programs. `pause` is implemented but is an x86-only number, so like `futimesat`
+the arm64 suite cannot call it; it is the same wait loop `rt_sigsuspend` uses,
+and that one is reachable.
+
+303 of 375.

@@ -834,6 +834,22 @@ else
     fail=1
 fi
 
+# sealtest: mseal, mincore, move_pages, the preadv/pwritev family, personality
+# and pkey_mprotect. mseal is checked by trying every gate against a sealed page
+# - munmap, mprotect, mremap, MAP_FIXED mmap and pkey_mprotect - and by checking
+# that the pages either side of it are still ordinary, so neither an
+# unenforced seal nor an over-broad one passes. It also forks: a fork here is a
+# fork plus an exec, so a seal that is not carried in the checkpoint comes back
+# cleared, and the child reports through its exit code.
+cp "$here/sealtest" "$root/"; chmod +x "$root/sealtest"
+out=$("$NABI" -m "$root" /sealtest); rc=$?
+if [ "$rc" -eq 0 ] && [ "$out" = "seal ok" ]; then
+    echo "  ok  sealtest -> \"$out\", exit 0"
+else
+    echo "  FAIL sealtest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 if [ "$fail" -eq 0 ]; then
     echo "smoke: PASS"
 else

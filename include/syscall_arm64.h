@@ -47,7 +47,7 @@
   SYSCALL(38, renameat) \
   SYSCALL(39, umount2) \
   SYSCALL(40, mount) \
-  SYSCALL(41, unimplemented) \
+  SYSCALL(41, pivot_root) \
   SYSCALL(42, nfsservctl) \
   SYSCALL(43, statfs) \
   SYSCALL(44, fstatfs) \
@@ -75,8 +75,8 @@
   SYSCALL(66, writev) \
   SYSCALL(67, pread64) \
   SYSCALL(68, pwrite64) \
-  SYSCALL(69, unimplemented) \
-  SYSCALL(70, unimplemented) \
+  SYSCALL(69, preadv) \
+  SYSCALL(70, pwritev) \
   SYSCALL(71, sendfile) \
   SYSCALL(72, pselect6) \
   SYSCALL(73, ppoll) \
@@ -98,7 +98,7 @@
   SYSCALL(89, acct) \
   SYSCALL(90, capget) \
   SYSCALL(91, capset) \
-  SYSCALL(92, unimplemented) \
+  SYSCALL(92, personality) \
   SYSCALL(93, exit) \
   SYSCALL(94, exit_group) \
   SYSCALL(95, unimplemented) \
@@ -238,16 +238,16 @@
   SYSCALL(229, munlock) \
   SYSCALL(230, mlockall) \
   SYSCALL(231, munlockall) \
-  SYSCALL(232, unimplemented) \
+  SYSCALL(232, mincore) \
   SYSCALL(233, madvise) \
   SYSCALL(234, unimplemented) \
   SYSCALL(235, mbind) \
   SYSCALL(236, get_mempolicy) \
   SYSCALL(237, unimplemented) \
   SYSCALL(238, migrate_pages) \
-  SYSCALL(239, unimplemented) \
+  SYSCALL(239, move_pages) \
   SYSCALL(240, unimplemented) \
-  SYSCALL(241, unimplemented) \
+  SYSCALL(241, perf_event_open) \
   SYSCALL(242, accept4) \
   SYSCALL(243, unimplemented) \
   SYSCALL(244, unimplemented) \
@@ -292,11 +292,11 @@
   SYSCALL(283, membarrier) \
   SYSCALL(284, mlock2) \
   SYSCALL(285, copy_file_range) \
-  SYSCALL(286, unimplemented) \
-  SYSCALL(287, unimplemented) \
-  SYSCALL(288, unimplemented) \
-  SYSCALL(289, unimplemented) \
-  SYSCALL(290, unimplemented) \
+  SYSCALL(286, preadv2) \
+  SYSCALL(287, pwritev2) \
+  SYSCALL(288, pkey_mprotect) \
+  SYSCALL(289, pkey_alloc) \
+  SYSCALL(290, pkey_free) \
   SYSCALL(291, statx) \
   SYSCALL(292, io_pgetevents) \
   SYSCALL(293, rseq) \
@@ -468,7 +468,7 @@
   SYSCALL(459, lsm_get_self_attr) \
   SYSCALL(460, lsm_set_self_attr) \
   SYSCALL(461, lsm_list_modules) \
-  SYSCALL(462, unimplemented) \
+  SYSCALL(462, mseal) \
   /* Numbers Linux has not allocated. Left explicitly empty so that the \
    * compat tail below cannot be mistaken for them. */ \
   SYSCALL(463, unimplemented) \
@@ -1062,28 +1062,30 @@
   SYSCALL(1050, lstat) \
   SYSCALL(1051, mkdir) \
   SYSCALL(1052, mknod) \
-  SYSCALL(1053, open) \
-  SYSCALL(1054, pipe) \
-  SYSCALL(1055, poll) \
-  SYSCALL(1056, putpmsg) \
-  SYSCALL(1057, query_module) \
-  SYSCALL(1058, readlink) \
-  SYSCALL(1059, rename) \
-  SYSCALL(1060, rmdir) \
-  SYSCALL(1061, security) \
-  SYSCALL(1062, select) \
-  SYSCALL(1063, set_thread_area) \
-  SYSCALL(1064, stat) \
-  SYSCALL(1065, symlink) \
-  SYSCALL(1066, sysfs) \
-  SYSCALL(1067, time) \
-  SYSCALL(1068, tuxcall) \
-  SYSCALL(1069, unimplemented) \
-  SYSCALL(1070, unlink) \
-  SYSCALL(1071, uselib) \
-  SYSCALL(1072, utime) \
-  SYSCALL(1073, utimes) \
-  SYSCALL(1074, vfork) \
-  SYSCALL(1075, vserver) \
+  SYSCALL(1053, modify_ldt) \
+  SYSCALL(1054, open) \
+  SYSCALL(1055, pause) \
+  SYSCALL(1056, pipe) \
+  SYSCALL(1057, poll) \
+  SYSCALL(1058, putpmsg) \
+  SYSCALL(1059, query_module) \
+  SYSCALL(1060, readlink) \
+  SYSCALL(1061, rename) \
+  SYSCALL(1062, rmdir) \
+  SYSCALL(1063, security) \
+  SYSCALL(1064, select) \
+  SYSCALL(1065, set_thread_area) \
+  SYSCALL(1066, stat) \
+  SYSCALL(1067, symlink) \
+  SYSCALL(1068, sysfs) \
+  SYSCALL(1069, time) \
+  SYSCALL(1070, tuxcall) \
+  SYSCALL(1071, unimplemented) \
+  SYSCALL(1072, unlink) \
+  SYSCALL(1073, uselib) \
+  SYSCALL(1074, utime) \
+  SYSCALL(1075, utimes) \
+  SYSCALL(1076, vfork) \
+  SYSCALL(1077, vserver) \
 
-#define NR_SYSCALLS 1076
+#define NR_SYSCALLS 1078

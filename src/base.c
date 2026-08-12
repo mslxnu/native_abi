@@ -307,6 +307,67 @@ DEFINE_NOT_IMPLEMENTED_SYSCALL(kexec_file_load)
  * inheritance rule across fork-by-exec, and a way to prove the enumeration of
  * entry points is complete. That is a feature, not a line in a table.
  */
+/*
+ * perf_event_open: the performance counters.
+ *
+ * Everything it opens is a hardware counter, a kernel tracepoint or a kernel
+ * software event, and a guest here has none of the three. The PMU belongs to
+ * macOS, which does not expose it to unprivileged userspace at all - kperf is
+ * private and entitled - and the Hypervisor.framework does not virtualise
+ * counters for a guest to program. Tracepoints and kprobes need a kernel with
+ * hooks in it, which is the same wall bpf meets.
+ *
+ * ENOSYS rather than EPERM, and the distinction is real for this call: EPERM is
+ * what perf_event_paranoid produces, and every profiler knows to tell the user
+ * to lower it and try again. There is no setting here that would help.
+ */
+DEFINE_NOT_IMPLEMENTED_SYSCALL(perf_event_open)
+
+/*
+ * modify_ldt: the local descriptor table.
+ *
+ * It installs segment descriptors for a process, which is how 16-bit and
+ * segmented 32-bit code gets its selectors - dosemu, Wine's Win16 support, old
+ * threading libraries. There is no aarch64 number because aarch64 has no
+ * segmentation, so this is for the x86_64 table, and it is refused there too:
+ * the descriptor tables belong to the VMCS nabi programs, and handing a guest
+ * the ability to write them is a different project from running its syscalls.
+ *
+ * set_thread_area and get_thread_area are the rest of that family and are
+ * refused a few lines below for the same reason.
+ */
+DEFINE_NOT_IMPLEMENTED_SYSCALL(modify_ldt)
+
+/*
+ * pivot_root: make a different directory the root.
+ *
+ * Refused, and the reason is worth being precise about, because nabi does have
+ * a root and does resolve every guest path against it. What it does not have is
+ * a way to *change* it: proc.fileinfo.rootfd is opened once at startup from -m,
+ * and chroot in src/fs/fs.c already refuses anything but "/" for that reason.
+ * pivot_root cannot be more capable than chroot when both need the same thing
+ * chroot has not got.
+ *
+ * And pivot_root needs more than chroot does. Its second argument says where
+ * the old root is to be found afterwards, and the container runtimes that use
+ * it depend on both halves - they pivot, then unmount the old root through that
+ * path. Making the new root take effect while put_old was an ordinary empty
+ * directory would satisfy the call and lose the filesystem the guest came from,
+ * with the failure appearing at the unmount rather than here.
+ *
+ * The order of work is therefore chroot first - a real, changeable root - and
+ * then this on top of it.
+ */
+DEFINE_NOT_IMPLEMENTED_SYSCALL(pivot_root)
+
+/*
+ * pkey_alloc and pkey_free: protection keys, which need a register that is not
+ * here. The reasoning is with pkey_mprotect in src/mm/mmap.c, which serves the
+ * one case that does not need a key.
+ */
+DEFINE_NOT_IMPLEMENTED_SYSCALL(pkey_alloc)
+DEFINE_NOT_IMPLEMENTED_SYSCALL(pkey_free)
+
 DEFINE_NOT_IMPLEMENTED_SYSCALL(landlock_create_ruleset)
 DEFINE_NOT_IMPLEMENTED_SYSCALL(landlock_add_rule)
 DEFINE_NOT_IMPLEMENTED_SYSCALL(landlock_restrict_self)

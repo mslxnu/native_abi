@@ -32,14 +32,14 @@
   SYSCALL(24, sched_yield) \
   SYSCALL(25, mremap) \
   SYSCALL(26, msync) \
-  SYSCALL(27, unimplemented) \
+  SYSCALL(27, mincore) \
   SYSCALL(28, madvise) \
   SYSCALL(29, shmget) \
   SYSCALL(30, shmat) \
   SYSCALL(31, shmctl) \
   SYSCALL(32, dup) \
   SYSCALL(33, dup2) \
-  SYSCALL(34, unimplemented) \
+  SYSCALL(34, pause) \
   SYSCALL(35, nanosleep) \
   SYSCALL(36, getitimer) \
   SYSCALL(37, alarm) \
@@ -140,7 +140,7 @@
   SYSCALL(132, utime) \
   SYSCALL(133, mknod) \
   SYSCALL(134, uselib) \
-  SYSCALL(135, unimplemented) \
+  SYSCALL(135, personality) \
   SYSCALL(136, unimplemented) \
   SYSCALL(137, statfs) \
   SYSCALL(138, fstatfs) \
@@ -159,8 +159,8 @@
   SYSCALL(151, mlockall) \
   SYSCALL(152, munlockall) \
   SYSCALL(153, unimplemented) \
-  SYSCALL(154, unimplemented) \
-  SYSCALL(155, unimplemented) \
+  SYSCALL(154, modify_ldt) \
+  SYSCALL(155, pivot_root) \
   SYSCALL(156, unimplemented) \
   SYSCALL(157, prctl) \
   SYSCALL(158, arch_prctl) \
@@ -284,7 +284,7 @@
   SYSCALL(276, tee) \
   SYSCALL(277, sync_file_range) \
   SYSCALL(278, vmsplice) \
-  SYSCALL(279, unimplemented) \
+  SYSCALL(279, move_pages) \
   SYSCALL(280, utimensat) \
   SYSCALL(281, epoll_pwait) \
   SYSCALL(282, unimplemented) \
@@ -300,10 +300,10 @@
   SYSCALL(292, dup3) \
   SYSCALL(293, pipe2) \
   SYSCALL(294, inotify_init1) \
-  SYSCALL(295, unimplemented) \
-  SYSCALL(296, unimplemented) \
+  SYSCALL(295, preadv) \
+  SYSCALL(296, pwritev) \
   SYSCALL(297, unimplemented) \
-  SYSCALL(298, unimplemented) \
+  SYSCALL(298, perf_event_open) \
   SYSCALL(299, unimplemented) \
   SYSCALL(300, fanotify_init) \
   SYSCALL(301, fanotify_mark) \
@@ -332,11 +332,11 @@
   SYSCALL(324, membarrier) \
   SYSCALL(325, mlock2) \
   SYSCALL(326, copy_file_range) \
-  SYSCALL(327, unimplemented) \
-  SYSCALL(328, unimplemented) \
-  SYSCALL(329, unimplemented) \
-  SYSCALL(330, unimplemented) \
-  SYSCALL(331, unimplemented) \
+  SYSCALL(327, preadv2) \
+  SYSCALL(328, pwritev2) \
+  SYSCALL(329, pkey_mprotect) \
+  SYSCALL(330, pkey_alloc) \
+  SYSCALL(331, pkey_free) \
   SYSCALL(332, statx) \
   SYSCALL(333, io_pgetevents) \
   SYSCALL(334, rseq) \
@@ -467,6 +467,6 @@
   SYSCALL(459, lsm_get_self_attr) \
   SYSCALL(460, lsm_set_self_attr) \
   SYSCALL(461, lsm_list_modules) \
-  SYSCALL(462, unimplemented) \
+  SYSCALL(462, mseal) \
 
 #define NR_SYSCALLS 463

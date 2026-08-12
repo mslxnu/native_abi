@@ -26,7 +26,7 @@
 #include "linux/signal.h"
 
 #define CHECKPOINT_MAGIC   0x4E414249434B5031ULL  /* "NABICKP1" */
-#define CHECKPOINT_VERSION 6
+#define CHECKPOINT_VERSION 7
 
 /* One guest memory region, as src/mm/mmap.c tracks it, with the host address
  * replaced by the arena offset that names the same bytes elsewhere. */
@@ -47,7 +47,10 @@ struct checkpoint_region {
    * region, so the region list already is that list.
    */
   int32_t  shm_id;
-  int32_t  _pad5;
+  /* As of version 7: whether mseal froze this range. A seal that did not
+   * survive the fork would leave a child less protected than its parent, with
+   * nothing in either of them saying so. */
+  int32_t  sealed;
 };
 
 /* One stage-2 mapping: which guest-physical range is backed by which arena
