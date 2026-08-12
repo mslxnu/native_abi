@@ -5246,3 +5246,62 @@ now says what happened, what still works, what does not, and the one command
 that fixes it.
 
 No new syscalls: `--user` is an option, not a call.
+
+### 3.5.99 Fourteen at once, of three different kinds
+
+A batch, and the interest is in how unlike each other they are.
+
+**Four cannot exist here, and each for its own reason.** `bpf` loads programs
+into a kernel to run at its hook points, and there is no kernel — no
+tracepoints, no verifier, nothing that could execute one. `add_key` wants
+kernel-held storage whose payload userspace cannot read directly; anything NABI
+kept would sit in the same address space as the program asking, which is not a
+keyring but a variable, and approximating it would be a security claim that is
+false. `acct` needs a single place every process exit passes through, and here a
+guest process is a host process reaped by another NABI. And `clock_settime` would
+step a clock the whole machine shares — the guest is not the administrator of
+this computer — so it answers `EPERM`, which is what Linux answers without
+`CAP_SYS_TIME` and which `date -s` already knows how to report.
+
+**Four are the same call with less in them**, kept so that programs built against
+older headers still run: `epoll_create` is `epoll_create1(0)` with the size hint
+that has meant nothing since 2.6.8, `epoll_wait` is `epoll_pwait` with no mask,
+`eventfd` is `eventfd2` with no flags. Delegation rather than reimplementation,
+so they cannot drift.
+
+**The rest do real work**, and each was tested on the one thing that separates it
+from the call it resembles — which is where two of them were wrong.
+
+`adjtimex` and `clock_adjtime` read the clock's discipline through Darwin's
+`ntp_adjtime`, which is the same interface under its BSD name, and refuse every
+mode that would write. The refusal comes before anything is applied, so a caller
+cannot get half an adjustment. Darwin's `struct timex` has no `tick`; it is left
+zero rather than invented, since a caller comparing it against `USER_HZ` would be
+comparing against a number nobody set.
+
+`close_range` closes a span without asking what is in it — the thing that made
+pre-exec cleanup a million syscalls on a machine with a large rlimit.
+`CLOSE_RANGE_CLOEXEC` **marks** instead, and the first version set only NABI's
+own bitmap: `F_GETFD` reported 0, because it reads the host flag. `F_SETFD` sets
+both, and so does this now — one without the other is a descriptor that is
+close-on-exec to whichever asks first.
+
+`fchmodat2` is `fchmodat` with the flags argument it should always have had, and
+`AT_SYMLINK_NOFOLLOW` is the whole point: Linux never honoured it on `fchmodat`,
+so a caller needing it had to open the file and use `fchmod`. The first version
+put the mode on the *target* and left the link alone — precisely the behaviour
+this call exists to replace, arrived at by accident, because the lookup was not
+told `LOOKUP_NOFOLLOW` and followed the link before the code saw anything.
+
+`execveat` needed a guest path for a descriptor, and NABI has no reverse mapping
+from a host path to a guest one. It does not need one: `/proc/self/fd/<n>` *is*
+that mapping expressed in the guest's own namespace, procfs already serves it,
+and it is what glibc's `fexecve` falls back to anyway. So a descriptor becomes a
+path the ordinary machinery resolves rather than a special case beside it.
+
+`fspick` builds a context for a mount that already exists, which is the new API's
+remount — and it makes `FSCONFIG_CMD_RECONFIGURE` reachable, which had been
+answering `EOPNOTSUPP` with a note that no context could arrive on it. There is
+one now.
+
+278 of 375.

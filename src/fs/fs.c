@@ -4941,3 +4941,108 @@ fdtable_clear_host_cloexec(void)
     }
   }
 }
+
+/*
+ * close_range: shut a whole span of descriptors without asking what is in it.
+ *
+ * The problem it solves is that a program about to exec has to close everything
+ * it does not mean to pass on, and until this existed the only way was to loop
+ * to the rlimit calling close on each - a million syscalls on a machine with a
+ * large limit, for a handful of open files. glibc's posix_spawn and every
+ * container runtime reach for it.
+ *
+ * CLOSE_RANGE_CLOEXEC marks rather than closes, which is what a caller wants
+ * when the descriptors must stay usable until the exec actually happens.
+ */
+#define LINUX_CLOSE_RANGE_UNSHARE (1U << 1)
+#define LINUX_CLOSE_RANGE_CLOEXEC (1U << 2)
+
+DEFINE_SYSCALL(close_range, unsigned int, first, unsigned int, last,
+               unsigned int, flags)
+{
+  if (flags & ~(unsigned) (LINUX_CLOSE_RANGE_UNSHARE | LINUX_CLOSE_RANGE_CLOEXEC))
+    return -LINUX_EINVAL;
+  if (first > last)
+    return -LINUX_EINVAL;
+  /*
+   * CLOSE_RANGE_UNSHARE asks for the descriptor table to be unshared first,
+   * which only means anything to a caller that shares one - and a table is
+   * shared here only by CLONE_FILES threads, which have nothing to unshare
+   * from. Accepted and not acted on, because for this process it is already
+   * true.
+   */
+
+  struct fdtable *t = &proc.fileinfo.fdtable;
+  pthread_rwlock_wrlock(&proc.fileinfo.fdtable_lock);
+  unsigned int top = (unsigned int) (t->start + t->size);
+  if (last >= top)
+    last = top ? top - 1 : 0;
+  for (unsigned int fd = first; fd <= last && fd < top; fd++) {
+    if (!test_fdbit(t, t->open_fds, (int) fd))
+      continue;
+    if (flags & LINUX_CLOSE_RANGE_CLOEXEC) {
+      /* Both halves, as F_SETFD does: the host flag is what an exec of the
+       * host process obeys and what F_GETFD reports back, and the bitmap is
+       * what nabi's own handover consults. Setting one and not the other
+       * leaves a descriptor that is close-on-exec to whichever asks first. */
+      if (syswrap(fcntl((int) fd, F_SETFD, FD_CLOEXEC)) >= 0)
+        set_fdbit(t, t->cloexec_fds, (int) fd);
+    } else {
+      do_close(t, (int) fd);
+    }
+  }
+  pthread_rwlock_unlock(&proc.fileinfo.fdtable_lock);
+  return 0;
+}
+
+/* eventfd is eventfd2 without the flags argument, kept so that a program built
+ * against the older header still runs. */
+DEFINE_SYSCALL(eventfd, unsigned int, initval)
+{
+  return sys_eventfd2(initval, 0);
+}
+
+/*
+ * fchmodat2 is fchmodat with the flags argument it should always have had.
+ *
+ * fchmodat takes one and Linux has never honoured it: AT_SYMLINK_NOFOLLOW
+ * returned EOPNOTSUPP, because chmod through a symlink was not expressible. So
+ * a caller that needed it had to open the file and use fchmod, and fchmodat2
+ * exists to end that.
+ */
+DEFINE_SYSCALL(fchmodat2, int, dirfd, gstr_t, path_ptr, l_mode_t, mode,
+               unsigned int, flags)
+{
+  if (flags & ~(unsigned) LINUX_AT_SYMLINK_NOFOLLOW)
+    return -LINUX_EINVAL;
+
+  char pathname[LINUX_PATH_MAX];
+  if (strncpy_from_user(pathname, path_ptr, sizeof pathname) < 0)
+    return -LINUX_EFAULT;
+
+  /*
+   * Without the flag this is fchmodat exactly, so it is fchmodat. With it, the
+   * mode belongs to the link rather than to what the link names - and a guest
+   * mode is recorded against the link itself, which is what nofollow means all
+   * the way down here.
+   */
+  if (!(flags & LINUX_AT_SYMLINK_NOFOLLOW))
+    return sys_fchmodat(dirfd, path_ptr, mode);
+
+  /*
+   * LOOKUP_NOFOLLOW, and it is the whole of the flag's meaning here: without
+   * it the resolution follows the link before this code sees anything, so the
+   * mode lands on the target and the link keeps whatever it had - which is
+   * exactly the behaviour fchmodat2 exists to replace, arrived at by accident.
+   */
+  char abs[PATH_MAX];
+  struct path path;
+  int r = vfs_grab_dir_w(dirfd, pathname, LOOKUP_NOFOLLOW, &path);
+  if (r < 0)
+    return r;
+  bool ok = abs_path_at(path.dir->fd, path.subpath, abs, sizeof abs);
+  vfs_ungrab_dir(&path);
+  if (!ok)
+    return -LINUX_ENOENT;
+  return guest_mode_record(AT_FDCWD, abs, true, mode);
+}

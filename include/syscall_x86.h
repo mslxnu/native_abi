@@ -164,11 +164,11 @@
   SYSCALL(156, unimplemented) \
   SYSCALL(157, prctl) \
   SYSCALL(158, arch_prctl) \
-  SYSCALL(159, unimplemented) \
+  SYSCALL(159, adjtimex) \
   SYSCALL(160, setrlimit) \
   SYSCALL(161, chroot) \
   SYSCALL(162, sync) \
-  SYSCALL(163, unimplemented) \
+  SYSCALL(163, acct) \
   SYSCALL(164, unimplemented) \
   SYSCALL(165, mount) \
   SYSCALL(166, umount2) \
@@ -218,7 +218,7 @@
   SYSCALL(210, io_cancel) \
   SYSCALL(211, get_thread_area) \
   SYSCALL(212, unimplemented) \
-  SYSCALL(213, unimplemented) \
+  SYSCALL(213, epoll_create) \
   SYSCALL(214, epoll_ctl_old) \
   SYSCALL(215, epoll_wait_old) \
   SYSCALL(216, unimplemented) \
@@ -232,12 +232,12 @@
   SYSCALL(224, timer_gettime) \
   SYSCALL(225, timer_getoverrun) \
   SYSCALL(226, timer_delete) \
-  SYSCALL(227, unimplemented) \
+  SYSCALL(227, clock_settime) \
   SYSCALL(228, clock_gettime) \
   SYSCALL(229, clock_getres) \
   SYSCALL(230, clock_nanosleep) \
   SYSCALL(231, exit_group) \
-  SYSCALL(232, unimplemented) \
+  SYSCALL(232, epoll_wait) \
   SYSCALL(233, epoll_ctl) \
   SYSCALL(234, tgkill) \
   SYSCALL(235, utimes) \
@@ -253,7 +253,7 @@
   SYSCALL(245, mq_getsetattr) \
   SYSCALL(246, kexec_load) \
   SYSCALL(247, unimplemented) \
-  SYSCALL(248, unimplemented) \
+  SYSCALL(248, add_key) \
   SYSCALL(249, unimplemented) \
   SYSCALL(250, unimplemented) \
   SYSCALL(251, ioprio_set) \
@@ -289,7 +289,7 @@
   SYSCALL(281, epoll_pwait) \
   SYSCALL(282, unimplemented) \
   SYSCALL(283, timerfd_create) \
-  SYSCALL(284, unimplemented) \
+  SYSCALL(284, eventfd) \
   SYSCALL(285, fallocate) \
   SYSCALL(286, timerfd_settime) \
   SYSCALL(287, timerfd_gettime) \
@@ -310,7 +310,7 @@
   SYSCALL(302, prlimit64) \
   SYSCALL(303, name_to_handle_at) \
   SYSCALL(304, open_by_handle_at) \
-  SYSCALL(305, unimplemented) \
+  SYSCALL(305, clock_adjtime) \
   SYSCALL(306, syncfs) \
   SYSCALL(307, sendmmsg) \
   SYSCALL(308, setns) \
@@ -326,8 +326,8 @@
   SYSCALL(318, getrandom) \
   SYSCALL(319, unimplemented) \
   SYSCALL(320, kexec_file_load) \
-  SYSCALL(321, unimplemented) \
-  SYSCALL(322, unimplemented) \
+  SYSCALL(321, bpf) \
+  SYSCALL(322, execveat) \
   SYSCALL(323, unimplemented) \
   SYSCALL(324, unimplemented) \
   SYSCALL(325, unimplemented) \
@@ -438,15 +438,15 @@
   SYSCALL(430, fsopen) \
   SYSCALL(431, fsconfig) \
   SYSCALL(432, fsmount) \
-  SYSCALL(433, unimplemented) \
+  SYSCALL(433, fspick) \
   SYSCALL(434, pidfd_open) \
   SYSCALL(435, clone3) \
-  SYSCALL(436, unimplemented) \
+  SYSCALL(436, close_range) \
   SYSCALL(437, openat2) \
   SYSCALL(438, pidfd_getfd) \
   SYSCALL(439, faccessat2) \
   SYSCALL(440, process_madvise) \
-  SYSCALL(441, unimplemented) \
+  SYSCALL(441, epoll_pwait2) \
   SYSCALL(442, mount_setattr) \
   SYSCALL(443, unimplemented) \
   SYSCALL(444, unimplemented) \
@@ -457,7 +457,7 @@
   SYSCALL(449, futex_waitv) \
   SYSCALL(450, unimplemented) \
   SYSCALL(451, unimplemented) \
-  SYSCALL(452, unimplemented) \
+  SYSCALL(452, fchmodat2) \
   SYSCALL(453, unimplemented) \
   SYSCALL(454, futex_wake) \
   SYSCALL(455, futex_wait) \

@@ -26,6 +26,7 @@
  */
 
 #include <errno.h>
+#include <limits.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -406,4 +407,55 @@ DEFINE_SYSCALL(epoll_pwait, int, epfd, gaddr_t, events, int, maxevents, int, tim
   if (have_mask)
     sigprocmask(SIG_SETMASK, &saved, NULL);
   return ret;
+}
+
+/*
+ * The older spellings, which are the same calls with less in them.
+ *
+ * epoll_create takes a size hint that has meant nothing since 2.6.8 - the
+ * kernel sizes the set itself - and Linux keeps it only so that programs
+ * compiled against the old header still run. It is required to be positive,
+ * which is the one part still worth enforcing: a caller passing 0 has almost
+ * certainly confused it with epoll_create1's flags.
+ */
+DEFINE_SYSCALL(epoll_create, int, size)
+{
+  if (size <= 0)
+    return -LINUX_EINVAL;
+  return sys_epoll_create1(0);
+}
+
+/* epoll_wait is epoll_pwait without the mask, and passing no mask is exactly
+ * what a null sigmask means. */
+DEFINE_SYSCALL(epoll_wait, int, epfd, gaddr_t, events, int, maxevents,
+               int, timeout)
+{
+  return sys_epoll_pwait(epfd, events, maxevents, timeout, 0, 0);
+}
+
+/*
+ * epoll_pwait2 differs from epoll_pwait in one thing: the timeout arrives as a
+ * timespec rather than a count of milliseconds, so a caller can ask for less
+ * than a millisecond and can tell "no timeout" from "zero" by the pointer
+ * rather than by a magic -1.
+ *
+ * The nanoseconds are rounded *up* to a millisecond, because the wait
+ * underneath counts in milliseconds and a sub-millisecond request rounded down
+ * becomes a poll that does not wait at all - which is a busy loop where the
+ * caller asked for a short sleep.
+ */
+DEFINE_SYSCALL(epoll_pwait2, int, epfd, gaddr_t, events, int, maxevents,
+               gaddr_t, timeout_ptr, gaddr_t, sigmask, size_t, sigsetsize)
+{
+  int timeout = -1;
+  if (timeout_ptr) {
+    struct l_timespec ts;
+    if (copy_from_user(&ts, timeout_ptr, sizeof ts))
+      return -LINUX_EFAULT;
+    if (ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1000000000L)
+      return -LINUX_EINVAL;
+    int64_t ms = (int64_t) ts.tv_sec * 1000 + (ts.tv_nsec + 999999) / 1000000;
+    timeout = ms > INT_MAX ? INT_MAX : (int) ms;
+  }
+  return sys_epoll_pwait(epfd, events, maxevents, timeout, sigmask, sigsetsize);
 }

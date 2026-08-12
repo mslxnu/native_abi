@@ -767,6 +767,24 @@ else
     fail=1
 fi
 
+# miscsystest: close_range, epoll_pwait2, execveat, fchmodat2, adjtimex and the
+# four that answer ENOSYS. Each is checked on what distinguishes it from the call
+# it resembles - CLOSE_RANGE_CLOEXEC marks rather than closes so the descriptor
+# stays usable, epoll_pwait2's sub-millisecond timeout must not round down to no
+# wait, fchmodat2's AT_SYMLINK_NOFOLLOW must land on the link and leave the
+# target alone, and adjtimex reads but refuses to write a clock the whole machine
+# shares. It ends by exec'ing /miscdone through a descriptor, so the "misc ok"
+# below is printed by the program execveat ran.
+cp "$here/miscsystest" "$here/miscdone" "$root/"
+chmod +x "$root/miscsystest" "$root/miscdone"
+out=$("$NABI" -m "$root" /miscsystest); rc=$?
+if [ "$rc" -eq 0 ] && [ "$out" = "misc ok" ]; then
+    echo "  ok  miscsystest -> \"$out\", exit 0"
+else
+    echo "  FAIL miscsystest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 if [ "$fail" -eq 0 ]; then
     echo "smoke: PASS"
 else

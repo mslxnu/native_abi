@@ -651,11 +651,15 @@ do_exec(const char *elf_path, int argc, char *argv[], char **envp)
   return 0;
 }
 
-DEFINE_SYSCALL(execve, gstr_t, gelf_path, gaddr_t, gargv, gaddr_t, genvp)
+/*
+ * The body of execve, taking the program as a string rather than as a guest
+ * pointer - so that execveat, which has to build the path, can use it without a
+ * second copy of the argument marshalling.
+ */
+static int
+do_execve(const char *elf_path, gaddr_t gargv, gaddr_t genvp)
 {
   int err;
-  char elf_path[LINUX_PATH_MAX];
-  strncpy_from_user(elf_path, gelf_path, sizeof elf_path);
 
   size_t argv_rsrv = 1024;
   char **argv = malloc(sizeof(char *) * argv_rsrv);
@@ -742,4 +746,57 @@ DEFINE_SYSCALL(execve, gstr_t, gelf_path, gaddr_t, gargv, gaddr_t, genvp)
  faile_copy_argv:
   free(argv);
   return err;
+}
+
+/*
+ * execveat: exec a program named relative to a descriptor.
+ *
+ * Two things it does that execve cannot. A directory descriptor plus a relative
+ * name is immune to the directory being moved or replaced between the lookup
+ * and the exec, which is what makes it safe to run something out of a tree
+ * another process can rename. And AT_EMPTY_PATH executes the descriptor itself,
+ * which is fexecve - running a file that may have no name at all, because it
+ * was created with O_TMPFILE or unlinked after opening.
+ *
+ * A descriptor has no *guest* path here, and nabi has no reverse mapping from a
+ * host path to a guest one. But it does not need one: /proc/self/fd/<n> is that
+ * mapping expressed in the guest's own namespace, procfs serves it, and it is
+ * exactly what glibc's fexecve falls back to when execveat is missing. So a
+ * descriptor becomes a path the ordinary machinery can resolve, rather than a
+ * special case running alongside it.
+ */
+DEFINE_SYSCALL(execve, gstr_t, gelf_path, gaddr_t, gargv, gaddr_t, genvp)
+{
+  char elf_path[LINUX_PATH_MAX];
+  if (strncpy_from_user(elf_path, gelf_path, sizeof elf_path) < 0)
+    return -LINUX_EFAULT;
+  return do_execve(elf_path, gargv, genvp);
+}
+
+DEFINE_SYSCALL(execveat, int, dirfd, gstr_t, gpath, gaddr_t, gargv,
+               gaddr_t, genvp, int, flags)
+{
+  if (flags & ~(LINUX_AT_EMPTY_PATH | LINUX_AT_SYMLINK_NOFOLLOW))
+    return -LINUX_EINVAL;
+
+  char path[LINUX_PATH_MAX];
+  if (strncpy_from_user(path, gpath, sizeof path) < 0)
+    return -LINUX_EFAULT;
+
+  if (path[0] == '\0') {
+    if (!(flags & LINUX_AT_EMPTY_PATH))
+      return -LINUX_ENOENT;
+    if (dirfd == LINUX_AT_FDCWD)
+      return -LINUX_ENOENT;     /* the cwd is not a program */
+    snprintf(path, sizeof path, "/proc/self/fd/%d", dirfd);
+  } else if (path[0] != '/' && dirfd != LINUX_AT_FDCWD) {
+    char rel[LINUX_PATH_MAX];
+    snprintf(rel, sizeof rel, "%s", path);
+    if ((size_t) snprintf(path, sizeof path, "/proc/self/fd/%d/%s", dirfd, rel)
+        >= sizeof path)
+      return -LINUX_ENAMETOOLONG;
+  }
+  /* An absolute path, or a relative one against the working directory, is what
+   * execve already takes. */
+  return do_execve(path, gargv, genvp);
 }

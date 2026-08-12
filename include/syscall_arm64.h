@@ -95,7 +95,7 @@
   SYSCALL(86, timerfd_settime) \
   SYSCALL(87, timerfd_gettime) \
   SYSCALL(88, utimensat) \
-  SYSCALL(89, unimplemented) \
+  SYSCALL(89, acct) \
   SYSCALL(90, capget) \
   SYSCALL(91, unimplemented) \
   SYSCALL(92, unimplemented) \
@@ -118,7 +118,7 @@
   SYSCALL(109, timer_getoverrun) \
   SYSCALL(110, timer_settime) \
   SYSCALL(111, timer_delete) \
-  SYSCALL(112, unimplemented) \
+  SYSCALL(112, clock_settime) \
   SYSCALL(113, clock_gettime) \
   SYSCALL(114, clock_getres) \
   SYSCALL(115, clock_nanosleep) \
@@ -177,7 +177,7 @@
   SYSCALL(168, unimplemented) \
   SYSCALL(169, gettimeofday) \
   SYSCALL(170, unimplemented) \
-  SYSCALL(171, unimplemented) \
+  SYSCALL(171, adjtimex) \
   SYSCALL(172, getpid) \
   SYSCALL(173, getppid) \
   SYSCALL(174, getuid) \
@@ -223,7 +223,7 @@
   SYSCALL(214, brk) \
   SYSCALL(215, munmap) \
   SYSCALL(216, mremap) \
-  SYSCALL(217, unimplemented) \
+  SYSCALL(217, add_key) \
   SYSCALL(218, unimplemented) \
   SYSCALL(219, unimplemented) \
   SYSCALL(220, clone) \
@@ -272,7 +272,7 @@
   SYSCALL(263, fanotify_mark) \
   SYSCALL(264, name_to_handle_at) \
   SYSCALL(265, open_by_handle_at) \
-  SYSCALL(266, unimplemented) \
+  SYSCALL(266, clock_adjtime) \
   SYSCALL(267, syncfs) \
   SYSCALL(268, setns) \
   SYSCALL(269, sendmmsg) \
@@ -286,8 +286,8 @@
   SYSCALL(277, unimplemented) \
   SYSCALL(278, getrandom) \
   SYSCALL(279, unimplemented) \
-  SYSCALL(280, unimplemented) \
-  SYSCALL(281, unimplemented) \
+  SYSCALL(280, bpf) \
+  SYSCALL(281, execveat) \
   SYSCALL(282, unimplemented) \
   SYSCALL(283, unimplemented) \
   SYSCALL(284, unimplemented) \
@@ -439,15 +439,15 @@
   SYSCALL(430, fsopen) \
   SYSCALL(431, fsconfig) \
   SYSCALL(432, fsmount) \
-  SYSCALL(433, unimplemented) \
+  SYSCALL(433, fspick) \
   SYSCALL(434, pidfd_open) \
   SYSCALL(435, clone3) \
-  SYSCALL(436, unimplemented) \
+  SYSCALL(436, close_range) \
   SYSCALL(437, openat2) \
   SYSCALL(438, pidfd_getfd) \
   SYSCALL(439, faccessat2) \
   SYSCALL(440, process_madvise) \
-  SYSCALL(441, unimplemented) \
+  SYSCALL(441, epoll_pwait2) \
   SYSCALL(442, mount_setattr) \
   SYSCALL(443, unimplemented) \
   SYSCALL(444, unimplemented) \
@@ -458,7 +458,7 @@
   SYSCALL(449, futex_waitv) \
   SYSCALL(450, unimplemented) \
   SYSCALL(451, unimplemented) \
-  SYSCALL(452, unimplemented) \
+  SYSCALL(452, fchmodat2) \
   SYSCALL(453, unimplemented) \
   SYSCALL(454, futex_wake) \
   SYSCALL(455, futex_wait) \
@@ -1041,40 +1041,43 @@
   SYSCALL(1029, chown) \
   SYSCALL(1030, creat) \
   SYSCALL(1031, dup2) \
-  SYSCALL(1032, epoll_ctl_old) \
-  SYSCALL(1033, epoll_wait_old) \
-  SYSCALL(1034, fork) \
-  SYSCALL(1035, get_thread_area) \
-  SYSCALL(1036, getdents) \
-  SYSCALL(1037, getpgrp) \
-  SYSCALL(1038, getpmsg) \
-  SYSCALL(1039, inotify_init) \
-  SYSCALL(1040, lchown) \
-  SYSCALL(1041, link) \
-  SYSCALL(1042, lstat) \
-  SYSCALL(1043, mkdir) \
-  SYSCALL(1044, mknod) \
-  SYSCALL(1045, open) \
-  SYSCALL(1046, pipe) \
-  SYSCALL(1047, poll) \
-  SYSCALL(1048, putpmsg) \
-  SYSCALL(1049, readlink) \
-  SYSCALL(1050, rename) \
-  SYSCALL(1051, rmdir) \
-  SYSCALL(1052, security) \
-  SYSCALL(1053, select) \
-  SYSCALL(1054, set_thread_area) \
-  SYSCALL(1055, stat) \
-  SYSCALL(1056, symlink) \
-  SYSCALL(1057, sysfs) \
-  SYSCALL(1058, time) \
-  SYSCALL(1059, tuxcall) \
-  SYSCALL(1060, unimplemented) \
-  SYSCALL(1061, unlink) \
-  SYSCALL(1062, uselib) \
-  SYSCALL(1063, utime) \
-  SYSCALL(1064, utimes) \
-  SYSCALL(1065, vfork) \
-  SYSCALL(1066, vserver) \
+  SYSCALL(1032, epoll_create) \
+  SYSCALL(1033, epoll_ctl_old) \
+  SYSCALL(1034, epoll_wait) \
+  SYSCALL(1035, epoll_wait_old) \
+  SYSCALL(1036, eventfd) \
+  SYSCALL(1037, fork) \
+  SYSCALL(1038, get_thread_area) \
+  SYSCALL(1039, getdents) \
+  SYSCALL(1040, getpgrp) \
+  SYSCALL(1041, getpmsg) \
+  SYSCALL(1042, inotify_init) \
+  SYSCALL(1043, lchown) \
+  SYSCALL(1044, link) \
+  SYSCALL(1045, lstat) \
+  SYSCALL(1046, mkdir) \
+  SYSCALL(1047, mknod) \
+  SYSCALL(1048, open) \
+  SYSCALL(1049, pipe) \
+  SYSCALL(1050, poll) \
+  SYSCALL(1051, putpmsg) \
+  SYSCALL(1052, readlink) \
+  SYSCALL(1053, rename) \
+  SYSCALL(1054, rmdir) \
+  SYSCALL(1055, security) \
+  SYSCALL(1056, select) \
+  SYSCALL(1057, set_thread_area) \
+  SYSCALL(1058, stat) \
+  SYSCALL(1059, symlink) \
+  SYSCALL(1060, sysfs) \
+  SYSCALL(1061, time) \
+  SYSCALL(1062, tuxcall) \
+  SYSCALL(1063, unimplemented) \
+  SYSCALL(1064, unlink) \
+  SYSCALL(1065, uselib) \
+  SYSCALL(1066, utime) \
+  SYSCALL(1067, utimes) \
+  SYSCALL(1068, vfork) \
+  SYSCALL(1069, vserver) \
 
-#define NR_SYSCALLS 1067
+#define NR_SYSCALLS 1070

@@ -1067,10 +1067,16 @@ DEFINE_SYSCALL(fsconfig, int, fd, unsigned int, cmd, gstr_t, key_ptr,
     return 0;
 
   case LINUX_FSCONFIG_CMD_RECONFIGURE:
-    /* Reconfiguring an existing superblock through a context obtained from
-     * fspick, which is not implemented - so there is no context this can
-     * arrive on. */
-    return -LINUX_EOPNOTSUPP;
+    /*
+     * Reconfiguring the superblock a context describes. fspick makes such a
+     * context, and it arrives here already created - so this is reachable now,
+     * and what it has to reconfigure is the set of options fsconfig can carry,
+     * which is `source` and nothing else. Saying yes to that is saying yes to
+     * what was actually asked.
+     */
+    if (!h.created)
+      return -LINUX_EINVAL;
+    return 0;
 
   default:
     return -LINUX_EINVAL;
@@ -1340,4 +1346,66 @@ DEFINE_SYSCALL(statmount, gaddr_t, req_ptr, gaddr_t, buf_ptr, size_t, bufsize,
       (used && copy_to_user(buf_ptr + sizeof st, strs, used)))
     return -LINUX_EFAULT;
   return 0;
+}
+
+/*
+ * fspick: a filesystem context for a mount that already exists.
+ *
+ * fsopen names a filesystem *type* and builds a context for something new;
+ * fspick names a *path* and builds one for something already mounted, so that
+ * fsconfig can reconfigure it. It is the new API's remount.
+ *
+ * The context it returns is the same object fsopen returns, marked as already
+ * created - because it is: the superblock it describes exists. That is what
+ * makes FSCONFIG_CMD_RECONFIGURE reachable, and why that command answered
+ * EOPNOTSUPP until now with the note that there was no context it could arrive
+ * on. There is one now.
+ */
+#define LINUX_FSPICK_CLOEXEC          0x00000001
+#define LINUX_FSPICK_SYMLINK_NOFOLLOW 0x00000002
+#define LINUX_FSPICK_NO_AUTOMOUNT     0x00000004
+#define LINUX_FSPICK_EMPTY_PATH       0x00000008
+
+DEFINE_SYSCALL(fspick, int, dfd, gstr_t, path_ptr, unsigned int, flags)
+{
+  if (!may_mount())
+    return -LINUX_EPERM;
+  if (flags & ~(unsigned) (LINUX_FSPICK_CLOEXEC | LINUX_FSPICK_SYMLINK_NOFOLLOW |
+                           LINUX_FSPICK_NO_AUTOMOUNT | LINUX_FSPICK_EMPTY_PATH))
+    return -LINUX_EINVAL;
+
+  char target[MOUNT_PATH_MAX];
+  if (strncpy_from_user(target, path_ptr, sizeof target) < 0)
+    return -LINUX_EFAULT;
+  if (target[0] != '/')
+    return -LINUX_EINVAL;       /* as elsewhere: the table is keyed by absolute
+                                 * guest paths */
+  (void) dfd;
+
+  struct mount_table t;
+  if (!current_table(&t))
+    return -LINUX_EINVAL;
+  const struct mount_entry *m = NULL;
+  for (uint32_t i = 0; i < t.n; i++)
+    if (strcmp(t.m[i].target, target) == 0) {
+      m = &t.m[i];
+      break;
+    }
+  if (!m)
+    return -LINUX_EINVAL;       /* not a mount point, as Linux says */
+
+  int fd = anon_file("fsctx");
+  if (fd < 0)
+    return fd;
+  struct fsctx_hdr h;
+  memset(&h, 0, sizeof h);
+  h.magic = FSCTX_MAGIC;
+  h.created = 1;                /* the thing it describes already exists */
+  snprintf(h.type, sizeof h.type, "%s", m->type);
+  snprintf(h.source, sizeof h.source, "%s", m->source);
+  if (pwrite(fd, &h, sizeof h, 0) != (ssize_t) sizeof h) {
+    close(fd);
+    return -LINUX_EIO;
+  }
+  return give_to_guest(fd, (flags & LINUX_FSPICK_CLOEXEC) != 0);
 }

@@ -173,6 +173,50 @@ char *sc_name_table[NR_SYSCALLS] = {
  * ENOSYS says the facility is absent, which is true and which every caller
  * already knows how to stop at.
  */
+/*
+ * bpf: loading programs into the kernel to run at its hook points.
+ *
+ * There is no kernel here to load them into. nabi is the Linux system call
+ * interface implemented in a userspace process on macOS; there are no
+ * tracepoints to attach to, no verifier, no maps in kernel memory, and nothing
+ * that could execute a bpf program if one were handed over. This is not a
+ * facility that is missing, it is one the shape of this program has no place
+ * for - and a caller told otherwise would attach a probe that never fires.
+ */
+DEFINE_NOT_IMPLEMENTED_SYSCALL(bpf)
+
+/*
+ * add_key: the kernel keyring.
+ *
+ * A keyring is kernel-held storage with its own lifetimes - a key belongs to a
+ * process, a session or a user, and goes when that does - and its point is that
+ * the payload is somewhere userspace cannot read it directly. Neither half is
+ * available here: there is no kernel to hold it, and anything nabi kept would
+ * sit in the same address space as the program asking, which is not a keyring,
+ * it is a variable.
+ *
+ * Refused rather than approximated, because the approximation would be a
+ * security claim that is not true. request_key and keyctl are the rest of the
+ * family and are absent for the same reason.
+ */
+DEFINE_NOT_IMPLEMENTED_SYSCALL(add_key)
+
+/*
+ * acct: BSD process accounting.
+ *
+ * Turning this on asks the kernel to append a record for every process that
+ * exits, which needs the kernel to be the thing that reaps them. Here a guest
+ * process is a host process and its parent is another nabi; there is no single
+ * place every exit passes through, and macOS's own acct(2) would write records
+ * about nabi's host processes in Darwin's format, which is neither the guest's
+ * processes nor the guest's format.
+ *
+ * So it is refused. What a caller gets from ENOSYS is that accounting is
+ * unavailable, which is true; what it would get from a pretend success is an
+ * accounting file that stays empty while it believes it is being filled.
+ */
+DEFINE_NOT_IMPLEMENTED_SYSCALL(acct)
+
 DEFINE_NOT_IMPLEMENTED_SYSCALL(kexec_load)
 DEFINE_NOT_IMPLEMENTED_SYSCALL(kexec_file_load)
 

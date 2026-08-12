@@ -8,9 +8,11 @@
 #include <string.h>
 #include <pthread.h>
 #include "linux/errno.h"
+#include "linux/time.h"
 #include <stdlib.h>
 #include <time.h>
 #include <sys/resource.h>
+#include <sys/timex.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/time.h>
@@ -337,5 +339,151 @@ DEFINE_SYSCALL(ioprio_get, int, which, int, who)
   case IOPOL_STANDARD:
   default:
     return (LINUX_IOPRIO_CLASS_BE << LINUX_IOPRIO_CLASS_SHIFT) | 4;
+  }
+}
+
+/* ------------------------------------------------------------- the clock */
+
+/*
+ * adjtimex and clock_adjtime: reading the clock's discipline, and not writing
+ * it.
+ *
+ * These are how a time daemon steers the system clock - it reads the current
+ * offset, frequency and status, and writes corrections back. Darwin has the
+ * same interface under its BSD name, ntp_adjtime, so *reading* translates
+ * almost directly.
+ *
+ * Writing does not, and the reason is not a missing facility. The clock these
+ * would steer is the host's: there is one clock and every process on the
+ * machine reads it, nabi's guests included. A guest that adjusted it would be
+ * adjusting macOS's idea of the time for everything else running on the
+ * machine, which is not a thing a program inside a Linux ABI layer should be
+ * able to do at all - the guest is not the administrator of this computer.
+ *
+ * So a read is answered and a write is EPERM, which is what Linux answers a
+ * caller without CAP_SYS_TIME. A time daemon that gets EPERM concludes it is
+ * not privileged and stops trying, which is the right outcome; one that got a
+ * pretend success would go on believing it was steering a clock that never
+ * moved.
+ */
+#define LINUX_ADJ_OFFSET     0x0001
+#define LINUX_ADJ_FREQUENCY  0x0002
+#define LINUX_ADJ_MAXERROR   0x0004
+#define LINUX_ADJ_ESTERROR   0x0008
+#define LINUX_ADJ_STATUS     0x0010
+#define LINUX_ADJ_TIMECONST  0x0020
+#define LINUX_ADJ_TAI        0x0080
+#define LINUX_ADJ_SETOFFSET  0x0100
+#define LINUX_ADJ_MICRO      0x1000
+#define LINUX_ADJ_NANO       0x2000
+#define LINUX_ADJ_TICK       0x4000
+
+#define LINUX_TIME_OK 0
+
+/* Linux's struct timex, which is not Darwin's. */
+struct l_timex {
+  unsigned int modes;
+  int64_t offset, freq, maxerror, esterror;
+  int status;
+  int64_t constant, precision, tolerance;
+  struct l_timeval time;
+  int64_t tick, ppsfreq, jitter;
+  int shift;
+  int64_t stabil, jitcnt, calcnt, errcnt, stbcnt;
+  int tai;
+  int pad[11];
+};
+
+static int
+do_adjtimex(gaddr_t buf_ptr)
+{
+  struct l_timex tx;
+  if (copy_from_user(&tx, buf_ptr, sizeof tx))
+    return -LINUX_EFAULT;
+
+  /*
+   * Anything that would change the clock is refused before it is looked at, so
+   * that a caller cannot get a partial adjustment. ADJ_OFFSET_SS_READ and the
+   * bare read (modes 0) are what is left.
+   */
+  if (tx.modes & (LINUX_ADJ_OFFSET | LINUX_ADJ_FREQUENCY | LINUX_ADJ_MAXERROR |
+                  LINUX_ADJ_ESTERROR | LINUX_ADJ_STATUS | LINUX_ADJ_TIMECONST |
+                  LINUX_ADJ_TAI | LINUX_ADJ_SETOFFSET | LINUX_ADJ_TICK))
+    return -LINUX_EPERM;
+
+  struct timex host;
+  memset(&host, 0, sizeof host);
+  int state = ntp_adjtime(&host);
+  if (state < 0)
+    return -darwin_to_linux_errno(errno);
+
+  memset(&tx, 0, sizeof tx);
+  tx.offset = host.offset;
+  tx.freq = host.freq;
+  tx.maxerror = host.maxerror;
+  tx.esterror = host.esterror;
+  tx.status = host.status;
+  tx.constant = host.constant;
+  tx.precision = host.precision;
+  tx.tolerance = host.tolerance;
+  /* No `tick` in Darwin's timex - it is a Linux field for the interval timer's
+   * period, and there is nothing here to read it from. Left zero rather than
+   * invented, since a caller comparing it against USER_HZ would be comparing
+   * against a number nobody set. */
+  tx.tick = 0;
+  /* The clock this reports is CLOCK_REALTIME, so the time it reports is the
+   * one gettimeofday would give - taken here rather than left zero, because a
+   * caller reads the pair together. */
+  struct timeval now;
+  gettimeofday(&now, NULL);
+  tx.time.tv_sec = now.tv_sec;
+  tx.time.tv_usec = now.tv_usec;
+
+  if (copy_to_user(buf_ptr, &tx, sizeof tx))
+    return -LINUX_EFAULT;
+  return state;
+}
+
+DEFINE_SYSCALL(adjtimex, gaddr_t, buf_ptr)
+{
+  return do_adjtimex(buf_ptr);
+}
+
+DEFINE_SYSCALL(clock_adjtime, l_clockid_t, which, gaddr_t, buf_ptr)
+{
+  /* Only the realtime clock has a discipline to report; the monotonic clocks
+   * are not steered, which is the property they are chosen for. */
+  if (which != LINUX_CLOCK_REALTIME)
+    return -LINUX_EINVAL;
+  return do_adjtimex(buf_ptr);
+}
+
+/*
+ * clock_settime: setting the wall clock, which is not the guest's to set.
+ *
+ * The same reasoning as adjtimex's write half, and more starkly: there is one
+ * clock on this machine and every process reads it. A guest stepping it would
+ * step it for macOS and everything else running there. Linux answers EPERM
+ * without CAP_SYS_TIME, and every caller already handles that - `date -s` says
+ * it cannot set the date, which is true and is what a person needs to be told.
+ *
+ * The time namespace does not change this. Its offsets apply to the monotonic
+ * and boottime clocks, not to the realtime one, precisely because the wall
+ * clock is shared.
+ */
+DEFINE_SYSCALL(clock_settime, l_clockid_t, which, gaddr_t, tp)
+{
+  (void) tp;
+  switch (which) {
+  case LINUX_CLOCK_REALTIME:
+    return -LINUX_EPERM;
+  case LINUX_CLOCK_MONOTONIC:
+  case LINUX_CLOCK_MONOTONIC_RAW:
+  case LINUX_CLOCK_BOOTTIME:
+    /* Not settable on Linux either: a clock that only counts forward has no
+     * meaning for being placed somewhere. */
+    return -LINUX_EINVAL;
+  default:
+    return -LINUX_EINVAL;
   }
 }

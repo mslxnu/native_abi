@@ -435,6 +435,18 @@ guest-code cache sync.
   `0000` against a host `0600` — `/etc/shadow`'s exact shape — is *consistent*,
   and must still be refused. "Restrictive" is not the test; disagreement is.
 
+- `miscsystest` — `close_range`, `epoll_pwait2`, `execveat`, `fchmodat2`,
+  `adjtimex`, and the four that answer `ENOSYS`. Each is checked on what
+  distinguishes it from the call it resembles, which is where these go wrong:
+  `CLOSE_RANGE_CLOEXEC` **marks** rather than closes, so the descriptor must
+  still be readable afterwards; `epoll_pwait2`'s sub-millisecond timeout must
+  round *up*, since rounding down turns a short sleep into a busy loop;
+  `fchmodat2`'s `AT_SYMLINK_NOFOLLOW` must land on the link and leave the target
+  alone — the thing `fchmodat` never could do, and which this got wrong until the
+  lookup was told not to follow. It ends by exec'ing `/miscdone` through a
+  descriptor with `AT_EMPTY_PATH`, so the `misc ok` it prints comes from the
+  program `execveat` ran.
+
 The ELF binaries are committed prebuilt (as the x86 guest tests under
 `test/*/build/` are), so the check needs no cross-toolchain. The `.s` sources
 are here for reference; rebuild with an aarch64-linux clang + ld.lld:
