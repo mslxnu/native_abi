@@ -5,6 +5,10 @@
 [![Platform](https://img.shields.io/badge/Platform-macOS-lightgrey)](#requirements)
 [![Architecture](https://img.shields.io/badge/Architecture-arm64-blue)](#status)
 
+<p align="center">
+<img width="609" height="459" alt="nabi" src="https://github.com/user-attachments/assets/95c6b24b-caa3-457a-bfbc-106a0ee88c1d" />
+</p>
+
 **macOS Subsystem for Linux / Native ABI** — Linux binaries running as ordinary
 macOS processes.
 
@@ -27,9 +31,9 @@ replaced or omitted:
 | Piece | What it does | Where |
 |-------|--------------|-------|
 | **Syscall translation** | Linux system calls onto Darwin's, over `Hypervisor.framework` | **this repository** |
-| **Filesystem Hierarchy Standard** | The Linux filesystem layout, natively | [mSL/FHS](https://github.com/somestupidgirl/mSL-FHS) |
-| **procfs** | `/proc`, as a real filesystem | [mSL/ProcFS](https://github.com/somestupidgirl/mSL-ProcFS) |
-| **sysfs** | `/sys`, likewise | [mSL/SysFS](https://github.com/somestupidgirl/mSL-SysFS) |
+| **Filesystem Hierarchy Standard** | The Linux filesystem layout, natively | [mSL/FHS](https://github.com/mslxnu/fhs) |
+| **procfs** | `/proc`, as a real filesystem | [mSL/ProcFS](https://github.com/mslxnu/procfs) |
+| **sysfs** | `/sys`, likewise | [mSL/SysFS](https://github.com/mslxnu/sysfs) |
 | **devfs** | `/dev` — already part of macOS | XNU |
 
 **This repository is the ABI piece.** The rest of this document describes it.
