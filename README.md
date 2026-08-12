@@ -5,12 +5,12 @@
 [![Platform](https://img.shields.io/badge/Platform-macOS-lightgrey)](#requirements)
 [![Architecture](https://img.shields.io/badge/Architecture-arm64-blue)](#status)
 
-<p align="center">
-<img width="609" height="459" alt="nabi" src="https://github.com/user-attachments/assets/95c6b24b-caa3-457a-bfbc-106a0ee88c1d" />
-</p>
-
 **macOS Subsystem for Linux / Native ABI** — Linux binaries running as ordinary
 macOS processes.
+
+<p align="center">
+<img width="609" height="459" alt="nabi" src="https://github.com/mslxnu/native_abi/blob/master/.uploads/nabi.png" />
+</p>
 
 This is the main module of **mSL/XNU**, a modular macOS Subsystem for Linux.
 
