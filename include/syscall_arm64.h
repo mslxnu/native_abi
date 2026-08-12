@@ -97,7 +97,7 @@
   SYSCALL(88, utimensat) \
   SYSCALL(89, acct) \
   SYSCALL(90, capget) \
-  SYSCALL(91, unimplemented) \
+  SYSCALL(91, capset) \
   SYSCALL(92, unimplemented) \
   SYSCALL(93, exit) \
   SYSCALL(94, exit_group) \
@@ -111,8 +111,8 @@
   SYSCALL(102, getitimer) \
   SYSCALL(103, setitimer) \
   SYSCALL(104, kexec_load) \
-  SYSCALL(105, unimplemented) \
-  SYSCALL(106, unimplemented) \
+  SYSCALL(105, init_module) \
+  SYSCALL(106, delete_module) \
   SYSCALL(107, timer_create) \
   SYSCALL(108, timer_gettime) \
   SYSCALL(109, timer_getoverrun) \
@@ -174,7 +174,7 @@
   SYSCALL(165, getrusage) \
   SYSCALL(166, umask) \
   SYSCALL(167, prctl) \
-  SYSCALL(168, unimplemented) \
+  SYSCALL(168, getcpu) \
   SYSCALL(169, gettimeofday) \
   SYSCALL(170, unimplemented) \
   SYSCALL(171, adjtimex) \
@@ -279,7 +279,7 @@
   SYSCALL(270, process_vm_readv) \
   SYSCALL(271, process_vm_writev) \
   SYSCALL(272, kcmp) \
-  SYSCALL(273, unimplemented) \
+  SYSCALL(273, finit_module) \
   SYSCALL(274, unimplemented) \
   SYSCALL(275, unimplemented) \
   SYSCALL(276, unimplemented) \
@@ -457,7 +457,7 @@
   SYSCALL(448, process_mrelease) \
   SYSCALL(449, futex_waitv) \
   SYSCALL(450, unimplemented) \
-  SYSCALL(451, unimplemented) \
+  SYSCALL(451, cachestat) \
   SYSCALL(452, fchmodat2) \
   SYSCALL(453, unimplemented) \
   SYSCALL(454, futex_wake) \
@@ -465,9 +465,9 @@
   SYSCALL(456, futex_requeue) \
   SYSCALL(457, statmount) \
   SYSCALL(458, listmount) \
-  SYSCALL(459, unimplemented) \
-  SYSCALL(460, unimplemented) \
-  SYSCALL(461, unimplemented) \
+  SYSCALL(459, lsm_get_self_attr) \
+  SYSCALL(460, lsm_set_self_attr) \
+  SYSCALL(461, lsm_list_modules) \
   SYSCALL(462, unimplemented) \
   /* Numbers Linux has not allocated. Left explicitly empty so that the \
    * compat tail below cannot be mistaken for them. */ \
@@ -1040,46 +1040,50 @@
   SYSCALL(1028, chmod) \
   SYSCALL(1029, chown) \
   SYSCALL(1030, creat) \
-  SYSCALL(1031, dup2) \
-  SYSCALL(1032, epoll_create) \
-  SYSCALL(1033, epoll_ctl_old) \
-  SYSCALL(1034, epoll_wait) \
-  SYSCALL(1035, epoll_wait_old) \
-  SYSCALL(1036, eventfd) \
-  SYSCALL(1037, fork) \
-  SYSCALL(1038, get_thread_area) \
-  SYSCALL(1039, getdents) \
-  SYSCALL(1040, getpgrp) \
-  SYSCALL(1041, getpmsg) \
-  SYSCALL(1042, inotify_init) \
-  SYSCALL(1043, ioperm) \
-  SYSCALL(1044, iopl) \
-  SYSCALL(1045, lchown) \
-  SYSCALL(1046, link) \
-  SYSCALL(1047, lstat) \
-  SYSCALL(1048, mkdir) \
-  SYSCALL(1049, mknod) \
-  SYSCALL(1050, open) \
-  SYSCALL(1051, pipe) \
-  SYSCALL(1052, poll) \
-  SYSCALL(1053, putpmsg) \
-  SYSCALL(1054, readlink) \
-  SYSCALL(1055, rename) \
-  SYSCALL(1056, rmdir) \
-  SYSCALL(1057, security) \
-  SYSCALL(1058, select) \
-  SYSCALL(1059, set_thread_area) \
-  SYSCALL(1060, stat) \
-  SYSCALL(1061, symlink) \
-  SYSCALL(1062, sysfs) \
-  SYSCALL(1063, time) \
-  SYSCALL(1064, tuxcall) \
-  SYSCALL(1065, unimplemented) \
-  SYSCALL(1066, unlink) \
-  SYSCALL(1067, uselib) \
-  SYSCALL(1068, utime) \
-  SYSCALL(1069, utimes) \
-  SYSCALL(1070, vfork) \
-  SYSCALL(1071, vserver) \
+  SYSCALL(1031, create_module) \
+  SYSCALL(1032, dup2) \
+  SYSCALL(1033, epoll_create) \
+  SYSCALL(1034, epoll_ctl_old) \
+  SYSCALL(1035, epoll_wait) \
+  SYSCALL(1036, epoll_wait_old) \
+  SYSCALL(1037, eventfd) \
+  SYSCALL(1038, fork) \
+  SYSCALL(1039, futimesat) \
+  SYSCALL(1040, get_kernel_syms) \
+  SYSCALL(1041, get_thread_area) \
+  SYSCALL(1042, getdents) \
+  SYSCALL(1043, getpgrp) \
+  SYSCALL(1044, getpmsg) \
+  SYSCALL(1045, inotify_init) \
+  SYSCALL(1046, ioperm) \
+  SYSCALL(1047, iopl) \
+  SYSCALL(1048, lchown) \
+  SYSCALL(1049, link) \
+  SYSCALL(1050, lstat) \
+  SYSCALL(1051, mkdir) \
+  SYSCALL(1052, mknod) \
+  SYSCALL(1053, open) \
+  SYSCALL(1054, pipe) \
+  SYSCALL(1055, poll) \
+  SYSCALL(1056, putpmsg) \
+  SYSCALL(1057, query_module) \
+  SYSCALL(1058, readlink) \
+  SYSCALL(1059, rename) \
+  SYSCALL(1060, rmdir) \
+  SYSCALL(1061, security) \
+  SYSCALL(1062, select) \
+  SYSCALL(1063, set_thread_area) \
+  SYSCALL(1064, stat) \
+  SYSCALL(1065, symlink) \
+  SYSCALL(1066, sysfs) \
+  SYSCALL(1067, time) \
+  SYSCALL(1068, tuxcall) \
+  SYSCALL(1069, unimplemented) \
+  SYSCALL(1070, unlink) \
+  SYSCALL(1071, uselib) \
+  SYSCALL(1072, utime) \
+  SYSCALL(1073, utimes) \
+  SYSCALL(1074, vfork) \
+  SYSCALL(1075, vserver) \
 
-#define NR_SYSCALLS 1072
+#define NR_SYSCALLS 1076

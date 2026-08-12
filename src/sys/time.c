@@ -182,9 +182,65 @@ DEFINE_SYSCALL(utimensat, int, dirfd, gaddr_t, filename, gaddr_t, times_ptr, int
   return do_utimensat(dirfd, filename == 0 ? NULL : name, times_ptr == 0 ? NULL : l_times, flags);
 }
 
+/*
+ * The two that take timevals, and the conversion that was missing.
+ *
+ * utimes and futimesat carry `struct timeval[2]` - seconds and *micro*seconds -
+ * and utimensat carries `struct timespec[2]`, seconds and nanoseconds. The two
+ * are the same shape and different units, so utimes delegating straight to
+ * utimensat compiled, ran, and quietly recorded a microsecond count as a
+ * nanosecond one: a timestamp of x.500000 landed as x.000500. Only the
+ * sub-second part was wrong, which is why nothing noticed - and APFS stores
+ * nanoseconds, so it was wrong on disk and not merely in transit.
+ *
+ * futimesat is the same call with a directory descriptor. It is obsolete on
+ * Linux and was never given a libc wrapper, but it is still what a program
+ * built against old headers emits, and it needed this conversion written
+ * anyway - so both go through it.
+ */
+static int
+timevals_to_timespecs(gaddr_t times_ptr, struct l_timespec out[2], bool *have)
+{
+  *have = times_ptr != 0;
+  if (!*have)
+    return 0;                   /* no times means now, which do_utimensat does */
+
+  struct l_timeval tv[2];
+  if (copy_from_user(tv, times_ptr, sizeof tv))
+    return -LINUX_EFAULT;
+  /* Linux checks this before it touches the file, and so does this: a caller
+   * passing nanoseconds by mistake finds out here rather than in the mtime. */
+  for (int i = 0; i < 2; i++)
+    if (tv[i].tv_usec < 0 || tv[i].tv_usec >= 1000000)
+      return -LINUX_EINVAL;
+
+  for (int i = 0; i < 2; i++) {
+    out[i].tv_sec = tv[i].tv_sec;
+    out[i].tv_nsec = (l_long) tv[i].tv_usec * 1000;
+  }
+  return 0;
+}
+
+DEFINE_SYSCALL(futimesat, int, dirfd, gaddr_t, filename, gaddr_t, times_ptr)
+{
+  char name[LINUX_PATH_MAX];
+  if (filename == 0)
+    return -LINUX_EFAULT;       /* unlike utimensat, this one needs a path */
+  if (strncpy_from_user(name, filename, sizeof name) < 0)
+    return -LINUX_EFAULT;
+
+  struct l_timespec ts[2];
+  bool have;
+  int r = timevals_to_timespecs(times_ptr, ts, &have);
+  if (r < 0)
+    return r;
+
+  return do_utimensat(dirfd, name, have ? ts : NULL, 0);
+}
+
 DEFINE_SYSCALL(utimes, gaddr_t, filename, gaddr_t, times_ptr)
 {
-  return sys_utimensat(LINUX_AT_FDCWD, filename, times_ptr, 0);
+  return sys_futimesat(LINUX_AT_FDCWD, filename, times_ptr);
 }
 
 DEFINE_SYSCALL(utime, gaddr_t, path, gaddr_t, times)

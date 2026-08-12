@@ -5380,3 +5380,105 @@ hardware this machine does not have. `ENOSYS` rather than `EPERM`, because
 and there is nothing to acquire.
 
 280 of 375.
+
+### 3.5.101 cachestat, capabilities, and six that need a kernel
+
+Eleven calls, and the interesting part is how differently "there is no kernel
+here" lands on each of them.
+
+**cachestat can be answered, and it was worth checking rather than assuming.**
+It reports five numbers about a file range, and the first plan was to refuse it
+outright on the grounds that Darwin does not keep a page cache the way Linux
+does. That turned out to be wrong. `mincore` over a read-only shared mapping
+reports residency in the unified buffer cache and not the faults the mapping
+itself has taken: a file just written reads back fully resident through a
+mapping nothing has touched, and a file this process has never opened reads back
+as zero. That is the same quantity `nr_cache` counts. The measurement does not
+disturb what it measures, since nothing faults a `PROT_READ` mapping that is
+never read.
+
+Getting there took one wrong turn worth recording. The first experiment said
+`mincore` was reporting a constant 1024 pages whatever the file was doing, which
+looked like a hard limit and nearly ended the idea. It was not: Apple Silicon
+has 16KiB pages and the vector was being indexed in 4KiB units, so exactly one
+byte in four was being read. The same page size is why `cachestat`'s unit needs
+no conversion — the guest's `AT_PAGESZ` *is* `STAGE2_GRANULE` — and since that
+equality is load-bearing it is checked at runtime instead of assumed.
+
+The other four fields stay zero, and that is a real limitation rather than a
+tidy default: Darwin exposes no per-file dirty or writeback count and keeps no
+shadow entry for an evicted page. A caller reading `nr_dirty` gets a wrong
+answer. It is the one place in this batch where something is claimed that is not
+known, and it is claimed because `nr_cache` — the field the call is named for —
+is worth having.
+
+**capget was already marked implemented and was returning uninitialised memory.**
+It printed "capget is unimplemented", returned 0, and wrote nothing to the
+caller's buffer, so a program read back whatever its own stack held and believed
+it was the capability set. That is the AT_RANDOM fault again in a different
+place: a security-relevant answer made out of nothing, arriving with a success
+return that every caller checks.
+
+The model now is the one nabi implements everywhere else. Privilege here is
+`euid == 0`, so guest root holds every capability up to `CAP_LAST_CAP` and
+nobody else holds any — which makes capget agree with what a caller will find
+when it actually tries the operation. `capset` records what it is given, and
+enforces the two rules a caller can be wrong about: effective may not exceed
+permitted, and neither may gain a capability the process does not already hold.
+
+What it does *not* do is enforce the recorded set, and that gap should be
+stated rather than discovered. A daemon that drops `CAP_SYS_ADMIN` and stays uid
+0 will see the drop in capget and will still be allowed to mount. Making that
+real means every privileged check in nabi consulting a capability set instead of
+a uid, which is a larger change than this one. Recording is still strictly
+better than the two alternatives: refusing breaks daemons that treat a failed
+drop as fatal, and ignoring is how the round trip lies.
+
+**The version handshake matters more than it looks.** libcap calls capget with a
+version of 0 to discover which ABI to use, and expects the kernel to correct the
+header in place and fail. A capget that accepted anything would break that
+discovery in a way that only shows up later.
+
+**futimesat is x86-only, and adding it found a bug in utimes.** Neither call has
+an aarch64 number - every timestamp on this architecture goes through
+`utimensat` - so this is for the x86_64 table. Both carry `struct timeval`,
+seconds and *micro*seconds, and `utimensat` carries `struct timespec`, seconds
+and nanoseconds. The two are the same shape and different units, so `utimes`
+delegating straight to `utimensat` compiled, ran, and recorded a microsecond
+count as a nanosecond one: x.500000 landed as x.000500. Only the fractional part
+was wrong, which is why nothing noticed, and APFS stores nanoseconds, so it was
+wrong on disk rather than merely in transit.
+
+Being x86-only means the arm64 smoke suite cannot call either of them, and this
+host cannot run an x86_64 guest. What the test does check is the half that is
+reachable: that `do_utimensat` records the fractional second it is given rather
+than rounding it away, which is the sink both calls feed and without which the
+conversion would be pointless. The multiply itself is unexercised, and that is
+worth knowing.
+
+**getcpu has to ignore the host's answer.** `pthread_cpu_number_np` is real and
+returns a real core, and passing it on would be wrong: `sched_getaffinity`
+offers this guest exactly one CPU and `sched_setaffinity` rejects a mask without
+CPU 0 for that reason. A program that sizes a per-CPU array from its affinity
+mask and indexes it by `getcpu` would be handed a 6 by a machine that told it
+there was one CPU. Zero is the truthful answer in the only numbering the guest
+has. The smoke test checks it against the affinity mask rather than against a
+constant, which is what catches the host number being passed through.
+
+**The LSM three are answered rather than refused**, because "no module is
+loaded" is true and useful. `lsm_list_modules` reporting zero is exactly what a
+caller checking for SELinux or AppArmor needs; `ENOSYS` would send it off to
+`/proc/self/attr` to ask the same question again. The other two answer
+`EOPNOTSUPP`, which is what Linux says when no loaded module handles the
+attribute — here that is all of them.
+
+**And six module calls cannot exist.** A module is native code linked against a
+running kernel's symbols and run in its address space; what a guest is talking
+to is a userspace process translating syscalls. Six rather than the four asked
+for, because the family only makes sense together — refusing `finit_module`
+while `init_module` answered nothing at all would leave modprobe taking
+whichever path happened to look supported. Three of them (`create_module`,
+`get_kernel_syms`, `query_module`) Linux removed in 2.6 and answers `ENOSYS`
+for, so on those this agrees with the kernel exactly.
+
+287 of 375.

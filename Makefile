@@ -135,6 +135,7 @@ COMMON_SRCS := src/main.c \
                src/fs/aio.c \
                src/fs/io_uring.c \
                src/fs/copy.c \
+               src/fs/cachestat.c \
                src/fs/splice.c \
                src/fs/tee.c \
                src/sys/timer.c \

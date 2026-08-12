@@ -131,7 +131,7 @@
   SYSCALL(123, unimplemented) \
   SYSCALL(124, getsid) \
   SYSCALL(125, capget) \
-  SYSCALL(126, unimplemented) \
+  SYSCALL(126, capset) \
   SYSCALL(127, rt_sigpending) \
   SYSCALL(128, unimplemented) \
   SYSCALL(129, unimplemented) \
@@ -179,11 +179,11 @@
   SYSCALL(171, setdomainname) \
   SYSCALL(172, iopl) \
   SYSCALL(173, ioperm) \
-  SYSCALL(174, unimplemented) \
-  SYSCALL(175, unimplemented) \
-  SYSCALL(176, unimplemented) \
-  SYSCALL(177, unimplemented) \
-  SYSCALL(178, unimplemented) \
+  SYSCALL(174, create_module) \
+  SYSCALL(175, init_module) \
+  SYSCALL(176, delete_module) \
+  SYSCALL(177, get_kernel_syms) \
+  SYSCALL(178, query_module) \
   SYSCALL(179, unimplemented) \
   SYSCALL(180, nfsservctl) \
   SYSCALL(181, getpmsg) \
@@ -266,7 +266,7 @@
   SYSCALL(258, mkdirat) \
   SYSCALL(259, mknodat) \
   SYSCALL(260, fchownat) \
-  SYSCALL(261, unimplemented) \
+  SYSCALL(261, futimesat) \
   SYSCALL(262, newfstatat) \
   SYSCALL(263, unlinkat) \
   SYSCALL(264, renameat) \
@@ -314,11 +314,11 @@
   SYSCALL(306, syncfs) \
   SYSCALL(307, sendmmsg) \
   SYSCALL(308, setns) \
-  SYSCALL(309, unimplemented) \
+  SYSCALL(309, getcpu) \
   SYSCALL(310, process_vm_readv) \
   SYSCALL(311, process_vm_writev) \
   SYSCALL(312, kcmp) \
-  SYSCALL(313, unimplemented) \
+  SYSCALL(313, finit_module) \
   SYSCALL(314, unimplemented) \
   SYSCALL(315, unimplemented) \
   SYSCALL(316, unimplemented) \
@@ -456,7 +456,7 @@
   SYSCALL(448, process_mrelease) \
   SYSCALL(449, futex_waitv) \
   SYSCALL(450, unimplemented) \
-  SYSCALL(451, unimplemented) \
+  SYSCALL(451, cachestat) \
   SYSCALL(452, fchmodat2) \
   SYSCALL(453, unimplemented) \
   SYSCALL(454, futex_wake) \
@@ -464,9 +464,9 @@
   SYSCALL(456, futex_requeue) \
   SYSCALL(457, statmount) \
   SYSCALL(458, listmount) \
-  SYSCALL(459, unimplemented) \
-  SYSCALL(460, unimplemented) \
-  SYSCALL(461, unimplemented) \
+  SYSCALL(459, lsm_get_self_attr) \
+  SYSCALL(460, lsm_set_self_attr) \
+  SYSCALL(461, lsm_list_modules) \
   SYSCALL(462, unimplemented) \
 
 #define NR_SYSCALLS 463

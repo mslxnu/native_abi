@@ -802,6 +802,23 @@ else
     fail=1
 fi
 
+# captest: cachestat, capget/capset, getcpu and the LSM three. cachestat is
+# checked against a *sparse* file, because a file that is entirely cached cannot
+# tell an implementation that measures residency from one that just counts the
+# range - which is exactly how the first version of this test passed while
+# measuring nothing. capget is checked by poisoning the buffer first, since the
+# fault it replaces was a capget that returned success and wrote nothing at all.
+# getcpu is checked against the affinity mask, which offers one CPU: the host's
+# real core number is outside it.
+cp "$here/captest" "$root/"; chmod +x "$root/captest"
+out=$("$NABI" -m "$root" /captest); rc=$?
+if [ "$rc" -eq 0 ] && [ "$out" = "cap ok" ]; then
+    echo "  ok  captest -> \"$out\", exit 0"
+else
+    echo "  FAIL captest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 if [ "$fail" -eq 0 ]; then
     echo "smoke: PASS"
 else

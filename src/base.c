@@ -259,6 +259,33 @@ DEFINE_NOT_IMPLEMENTED_SYSCALL(acct)
 DEFINE_NOT_IMPLEMENTED_SYSCALL(kexec_load)
 DEFINE_NOT_IMPLEMENTED_SYSCALL(kexec_file_load)
 
+/*
+ * Loading kernel modules, all six of them.
+ *
+ * There is no kernel to load one into. That is the whole answer, and unlike
+ * most of the refusals here it is not a Darwin limitation that a different host
+ * might lift: a module is native code linked against a running kernel's symbols
+ * and run in its address space, and what a guest is talking to is nabi, a
+ * userspace process translating syscalls. An aarch64 Linux module has nothing
+ * to be loaded into even in principle.
+ *
+ * All six rather than the four that were asked for, because the family only
+ * makes sense together: refusing finit_module while init_module answered
+ * nothing at all would leave modprobe taking whichever path happened to look
+ * supported. create_module, get_kernel_syms and query_module are additionally
+ * ones Linux itself removed in 2.6 and answers ENOSYS for, so on those three
+ * this agrees with the kernel exactly.
+ *
+ * ENOSYS is what modprobe and the udev/kmod stack expect from a kernel built
+ * without module support, and they degrade the way they were written to.
+ */
+DEFINE_NOT_IMPLEMENTED_SYSCALL(init_module)
+DEFINE_NOT_IMPLEMENTED_SYSCALL(finit_module)
+DEFINE_NOT_IMPLEMENTED_SYSCALL(delete_module)
+DEFINE_NOT_IMPLEMENTED_SYSCALL(create_module)
+DEFINE_NOT_IMPLEMENTED_SYSCALL(get_kernel_syms)
+DEFINE_NOT_IMPLEMENTED_SYSCALL(query_module)
+
 DEFINE_NOT_IMPLEMENTED_SYSCALL(vserver)
 DEFINE_NOT_IMPLEMENTED_SYSCALL(uselib)
 DEFINE_NOT_IMPLEMENTED_SYSCALL(epoll_ctl_old)

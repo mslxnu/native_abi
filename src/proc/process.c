@@ -22,6 +22,7 @@
 #include "namespace.h"
 #include "linux/errno.h"
 #include "linux/futex.h"
+#include "linux/capability.h"
 
 #include <sys/sysctl.h>
 
@@ -743,9 +744,266 @@ DEFINE_SYSCALL(tkill, l_pid_t, tid, int, sig)
   return send_signal(h, sig);
 }
 
+/*
+ * Capabilities: reported from the credentials, recorded when set, and not
+ * separately enforced.
+ *
+ * What was here before returned 0 and wrote nothing, so a caller read back
+ * whatever its own buffer happened to hold and believed it was the capability
+ * set. That is the same fault AT_RANDOM had - a security-relevant answer made
+ * out of uninitialised memory - and it is worse than saying nothing, because
+ * every caller checks the return value and none of them checks that the kernel
+ * bothered.
+ *
+ * The model is the one nabi actually implements everywhere else: privilege here
+ * is `euid == 0`, so guest root holds every capability and nobody else holds
+ * any. That is not an approximation of the credentials, it *is* them, and it
+ * makes capget agree with what a caller will find when it tries the operation.
+ *
+ * capset records what it is given rather than enforcing it, and that gap is
+ * worth stating plainly: a daemon that drops CAP_SYS_ADMIN and stays uid 0 will
+ * see the drop in capget, and will still be allowed to mount. Enforcing it
+ * would mean every privileged check in nabi consulting a capability set instead
+ * of the uid, which is a larger change than this. Recording is still better
+ * than refusing - a program that drops privileges and verifies the drop gets a
+ * consistent answer instead of an error it treats as fatal - and better than
+ * ignoring, which is how the round trip silently lies.
+ */
+static uint64_t cap_effective   = ~0ULL;
+static uint64_t cap_permitted   = ~0ULL;
+static uint64_t cap_inheritable = 0;
+static pthread_mutex_t cap_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* The whole set, bounded by the last capability that exists. */
+#define CAP_FULL_SET  ((LINUX_CAP_LAST_CAP >= 63) ? ~0ULL \
+                       : ((1ULL << (LINUX_CAP_LAST_CAP + 1)) - 1))
+
+/*
+ * Which ABI version the header names, or 0.
+ *
+ * A version this cannot serve is corrected in place and the call fails, which
+ * is the probe libcap performs before it does anything else: capget with
+ * version 0 is how it learns which one to use.
+ */
+static int
+cap_version(gaddr_t header_ptr, struct l_user_cap_header *hdr, int *nwords)
+{
+  if (copy_from_user(hdr, header_ptr, sizeof *hdr))
+    return -LINUX_EFAULT;
+
+  switch (hdr->version) {
+  case LINUX_CAPABILITY_VERSION_1:
+    *nwords = LINUX_CAPABILITY_U32S_1;
+    return 0;
+  case LINUX_CAPABILITY_VERSION_2:
+  case LINUX_CAPABILITY_VERSION_3:
+    *nwords = LINUX_CAPABILITY_U32S_3;
+    return 0;
+  default:
+    hdr->version = LINUX_CAPABILITY_VERSION_3;
+    if (copy_to_user(header_ptr, hdr, sizeof *hdr))
+      return -LINUX_EFAULT;
+    return -LINUX_EINVAL;
+  }
+}
+
+/*
+ * Only this process, its threads, or 0 meaning the caller.
+ *
+ * Linux allows reading another process's capabilities and refuses to set them
+ * from outside; here there is nothing to read, for the reason process_vm_readv
+ * documents, so both are ESRCH rather than a set belonging to nobody.
+ */
+static int
+cap_check_pid(int32_t pid)
+{
+  if (pid < 0)
+    return -LINUX_EINVAL;
+  if (pid == 0)
+    return 0;
+  pid_t h = pidns_to_host(pid);
+  if (h < 0 || h != getpid())
+    return -LINUX_ESRCH;
+  return 0;
+}
+
 DEFINE_SYSCALL(capget, gaddr_t, header_ptr, gaddr_t, data_ptr)
 {
-  printk("capget is unimplemented\n");
+  struct l_user_cap_header hdr;
+  int nwords, r;
+  if ((r = cap_version(header_ptr, &hdr, &nwords)) < 0)
+    return r;
+  if ((r = cap_check_pid(hdr.pid)) < 0)
+    return r;
+
+  /* A null data pointer is the version probe, and it has already been served. */
+  if (data_ptr == 0)
+    return 0;
+
+  uint64_t eff, perm, inh;
+  pthread_mutex_lock(&cap_lock);
+  bool root;
+  pthread_rwlock_rdlock(&proc.cred.lock);
+  root = proc.cred.euid == 0;
+  pthread_rwlock_unlock(&proc.cred.lock);
+  /*
+   * Not root means not capable, whatever was recorded - the recorded set is a
+   * ceiling a process lowered for itself, not a way to hold a capability the
+   * credentials do not give it.
+   */
+  eff  = root ? (cap_effective   & CAP_FULL_SET) : 0;
+  perm = root ? (cap_permitted   & CAP_FULL_SET) : 0;
+  inh  = root ? (cap_inheritable & CAP_FULL_SET) : 0;
+  pthread_mutex_unlock(&cap_lock);
+
+  struct l_user_cap_data data[LINUX_CAPABILITY_U32S_3] = {{0, 0, 0}, {0, 0, 0}};
+  data[0].effective   = (uint32_t) eff;
+  data[0].permitted   = (uint32_t) perm;
+  data[0].inheritable = (uint32_t) inh;
+  if (nwords > 1) {
+    data[1].effective   = (uint32_t) (eff  >> 32);
+    data[1].permitted   = (uint32_t) (perm >> 32);
+    data[1].inheritable = (uint32_t) (inh  >> 32);
+  }
+  if (copy_to_user(data_ptr, data, sizeof data[0] * nwords))
+    return -LINUX_EFAULT;
+  return 0;
+}
+
+DEFINE_SYSCALL(capset, gaddr_t, header_ptr, gaddr_t, data_ptr)
+{
+  struct l_user_cap_header hdr;
+  int nwords, r;
+  if ((r = cap_version(header_ptr, &hdr, &nwords)) < 0)
+    return r;
+  /* Setting another process's capabilities has never been allowed. */
+  if (hdr.pid != 0 && (r = cap_check_pid(hdr.pid)) < 0)
+    return r;
+  if (data_ptr == 0)
+    return -LINUX_EFAULT;
+
+  struct l_user_cap_data data[LINUX_CAPABILITY_U32S_3] = {{0, 0, 0}, {0, 0, 0}};
+  if (copy_from_user(data, data_ptr, sizeof data[0] * nwords))
+    return -LINUX_EFAULT;
+
+  uint64_t eff  = data[0].effective;
+  uint64_t perm = data[0].permitted;
+  uint64_t inh  = data[0].inheritable;
+  if (nwords > 1) {
+    eff  |= (uint64_t) data[1].effective   << 32;
+    perm |= (uint64_t) data[1].permitted   << 32;
+    inh  |= (uint64_t) data[1].inheritable << 32;
+  }
+
+  bool root;
+  pthread_rwlock_rdlock(&proc.cred.lock);
+  root = proc.cred.euid == 0;
+  pthread_rwlock_unlock(&proc.cred.lock);
+  if (!root)
+    return -LINUX_EPERM;
+
+  pthread_mutex_lock(&cap_lock);
+  /*
+   * The two rules Linux enforces and a caller can be wrong about: the effective
+   * set cannot exceed the permitted one, and neither may gain a capability the
+   * process does not already hold. A set is a thing you drop.
+   */
+  int ret = 0;
+  if ((eff & ~perm) || (perm & ~cap_permitted) || (inh & ~cap_permitted)) {
+    ret = -LINUX_EPERM;
+  } else {
+    cap_permitted   = perm & CAP_FULL_SET;
+    cap_effective   = eff  & CAP_FULL_SET;
+    cap_inheritable = inh  & CAP_FULL_SET;
+  }
+  pthread_mutex_unlock(&cap_lock);
+  return ret;
+}
+
+/*
+ * The LSM calls, answered rather than refused, because "no module is loaded" is
+ * a true and useful thing to be told.
+ *
+ * These arrived in 6.8 so a program could ask which security modules are active
+ * without parsing /sys/kernel/security. Here the answer is none: there is no
+ * kernel to load one into, so nothing labels a process and nothing has an
+ * attribute to read or set. ENOSYS would say the *calls* are missing, which
+ * would send a caller off to the older per-module interfaces - /proc/self/attr
+ * and the rest - to ask the same question again and get the same nothing.
+ *
+ * lsm_list_modules reporting zero is what a caller checking for SELinux or
+ * AppArmor needs, and it is not an approximation. The other two answer
+ * EOPNOTSUPP, which is what Linux itself answers when no loaded module handles
+ * the attribute - here that is all of them.
+ */
+DEFINE_SYSCALL(lsm_list_modules, gaddr_t, ids_ptr, gaddr_t, size_ptr, uint32_t, flags)
+{
+  if (flags != 0)
+    return -LINUX_EINVAL;
+  if (size_ptr == 0)
+    return -LINUX_EFAULT;
+
+  uint32_t size;
+  if (copy_from_user(&size, size_ptr, sizeof size))
+    return -LINUX_EFAULT;
+  /* Nothing to list, so nothing is needed to list it into. Written back
+   * whatever was asked for, because that is the caller's answer. */
+  size = 0;
+  if (copy_to_user(size_ptr, &size, sizeof size))
+    return -LINUX_EFAULT;
+  (void) ids_ptr;
+  return 0;             /* the number of modules, which is the point */
+}
+
+DEFINE_SYSCALL(lsm_get_self_attr, uint32_t, attr, gaddr_t, ctx_ptr,
+               gaddr_t, size_ptr, uint32_t, flags)
+{
+  if (attr == 0)                /* LSM_ATTR_UNDEF names nothing */
+    return -LINUX_EINVAL;
+  if (size_ptr == 0)
+    return -LINUX_EFAULT;
+  uint32_t size;
+  if (copy_from_user(&size, size_ptr, sizeof size))
+    return -LINUX_EFAULT;
+  (void) ctx_ptr; (void) flags;
+  return -LINUX_EOPNOTSUPP;     /* no module supplies it, because there is none */
+}
+
+DEFINE_SYSCALL(lsm_set_self_attr, uint32_t, attr, gaddr_t, ctx_ptr,
+               uint32_t, size, uint32_t, flags)
+{
+  if (attr == 0 || flags != 0)
+    return -LINUX_EINVAL;
+  if (ctx_ptr == 0 || size == 0)
+    return -LINUX_EINVAL;
+  return -LINUX_EOPNOTSUPP;
+}
+
+/*
+ * getcpu: which CPU, in the guest's numbering rather than the host's.
+ *
+ * The host will answer this - pthread_cpu_number_np is real and returns a real
+ * core - and that answer would be wrong to pass on. sched_getaffinity offers
+ * this guest exactly one CPU, and sched_setaffinity rejects a mask without CPU
+ * 0 for that reason; a program that sizes a per-CPU array from its affinity
+ * mask and then indexes it by getcpu would be handed a 4 by a machine that told
+ * it there was one CPU. Zero is not a fudge here, it is the truthful answer in
+ * the only numbering the guest has been given.
+ *
+ * The node is zero for the same kind of reason and with none of the doubt:
+ * there is one memory node, and it is node 0.
+ *
+ * Both pointers are optional, and the third argument has been ignored by Linux
+ * since 2.6.24 - it was a per-thread cache that no longer exists.
+ */
+DEFINE_SYSCALL(getcpu, gaddr_t, cpu_ptr, gaddr_t, node_ptr, gaddr_t, tcache)
+{
+  uint32_t zero = 0;
+  if (cpu_ptr != 0 && copy_to_user(cpu_ptr, &zero, sizeof zero))
+    return -LINUX_EFAULT;
+  if (node_ptr != 0 && copy_to_user(node_ptr, &zero, sizeof zero))
+    return -LINUX_EFAULT;
+  (void) tcache;
   return 0;
 }
 
