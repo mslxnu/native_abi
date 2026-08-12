@@ -5681,3 +5681,74 @@ the arm64 suite cannot call it; it is the same wait loop `rt_sigsuspend` uses,
 and that one is reachable.
 
 303 of 375.
+
+### 3.5.104 A flag that was never accepted, and a chown that never happened
+
+A field report: on a fresh Fedora 43 tree, `dnf install waydroid` came apart.
+Every package that creates a system user failed its `%sysusers` scriptlet, the
+transaction rolled back, and the message was the same each time:
+
+    Failed to copy permissions from /etc/group to /etc/.#group3b88ba9dd9e81906:
+
+dnf truncated the line at the terminal width, which took the `%m` off the end -
+so the one piece of information that mattered, the errno, was missing. Reading
+it as written, it looks like an ownership or a mode problem, and that is where
+the first look went.
+
+Running `systemd-sysusers` directly under nabi printed the whole line:
+`Invalid argument`. And nabi's own strace named the call:
+
+    fchmodat2(dirfd: 27, path_ptr: "", mode: 0644, flags: 0x1000) = -EINVAL
+
+`0x1000` is `AT_EMPTY_PATH`. systemd's `copy_rights()` sets the mode of a
+temporary file by descriptor, which is what `fchmodat2` was added to Linux to
+make possible - `fchmod` cannot take an `O_PATH` descriptor, and the old dance
+through `/proc/self/fd` needs `/proc` mounted. nabi's `fchmodat2` accepted
+`AT_SYMLINK_NOFOLLOW` and refused everything else, which is a flags check
+written for the flag the call was implemented *for* rather than for the flags it
+has.
+
+**The second wall was found by looking rather than by hitting it.** systemd's
+`fchmod_and_chown` sets a mode and an owner on one descriptor together, so
+`fchownat` was going to be asked the same thing one line later - and it had the
+same narrow check. Fixing only the first would have moved the failure by a line.
+
+**And the third was found by the test.** Routing `fchownat`'s empty-path form to
+`fchown` made it succeed and change nothing, because `darwinfs_fchown` was a
+no-op:
+
+    static bool
+    chown_is_noop(l_uid_t uid, l_gid_t gid)
+    {
+      (void) uid; (void) gid;
+      return true;
+    }
+
+The comment above it explained that ownership cannot persist, since every file
+the guest sees is really owned by the one account nabi runs as. That was true
+when it was written. It stopped being true when guest ownership arrived:
+`fchownat` records the guest's answer in `msl.nabi.owner` and `stat` reads it
+back through `guest_owner_overlay`. Only the by-descriptor form was left on the
+old model, so `chown` on a path persisted, `fchown` on the same file did not,
+and both returned 0 - so nothing in the guest could tell which it had used. The
+read side by descriptor already existed (`guest_owner_overlay_fd`, via
+`fgetxattr`); it was only the write side that was missing.
+
+Recording by descriptor rather than by looking the path up is also the better
+half of the pair, since it keeps working for a file that has already been
+unlinked - which is what a program building a file atomically is holding.
+
+**The near-miss is worth recording too.** `AT_FDCWD` with an empty path means
+the working directory rather than descriptor -100, so that case rewrites the
+path to `"."`. The first version of the fix did the rewrite and then handed
+`sys_fchmodat` the guest's *own* pointer, re-reading the empty string it had
+just replaced. It compiled, and the ordinary cases all passed. Factoring
+`do_fchmodat` to take the string is what made the rewrite reach the lookup, and
+that case is in the test because a wrong answer there is silent.
+
+The test checks the mode and the owner actually *changing*, not the calls
+returning 0. A stub that accepted `AT_EMPTY_PATH` and did nothing would have
+satisfied systemd completely and left every file it touched at the temporary
+0600 - which is a worse failure than the EINVAL, because nothing reports it.
+
+No new syscalls: 303 of 375.

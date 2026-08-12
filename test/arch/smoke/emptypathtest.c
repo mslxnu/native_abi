@@ -16,6 +16,24 @@
  *
  * The check is that the answer matches fstat on the same descriptor, not just
  * that the call returns 0: a stat of the wrong object would also succeed.
+ *
+ * ---------------------------------------------------------------------------
+ *
+ * fchmodat2 and fchownat, added later, are the same flag on the calls that
+ * *change* a file rather than read it - and they arrived the same way, from a
+ * field report whose message pointed somewhere else.
+ *
+ * On a fresh Fedora 43 tree, `dnf install` failed every %sysusers scriptlet
+ * with "Failed to copy permissions from /etc/group to /etc/.#groupXXXX:", so
+ * any package that creates a system user rolled the transaction back. dnf cut
+ * the line off at the terminal width, taking the errno with it; it was EINVAL,
+ * from fchmodat2 refusing AT_EMPTY_PATH. systemd sets a temporary file's mode
+ * by descriptor, which is the thing fchmodat2 exists for.
+ *
+ * These checks are on the mode and the owner actually changing, not on the
+ * calls returning 0. A stub that accepted the flag and did nothing would have
+ * satisfied systemd completely and left every file at its temporary 0600 -
+ * which is a worse failure than the EINVAL, because nothing reports it.
  */
 static long sys6(long n,long a,long b,long c,long d,long e,long f){
   register long x8 asm("x8")=n; register long x0 asm("x0")=a; register long x1 asm("x1")=b;
@@ -30,12 +48,23 @@ static long sys6(long n,long a,long b,long c,long d,long e,long f){
 #define SYS_newfstatat 79
 #define SYS_statx 291
 #define SYS_unlinkat 35
+#define SYS_fchmodat2 452
+#define SYS_fchownat 54
+#define SYS_symlinkat 36
+#define SYS_mkdirat 34
+#define SYS_chdir 49
 #define AT_FDCWD -100
 #define AT_EMPTY_PATH 0x1000
 #define O_RDONLY 0
 #define O_WRONLY 1
 #define O_CREAT 0100
 #define O_TRUNC 01000
+#define O_RDWR 2
+#define AT_SYMLINK_NOFOLLOW 0x100
+#define AT_REMOVEDIR 0x200
+#define ENOENT 2
+#define EBADF 9
+#define EINVAL 22
 
 /* Only the fields compared below are named; the rest is padding to the real
  * size so the kernel has somewhere to write. */
@@ -101,6 +130,96 @@ void _start(void)
 
   sys6(SYS_close, fd, 0,0,0,0,0);
   sys6(SYS_unlinkat, AT_FDCWD, (long) "/emptypath.tmp", 0, 0, 0, 0);
+
+  /* ======================================================================
+   * fchmodat2 and fchownat: the same flag, on the calls that change a file.
+   * ====================================================================== */
+  {
+    const char *path = "/emptypath.chmod";
+    fd = sys6(SYS_openat, AT_FDCWD, (long) path, O_RDWR|O_CREAT|O_TRUNC, 0600, 0, 0);
+    if (fd < 0) fail("create for fchmodat2", fd);
+    if ((sys6(SYS_fstat, fd, (long) &ref, 0,0,0,0)) < 0) fail("fstat", -1);
+    if ((ref.mode & 07777) != 0600) fail("the file did not start at 0600", ref.mode & 07777);
+
+    /* Still refused: a flag that does not exist, and an empty path without the
+     * flag - so it is AT_EMPTY_PATH that enables this and not the empty string. */
+    r = sys6(SYS_fchmodat2, fd, (long) "", 0644, 0x40, 0, 0);
+    if (r != -EINVAL) fail("fchmodat2 with a flag that does not exist", r);
+    r = sys6(SYS_fchmodat2, fd, (long) "", 0644, 0, 0, 0);
+    if (r != -ENOENT) fail("fchmodat2 empty path without AT_EMPTY_PATH", r);
+    sys6(SYS_fstat, fd, (long) &ref, 0,0,0,0);
+    if ((ref.mode & 07777) != 0600) fail("a refused fchmodat2 changed the mode", ref.mode & 07777);
+
+    /* The form the Fedora failure was about. Twice, to different modes, so a
+     * coincidence cannot pass for an answer. */
+    r = sys6(SYS_fchmodat2, fd, (long) "", 0644, AT_EMPTY_PATH, 0, 0);
+    if (r != 0) fail("fchmodat2 AT_EMPTY_PATH", r);
+    sys6(SYS_fstat, fd, (long) &ref, 0,0,0,0);
+    if ((ref.mode & 07777) != 0644) fail("fchmodat2 AT_EMPTY_PATH did not set 0644", ref.mode & 07777);
+    r = sys6(SYS_fchmodat2, fd, (long) "", 0751, AT_EMPTY_PATH, 0, 0);
+    if (r != 0) fail("fchmodat2 AT_EMPTY_PATH, second time", r);
+    sys6(SYS_fstat, fd, (long) &ref, 0,0,0,0);
+    if ((ref.mode & 07777) != 0751) fail("fchmodat2 AT_EMPTY_PATH did not set 0751", ref.mode & 07777);
+
+    r = sys6(SYS_fchmodat2, 999, (long) "", 0644, AT_EMPTY_PATH, 0, 0);
+    if (r != -EBADF) fail("fchmodat2 AT_EMPTY_PATH on a closed descriptor", r);
+
+    /* fchownat is the other half of systemd's fchmod_and_chown, and routing it
+     * here is what exposed fchown recording nothing at all. */
+    r = sys6(SYS_fchownat, fd, (long) "", 1000, 1000, AT_EMPTY_PATH, 0);
+    if (r != 0) fail("fchownat AT_EMPTY_PATH", r);
+    sys6(SYS_fstat, fd, (long) &ref, 0,0,0,0);
+    if (ref.uid != 1000) fail("fchownat AT_EMPTY_PATH did not change the owner", ref.uid);
+    if (ref.gid != 1000) fail("fchownat AT_EMPTY_PATH did not change the group", ref.gid);
+
+    r = sys6(SYS_fchownat, fd, (long) "", 0, 0, AT_EMPTY_PATH, 0);
+    if (r != 0) fail("fchownat AT_EMPTY_PATH back to root", r);
+    sys6(SYS_fstat, fd, (long) &ref, 0,0,0,0);
+    if (ref.uid != 0) fail("fchownat AT_EMPTY_PATH did not take the second time", ref.uid);
+
+    r = sys6(SYS_fchownat, fd, (long) "", 0, 0, 0, 0);
+    if (r != -ENOENT) fail("fchownat empty path without AT_EMPTY_PATH", r);
+    r = sys6(SYS_fchownat, fd, (long) "", 0, 0, 0x40, 0);
+    if (r != -EINVAL) fail("fchownat with a flag that does not exist", r);
+    sys6(SYS_close, fd, 0,0,0,0,0);
+
+    /* The ordinary paths, which making room for the flag could have broken. */
+    r = sys6(SYS_fchmodat2, AT_FDCWD, (long) path, 0640, 0, 0, 0);
+    if (r != 0) fail("fchmodat2 with a real path", r);
+    r = sys6(SYS_newfstatat, AT_FDCWD, (long) path, (long) &st, 0, 0, 0);
+    if (r != 0 || (st.mode & 07777) != 0640) fail("fchmodat2 with a real path did not take", st.mode & 07777);
+
+    /* AT_SYMLINK_NOFOLLOW still lands on the link, not on what it names. */
+    r = sys6(SYS_symlinkat, (long) path, AT_FDCWD, (long) "/emptypath.link", 0, 0, 0);
+    if (r != 0) fail("symlinkat", r);
+    r = sys6(SYS_fchmodat2, AT_FDCWD, (long) "/emptypath.link", 0777, AT_SYMLINK_NOFOLLOW, 0, 0);
+    if (r != 0) fail("fchmodat2 AT_SYMLINK_NOFOLLOW", r);
+    r = sys6(SYS_newfstatat, AT_FDCWD, (long) path, (long) &st, 0, 0, 0);
+    if (r != 0 || (st.mode & 07777) != 0640) fail("AT_SYMLINK_NOFOLLOW put the mode on the target", st.mode & 07777);
+    sys6(SYS_unlinkat, AT_FDCWD, (long) "/emptypath.link", 0, 0, 0, 0);
+    sys6(SYS_unlinkat, AT_FDCWD, (long) path, 0, 0, 0, 0);
+  }
+
+  /*
+   * AT_FDCWD with an empty path is the working directory - the same rule the
+   * fstatat check above relies on, now on a call that writes. The first version
+   * of this rewrote the path to "." and then handed the lookup the guest's own
+   * pointer, re-reading the empty string it had just replaced; it compiled, and
+   * every other case passed.
+   */
+  {
+    r = sys6(SYS_mkdirat, AT_FDCWD, (long) "/emptypath.dir", 0755, 0, 0, 0);
+    if (r != 0) fail("mkdirat", r);
+    if ((r = sys6(SYS_chdir, (long) "/emptypath.dir", 0,0,0,0,0)) != 0) fail("chdir", r);
+    r = sys6(SYS_fchmodat2, AT_FDCWD, (long) "", 0700, AT_EMPTY_PATH, 0, 0);
+    if (r != 0) fail("fchmodat2 AT_FDCWD with an empty path", r);
+    if ((r = sys6(SYS_chdir, (long) "/", 0,0,0,0,0)) != 0) fail("chdir back", r);
+    r = sys6(SYS_newfstatat, AT_FDCWD, (long) "/emptypath.dir", (long) &st, 0, 0, 0);
+    if (r != 0 || (st.mode & 07777) != 0700)
+      fail("AT_FDCWD with an empty path did not reach the working directory", st.mode & 07777);
+    sys6(SYS_unlinkat, AT_FDCWD, (long) "/emptypath.dir", AT_REMOVEDIR, 0, 0, 0);
+  }
+
   put("emptypath ok\n");
   sys6(SYS_exit, 0, 0,0,0,0,0);
 }

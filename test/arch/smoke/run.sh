@@ -290,8 +290,12 @@ else
     fail=1
 fi
 
-# emptypathtest: statx and fstatat accept AT_EMPTY_PATH, which is how Rust's
-# standard library stats every file it opens.
+# emptypathtest: AT_EMPTY_PATH, on the calls that read a file and on the ones
+# that change it. statx and fstatat are how Rust's standard library stats every
+# file it opens; fchmodat2 and fchownat are how systemd sets the mode and owner
+# of a temporary file by descriptor, which is what every %sysusers scriptlet in
+# a Fedora dnf transaction does - and which used to answer EINVAL. The mode and
+# owner are checked for actually changing, not for the call returning 0.
 cp "$here/emptypathtest" "$root/"; chmod +x "$root/emptypathtest"
 out=$("$NABI" -m "$root" /emptypathtest); rc=$?
 if [ "$rc" -eq 0 ] && [ "$out" = "emptypath ok" ]; then

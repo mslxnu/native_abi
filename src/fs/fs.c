@@ -1587,34 +1587,93 @@ darwinfs_fstat(struct file *file, struct l_newstat *l_st)
   return ret;
 }
 
+/* Defined further down, beside the other credential checks. */
+static bool cred_is_root(void);
+
 /*
- * Turn a chown the guest asked for into one the host can perform.
+ * Record an owner against a descriptor rather than a name.
  *
- * Every file the guest can see is really owned by the one account NABI runs as,
- * so there is no ownership to change: the guest's uids are names for a thing
- * the host filesystem does not have. Accepting and doing nothing is the honest
- * end of that - Darwin reserves chown for the superuser, so passing it on fails
- * with EPERM, and both dpkg and apt treat that as a broken unpack rather than a
- * missing capability. dpkg chowns nearly everything to root:root, apt chowns
- * its partial downloads to _apt.
- *
- * What is lost is that ownership does not persist: chown to _apt then stat
- * reads back root. Nothing in a single-account world could make it read back
- * otherwise, and a guest that is root is entitled to be told its chown worked.
+ * The read side of this has always existed - guest_owner_overlay_fd pulls the
+ * attribute back out with fgetxattr - and the write side did not, which is why
+ * fchown was a no-op that reported success for as long as it was. Doing it by
+ * descriptor rather than by looking the path up keeps it working for a file
+ * that has already been unlinked, which is what a program building a file
+ * atomically is holding.
  */
-static bool
-chown_is_noop(l_uid_t uid, l_gid_t gid)
+static int
+guest_owner_record_fd(int fd, l_uid_t uid, l_gid_t gid)
 {
-  (void) uid; (void) gid;
-  return true;
+  struct guest_owner o = { 0, 0 };
+  if (fgetxattr(fd, GUEST_OWNER_XATTR, &o, sizeof o, 0, 0) != (ssize_t) sizeof o)
+    o = (struct guest_owner){ 0, 0 };   /* keep whatever is not changing */
+  if (uid != (l_uid_t) -1) o.uid = uid;
+  if (gid != (l_gid_t) -1) o.gid = gid;
+
+  /* Back to root removes the attribute, so that it says something only when
+   * the answer differs from the host's. */
+  if (o.uid == 0 && o.gid == 0) {
+    fremovexattr(fd, GUEST_OWNER_XATTR, 0);
+    return 0;
+  }
+  if (fsetxattr(fd, GUEST_OWNER_XATTR, &o, sizeof o, 0, 0) == 0)
+    return 0;
+
+  /*
+   * The same allowance the path form makes, for the same reason: a host object
+   * carries no extended attributes, and telling a guest that is root it may not
+   * chown a pty is what stopped `sudo id` working. A descriptor with no name at
+   * all is accepted too - nothing can look up the ownership of a file that
+   * cannot be named.
+   */
+  char abs[PATH_MAX];
+  if (fcntl(fd, F_GETPATH, abs) < 0)
+    return 0;
+  if (is_host_passthrough(abs) && (errno == EPERM || errno == ENOTSUP))
+    return 0;
+  return -darwin_to_linux_errno(errno);
 }
 
+/*
+ * fchown, which used to accept everything and do nothing.
+ *
+ * The comment that stood here said ownership could not persist, because every
+ * file the guest sees is really owned by the one account nabi runs as. That was
+ * true when it was written and stopped being true when guest ownership arrived:
+ * fchownat has recorded the guest's answer in an extended attribute ever since,
+ * and stat reads it back. Only the by-descriptor form was left behind, so
+ * `chown` on a path persisted and fchown on the same file did not - and fchown
+ * still returned 0, so nothing said which of the two a program had used.
+ *
+ * That mattered here beyond tidiness. systemd sets a mode and an owner on one
+ * descriptor together, so the AT_EMPTY_PATH form of fchownat added alongside
+ * this lands on exactly this function; leaving it a no-op would have made the
+ * new path succeed and change nothing, which is worse than the EINVAL it
+ * replaced.
+ */
 int
 darwinfs_fchown(struct file *file, l_uid_t uid, l_gid_t gid)
 {
-  if (chown_is_noop(uid, gid))
-    return 0;
-  return syswrap(fchown(file->fd, guest_uid_to_host(uid), guest_gid_to_host(gid)));
+  /*
+   * Who may, matching fchownat: only root gives a file to somebody else, and an
+   * owner may change the group only to one they belong to.
+   */
+  if (!cred_is_root()) {
+    struct l_newstat st;
+    int r = darwinfs_fstat(file, &st);
+    if (r < 0)
+      return r;
+    l_uid_t euid;
+    pthread_rwlock_rdlock(&proc.cred.lock);
+    euid = proc.cred.euid;
+    pthread_rwlock_unlock(&proc.cred.lock);
+    if (st.st_uid != euid)
+      return -LINUX_EPERM;
+    if (uid != (l_uid_t) -1 && uid != st.st_uid)
+      return -LINUX_EPERM;
+    if (gid != (l_gid_t) -1 && !guest_in_group(gid))
+      return -LINUX_EPERM;
+  }
+  return guest_owner_record_fd(file->fd, uid, gid);
 }
 
 int
@@ -3736,9 +3795,29 @@ DEFINE_SYSCALL(fchownat, int, dirfd, gstr_t, path_ptr, l_uid_t, user, l_gid_t, g
 {
   char pathname[LINUX_PATH_MAX];
   strncpy_from_user(pathname, path_ptr, sizeof pathname);
-  if (flags & ~(LINUX_AT_SYMLINK_NOFOLLOW)) {
+  if (flags & ~(LINUX_AT_SYMLINK_NOFOLLOW | LINUX_AT_EMPTY_PATH)) {
     return -LINUX_EINVAL;
   }
+
+  /*
+   * AT_EMPTY_PATH, for the same reason fchmodat2 needs it and found here by
+   * looking for the next wall rather than by hitting it: the two calls are used
+   * as a pair. systemd's fchmod_and_chown sets a mode and an owner on one
+   * descriptor, so a build that accepted the chmod and refused the chown would
+   * have moved the failure one line down and no further.
+   *
+   * fchown carries the id mapping and the ownership record already, so an
+   * empty path is that call and nothing else.
+   */
+  /*
+   * With AT_FDCWD there is no descriptor to act on and the empty name means the
+   * working directory, so it becomes one - the lookup below does the rest.
+   */
+  if (is_at_empty_path(pathname, flags) && dirfd == LINUX_AT_FDCWD)
+    strcpy(pathname, ".");
+  else if (is_at_empty_path(pathname, flags))
+    return sys_fchown(dirfd, user, group);
+
   /*
    * The ids the guest names are its namespace's, so they come back out to the
    * ones the rest of nabi works in. An id the map does not cover has no outside
@@ -3779,10 +3858,10 @@ DEFINE_SYSCALL(lchown, gstr_t, path, int, uid, int, gid)
   return sys_fchownat(LINUX_AT_FDCWD, path, uid, gid, LINUX_AT_SYMLINK_NOFOLLOW);
 }
 
-DEFINE_SYSCALL(fchmodat, int, dirfd, gstr_t, path_ptr, l_mode_t, mode)
+/* Taking the name as a string, because fchmodat2 may have rewritten it. */
+static int
+do_fchmodat(int dirfd, const char *pathname, l_mode_t mode)
 {
-  char pathname[LINUX_PATH_MAX];
-  strncpy_from_user(pathname, path_ptr, sizeof pathname);
   struct path path;
   int r = vfs_grab_dir_w(dirfd, pathname, 0, &path);
   if (r < 0) {
@@ -3791,6 +3870,13 @@ DEFINE_SYSCALL(fchmodat, int, dirfd, gstr_t, path_ptr, l_mode_t, mode)
   r = path.fs->ops->fchmodat(path.fs, path.dir, path.subpath, mode);
   vfs_ungrab_dir(&path);
   return r;
+}
+
+DEFINE_SYSCALL(fchmodat, int, dirfd, gstr_t, path_ptr, l_mode_t, mode)
+{
+  char pathname[LINUX_PATH_MAX];
+  strncpy_from_user(pathname, path_ptr, sizeof pathname);
+  return do_fchmodat(dirfd, pathname, mode);
 }
 
 DEFINE_SYSCALL(chmod, gstr_t, path, int, mode)
@@ -5208,12 +5294,40 @@ DEFINE_SYSCALL(eventfd, unsigned int, initval)
 DEFINE_SYSCALL(fchmodat2, int, dirfd, gstr_t, path_ptr, l_mode_t, mode,
                unsigned int, flags)
 {
-  if (flags & ~(unsigned) LINUX_AT_SYMLINK_NOFOLLOW)
+  if (flags & ~(unsigned) (LINUX_AT_SYMLINK_NOFOLLOW | LINUX_AT_EMPTY_PATH))
     return -LINUX_EINVAL;
 
   char pathname[LINUX_PATH_MAX];
   if (strncpy_from_user(pathname, path_ptr, sizeof pathname) < 0)
     return -LINUX_EFAULT;
+
+  /*
+   * AT_EMPTY_PATH: the descriptor is the file, and there is no name to look
+   * up. This is how a program chmods something it only holds a descriptor for -
+   * in particular an O_PATH one, which fchmod cannot take - and it is the
+   * reason fchmodat2 was added rather than the nofollow flag.
+   *
+   * Leaving it out was a real fault rather than a missing nicety. systemd's
+   * copy_rights() sets a temporary file's mode this way, so every %sysusers
+   * scriptlet in an RPM transaction failed with "Failed to copy permissions
+   * from /etc/group to /etc/.#groupXXXX: Invalid argument" - the EINVAL from
+   * this flags check - and dnf install came apart on any package that creates a
+   * system user. The message named a permissions problem, which is what sent
+   * the first look at it towards ownership and modes rather than to a flag that
+   * was never accepted.
+   *
+   * fchmod is the whole implementation, since a descriptor names its file
+   * exactly: no lookup, so nothing for AT_SYMLINK_NOFOLLOW to mean, and the
+   * guest's mode is recorded by the same path an ordinary fchmod takes.
+   */
+  /*
+   * With AT_FDCWD there is no descriptor to act on and the empty name means the
+   * working directory, so it becomes one - the lookup below does the rest.
+   */
+  if (is_at_empty_path(pathname, (int) flags) && dirfd == LINUX_AT_FDCWD)
+    strcpy(pathname, ".");
+  else if (is_at_empty_path(pathname, (int) flags))
+    return sys_fchmod(dirfd, mode);
 
   /*
    * Without the flag this is fchmodat exactly, so it is fchmodat. With it, the
@@ -5222,7 +5336,7 @@ DEFINE_SYSCALL(fchmodat2, int, dirfd, gstr_t, path_ptr, l_mode_t, mode,
    * the way down here.
    */
   if (!(flags & LINUX_AT_SYMLINK_NOFOLLOW))
-    return sys_fchmodat(dirfd, path_ptr, mode);
+    return do_fchmodat(dirfd, pathname, mode);
 
   /*
    * LOOKUP_NOFOLLOW, and it is the whole of the flag's meaning here: without
