@@ -429,7 +429,7 @@
   SYSCALL(421, unimplemented) \
   SYSCALL(422, unimplemented) \
   SYSCALL(423, unimplemented) \
-  SYSCALL(424, unimplemented) \
+  SYSCALL(424, pidfd_send_signal) \
   SYSCALL(425, io_uring_setup) \
   SYSCALL(426, io_uring_enter) \
   SYSCALL(427, io_uring_register) \
@@ -443,7 +443,7 @@
   SYSCALL(435, clone3) \
   SYSCALL(436, unimplemented) \
   SYSCALL(437, openat2) \
-  SYSCALL(438, unimplemented) \
+  SYSCALL(438, pidfd_getfd) \
   SYSCALL(439, faccessat2) \
   SYSCALL(440, process_madvise) \
   SYSCALL(441, unimplemented) \

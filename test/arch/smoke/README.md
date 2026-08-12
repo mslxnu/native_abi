@@ -416,7 +416,13 @@ guest-code cache sync.
   process must **not** be readable, and a child that has exited must be, through
   `poll`, `select` and `epoll` alike. The `epoll` half needed its own work in the
   opposite direction, since kqueue raises no read event for a regular file at
-  all, so an event loop would otherwise wait on a pidfd forever.
+  all, so an event loop would otherwise wait on a pidfd forever. It then
+  exercises the family end to end: a child forked with `CLONE_PIDFD`, killed
+  through the descriptor the *parent* was handed at the moment the child
+  appeared, and a second signal to the same descriptor answering `ESRCH`
+  rather than reaching whoever holds that number now — which is the whole
+  reason the family exists. `pidfd_getfd`'s copy is *used* rather than
+  counted: a pipe is written and read back through it.
 
 - `staletest` — a recorded guest mode that the host mode contradicts. NABI writes
   the mode attribute and the host mode together, and the host mode is always

@@ -5157,3 +5157,50 @@ for self-healing rather than a sweep: a wrong mode does not stay where it was
 written.
 
 Still 265 of 375: this is a bug in what a recorded mode means, not a new call.
+
+### 3.5.97 The rest of the pidfd family
+
+`pidfd_open` arrived because `process_madvise` needed an input. What it did not
+have was anything to *do* with the descriptor, which is most of the point: a pid
+is a name that can be reused, and between deciding to signal a process and
+signalling it that process can exit and its number pass to a stranger.
+
+`pidfd_send_signal` closes that window, and `CLONE_PIDFD` closes it one step
+further back — the parent is handed a descriptor at the moment the child appears,
+so nothing can have taken the pid in between, because the parent has not returned
+to its own code yet. That is why the descriptor is made on the parent's side: the
+child could make one for itself, but by the time it ran the parent would already
+have had to be told a number.
+
+The guarantee here is narrower than the kernel's, and the difference is worth
+stating rather than implying. Linux's pidfd holds a reference to the process, so
+the pid cannot be recycled while the descriptor lives. Nothing on Darwin makes a
+pid stop being reusable, so a pid recycled after the descriptor was made would
+still be signalled. What *is* removed is the window between the caller's decision
+and the call — the one a program can do nothing about. What remains is the window
+a program closes by holding the descriptor, exactly as it would on Linux.
+
+A `siginfo` is refused rather than dropped. Supplying one makes this
+`rt_sigqueueinfo` — the signal carries a value — and NABI's delivery has no way
+to attach one, so a receiver reading `si_value` would get whatever the host put
+there. A caller that needs the value learns it did not travel; a caller that does
+not passes NULL and this is `kill`.
+
+`pidfd_getfd` is a debugger's operation and meets the wall `process_vm_readv`
+describes, so the cross-process half answers `EPERM`. A process naming itself is
+`dup` with the race removed, and that half is real — the test writes a pipe and
+reads it back through the copy rather than checking a number came out.
+
+`clone3` no longer refuses `CLONE_PIDFD`; the comment there said it was a wiring
+job rather than an impossibility, and this is the wiring. `do_clone`'s own list
+of accepted flags had to learn it too, or the clone was refused before reaching
+the code that handles it. `CLONE_PIDFD` with `CLONE_PARENT_SETTID` is refused, as
+on Linux: the old `clone` has no field of its own, so the descriptor goes where
+the parent tid would have, and two answers cannot share one place.
+
+One check came out again during testing. `pidfd_send_signal` had a liveness test
+before the signal, and deleting it changed nothing — `send_signal` already
+answers `ESRCH` for a process that has gone. Code no test can distinguish is
+weight without evidence, so it went.
+
+267 of 375.

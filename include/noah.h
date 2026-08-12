@@ -287,6 +287,7 @@ void    epoll_close(int epfd);
  * exited, which poll and select have to answer since Darwin has no descriptor
  * that does it. */
 int     pidfd_host_pid(int fd);
+int     pidfd_make(int32_t host, bool cloexec);
 bool    pidfd_any(void);
 bool    pidfd_is(int fd);
 int     pidfd_fix_readset(int nfds, fd_set *out, const fd_set *want);

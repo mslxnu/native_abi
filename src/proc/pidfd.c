@@ -193,3 +193,125 @@ DEFINE_SYSCALL(pidfd_open, int, pid, unsigned int, flags)
   pidfd_live++;
   return fd;
 }
+
+/*
+ * Make a pidfd for a host pid that is known to exist.
+ *
+ * Split out because clone needs it: a child's descriptor has to be created by
+ * the parent at the moment the child appears, which is the only moment at which
+ * the pid is certainly still that child's.
+ */
+int
+pidfd_make(int32_t host, bool cloexec)
+{
+  const char *tmp = getenv("TMPDIR");
+  char path[PATH_MAX];
+  snprintf(path, sizeof path, "%s/nabi-pidfd-%s-XXXXXX",
+           tmp && *tmp ? tmp : "/tmp", nabi_boot_tag());
+  int fd = mkstemp(path);
+  if (fd < 0)
+    return -darwin_to_linux_errno(errno);
+  unlink(path);
+
+  struct pidfd_hdr h = { PIDFD_MAGIC, host };
+  if (pwrite(fd, &h, sizeof h, 0) != (ssize_t) sizeof h) {
+    close(fd);
+    return -LINUX_EIO;
+  }
+  pthread_rwlock_wrlock(&proc.fileinfo.fdtable_lock);
+  int err = register_fd(fd, cloexec);
+  pthread_rwlock_unlock(&proc.fileinfo.fdtable_lock);
+  if (err < 0) {
+    close(fd);
+    return err;
+  }
+  pidfd_live++;
+  return fd;
+}
+
+/*
+ * pidfd_send_signal: the reason a pidfd is worth having.
+ *
+ * kill(2) names a process by a number that can be reused, so between deciding
+ * to signal and signalling, the target can exit and its number pass to someone
+ * else - and the signal arrives at a stranger. That window cannot be closed
+ * from outside the kernel, which is why this call exists.
+ *
+ * Here it is closed for the same reason it is on Linux, if by a different
+ * mechanism: the descriptor holds the pid it was opened for, and pidfd_open
+ * checked the process existed at that moment. A pid recycled afterwards is
+ * still a wrong target - nothing on Darwin makes a pid *stop* being reusable -
+ * so this is narrower than the kernel's guarantee and the difference is worth
+ * stating: what is removed is the window between the caller's decision and the
+ * call, which is the one a program can do nothing about. What remains is the
+ * window between opening the descriptor and using it, which a program closes by
+ * holding the descriptor, exactly as it would on Linux.
+ */
+DEFINE_SYSCALL(pidfd_send_signal, int, pidfd, int, sig, gaddr_t, info,
+               unsigned int, flags)
+{
+  if (flags != 0)
+    return -LINUX_EINVAL;
+
+  struct pidfd_hdr h;
+  int r = pidfd_read(pidfd, &h);
+  if (r < 0)
+    return r;
+
+  /*
+   * A siginfo may be supplied, which makes this rt_sigqueueinfo rather than
+   * kill - the signal carries a value with it. nabi's signal delivery has no
+   * way to attach one, and a receiver that read si_value would get whatever the
+   * host put there rather than what the sender sent. Refused, so a caller that
+   * needs the value knows it did not travel; a caller that does not need it
+   * passes NULL and this is kill.
+   */
+  if (info != 0)
+    return -LINUX_EINVAL;
+
+  /* No liveness check first: send_signal answers ESRCH for a process that has
+   * gone, so one here would change nothing a caller could see. */
+  return send_signal(h.pid, sig);
+}
+
+/*
+ * pidfd_getfd: take a copy of a descriptor belonging to another process.
+ *
+ * That is a debugger's operation - it needs the same access ptrace does - and
+ * the cross-process half runs into the wall process_vm_readv describes: a guest
+ * process is a host process, and nabi has no way into another one's descriptor
+ * table. It answers EPERM there, which is what Linux answers when the ptrace
+ * check fails.
+ *
+ * A process may name itself, and then this is dup with a race removed, so that
+ * half is real.
+ */
+DEFINE_SYSCALL(pidfd_getfd, int, pidfd, int, targetfd, unsigned int, flags)
+{
+  if (flags != 0)
+    return -LINUX_EINVAL;
+
+  struct pidfd_hdr h;
+  int r = pidfd_read(pidfd, &h);
+  if (r < 0)
+    return r;
+  if (kill(h.pid, 0) < 0 && errno == ESRCH)
+    return -LINUX_ESRCH;
+  if (h.pid != getpid())
+    return -LINUX_EPERM;
+
+  int copy = dup(targetfd);
+  if (copy < 0)
+    return -darwin_to_linux_errno(errno);
+  pthread_rwlock_wrlock(&proc.fileinfo.fdtable_lock);
+  int err = register_fd(copy, true);   /* always close-on-exec, as on Linux */
+  pthread_rwlock_unlock(&proc.fileinfo.fdtable_lock);
+  if (err < 0) {
+    close(copy);
+    return err;
+  }
+  /* A copy of a pidfd is another pidfd, and the count has to know. */
+  if (pidfd_is(copy))
+    pidfd_live++;
+  return copy;
+}

@@ -39,12 +39,20 @@ static long sys6(long n, long a, long b, long c, long d, long e, long f){
 #define SYS_pidfd_open         434
 #define SYS_process_madvise    440
 #define SYS_process_mrelease   448
+#define SYS_pidfd_send_signal  424
+#define SYS_pidfd_getfd        438
+#define SYS_read               63
+#define SYS_pipe2              59
 
 #define EBADF   9
 #define EINVAL 22
 #define ESRCH   3
 #define EPERM   1
 #define POLLIN  1
+#define SIGKILL 9
+#define SIGTERM 15
+#define CLONE_PIDFD 0x00001000
+#define CLONE_PARENT_SETTID 0x00100000
 
 #define MADV_WILLNEED   3
 #define MADV_DONTNEED   4
@@ -223,6 +231,111 @@ void _start(void)
       sys6(SYS_close, ep, 0, 0, 0, 0, 0); }
 
     sys6(SYS_close, cfd, 0, 0, 0, 0, 0); }
+
+  /*
+   * ---- signalling through a descriptor rather than a number ----
+   *
+   * The point of the whole family. A child is forked with CLONE_PIDFD, so the
+   * parent is handed the descriptor at the moment the child appears rather than
+   * a number it must hope stays that child's, and the child is then killed
+   * through it.
+   */
+  { int pf = -1;
+    long child = sys6(SYS_clone, CLONE_PIDFD | 17 /* SIGCHLD */, 0,
+                      (long) &pf, 0, 0, 0);
+    if (child < 0)
+      fail("clone with CLONE_PIDFD", child, 0);
+    if (child == 0) {
+      /* Long enough that the parent's signal is what ends this, not the clock. */
+      struct tspec nap = { 30, 0 };
+      sys6(SYS_nanosleep, (long) &nap, 0, 0, 0, 0, 0);
+      sys6(SYS_exit, 0, 0, 0, 0, 0, 0);
+    }
+    if (pf <= 0)
+      fail("the descriptor CLONE_PIDFD wrote back", pf, 1);
+
+    /* It names the child, so it is not readable while the child runs. */
+    { struct pfd p = { pf, POLLIN, 0 };
+      struct tspec to = { 0, 0 };
+      if ((r = sys6(SYS_ppoll, (long) &p, 1, (long) &to, 0, 0, 0)) != 0)
+        fail("polling a CLONE_PIDFD descriptor while the child runs", r, 0); }
+
+    if ((r = sys6(SYS_pidfd_send_signal, pf, SIGKILL, 0, 0, 0, 0)) != 0)
+      fail("pidfd_send_signal", r, 0);
+
+    int status = 0;
+    if ((r = sys6(SYS_wait4, child, (long) &status, 0, 0, 0, 0)) < 0)
+      fail("waiting for the signalled child", r, 0);
+
+    /* And now it is readable, which is how the parent would have learnt of the
+     * exit had it been waiting rather than killing. */
+    { struct pfd p = { pf, POLLIN, 0 };
+      struct tspec to = { 1, 0 };
+      r = sys6(SYS_ppoll, (long) &p, 1, (long) &to, 0, 0, 0);
+      if (r != 1 || !(p.revents & POLLIN))
+        fail("polling the descriptor after the child was signalled", r, 1); }
+
+    /* A signal to a process that has gone is ESRCH rather than a signal to
+     * whoever holds the number now - which is the entire point. */
+    if ((r = sys6(SYS_pidfd_send_signal, pf, SIGTERM, 0, 0, 0, 0)) != -ESRCH)
+      fail("signalling through a descriptor whose process has gone", r, -ESRCH);
+
+    sys6(SYS_close, pf, 0, 0, 0, 0, 0); }
+
+  /* ---- what pidfd_send_signal refuses ---- */
+  { long p2 = sys6(SYS_pidfd_open, me, 0, 0, 0, 0, 0);
+    if (p2 < 0)
+      fail("pidfd_open for the refusal checks", p2, 0);
+    if ((r = sys6(SYS_pidfd_send_signal, p2, 0, 0, 1, 0, 0)) != -EINVAL)
+      fail("pidfd_send_signal with a flag that does not exist", r, -EINVAL);
+    if ((r = sys6(SYS_pidfd_send_signal, 1, SIGTERM, 0, 0, 0, 0)) != -EBADF)
+      fail("pidfd_send_signal on a descriptor that is not a pidfd", r, -EBADF);
+    /* A siginfo cannot be carried, so it is refused rather than dropped. */
+    { char si[128];
+      for (int i = 0; i < 128; i++) si[i] = 0;
+      if ((r = sys6(SYS_pidfd_send_signal, p2, SIGTERM, (long) si, 0, 0, 0)) != -EINVAL)
+        fail("pidfd_send_signal carrying a siginfo", r, -EINVAL); }
+
+    /*
+     * ---- pidfd_getfd ----
+     *
+     * A copy of a descriptor belonging to the process the pidfd names. For this
+     * process that is dup with the race removed, and the copy has to be a real
+     * descriptor - so it is used, not merely counted.
+     */
+    { int pp[2];
+      if (sys6(SYS_pipe2, (long) pp, 0, 0, 0, 0, 0) != 0)
+        fail("pipe2", -1, 0);
+      long copy = sys6(SYS_pidfd_getfd, p2, pp[0], 0, 0, 0, 0);
+      if (copy < 0)
+        fail("pidfd_getfd of our own descriptor", copy, 0);
+      if (copy == pp[0])
+        fail("pidfd_getfd returning the same descriptor", copy, -1);
+
+      sys6(SYS_write, pp[1], (long) "dup", 3, 0, 0, 0);
+      char buf[8]; for (int i = 0; i < 8; i++) buf[i] = 0;
+      if ((r = sys6(SYS_read, copy, (long) buf, 3, 0, 0, 0)) != 3)
+        fail("reading through the copy pidfd_getfd made", r, 3);
+      if (buf[0] != 'd' || buf[1] != 'u' || buf[2] != 'p')
+        fail("what the copy read", buf[0], 'd');
+
+      if ((r = sys6(SYS_pidfd_getfd, p2, 999, 0, 0, 0, 0)) != -EBADF)
+        fail("pidfd_getfd of a descriptor that does not exist", r, -EBADF);
+      if ((r = sys6(SYS_pidfd_getfd, p2, pp[0], 1, 0, 0, 0)) != -EINVAL)
+        fail("pidfd_getfd with a flag that does not exist", r, -EINVAL);
+
+      sys6(SYS_close, copy, 0, 0, 0, 0, 0);
+      sys6(SYS_close, pp[0], 0, 0, 0, 0, 0);
+      sys6(SYS_close, pp[1], 0, 0, 0, 0, 0); }
+
+    sys6(SYS_close, p2, 0, 0, 0, 0, 0); }
+
+  /* CLONE_PIDFD wants a place to write the descriptor, and CLONE_PARENT_SETTID
+   * wants the same place for a different number. */
+  { int slot = -1;
+    if ((r = sys6(SYS_clone, CLONE_PIDFD | CLONE_PARENT_SETTID | 17, 0,
+                  (long) &slot, 0, 0, 0)) != -EINVAL)
+      fail("CLONE_PIDFD together with CLONE_PARENT_SETTID", r, -EINVAL); }
 
   put("pidfd ok\n");
   sys6(SYS_exit, 0, 0, 0, 0, 0, 0);

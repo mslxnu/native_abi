@@ -361,7 +361,10 @@ do_clone(unsigned long clone_flags, unsigned long newsp, gaddr_t parent_tid, gad
   assert(sigtype == LINUX_SIGCHLD || sigtype == 0);
 
   clone_flags &= -0x100;
-  unsigned long implemented = LINUX_CLONE_THREAD | LINUX_CLONE_DETACHED | LINUX_CLONE_SETTLS | LINUX_CLONE_CHILD_SETTID | LINUX_CLONE_CHILD_CLEARTID | LINUX_CLONE_PARENT_SETTID;
+  /* CLONE_PIDFD is handled by the caller, which writes the descriptor once
+   * the child exists - do_clone itself needs nothing for it, but it has to be
+   * accepted here or the clone is refused before it gets there. */
+  unsigned long implemented = LINUX_CLONE_THREAD | LINUX_CLONE_DETACHED | LINUX_CLONE_SETTLS | LINUX_CLONE_CHILD_SETTID | LINUX_CLONE_CHILD_CLEARTID | LINUX_CLONE_PARENT_SETTID | LINUX_CLONE_PIDFD;
   unsigned long needed = 0;
   if (clone_flags & LINUX_CLONE_THREAD) {
     int needed = LINUX_CLONE_VM | LINUX_CLONE_FS | LINUX_CLONE_FILES | LINUX_CLONE_SIGHAND | LINUX_CLONE_SYSVSEM;
@@ -433,6 +436,50 @@ struct l_clone_args {
 #define CLONE_ARGS_SIZE_VER1 80
 #define CLONE_ARGS_SIZE_VER2 88
 
+/*
+ * CLONE_PIDFD: hand the parent a descriptor for the child it just made.
+ *
+ * This is the race pidfd_send_signal exists to close, taken one step further
+ * back. A parent that forks and later signals by pid has a window even if it
+ * never lets go of the number, because the child can exit and the number be
+ * reused before the signal is sent. A descriptor made *here*, by the parent, at
+ * the moment the child appeared, has no such window: nothing else can have taken
+ * that pid in between, because the parent has not returned to its own code yet.
+ *
+ * Which is why it is made on this side rather than by the child. The child could
+ * make one for itself, but by the time it ran the parent would already have had
+ * to be told a number.
+ */
+static int
+clone_pidfd_out(unsigned long flags, gaddr_t out, int guest_pid)
+{
+  if (!(flags & LINUX_CLONE_PIDFD) || guest_pid <= 0)
+    return 0;
+  int32_t host = pidns_to_host(guest_pid);
+  if (host < 0)
+    return -LINUX_ESRCH;
+  int fd = pidfd_make(host, true);   /* close-on-exec, as Linux makes it */
+  if (fd < 0)
+    return fd;
+  if (copy_to_user(out, &fd, sizeof fd))
+    return -LINUX_EFAULT;
+  return 0;
+}
+
+/*
+ * What CLONE_PIDFD cannot be combined with, which Linux refuses and so does
+ * this. CLONE_THREAD has no pid of its own to name, and CLONE_PARENT_SETTID
+ * wants the same pointer written with a different number - two answers for one
+ * place.
+ */
+static bool
+clone_pidfd_conflicts(unsigned long flags)
+{
+  return (flags & LINUX_CLONE_PIDFD) &&
+         (flags & (LINUX_CLONE_THREAD | LINUX_CLONE_PARENT_SETTID |
+                   LINUX_CLONE_DETACHED));
+}
+
 DEFINE_SYSCALL(clone3, gaddr_t, args_ptr, size_t, size)
 {
   if (size < CLONE_ARGS_SIZE_VER0 || size > sizeof(struct l_clone_args))
@@ -447,15 +494,10 @@ DEFINE_SYSCALL(clone3, gaddr_t, args_ptr, size_t, size)
     return -LINUX_EINVAL;
 
   /*
-   * Things this cannot do, refused rather than dropped. CLONE_PIDFD wants a
-   * descriptor written back for the new child; src/proc/pidfd.c can now make
-   * one, so this is a wiring job rather than an impossibility, but it is not
-   * wired yet and saying yes without writing the descriptor would be worse than
-   * saying no. set_tid asks to choose the child's pid - which is the pid
-   * namespace's to allocate, and here comes from the host besides.
+   * set_tid asks to choose the child's pid, which is the pid namespace's to
+   * allocate and here comes from the host besides - refused rather than
+   * dropped.
    */
-  if (a.flags & LINUX_CLONE_PIDFD)
-    return -LINUX_EINVAL;
   if (a.set_tid_size != 0)
     return -LINUX_EINVAL;
 
@@ -475,8 +517,19 @@ DEFINE_SYSCALL(clone3, gaddr_t, args_ptr, size_t, size)
    * stack that grows down starts at the far end of what it was given. */
   gaddr_t sp = a.stack ? (gaddr_t) (a.stack + a.stack_size) : 0;
 
-  return do_clone(clone_flags, sp, (gaddr_t) a.parent_tid,
-                  (gaddr_t) a.child_tid, (gaddr_t) a.tls);
+  if (clone_pidfd_conflicts(clone_flags))
+    return -LINUX_EINVAL;
+
+  int ret = do_clone(clone_flags, sp, (gaddr_t) a.parent_tid,
+                     (gaddr_t) a.child_tid, (gaddr_t) a.tls);
+  if (ret > 0) {
+    /* clone3 has a field for it; the child itself gets 0 back and writes
+     * nothing. */
+    int pr = clone_pidfd_out(clone_flags, (gaddr_t) a.pidfd, ret);
+    if (pr < 0)
+      return pr;
+  }
+  return ret;
 }
 
 DEFINE_SYSCALL(clone, unsigned long, clone_flags, unsigned long, newsp, gaddr_t, parent_tid, gaddr_t, arg4, gaddr_t, arg5)
@@ -520,7 +573,19 @@ DEFINE_SYSCALL(clone, unsigned long, clone_flags, unsigned long, newsp, gaddr_t,
 #else
   gaddr_t child_tid = arg4, tls = arg5;
 #endif
-  return do_clone(clone_flags, newsp, parent_tid, child_tid, tls);
+  if (clone_pidfd_conflicts(clone_flags))
+    return -LINUX_EINVAL;
+
+  int ret = do_clone(clone_flags, newsp, parent_tid, child_tid, tls);
+  if (ret > 0) {
+    /* The old call has no field of its own, so the descriptor goes where the
+     * parent tid would have - which is why CLONE_PARENT_SETTID is refused
+     * alongside it. */
+    int pr = clone_pidfd_out(clone_flags, parent_tid, ret);
+    if (pr < 0)
+      return pr;
+  }
+  return ret;
 }
 
 DEFINE_SYSCALL(fork)
