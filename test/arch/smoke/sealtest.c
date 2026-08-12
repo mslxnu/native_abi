@@ -1,5 +1,5 @@
 /* freestanding: mseal, mincore, move_pages, preadv/pwritev and friends,
- * pause, personality, pkey_mprotect, and the five that answer ENOSYS.
+ * pause, personality, pkey_mprotect, and the ones that answer ENOSYS.
  *
  * What is worth checking:
  *
@@ -58,7 +58,6 @@ static long sys6(long n, long a, long b, long c, long d, long e, long f){
 #define SYS_pkey_free      290
 #define SYS_mseal          462
 #define SYS_perf_event_open 241
-#define SYS_pivot_root      41
 
 #define EPERM         1
 #define ENOENT        2
@@ -403,8 +402,11 @@ void _start(void)
   /* ================= the ones that cannot exist ================= */
   if ((r = sys6(SYS_perf_event_open, 0, 0, -1, -1, 0, 0)) != -ENOSYS)
     fail("perf_event_open", r, -ENOSYS);
-  if ((r = sys6(SYS_pivot_root, (long) "/", (long) "/", 0, 0, 0, 0)) != -ENOSYS)
-    fail("pivot_root", r, -ENOSYS);
+  /*
+   * pivot_root used to be checked here for ENOSYS and is implemented now, so the
+   * assertion moved to pivottest rather than being deleted: this one would have
+   * gone on describing a refusal that no longer exists.
+   */
 
   /*
    * pause is not called from here: like futimesat it is an x86-only number and

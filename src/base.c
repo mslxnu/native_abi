@@ -338,27 +338,6 @@ DEFINE_NOT_IMPLEMENTED_SYSCALL(perf_event_open)
  */
 DEFINE_NOT_IMPLEMENTED_SYSCALL(modify_ldt)
 
-/*
- * pivot_root: make a different directory the root.
- *
- * Refused, and the reason is worth being precise about, because nabi does have
- * a root and does resolve every guest path against it. What it does not have is
- * a way to *change* it: proc.fileinfo.rootfd is opened once at startup from -m,
- * and chroot in src/fs/fs.c already refuses anything but "/" for that reason.
- * pivot_root cannot be more capable than chroot when both need the same thing
- * chroot has not got.
- *
- * And pivot_root needs more than chroot does. Its second argument says where
- * the old root is to be found afterwards, and the container runtimes that use
- * it depend on both halves - they pivot, then unmount the old root through that
- * path. Making the new root take effect while put_old was an ordinary empty
- * directory would satisfy the call and lose the filesystem the guest came from,
- * with the failure appearing at the unmount rather than here.
- *
- * The order of work is therefore chroot first - a real, changeable root - and
- * then this on top of it.
- */
-DEFINE_NOT_IMPLEMENTED_SYSCALL(pivot_root)
 
 /*
  * pkey_alloc and pkey_free: protection keys, which need a register that is not

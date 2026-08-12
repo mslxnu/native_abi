@@ -233,6 +233,13 @@ void report_rootfs_case(void);
 void init_host_ids(void);
 bool guest_in_group(l_gid_t gid);
 
+/* The guest's root, which pivot_root and chroot change; see src/fs/fs.c. */
+int  fs_root_open(const char *hostdir);
+void fs_root_commit(int vfd);
+bool fs_root_host_path(char *out, size_t outsz);
+bool mount_pivot(const char *new_root, const char *put_old_after,
+                 const char *old_root_host);
+
 /* seccomp; see src/proc/seccomp.c. */
 bool   seccomp_check(uint64_t nr, const uint64_t *args, uint64_t *ret);
 int    seccomp_prctl_set(unsigned long mode, gaddr_t prog);

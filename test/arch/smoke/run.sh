@@ -883,6 +883,23 @@ else
     fail=1
 fi
 
+# pivottest: chroot and pivot_root. The check that matters is that the old root
+# is still reachable at put_old afterwards - a pivot that swapped the root and
+# left put_old an empty directory would pass everything else and lose the
+# filesystem the guest came from, with the failure surfacing later at the
+# unmount. It also asks the ".." question through a descriptor the guest opened
+# itself, before and after the root changes, which is the only path that
+# consults nabi's root-identity cache: a stale one lets a handle on "/" climb
+# out of the root the guest was just confined to.
+cp "$here/pivottest" "$root/"; chmod +x "$root/pivottest"
+out=$("$NABI" -m "$root" /pivottest); rc=$?
+if [ "$rc" -eq 0 ] && [ "$out" = "pivot ok" ]; then
+    echo "  ok  pivottest -> \"$out\", exit 0"
+else
+    echo "  FAIL pivottest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 if [ "$fail" -eq 0 ]; then
     echo "smoke: PASS"
 else

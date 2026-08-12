@@ -280,6 +280,66 @@ find_mount(const struct mount_table *t, const char *guest_path)
   return best;
 }
 
+/*
+ * pivot_root's effect on the mount table.
+ *
+ * The root moves to put_old and new_root becomes the root, so every target in
+ * the table has to be re-expressed in the namespace that results. Two cases,
+ * and they are the whole of it:
+ *
+ *   - a mount that was under new_root keeps its object and loses the prefix.
+ *     /newroot/proc becomes /proc.
+ *   - everything else was under the old root, which is now reachable only at
+ *     put_old, so it gains that prefix. /dev becomes /old/dev.
+ *
+ * And the old root itself becomes an entry, pointing at the host directory it
+ * always was. That entry is what makes put_old real rather than an empty
+ * directory the guest was told about - a caller that pivots and then unmounts
+ * the old root through that path is doing something that means what it says.
+ *
+ * This rewrites state the whole mount namespace shares, which is right for
+ * pivot_root and would be wrong for chroot: pivot_root restructures the
+ * namespace, chroot only changes one process's view of it. The divergence worth
+ * naming is that a *second* process already in this namespace keeps its own
+ * root descriptor and would now see rewritten targets against an unchanged
+ * root. Container runtimes pivot immediately after unshare, with one process in
+ * the namespace, which is the case this serves.
+ */
+bool
+mount_pivot(const char *new_root, const char *put_old_after,
+            const char *old_root_host)
+{
+  struct mount_table t;
+  current_table(&t);
+
+  for (uint32_t i = 0; i < t.n; i++) {
+    char re[sizeof t.m[i].target];
+    size_t n = under(t.m[i].target, new_root);
+    if (n > 0) {
+      const char *rest = t.m[i].target + n;
+      snprintf(re, sizeof re, "%s", rest[0] ? rest : "/");
+    } else {
+      snprintf(re, sizeof re, "%s%s", put_old_after,
+               strcmp(t.m[i].target, "/") == 0 ? "" : t.m[i].target);
+    }
+    snprintf(t.m[i].target, sizeof t.m[i].target, "%s", re);
+  }
+
+  if (t.n == MOUNT_MAX)
+    return false;
+  struct mount_entry e;
+  memset(&e, 0, sizeof e);
+  snprintf(e.target, sizeof e.target, "%s", put_old_after);
+  snprintf(e.hostdir, sizeof e.hostdir, "%s", old_root_host);
+  snprintf(e.source, sizeof e.source, "/dev/root");
+  snprintf(e.type, sizeof e.type, "rootfs");
+  e.id = t.next_id++;
+  t.m[t.n++] = e;
+
+  table_store(ns_ino_of(NS_MNT), &t);
+  return true;
+}
+
 bool
 mount_resolve(const char *guest_path, char *out, size_t outsz, bool *rdonly)
 {

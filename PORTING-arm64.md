@@ -5860,3 +5860,76 @@ because `chroot` is a stub that accepts only `/`. Ordinary Wayland clients are
 now a question of trying them; Waydroid is a different project.
 
 310 of 375.
+
+### 3.5.106 A root that can move
+
+The last section refused `pivot_root` and said why: nabi has a root and resolves
+every guest path against it, but had no way to *change* it, and `chroot` already
+refused every path but `/` for that reason. The stated order of work was chroot
+first and then this on top. That is what this is.
+
+**chroot is real.** The root is a descriptor - `proc.fileinfo.rootfd` - so
+changing it is a matter of opening the new directory and putting it there. What
+the old version had instead was a check for the literal string `"/"` and an
+`EACCES` for everything else, with a comment saying it was there "for pacman".
+The permission check also moved: it asked `getuid()`, which is the account nabi
+runs as and says nothing about who the *guest* believes it is, so it now asks
+the guest's own credentials the way every other privileged operation here does.
+
+The working directory is deliberately left where it was, which is what Linux
+does and is the reason chroot has never been a security boundary. Moving it
+would be friendlier and would not match.
+
+**pivot_root is the interesting half, and the interesting half of it is
+put_old.** Swapping the root is the easy part; a call that did only that would
+be a rename of chroot. What makes pivot_root worth having is that the old root
+stays reachable, because a container runtime pivots and then unmounts the old
+root through that path. A pivot that left `put_old` as the empty directory it
+was would satisfy the call and silently lose the filesystem the guest came from,
+with the failure surfacing later at the unmount and pointing at the wrong thing.
+
+It is servable because nabi's mount table is a real redirection mechanism rather
+than bookkeeping for `/proc/mounts`: `mount_resolve` rewrites a guest path to a
+host one, and an entry is a (guest target, host directory) pair. So the old root
+becomes an entry pointing at the host directory it always was, and the rest of
+the table is re-expressed around the new root - mounts that were under
+`new_root` lose the prefix, and everything else gains `put_old`, because
+everything else was under the old root and the old root is now reachable only
+there.
+
+Two of Linux's checks are relaxed and it is better to name them than to let
+somebody find out. `new_root` must be a mount point on Linux; here it need only
+be a directory, because "is a mount point" is a property of a table this guest
+may never have written to. And Linux requires the two not to be on the current
+root filesystem, a rule that exists to keep the old root reachable - which
+cannot fail here, because the entry naming it is a host path rather than a
+relationship between mounts.
+
+The divergence that could bite is different and worth stating: this rewrites
+state the whole mount namespace shares, which is right for `pivot_root` and
+would be wrong for `chroot`. A second process already in the namespace keeps its
+own root descriptor and would see rewritten targets against an unchanged root.
+Container runtimes pivot immediately after `unshare`, with one process in the
+namespace, which is the case this serves.
+
+**And one thing had quietly stopped being true.** `dir_is_rootfs` caches the
+root's identity, under a comment reading "the root's identity cannot change
+while a guest runs" - correct for as long as chroot refused everything. It is
+what stops `..` walking out of the rootfs, so a cache still naming the *previous*
+root lets a guest climb out of the new one at exactly the moment it was confined
+to it.
+
+Testing that took three attempts and each failure was mine rather than the
+code's. A path beginning with `/` starts at nabi's own root descriptor and is
+recognised by its number, so it never reaches the cache - the case that does is
+a descriptor the *guest* opened on `/`, which is how systemd walked out of the
+rootfs in the first place. Then the cache is filled lazily, so with nothing
+asking before the pivot it was being filled with the *new* root and was correct
+by accident; the test now asks once at the start so there is a stale answer to
+find. And the first expectation was simply wrong: `..` at the root clamps to the
+root rather than failing, as it does on Linux, so the check had to be a file
+that exists only *outside* the new root. With all three fixed, removing the
+invalidation lets a guest handle on `/` read a file from the tree it had just
+been confined out of, which is what the test now reports.
+
+311 of 375.

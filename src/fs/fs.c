@@ -2827,12 +2827,30 @@ is_host_passthrough(const char *name)
  * once. Lazily, because a resumed child rebuilds its descriptor table from a
  * checkpoint and this file's statics start empty again.
  */
+static dev_t root_dev;
+static ino_t root_ino;
+static bool root_identity_known;
+
+/*
+ * Called whenever the root changes, which it now can.
+ *
+ * The comment above used to say the root's identity cannot change while a guest
+ * runs, and it was true for as long as chroot refused every path but "/". It is
+ * not true any more, and a stale cache here is not a small error: dir_is_rootfs
+ * is what stops ".." walking out of the rootfs, so remembering the *old* root
+ * would let a guest climb out of the new one at exactly the moment it was
+ * confined to it.
+ */
+static void
+root_identity_forget(void)
+{
+  root_identity_known = false;
+}
+
 static bool
 dir_is_rootfs(int fd)
 {
-  static dev_t root_dev;
-  static ino_t root_ino;
-  static bool known;
+  bool known = root_identity_known;
 
   if (fd == proc.fileinfo.rootfd)
     return true;
@@ -2845,7 +2863,7 @@ dir_is_rootfs(int fd)
       return false;
     root_dev = rst.st_dev;
     root_ino = rst.st_ino;
-    known = true;
+    root_identity_known = true;
   }
 
   struct stat st;
@@ -5008,6 +5026,155 @@ DEFINE_SYSCALL(ppoll, gaddr_t, fds_ptr, int, nfds, gaddr_t, tmo_ptr, gaddr_t, si
   return r;
 }
 
+/*
+ * Changing the guest's root, which until now could not be done at all.
+ *
+ * chroot accepted "/" and answered EACCES for everything else, with a comment
+ * saying it was there "for pacman". That was survivable on its own and it was
+ * also the thing standing in front of pivot_root: a call that replaces the root
+ * cannot be built on one that cannot change it.
+ *
+ * The root is a descriptor - proc.fileinfo.rootfd - and every path resolves
+ * against it, so changing it is genuinely a matter of opening the new directory
+ * and putting it there. Split in two because the open is the part that can
+ * fail: a caller that has already rewritten the mount table needs to know the
+ * new root is in hand before it commits.
+ */
+int
+fs_root_open(const char *hostdir)
+{
+  int fd = open(hostdir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+  if (fd < 0)
+    return -darwin_to_linux_errno(errno);
+  int vfd = vkern_dup_fd(fd, false);
+  close(fd);
+  if (vfd < 0)
+    return vfd;
+  return vfd;
+}
+
+void
+fs_root_commit(int vfd)
+{
+  int old = proc.fileinfo.rootfd;
+  proc.fileinfo.rootfd = vfd;
+  root_identity_forget();
+  if (old >= 0 && old != vfd)
+    vkern_close(old);
+}
+
+/* The host directory the guest's root currently is. */
+bool
+fs_root_host_path(char *out, size_t outsz)
+{
+  char buf[PATH_MAX];
+  if (fcntl(proc.fileinfo.rootfd, F_GETPATH, buf) < 0)
+    return false;
+  return strlcpy(out, buf, outsz) < outsz;
+}
+
+/*
+ * pivot_root: make new_root the root and leave the old one reachable at put_old.
+ *
+ * The previous note here said this was refused because chroot could not change
+ * the root, and that the order of work was chroot first and then this on top of
+ * it. That is what happened.
+ *
+ * The half that makes it worth having rather than a rename of chroot is
+ * put_old. A container runtime pivots and then unmounts the old root through
+ * that path; a pivot_root that swapped the root and left put_old as an empty
+ * directory would satisfy the call and silently lose the filesystem the guest
+ * came from, with the failure surfacing at the unmount. So the old root becomes
+ * a mount table entry pointing at the host directory it always was, and the
+ * rest of the table is re-expressed around the new root - see mount_pivot.
+ *
+ * Two of Linux's checks are relaxed and it is better to say which. new_root
+ * must be a mount point on Linux; here it need only be a directory, because
+ * "is a mount point" is a property of a table this guest may never have written
+ * to. And the two must not be on the same filesystem as the current root - a
+ * rule that exists to stop the old root becoming unreachable, which cannot
+ * happen here because the entry naming it is a host path rather than a
+ * relationship between mounts.
+ */
+DEFINE_SYSCALL(pivot_root, gstr_t, new_root_ptr, gstr_t, put_old_ptr)
+{
+  char new_root[LINUX_PATH_MAX], put_old[LINUX_PATH_MAX];
+  if (strncpy_from_user(new_root, new_root_ptr, sizeof new_root) < 0 ||
+      strncpy_from_user(put_old, put_old_ptr, sizeof put_old) < 0)
+    return -LINUX_EFAULT;
+
+  /* CAP_SYS_ADMIN on Linux. */
+  if (!cred_is_root())
+    return -LINUX_EPERM;
+  if (new_root[0] != '/' || put_old[0] != '/')
+    return -LINUX_EINVAL;       /* both are resolved against the current root */
+
+  /*
+   * put_old has to be at or under new_root, and that is the check the whole
+   * call turns on: it is what guarantees the old root ends up somewhere the new
+   * one can name. Compared as guest paths, whole components at a time, so that
+   * /newrootfoo is not taken to be inside /newroot.
+   */
+  size_t nl = strlen(new_root);
+  while (nl > 1 && new_root[nl - 1] == '/')
+    new_root[--nl] = '\0';
+  /*
+   * Checked before the containment test below, and not after: with new_root of
+   * "/" every path is under it, so the test would pass and the answer would come
+   * out as whatever the next check said. Pivoting onto the current root is its
+   * own refusal and deserves its own errno.
+   */
+  if (strcmp(new_root, "/") == 0)
+    return -LINUX_EBUSY;
+  if (strncmp(put_old, new_root, nl) != 0 ||
+      (put_old[nl] != '\0' && put_old[nl] != '/'))
+    return -LINUX_EINVAL;
+
+  char host_new[PATH_MAX], host_old_dir[PATH_MAX];
+  int r = guest_to_host_path(new_root, host_new, sizeof host_new);
+  if (r < 0)
+    return r;
+  r = guest_to_host_path(put_old, host_old_dir, sizeof host_old_dir);
+  if (r < 0)
+    return r;
+
+  struct stat st;
+  if (stat(host_new, &st) < 0)
+    return -darwin_to_linux_errno(errno);
+  if (!S_ISDIR(st.st_mode))
+    return -LINUX_ENOTDIR;
+  if (stat(host_old_dir, &st) < 0)
+    return -darwin_to_linux_errno(errno);
+  if (!S_ISDIR(st.st_mode))
+    return -LINUX_ENOTDIR;
+
+  /* Where the old root will be found afterwards: put_old with the new root's
+   * prefix removed, since that prefix is about to become "/". */
+  const char *after = put_old + nl;
+  char put_old_after[LINUX_PATH_MAX];
+  snprintf(put_old_after, sizeof put_old_after, "%s", after[0] ? after : "/");
+  if (strcmp(put_old_after, "/") == 0)
+    return -LINUX_EBUSY;        /* the old root would be mounted over the new */
+
+  char host_old_root[PATH_MAX];
+  if (!fs_root_host_path(host_old_root, sizeof host_old_root))
+    return -LINUX_ENOENT;
+
+  /*
+   * The new root is opened before anything is rewritten, so a failure here
+   * leaves the namespace as it was rather than half-pivoted.
+   */
+  int vfd = fs_root_open(host_new);
+  if (vfd < 0)
+    return vfd;
+  if (!mount_pivot(new_root, put_old_after, host_old_root)) {
+    vkern_close(vfd);
+    return -LINUX_ENOSPC;
+  }
+  fs_root_commit(vfd);
+  return 0;
+}
+
 DEFINE_SYSCALL(chroot, gstr_t, path_ptr)
 {
   char path[PATH_MAX];
@@ -5019,15 +5186,33 @@ DEFINE_SYSCALL(chroot, gstr_t, path_ptr)
     return -LINUX_EFAULT;
   }
 
-  /* We have not impelemented caps, just check if user is root */
-  if (getuid() != 0) {
+  /* CAP_SYS_CHROOT on Linux; guest root here, as mounting is. Asked of the
+   * guest's credentials rather than the host's - getuid() is the account nabi
+   * runs as and says nothing about who the guest thinks it is. */
+  if (!cred_is_root())
     return -LINUX_EPERM;
-  }
 
-  /* for pacman */
-  if (! (path[0] == '/' && path[1] == '\0')) {
-    return -LINUX_EACCES;
-  }
+  char host[PATH_MAX];
+  int r = guest_to_host_path(path, host, sizeof host);
+  if (r < 0)
+    return r;
+
+  struct stat st;
+  if (stat(host, &st) < 0)
+    return -darwin_to_linux_errno(errno);
+  if (!S_ISDIR(st.st_mode))
+    return -LINUX_ENOTDIR;
+
+  int vfd = fs_root_open(host);
+  if (vfd < 0)
+    return vfd;
+  fs_root_commit(vfd);
+  /*
+   * The working directory is deliberately left alone, which is what Linux does
+   * and is the reason chroot has never been a security boundary: a process that
+   * keeps a directory outside the new root can still reach it. Moving it would
+   * be friendlier and would not match.
+   */
   return 0;
 }
 
