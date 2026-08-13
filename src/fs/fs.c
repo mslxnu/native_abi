@@ -1122,6 +1122,8 @@ br_cmd_len(uint32_t cmd)
   case 0x80407202u:                       /* BR_TRANSACTION */
   case 0x80407203u:                       /* BR_REPLY */
     return 64;
+  case 0x80487202u:                       /* BR_TRANSACTION_SEC_CTX */
+    return 72;
   case 0x80107207u:                       /* BR_INCREFS */
   case 0x80107208u:                       /* BR_ACQUIRE */
   case 0x80107209u:                       /* BR_RELEASE */
@@ -1356,6 +1358,19 @@ binder_translate_read(struct binder_state *bs, uint8_t *buf, size_t len)
       tr->buffer = binder_arena_to_guest(bs, tr->buffer);
       if (tr->offsets_size != 0)
         tr->offsets = binder_arena_to_guest(bs, tr->offsets);
+    }
+    if (cmd == 0x80487202u) {   /* TRANSACTION_SEC_CTX */
+      struct binder_transaction_wire *tr = (void *)(buf + off);
+      uint64_t *secctx = (uint64_t *)(buf + off + 64);
+
+      if (!binder_materialize_fds(tr))
+        return false;
+      tr->buffer = binder_arena_to_guest(bs, tr->buffer);
+      if (tr->offsets_size != 0)
+        tr->offsets = binder_arena_to_guest(bs, tr->offsets);
+      /* secctx is a host pointer to a security-context string. Translating
+       * it requires guest memory for the copy; left as a TODO. */
+      (void)secctx;
     }
     off += plen;
   }
