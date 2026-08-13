@@ -155,6 +155,13 @@ typedef char assert_ver[sizeof(struct binder_version) == 4 ? 1 : -1];
 typedef char assert_arena[sizeof(struct binder_msl_arena) == 16 ? 1 : -1];
 typedef char assert_tr[sizeof(struct binder_transaction_data) == 64 ? 1 : -1];
 
+struct binder_transaction_data_secctx {
+  struct binder_transaction_data transaction_data;
+  unsigned long secctx;
+}; /* 72 bytes */
+
+typedef char assert_secctx[sizeof(struct binder_transaction_data_secctx) == 72 ? 1 : -1];
+
 /* A binder object in a payload: the fd sits in the low 4 bytes of the union
  * at offset 8, the cookie at 16. */
 struct flat_binder_object {
@@ -1148,6 +1155,130 @@ void _start(void)
   sys6(SYS_close, fd, 0,0,0,0,0);
 }
 
+/* The security-context transaction form: every transaction is delivered as
+ * BR_TRANSACTION_SEC_CTX with a fixed "u:r:untrusted_app:s0" string appended
+ * after the struct. NABI's read translation rewrites the secctx pointer into
+ * the guest's read buffer and leaves the string there, so the guest can read
+ * it at that address. */
+static void stage_secctx(void)
+{
+  struct binder_transaction_data_secctx *got;
+  unsigned char wbuf[128], rbuf[512];
+  struct binder_msl_arena a;
+  unsigned long arena, consumed;
+  unsigned int cmd;
+  int woff, fd, spin, i;
+  int zero = 0;
+  long child, status;
+
+  fd = open_binder("/dev/binder");
+  if (fd < 0)
+    fail("open /dev/binder (secctx)", fd);
+
+  r = bioctl(fd, BINDER_SET_CONTEXT_MGR, &zero);
+  if (r != 0)
+    fail("become the context manager (secctx)", r);
+
+  arena = (unsigned long)sys6(SYS_mmap, 0, ARENA_SIZE,
+      PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if ((long)arena >= -4096 && (long)arena < 0)
+    fail("mmap the arena (secctx)", (long)arena);
+  a.addr = arena;
+  a.size = ARENA_SIZE;
+  r = bioctl(fd, BINDER_MSL_SET_ARENA, &a);
+  if (r != 0)
+    fail("register the arena (secctx)", r);
+
+  woff = 0;
+  cmd = BC_ACQUIRE;
+  *(unsigned int *)(wbuf + woff) = cmd; woff += 4;
+  *(unsigned int *)(wbuf + woff) = zero; woff += 4;
+  cmd = BC_ENTER_LOOPER;
+  *(unsigned int *)(wbuf + woff) = cmd; woff += 4;
+  if (binder_wr(fd, wbuf, woff, 0, 0, 0) != 0)
+    fail("BC_ACQUIRE/ENTER_LOOPER (secctx)", 0);
+
+  child = sys6(SYS_clone, SIGCHLD, 0, 0, 0, 0);
+  if (child < 0)
+    fail("fork (secctx)", child);
+
+  if (child == 0) {
+    struct binder_transaction_data tr;
+    unsigned char payload[16] = "secctx-payload";
+    int cfd = open_binder("/dev/binder");
+    if (cfd < 0)
+      sys6(SYS_exit_group, 1, 0,0,0,0,0);
+
+    for (i = 0; i < (int)sizeof(tr); i++)
+      ((unsigned char *)&tr)[i] = 0;
+    tr.target.handle = 0;
+    tr.code = 99;
+    tr.flags = TF_ONE_WAY;
+    tr.data_size = sizeof(payload);
+    tr.data.ptr.buffer = (unsigned long)payload;
+    tr.data.ptr.offsets = 0;
+
+    woff = 0;
+    cmd = BC_TRANSACTION;
+    *(unsigned int *)(wbuf + woff) = cmd; woff += 4;
+    for (i = 0; i < (int)sizeof(tr); i++)
+      wbuf[woff + i] = ((unsigned char *)&tr)[i];
+    woff += (int)sizeof(tr);
+    if (binder_wr(cfd, wbuf, woff, 0, 0, 0) != 0)
+      sys6(SYS_exit_group, 2, 0,0,0,0,0);
+
+    sys6(SYS_close, cfd, 0,0,0,0,0);
+    sys6(SYS_exit_group, 0, 0,0,0,0,0);
+  }
+
+  got = 0;
+  for (spin = 0; spin < 10 && got == 0; spin++) {
+    consumed = 0;
+    if (binder_wr(fd, 0, 0, rbuf, sizeof(rbuf), &consumed) != 0)
+      break;
+    i = 0;
+    while (i + 4 <= (int)consumed) {
+      unsigned int c = *(unsigned int *)(rbuf + i);
+      i += 4;
+      if (c == 0x80487202u) {   /* BR_TRANSACTION_SEC_CTX */
+        got = (struct binder_transaction_data_secctx *)(rbuf + i);
+        i += sizeof(*got);
+        break;
+      }
+    }
+  }
+  if (got == 0)
+    fail("BR_TRANSACTION_SEC_CTX from the client", 0);
+  if (got->transaction_data.code != 99)
+    fail("the secctx transaction code survived", got->transaction_data.code);
+  if (got->transaction_data.data.ptr.buffer < arena ||
+      got->transaction_data.data.ptr.buffer >= arena + ARENA_SIZE)
+    fail("the payload landed outside the owner's arena",
+         (long)got->transaction_data.data.ptr.buffer);
+
+  if (got->secctx < (unsigned long)rbuf ||
+      got->secctx >= (unsigned long)rbuf + sizeof(rbuf))
+    fail("secctx pointer outside read buffer", (long)got->secctx);
+  if (strcmp((const char *)got->secctx, "u:r:untrusted_app:s0") != 0)
+    fail("secctx string is not the placeholder", 0);
+
+  woff = 0;
+  cmd = BC_FREE_BUFFER;
+  *(unsigned int *)(wbuf + woff) = cmd; woff += 4;
+  *(unsigned long *)(wbuf + woff) = got->transaction_data.data.ptr.buffer;
+  woff += 8;
+  if (binder_wr(fd, wbuf, woff, 0, 0, 0) != 0)
+    fail("BC_FREE_BUFFER accepted (secctx)", 0);
+
+  status = 0;
+  if (sys6(SYS_wait4, child, (long)&status, 0, 0, 0, 0) < 0)
+    fail("wait4 the client (secctx)", 0);
+  if (((status >> 8) & 0xff) != 0)
+    fail("the client exited nonzero (secctx)", status);
+
+  sys6(SYS_close, fd, 0,0,0,0,0);
+}
+
 void _start(void)
 {
   int fd;
@@ -1163,6 +1294,7 @@ void _start(void)
     stage_twoproc();
     stage_fd();
     stage_fda();
+    stage_secctx();
     put("binderprobe ok\n");
   }
   sys6(SYS_exit_group, fd < 0 ? 77 : 0, 0,0,0,0,0);

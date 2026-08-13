@@ -1369,15 +1369,8 @@ binder_translate_read(struct binder_state *bs, uint8_t *buf, size_t len,
       tr->buffer = binder_arena_to_guest(bs, tr->buffer);
       if (tr->offsets_size != 0)
         tr->offsets = binder_arena_to_guest(bs, tr->offsets);
-      if (*secctx != 0) {
-        uint64_t host_secctx = *secctx;
-        size_t slen = strlen((const char *)(uintptr_t)host_secctx) + 1;
-        char *dst = malloc(slen);
-        if (dst == NULL)
-          return false;
-        memcpy(dst, (const void *)(uintptr_t)host_secctx, slen);
-        *secctx = rguest + (host_secctx - (uint64_t)(uintptr_t)buf);
-      }
+      if (*secctx != 0)
+        *secctx = rguest + (*secctx - (uint64_t)(uintptr_t)buf);
     }
     off += plen;
   }
