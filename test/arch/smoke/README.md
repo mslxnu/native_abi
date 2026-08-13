@@ -48,6 +48,12 @@ guest-code cache sync.
 - `epolltest` — `epoll` over a self-pipe (translated to kqueue): the timeout
   path, a readable descriptor, the guest's opaque 64-bit data returned verbatim,
   and that `EPOLL_CTL_DEL` really unregisters.
+- `binderprobe` — the mSL/DevFS binder driver's ioctls spoken in a guest (needs
+  a live `/dev/binder`; skips 77 otherwise). Its epoll stage registers the
+  binder fd for `EPOLLIN` and checks the filter is exact both ways: silent
+  before work arrives, woken by it, and silent again once drained - the
+  NOTE_LOWAT-of-one registration NABI has to use for a device kqueue would
+  otherwise refuse.
 - `pathtest` — a guest path merely starting with a host-passthrough name
   (`/tmpmark` vs `/tmp`) must resolve in the rootfs, not on the host.
 - `protecttest` — `mprotect` a page read-only and write to it; the write must trap.

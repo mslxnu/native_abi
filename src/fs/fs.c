@@ -1344,6 +1344,25 @@ binder_cmd_size(int cmd)
   }
 }
 
+/* Is this descriptor a binder device?
+ *
+ * kqueue refuses a plain read filter on a device without its own kqfilter
+ * (EINVAL), but accepts one with a NOTE_LOWAT of 1, and that is the form the
+ * driver's selwakeup fires. epoll has to know which read filters it is setting
+ * up are on a binder device, so it can register those with the low-water mark.
+ */
+bool
+binder_fd(int fd)
+{
+  char path[PATH_MAX];
+  if (fcntl(fd, F_GETPATH, path) < 0)
+    return false;
+  return strcmp(path, "/dev/binder") == 0 ||
+         strcmp(path, "/dev/hwbinder") == 0 ||
+         strcmp(path, "/dev/vndbinder") == 0 ||
+         strncmp(path, "/dev/binderfs/", 14) == 0;
+}
+
 static int
 binder_ioctl_host(struct file *file, int cmd, uint64_t val0)
 {

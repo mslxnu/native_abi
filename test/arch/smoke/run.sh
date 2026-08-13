@@ -904,7 +904,9 @@ fi
 # mSL/DevFS load. The guest opens /dev/binder through a symlink to the host's
 # node (a real device node needs root to mknod, and the guest root is a plain
 # directory); the numbers and argument pointers then travel through nabi to
-# the driver exactly as on the host. Skips (77) when the driver is not loaded.
+# the driver exactly as on the host. The epoll stage of the same binary is
+# where the read filter needs its NOTE_LOWAT of one. Skips (77) when the
+# driver is not loaded.
 if [ -e /dev/binder ]; then
     mkdir -p "$root/dev"
     ln -s /dev/binder "$root/dev/binder"

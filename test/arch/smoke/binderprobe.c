@@ -22,6 +22,11 @@
  * proves the ioctl numbers, the argument, and the arena all survive the
  * NABI layer, which is the thing being tested here.
  *
+ * epoll   is the looper path: a read filter on the binder fd, which kqueue
+ * refuses as a plain filter and NABI has to register with NOTE_LOWAT of one.
+ * The filter must be exact both ways - silent before work, woken by it - or
+ * a binder looper either spins or sleeps through a pending transaction.
+ *
  * Exits 77 when /dev/binder is not present, so a host without the driver
  * loaded skips rather than fails.
  */
@@ -36,12 +41,17 @@ static long sys6(long n,long a,long b,long c,long d,long e,long f){
 #define SYS_write 64
 #define SYS_exit_group 94
 #define SYS_mmap 222
+#define SYS_epoll_create1 20
+#define SYS_epoll_ctl 21
+#define SYS_epoll_pwait 22
 #define AT_FDCWD -100
 #define O_RDWR 2
 #define PROT_READ 1
 #define PROT_WRITE 2
 #define MAP_PRIVATE 0x02
 #define MAP_ANONYMOUS 0x20
+#define EPOLL_CTL_ADD 1
+#define EPOLLIN 0x001u
 
 /* Linux's own ioctl encodings; NABI rewrites the direction bits. */
 #define BINDER_WRITE_READ          0xC0306201u
@@ -103,6 +113,14 @@ typedef char assert_wr[sizeof(struct binder_write_read) == 48 ? 1 : -1];
 typedef char assert_ver[sizeof(struct binder_version) == 4 ? 1 : -1];
 typedef char assert_arena[sizeof(struct binder_msl_arena) == 16 ? 1 : -1];
 typedef char assert_tr[sizeof(struct binder_transaction_data) == 64 ? 1 : -1];
+
+/* Unpacked, as on aarch64: NABI's l_epoll_event is 16 bytes there (the x86-64
+ * spelling is the packed 12-byte one). */
+struct ep_event {
+  unsigned int events;
+  unsigned long long data;
+}; /* 16 bytes */
+typedef char assert_ep[sizeof(struct ep_event) == 16 ? 1 : -1];
 
 static void put(const char*m){int i=0;while(m[i])i++;sys6(SYS_write,1,(long)m,i,0,0,0);}
 static void putd(long v){char b[24];int i=23;b[i--]=0;int neg=v<0;if(neg)v=-v;
@@ -323,6 +341,140 @@ static void stage_oneway(void)
   sys6(SYS_close, fd, 0,0,0,0,0);
 }
 
+/* The looper path: epoll over the binder fd. NABI must register the read
+ * filter with a NOTE_LOWAT of one, because kqueue refuses the plain filter
+ * on a device without its own kqfilter; and that filter has to be exact, or
+ * a looper either busy-spins or sleeps through a pending transaction. */
+static void stage_epoll(void)
+{
+  struct binder_transaction_data tr, *got;
+  unsigned char payload[16] = "binder-oneway";
+  unsigned char wbuf[128], rbuf[512];
+  struct binder_msl_arena a;
+  struct ep_event ev;
+  unsigned long arena, consumed, off;
+  unsigned int cmd;
+  int woff, fd, epfd, i, spin;
+  int zero = 0;
+  long r;
+
+  fd = open_binder("/dev/binder");
+  if (fd < 0)
+    fail("open /dev/binder (epoll)", fd);
+  r = bioctl(fd, BINDER_SET_CONTEXT_MGR, &zero);
+  if (r != 0)
+    fail("become the context manager (epoll)", r);
+
+  arena = (unsigned long)sys6(SYS_mmap, 0, ARENA_SIZE,
+      PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if ((long)arena >= -4096 && (long)arena < 0)
+    fail("mmap the arena (epoll)", (long)arena);
+  a.addr = arena;
+  a.size = ARENA_SIZE;
+  r = bioctl(fd, BINDER_MSL_SET_ARENA, &a);
+  if (r != 0)
+    fail("register the arena (epoll)", r);
+
+  woff = 0;
+  cmd = BC_ACQUIRE;
+  *(unsigned int *)(wbuf + woff) = cmd; woff += 4;
+  *(unsigned int *)(wbuf + woff) = zero; woff += 4;
+  cmd = BC_ENTER_LOOPER;
+  *(unsigned int *)(wbuf + woff) = cmd; woff += 4;
+  if (binder_wr(fd, wbuf, woff, 0, 0, 0) != 0)
+    fail("BC_ACQUIRE on handle 0 (epoll)", 0);
+
+  epfd = (int)sys6(SYS_epoll_create1, 0, 0,0,0,0,0);
+  if (epfd < 0)
+    fail("epoll_create1", epfd);
+  ev.events = EPOLLIN;
+  ev.data = 77;
+  r = sys6(SYS_epoll_ctl, epfd, EPOLL_CTL_ADD, fd, (long)&ev, 0, 0);
+  if (r != 0)
+    fail("epoll_ctl ADD the binder fd", r);
+
+  /* With nothing pending the filter must be silent - the alternative, an
+   * always-ready registration, is a looper that spins. */
+  i = (int)sys6(SYS_epoll_pwait, epfd, (long)&ev, 1, 0, 0, 0);
+  if (i != 0)
+    fail("epoll before work (must sleep)", i);
+
+  /* Deliver a oneway transaction to ourselves: the driver queues it and
+   * selwakeups the process, which is what the filter is armed on. */
+  for (i = 0; i < (int)sizeof(tr); i++)
+    ((unsigned char *)&tr)[i] = 0;
+  tr.target.handle = 0;
+  tr.code = 43;
+  tr.flags = TF_ONE_WAY;
+  tr.data_size = sizeof(payload);
+  tr.data.ptr.buffer = (unsigned long)payload;
+  tr.data.ptr.offsets = 0;
+
+  woff = 0;
+  cmd = BC_TRANSACTION;
+  *(unsigned int *)(wbuf + woff) = cmd; woff += 4;
+  for (i = 0; i < (int)sizeof(tr); i++)
+    wbuf[woff + i] = ((unsigned char *)&tr)[i];
+  woff += (int)sizeof(tr);
+  if (binder_wr(fd, wbuf, woff, 0, 0, 0) != 0)
+    fail("BC_TRANSACTION accepted (epoll)", 0);
+
+  /* And the wait must wake: the other failure mode is a looper that sleeps
+   * through a transaction that is already pending. */
+  i = (int)sys6(SYS_epoll_pwait, epfd, (long)&ev, 1, 5000, 0, 0);
+  if (i != 1)
+    fail("epoll after work (must wake)", i);
+  if ((ev.events & EPOLLIN) == 0)
+    fail("the woken event is EPOLLIN", ev.events);
+  if (ev.data != 77)
+    fail("the epoll data survived", ev.data);
+
+  /* Drain the transaction, as stage_oneway does, and free its buffer. */
+  got = 0;
+  for (spin = 0; spin < 5 && got == 0; spin++) {
+    consumed = 0;
+    if (binder_wr(fd, 0, 0, rbuf, sizeof(rbuf), &consumed) != 0)
+      break;
+    off = 0;
+    while (off + 4 <= consumed) {
+      unsigned int c = *(unsigned int *)(rbuf + off);
+      off += 4;
+      if (c == BR_TRANSACTION) {
+        got = (struct binder_transaction_data *)(rbuf + off);
+        off += sizeof(tr);
+        break;
+      }
+    }
+  }
+  if (got == 0)
+    fail("BR_TRANSACTION came back (epoll)", 0);
+  if (got->code != 43)
+    fail("the epoll transaction code survived", got->code);
+  if (got->data.ptr.buffer < arena ||
+      got->data.ptr.buffer >= arena + ARENA_SIZE)
+    fail("the epoll payload landed outside the arena", (long)got->data.ptr.buffer);
+  for (i = 0; i < (int)sizeof(payload); i++) {
+    if (((unsigned char *)got->data.ptr.buffer)[i] != payload[i])
+      fail("the epoll payload bytes survived", 0);
+  }
+
+  woff = 0;
+  cmd = BC_FREE_BUFFER;
+  *(unsigned int *)(wbuf + woff) = cmd; woff += 4;
+  *(unsigned long *)(wbuf + woff) = got->data.ptr.buffer; woff += 8;
+  if (binder_wr(fd, wbuf, woff, 0, 0, 0) != 0)
+    fail("BC_FREE_BUFFER accepted (epoll)", 0);
+
+  /* Work drained, the filter must be silent again - it re-armed rather than
+   * staying latched, or the looper would spin after every transaction. */
+  i = (int)sys6(SYS_epoll_pwait, epfd, (long)&ev, 1, 0, 0, 0);
+  if (i != 0)
+    fail("epoll after drain (must sleep)", i);
+
+  sys6(SYS_close, epfd, 0,0,0,0,0);
+  sys6(SYS_close, fd, 0,0,0,0,0);
+}
+
 void _start(void)
 {
   int fd;
@@ -334,6 +486,7 @@ void _start(void)
     stage_arena();
     stage_manager();
     stage_oneway();
+    stage_epoll();
     put("binderprobe ok\n");
   }
   sys6(SYS_exit_group, fd < 0 ? 77 : 0, 0,0,0,0,0);

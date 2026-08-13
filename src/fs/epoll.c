@@ -228,8 +228,14 @@ DEFINE_SYSCALL(epoll_ctl, int, epfd, int, op, int, fd, gaddr_t, event_ptr)
 
     /* Additions, where an error is real. */
     n = 0;
-    if (want_read)
-      EV_SET(&kev[n++], fd, EVFILT_READ, EV_ADD | EV_ENABLE | extra, 0, 0, NULL);
+    if (want_read) {
+      /* A binder device refuses a plain read filter (EINVAL); the NOTE_LOWAT
+       * form is the one its selwakeup fires. */
+      if (binder_fd(fd))
+        EV_SET(&kev[n++], fd, EVFILT_READ, EV_ADD | EV_ENABLE | extra, NOTE_LOWAT, 1, NULL);
+      else
+        EV_SET(&kev[n++], fd, EVFILT_READ, EV_ADD | EV_ENABLE | extra, 0, 0, NULL);
+    }
     if (want_write)
       EV_SET(&kev[n++], fd, EVFILT_WRITE, EV_ADD | EV_ENABLE | extra, 0, 0, NULL);
     if (n > 0) {
