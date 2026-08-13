@@ -252,6 +252,18 @@ guest-code cache sync.
   realtime signal is refused at creation rather than becoming a timer that never
   fires.
 
+- `signalfdtest` — `signalfd4`, which replaces the 3-arg `signalfd` and so is
+  checked in its aarch64 argument order (fd, mask, sizemask, flags). What can go
+  wrong in an emulation is distinct from the kernel's own story: a signal
+  blocked in the guest and handled must still reach the host's handler, or the
+  descriptor would never learn it arrived; a signal already pending when the
+  descriptor is created must be readable without the poke its arrival would have
+  sent; and the read must *consume* the signal, or it would also reach a
+  handler. Readability is a byte held in a socketpair, so `poll` answers
+  without knowing any of this — and the test drives the readiness through
+  `ppoll` rather than `read`, since that is what an event loop does and it is
+  the difference between a descriptor and a file.
+
 - `ipctest` — System V IPC: a segment created, attached, shared across a fork,
   detached and removed; keys resolving to ids; semaphore values through
   `SETVAL`/`GETALL`/`semop`; and `unshare(CLONE_NEWIPC)` making the same key

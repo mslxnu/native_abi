@@ -80,7 +80,7 @@
   SYSCALL(71, sendfile) \
   SYSCALL(72, pselect6) \
   SYSCALL(73, ppoll) \
-  SYSCALL(74, unimplemented) \
+  SYSCALL(74, signalfd4) \
   SYSCALL(75, vmsplice) \
   SYSCALL(76, splice) \
   SYSCALL(77, tee) \

@@ -37,6 +37,7 @@
 #include "linux/common.h"
 #include "linux/time.h"
 #include "linux/fs.h"
+#include "linux/signal.h"
 #include "linux/fanotify.h"
 #include "linux/misc.h"
 #include "linux/errno.h"
@@ -94,6 +95,7 @@ struct file_operations {
 };
 
 static inline bool in_userfd(int fd);
+static void signalfds_init(void);
 static const int user_fdtable_initsize = 64;
 static const int vkern_fdtable_maxsize = 64;
 static const int fdtable_alloc_unit = 64; // must be a multiple of 64
@@ -171,6 +173,7 @@ void
 init_fileinfo(int rootfd)
 {
   init_host_passthrough();
+  signalfds_init();
 
   /* pathconf answers this without touching the tree, which matters: probing by
    * creating two files would write to a rootfs that may be read-only, and
@@ -484,6 +487,269 @@ fail:;
   close(sv[0]);
   close(sv[1]);
   return -darwin_to_linux_errno(e);
+}
+
+/* ------------------------------------------------------------- signalfd */
+
+/*
+ * A signalfd turns a pending signal into a thing to be read. The usual shape:
+ * the guest blocks the signals it wants with sigprocmask, creates the signalfd
+ * with that set as its mask, and reads the records back. The signal is consumed
+ * by the read - this is the only place it is taken out of the pending set - so
+ * a signal read here is not also delivered to a handler.
+ *
+ * Readability is a byte held in flight, as with eventfd: when a signal the
+ * descriptor's mask names becomes pending, nabi sends one byte to the far end
+ * of the socketpair the guest holds. A blocking read sleeps on that socketpair
+ * and is woken either by the byte or by the EINTR the host signal itself
+ * produces, and poll, select and epoll answer from the byte without any of them
+ * knowing this is emulated.
+ *
+ * The poke has to survive a signal handler, because __host_signal_handler is
+ * the one place a signal becomes pending and that is where nabi pokes from. So
+ * the table is a fixed array - never reallocated, which keeps the handler's
+ * lock-free scan of it safe - and each poke is a single nonblocking send with
+ * MSG_NOSIGNAL, since raising SIGPIPE from inside a signal handler would be a
+ * fine way to die. A signal that was already pending when the descriptor came
+ * into existence left a bit with no byte behind it, so creation pokes once too;
+ * the read loop would have found it either way, poll would not have.
+ *
+ * As with eventfd, the table is process memory rather than checkpoint state: a
+ * forked child inherits the descriptor without the entry that makes it a
+ * signalfd, and reads fall through to the plain socket underneath.
+ */
+#define SIGNALFD_MAX 1024
+
+struct signalfd_state {
+  int fd;                        /* the end the guest was given; -1 is a free slot */
+  int wr;                        /* the end nabi pokes to make fd readable */
+  l_sigset_t mask;
+};
+
+static struct signalfd_state signalfds[SIGNALFD_MAX];
+static pthread_mutex_t signalfds_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* The array is static, so it starts all-fd-0; a free slot is fd < 0. Set that
+ * at boot rather than on first use, because signalfd_note_signal runs from a
+ * signal handler and may fire before any signalfd has been created - a slot
+ * that still read fd 0 would make it write a byte to the guest's stdout. */
+static void
+signalfds_init(void)
+{
+  for (int i = 0; i < SIGNALFD_MAX; i++)
+    signalfds[i].fd = -1;
+}
+
+static struct signalfd_state *
+signalfd_lookup(int fd)
+{
+  pthread_mutex_lock(&signalfds_lock);
+  for (int i = 0; i < SIGNALFD_MAX; i++) {
+    if (signalfds[i].fd == fd) {
+      pthread_mutex_unlock(&signalfds_lock);
+      return &signalfds[i];
+    }
+  }
+  pthread_mutex_unlock(&signalfds_lock);
+  return NULL;
+}
+
+static void
+signalfd_poke(struct signalfd_state *sf)
+{
+  char one = 1;
+  (void) send(sf->wr, &one, 1, MSG_NOSIGNAL);
+}
+
+/*
+ * Make every signalfd whose mask names `lsig` readable. Runs inside the host
+ * signal handler, so it takes no lock and only does a fixed array walk and a
+ * nonblocking send: nothing that can block or raise a signal of its own.
+ */
+void
+signalfd_note_signal(int lsig)
+{
+  if (lsig <= 0 || lsig > LINUX_NSIG)
+    return;
+  uint64_t bit = 1UL << (lsig - 1);
+  for (int i = 0; i < SIGNALFD_MAX; i++) {
+    struct signalfd_state *sf = &signalfds[i];
+    if (sf->fd < 0)
+      continue;
+    if (sf->mask.__mask & bit)
+      signalfd_poke(sf);
+  }
+}
+
+/*
+ * Reading a signalfd is not reading the socketpair: the answer is the record
+ * for a pending signal, and the byte underneath only wakes the wait for one.
+ */
+static bool
+signalfd_read(int fd, char *out, size_t size, int *ret)
+{
+  struct signalfd_state *sf = signalfd_lookup(fd);
+  if (sf == NULL)
+    return false;
+
+  if (size < sizeof(struct l_signalfd_siginfo)) {
+    *ret = -LINUX_EINVAL;
+    return true;
+  }
+
+  for (;;) {
+    pthread_rwlock_rdlock(&proc.sig_lock);
+    uint64_t pending = task.sigpending & sf->mask.__mask;
+    if (pending != 0) {
+      int sig = __builtin_ffsl(pending);
+      atomic_fetch_and(&task.sigpending, ~(1UL << (sig - 1)));
+      pthread_rwlock_unlock(&proc.sig_lock);
+
+      /* Drain everything the arrival woke: the descriptor must not stay
+       * readable for a signal that has already been reported. */
+      char drain[64];
+      while (recv(fd, drain, sizeof drain, MSG_DONTWAIT) > 0)
+        ;
+
+      struct l_signalfd_siginfo si = { 0 };
+      si.ssi_signo = (uint32_t) sig;
+      /* 0 is SI_USER. This path carries no sender identity - the pending set
+       * is a bitmap, not a queue of siginfo records - and the guests that
+       * matter only look at ssi_signo anyway. */
+      memcpy(out, &si, sizeof si);
+      *ret = (int) sizeof si;
+      return true;
+    }
+    pthread_rwlock_unlock(&proc.sig_lock);
+
+    int fl = fcntl(fd, F_GETFL);
+    if (fl >= 0 && (fl & O_NONBLOCK)) {
+      *ret = -LINUX_EAGAIN;
+      return true;
+    }
+    /* Block where the guest asked to block. A matching signal's arrival wakes
+     * this with a byte or an EINTR; either way the loop looks again. */
+    char b;
+    ssize_t r = read(fd, &b, 1);
+    if (r < 0) {
+      if (errno == EINTR && sigrestart_wanted())
+        continue;
+      *ret = -darwin_to_linux_errno(errno);
+      return true;
+    }
+    if (r == 0) {
+      *ret = -LINUX_EBADF;       /* the far end is gone; nothing can wake us now */
+      return true;
+    }
+  }
+}
+
+DEFINE_SYSCALL(signalfd4, int, fd, gaddr_t, mask_ptr, size_t, sizemask, int, flags)
+{
+  if (flags & ~(LINUX_O_NONBLOCK | LINUX_O_CLOEXEC))
+    return -LINUX_EINVAL;
+  if (sizemask != sizeof(l_sigset_t))
+    return -LINUX_EINVAL;
+
+  l_sigset_t mask;
+  if (copy_from_user(&mask, mask_ptr, sizeof mask))
+    return -LINUX_EFAULT;
+
+  /* An fd that is not -1 names an existing signalfd whose mask is replaced. */
+  if (fd != -1) {
+    pthread_mutex_lock(&signalfds_lock);
+    struct signalfd_state *sf = NULL;
+    for (int i = 0; i < SIGNALFD_MAX; i++) {
+      if (signalfds[i].fd == fd) {
+        sf = &signalfds[i];
+        break;
+      }
+    }
+    if (sf == NULL) {
+      pthread_mutex_unlock(&signalfds_lock);
+      return -LINUX_EBADF;
+    }
+    sf->mask = mask;
+    pthread_mutex_unlock(&signalfds_lock);
+    return fd;
+  }
+
+  int sv[2];
+  if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) < 0)
+    return -darwin_to_linux_errno(errno);
+
+  /* Only the guest's end takes the guest's flags. The end nabi pokes must be
+   * nonblocking so that a poke can never wait. */
+  if ((flags & LINUX_O_NONBLOCK) && fcntl(sv[0], F_SETFL, O_NONBLOCK) < 0)
+    goto fail;
+  if ((flags & LINUX_O_CLOEXEC) && fcntl(sv[0], F_SETFD, FD_CLOEXEC) < 0)
+    goto fail;
+  fcntl(sv[1], F_SETFL, O_NONBLOCK);
+
+  /* register_fd reports success or -errno; the descriptor the guest is given
+   * is the host one it was handed, because nabi does not renumber. */
+  pthread_rwlock_wrlock(&proc.fileinfo.fdtable_lock);
+  int err = register_fd(sv[0], (flags & LINUX_O_CLOEXEC) != 0);
+  pthread_rwlock_unlock(&proc.fileinfo.fdtable_lock);
+  if (err < 0) {
+    close(sv[0]);
+    close(sv[1]);
+    return err;
+  }
+
+  pthread_mutex_lock(&signalfds_lock);
+  int slot = -1;
+  for (int i = 0; i < SIGNALFD_MAX; i++) {
+    if (signalfds[i].fd < 0) {
+      slot = i;
+      break;
+    }
+  }
+  if (slot < 0) {
+    pthread_mutex_unlock(&signalfds_lock);
+    close(sv[0]);
+    close(sv[1]);
+    return -LINUX_EMFILE;
+  }
+  /* fd is published last so the signal handler never pokes a half-built slot;
+   * anything it misses in the gap, the creation poke below covers. */
+  signalfds[slot].wr = sv[1];
+  signalfds[slot].mask = mask;
+  signalfds[slot].fd = sv[0];
+  pthread_mutex_unlock(&signalfds_lock);
+
+  /* A signal that arrived before this descriptor existed left a pending bit
+   * with no byte behind it; put the byte there now, or the first read would
+   * work but poll would sleep on a signal already in hand. */
+  pthread_rwlock_rdlock(&proc.sig_lock);
+  if (task.sigpending & mask.__mask)
+    signalfd_poke(&signalfds[slot]);
+  pthread_rwlock_unlock(&proc.sig_lock);
+
+  return sv[0];
+
+fail:;
+  int e = errno;
+  close(sv[0]);
+  close(sv[1]);
+  return -darwin_to_linux_errno(e);
+}
+
+static void
+signalfd_close(int fd)
+{
+  pthread_mutex_lock(&signalfds_lock);
+  for (int i = 0; i < SIGNALFD_MAX; i++) {
+    if (signalfds[i].fd == fd) {
+      int wr = signalfds[i].wr;
+      signalfds[i].fd = -1;
+      signalfds[i].wr = -1;
+      pthread_mutex_unlock(&signalfds_lock);
+      close(wr);
+      return;
+    }
+  }
+  pthread_mutex_unlock(&signalfds_lock);
 }
 
 /*
@@ -2556,6 +2822,13 @@ DEFINE_SYSCALL(read, int, fd, gaddr_t, buf_ptr, size_t, size)
     return r;
   }
 
+  if (buf != NULL && signalfd_read(fd, buf, size, &r)) {
+    if (r > 0 && copy_to_user(buf_ptr, buf, (size_t) r))
+      r = -LINUX_EFAULT;
+    free(buf);
+    return r;
+  }
+
   if (buf != NULL && fanotify_read(fd, buf, size, &r)) {
     if (r > 0 && copy_to_user(buf_ptr, buf, (size_t) r))
       r = -LINUX_EFAULT;
@@ -3963,6 +4236,7 @@ user_close(int fd)
   inotify_close(fd);
   fanotify_close(fd);
   timerfd_close(fd);
+  signalfd_close(fd);
   uring_close(fd);
   pidfd_close(fd);
   epoll_close(fd);

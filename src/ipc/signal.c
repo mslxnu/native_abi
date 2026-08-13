@@ -21,6 +21,12 @@ __host_signal_handler(int signum, siginfo_t *info, ucontext_t *context)
 {
   /* actually no need to do it atomically */
   SET_SIGBIT(&task.sigpending, darwin_to_linux_signal(signum));
+  /* A signalfd wanting this signal must see it as readable, which means a byte
+   * in the socketpair underneath it. The poke is lock-free and nonblocking -
+   * it runs inside a signal handler - and a lost one costs nothing, because
+   * every signalfd read looks the pending set up again before deciding to
+   * sleep. */
+  signalfd_note_signal(darwin_to_linux_signal(signum));
 }
 
 int
@@ -313,7 +319,27 @@ DEFINE_SYSCALL(rt_sigprocmask, int, how, gaddr_t, nset, gaddr_t, oset, size_t, s
       return -LINUX_EINVAL;
   }
 
-  linux_to_darwin_sigset(&task.sigmask, &dset);
+  /*
+   * The host thread's mask is not quite the guest's. A signal the guest blocks
+   * *and* handles must still reach the host's handler, or it would never be
+   * recorded as pending: __host_signal_handler is the one place nabi learns a
+   * signal exists, and a signalfd wanting one would wait forever on a signal
+   * that arrived and was swallowed by the host's own blocking. Leaving handled
+   * signals unblocked here costs nothing, because nabi's own delivery already
+   * honours the guest mask - has_sigpending and pop_signal subtract it - and
+   * sigrestart_wanted re-runs a blocking call interrupted by a signal the guest
+   * cannot yet receive. A signal without a handler keeps its host disposition
+   * and stays blocked, so a default action cannot fire behind the guest's back.
+   */
+  sigemptyset(&dset);
+  for (int sig = 1; sig <= LINUX_NSIG; sig++) {
+    if (!LINUX_SIGISMEMBER(&task.sigmask, sig))
+      continue;
+    l_handler_t h = proc.sigaction[sig - 1].lsa_handler;
+    if (h != LINUX_SIG_DFL && h != LINUX_SIG_IGN)
+      continue;
+    sigaddset(&dset, linux_to_darwin_signal(sig));
+  }
 
   int err = syswrap(pthread_sigmask(SIG_SETMASK, &dset, NULL));
   if (err < 0) {

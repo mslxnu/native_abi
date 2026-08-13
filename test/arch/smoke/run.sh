@@ -922,6 +922,21 @@ else
     echo "  ok  binderprobe -> skipped (no /dev/binder on the host)"
 fi
 
+# signalfdtest: signalfd4 - the record it answers a read with, that the read
+# consumes the signal (blocked in the guest and handled, it must neither stay
+# pending nor reach a handler), and that the descriptor polls readable only
+# while a wanted signal is pending. The socketpair byte is the last half, since
+# signalfd exists for event loops and one that only worked through read() would
+# be useless there.
+cp "$here/signalfdtest" "$root/"; chmod +x "$root/signalfdtest"
+out=$("$NABI" -m "$root" /signalfdtest); rc=$?
+if [ "$rc" -eq 0 ] && [ "$out" = "signalfd ok" ]; then
+    echo "  ok  signalfdtest -> \"$out\", exit 0"
+else
+    echo "  FAIL signalfdtest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 if [ "$fail" -eq 0 ]; then
     echo "smoke: PASS"
 else
