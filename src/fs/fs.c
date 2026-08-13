@@ -962,6 +962,9 @@ typedef char binder_abi_wr[sizeof(struct binder_write_read_wire) == 48 ? 1 : -1]
 typedef char binder_abi_ar[sizeof(struct binder_msl_arena_wire) == 16 ? 1 : -1];
 typedef char binder_abi_tr[sizeof(struct binder_transaction_wire) == 64 ? 1 : -1];
 
+/* B_PACK_CHARS('f', 'd', '*', B_TYPE_LARGE) in mSL-DevFS's binder.h. */
+#define LINUX_BINDER_TYPE_FD 0x66642a85u
+
 /* Per-descriptor state: the arena, in both address spaces, so pointers can
  * be translated either way. */
 struct binder_state {
@@ -1125,6 +1128,77 @@ br_cmd_len(uint32_t cmd)
   }
 }
 
+/* A BINDER_TYPE_FD object is a request to move a descriptor. The driver can
+ * only stamp the sender's pid into the cookie (binder_txn.c
+ * binder_translate_fd); the descriptor itself goes to the receiver through the
+ * broker (binder_broker.c). Walk the offsets the guest gave - a binder_size_t
+ * array naming objects in the payload - and for every FD object register
+ * (pid, fd) with the broker. This runs before the ioctl queues the
+ * transaction, so the receiver always finds the descriptor waiting. Both
+ * pointers were translated to host addresses just above. */
+static bool
+binder_scan_fds(const struct binder_transaction_wire *tr)
+{
+  uint64_t n = tr->offsets_size / sizeof(uint64_t);
+  const uint64_t *offp = (const uint64_t *)(uintptr_t)tr->offsets;
+  const uint8_t *data = (const uint8_t *)(uintptr_t)tr->buffer;
+  uint32_t pid = (uint32_t)getpid();
+
+  for (uint64_t i = 0; i < n; i++) {
+    uint32_t type, fd;
+    uint64_t off = offp[i];
+
+    if (off + 24 > tr->data_size)
+      return false;                 /* an offset outside the payload */
+    memcpy(&type, data + off, sizeof type);
+    if (type != LINUX_BINDER_TYPE_FD)
+      continue;
+    memcpy(&fd, data + off + 8, sizeof fd);
+    if (fcntl((int)fd, F_GETFD) < 0)
+      return false;                 /* the object names a closed descriptor */
+    if (binder_broker_register(pid, fd) != 0)
+      return false;
+  }
+  return true;
+}
+
+/* The read half: the driver handed the object back with the sender's pid in
+ * the cookie and the sender's descriptor number in the fd. Ask the broker for
+ * the descriptor, register it with this process's fd table - NABI's guest fd
+ * numbers are the host ones, so the number it returns is the one the guest
+ * will use - and rewrite the object in the arena, which is the host address
+ * of what the guest reads through tr->buffer. */
+static bool
+binder_materialize_fds(struct binder_transaction_wire *tr)
+{
+  uint64_t n = tr->offsets_size / sizeof(uint64_t);
+  const uint64_t *offp = (const uint64_t *)(uintptr_t)tr->offsets;
+  uint8_t *data = (uint8_t *)(uintptr_t)tr->buffer;
+
+  for (uint64_t i = 0; i < n; i++) {
+    uint64_t off = offp[i];
+    uint32_t type, fd;
+    uint64_t cookie;
+
+    if (off + 24 > tr->data_size)
+      return false;
+    memcpy(&type, data + off, sizeof type);
+    if (type != LINUX_BINDER_TYPE_FD)
+      continue;
+    memcpy(&cookie, data + off + 16, sizeof cookie);
+    memcpy(&fd, data + off + 8, sizeof fd);
+    int nfd = binder_broker_request((uint32_t)(cookie & 0xffffffffu), fd);
+    if (nfd < 0)
+      return false;
+    if (register_fd(nfd, false) != 0) {
+      close(nfd);
+      return false;
+    }
+    memcpy(data + off + 8, &nfd, sizeof nfd);
+  }
+  return true;
+}
+
 /* Walk the guest's write stream, rewriting the pointer fields to their host
  * addresses. Works on a NABI-local copy, never on the guest's memory. */
 static bool
@@ -1155,6 +1229,8 @@ binder_translate_write(struct binder_state *bs, uint8_t *buf, size_t len)
           return false;
         tr->offsets = h;
       }
+      if (!binder_scan_fds(tr))
+        return false;
     } else if (cmd == 0x40086303u) {      /* BC_FREE_BUFFER: an arena buffer */
       uint64_t *p = (void *)(buf + off);
       uint64_t h;
@@ -1168,8 +1244,9 @@ binder_translate_write(struct binder_state *bs, uint8_t *buf, size_t len)
 }
 
 /* Walk the driver's read stream, rewriting the arena pointers it returned
- * back into guest addresses. */
-static void
+ * back into guest addresses, and the descriptors it cannot move into ones the
+ * receiver owns. Returns false when a descriptor cannot be materialized. */
+static bool
 binder_translate_read(struct binder_state *bs, uint8_t *buf, size_t len)
 {
   size_t off = 0;
@@ -1182,16 +1259,19 @@ binder_translate_read(struct binder_state *bs, uint8_t *buf, size_t len)
     off += sizeof(cmd);
     plen = br_cmd_len(cmd);
     if (off + plen > len)
-      return;
+      return false;
     if (cmd == 0x80407202u || cmd == 0x80407203u) {   /* TRANSACTION/REPLY */
       struct binder_transaction_wire *tr = (void *)(buf + off);
 
+      if (!binder_materialize_fds(tr))
+        return false;
       tr->buffer = binder_arena_to_guest(bs, tr->buffer);
       if (tr->offsets_size != 0)
         tr->offsets = binder_arena_to_guest(bs, tr->offsets);
     }
     off += plen;
   }
+  return off == len;
 }
 
 static int
@@ -1254,7 +1334,8 @@ binder_write_read(struct file *file, uint64_t arg, struct binder_state *bs)
     if (rsize != 0 && bwr.read_consumed != 0) {
       size_t n = bwr.read_consumed < rsize ? (size_t)bwr.read_consumed : rsize;
 
-      binder_translate_read(bs, rbuf, n);
+      if (!binder_translate_read(bs, rbuf, n))
+        r = -LINUX_EFAULT;
       if (copy_to_user(rguest, rbuf, n))
         r = -LINUX_EFAULT;
     }

@@ -55,8 +55,10 @@ guest-code cache sync.
   NOTE_LOWAT-of-one registration NABI has to use for a device kqueue would
   otherwise refuse. Its twoproc stage sends a oneway transaction across a fork,
   so the client is its own process with its own binder fd, arena and acquire,
-  and the manager receives the payload in its own arena - the per-process
-  binder state that the descriptor broker will build on.
+  and the manager receives the payload in its own arena. Its fd stage sends a
+  `BINDER_TYPE_FD` object in a transaction: NABI's broker moves the descriptor
+  over `SCM_RIGHTS` (the manager registered with `FLAT_BINDER_FLAG_ACCEPTS_FDS`
+  and receives a real, usable fd back, keyed by the sender's pid in the cookie).
 - `pathtest` — a guest path merely starting with a host-passthrough name
   (`/tmpmark` vs `/tmp`) must resolve in the rootfs, not on the host.
 - `protecttest` — `mprotect` a page read-only and write to it; the write must trap.

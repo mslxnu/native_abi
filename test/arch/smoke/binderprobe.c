@@ -27,6 +27,13 @@
  * the descriptor broker will build on, and the two processes are where the
  * per-process binder state is what separates them.
  *
+ * fd      is the descriptor broker: the client sends a BINDER_TYPE_FD object
+ * (its own /dev/binder open) in a oneway transaction and the manager, which
+ * registered with FLAT_BINDER_FLAG_ACCEPTS_FDS, receives it back as a real
+ * descriptor. NABI moved the fd over SCM_RIGHTS, keyed by the pid the driver
+ * stamped into the cookie; the manager proves the substitution by asking the
+ * received descriptor for its version.
+ *
  * epoll   is the looper path: a read filter on the binder fd, which kqueue
  * refuses as a plain filter and NABI has to register with NOTE_LOWAT of one.
  * The filter must be exact both ways - silent before work, woken by it - or
@@ -66,6 +73,7 @@ static long sys6(long n,long a,long b,long c,long d,long e,long f){
 /* Linux's own ioctl encodings; NABI rewrites the direction bits. */
 #define BINDER_WRITE_READ          0xC0306201u
 #define BINDER_SET_CONTEXT_MGR     0x40046207u
+#define BINDER_SET_CONTEXT_MGR_EXT 0x4018620Du
 #define BINDER_VERSION             0xC0046209u
 #define BINDER_MSL_SET_ARENA       0xC01062E0u
 #define BINDER_MSL_ABI_VERSION     0xC00462E1u
@@ -77,6 +85,11 @@ static long sys6(long n,long a,long b,long c,long d,long e,long f){
 #define BR_TRANSACTION             0x80407202u
 #define BR_TRANSACTION_COMPLETE    0x00007206u
 #define TF_ONE_WAY                 0x01u
+
+/* B_PACK_CHARS('f', 'd', '*', B_TYPE_LARGE) and flat_binder_object.flags, from
+ * mSL-DevFS's binder.h. */
+#define BINDER_TYPE_FD             0x66642a85u
+#define FLAT_BINDER_FLAG_ACCEPTS_FDS 0x0100u
 
 #define ARENA_SIZE (256u * 1024u)
 
@@ -124,6 +137,17 @@ typedef char assert_ver[sizeof(struct binder_version) == 4 ? 1 : -1];
 typedef char assert_arena[sizeof(struct binder_msl_arena) == 16 ? 1 : -1];
 typedef char assert_tr[sizeof(struct binder_transaction_data) == 64 ? 1 : -1];
 
+/* A binder object in a payload: the fd sits in the low 4 bytes of the union
+ * at offset 8, the cookie at 16. */
+struct flat_binder_object {
+  unsigned int type;
+  unsigned int flags;
+  unsigned int fd;
+  unsigned int pad;
+  unsigned long cookie;
+}; /* 24 bytes */
+typedef char assert_fbo[sizeof(struct flat_binder_object) == 24 ? 1 : -1];
+
 /* Unpacked, as on aarch64: NABI's l_epoll_event is 16 bytes there (the x86-64
  * spelling is the packed 12-byte one). */
 struct ep_event {
@@ -139,6 +163,21 @@ static void fail(const char *what, long v)
 {
   put("binderprobe FAIL: "); put(what); put(" -> "); putd(v); put("\n");
   sys6(SYS_exit_group, 1, 0,0,0,0,0);
+}
+
+static void mzero(void *p, unsigned long n)
+{
+  unsigned char *b = p;
+  unsigned long i;
+  for (i = 0; i < n; i++) b[i] = 0;
+}
+
+static void mcopy(void *d, const void *s, unsigned long n)
+{
+  unsigned char *a = d;
+  const unsigned char *b = s;
+  unsigned long i;
+  for (i = 0; i < n; i++) a[i] = b[i];
 }
 
 static long bioctl(int fd, unsigned int cmd, void *arg)
@@ -657,6 +696,206 @@ static void stage_twoproc(void)
   sys6(SYS_close, fd, 0,0,0,0,0);
 }
 
+/* A descriptor across the boundary: the client puts a BINDER_TYPE_FD object -
+ * its own /dev/binder open - in the transaction, and the manager, which
+ * registered as the manager with FLAT_BINDER_FLAG_ACCEPTS_FDS, receives the
+ * object with the driver's stamp (the sender's pid in the cookie) and NABI's
+ * substitution (the descriptor, arrived over SCM_RIGHTS, in the fd). The
+ * manager proves the descriptor is a real one by asking the received fd for
+ * its version. */
+static void stage_fd(void)
+{
+  struct binder_transaction_data tr, *got;
+  struct binder_msl_arena a;
+  struct flat_binder_object obj;
+  unsigned char payload[64];
+  unsigned char wbuf[128], rbuf[512];
+  unsigned long arena, consumed, offsets[1];
+  unsigned int cmd;
+  int ready[2], go[2], woff, fd, spin, i;
+  int zero = 0;
+  long child, status, r;
+
+  fd = open_binder("/dev/binder");
+  if (fd < 0)
+    fail("open /dev/binder (fd)", fd);
+
+  /* The manager must say it accepts descriptors, or the driver refuses the
+   * object (EPERM) at the transaction boundary. SET_CONTEXT_MGR_EXT is how
+   * the object's flags reach the node. */
+  mzero(&obj, sizeof obj);
+  obj.flags = FLAT_BINDER_FLAG_ACCEPTS_FDS;
+  r = bioctl(fd, BINDER_SET_CONTEXT_MGR_EXT, &obj);
+  if (r != 0)
+    fail("become the context manager with ACCEPTS_FDS", r);
+
+  arena = (unsigned long)sys6(SYS_mmap, 0, ARENA_SIZE,
+      PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if ((long)arena >= -4096 && (long)arena < 0)
+    fail("mmap the arena (fd)", (long)arena);
+  a.addr = arena;
+  a.size = ARENA_SIZE;
+  r = bioctl(fd, BINDER_MSL_SET_ARENA, &a);
+  if (r != 0)
+    fail("register the arena (fd)", r);
+
+  woff = 0;
+  cmd = BC_ACQUIRE;
+  *(unsigned int *)(wbuf + woff) = cmd; woff += 4;
+  *(unsigned int *)(wbuf + woff) = zero; woff += 4;
+  cmd = BC_ENTER_LOOPER;
+  *(unsigned int *)(wbuf + woff) = cmd; woff += 4;
+  if (binder_wr(fd, wbuf, woff, 0, 0, 0) != 0)
+    fail("BC_ACQUIRE on handle 0 (fd)", 0);
+
+  if (sys6(SYS_pipe2, (long)ready, 0, 0,0,0,0) != 0)
+    fail("pipe(ready) (fd)", 0);
+  if (sys6(SYS_pipe2, (long)go, 0, 0,0,0,0) != 0)
+    fail("pipe(go) (fd)", 0);
+
+  child = sys6(SYS_clone, SIGCHLD, 0, 0, 0, 0, 0);   /* fork */
+  if (child < 0)
+    fail("fork (fd)", child);
+
+  if (child == 0) {
+    char c;
+
+    sys6(SYS_close, fd, 0,0,0,0,0);
+    sys6(SYS_close, ready[0], 0,0,0,0,0);
+    sys6(SYS_close, go[1], 0,0,0,0,0);
+
+    fd = open_binder("/dev/binder");
+    if (fd < 0)
+      sys6(SYS_exit_group, 2, 0,0,0,0,0);
+
+    a.addr = (unsigned long)sys6(SYS_mmap, 0, ARENA_SIZE,
+        PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if ((long)a.addr >= -4096 && (long)a.addr < 0)
+      sys6(SYS_exit_group, 3, 0,0,0,0,0);
+    a.size = ARENA_SIZE;
+    r = bioctl(fd, BINDER_MSL_SET_ARENA, &a);
+    if (r != 0)
+      sys6(SYS_exit_group, 3, 0,0,0,0,0);
+
+    woff = 0;
+    cmd = BC_ACQUIRE;
+    *(unsigned int *)(wbuf + woff) = cmd; woff += 4;
+    *(unsigned int *)(wbuf + woff) = zero; woff += 4;
+    cmd = BC_ENTER_LOOPER;
+    *(unsigned int *)(wbuf + woff) = cmd; woff += 4;
+    if (binder_wr(fd, wbuf, woff, 0, 0, 0) != 0)
+      sys6(SYS_exit_group, 4, 0,0,0,0,0);
+
+    /* The parcel: the string, then the object at offset 16. The fd field
+     * names the client's own /dev/binder open. */
+    for (i = 0; i < (int)sizeof(payload); i++)
+      payload[i] = 0;
+    mcopy(payload, "fd-probe", 8);
+    obj.type = BINDER_TYPE_FD;
+    obj.flags = 0;
+    obj.fd = (unsigned int)fd;
+    obj.cookie = 0;
+    mcopy(payload + 16, &obj, sizeof obj);
+    offsets[0] = 16;
+
+    if (sys6(SYS_write, ready[1], (long)"g", 1, 0,0,0) != 1)
+      sys6(SYS_exit_group, 4, 0,0,0,0,0);
+    if (sys6(SYS_read, go[0], (long)&c, 1, 0,0,0) != 1)
+      sys6(SYS_exit_group, 4, 0,0,0,0,0);
+
+    for (i = 0; i < (int)sizeof(tr); i++)
+      ((unsigned char *)&tr)[i] = 0;
+    tr.target.handle = 0;
+    tr.code = 45;
+    tr.flags = TF_ONE_WAY;
+    tr.data_size = 16 + sizeof(obj);
+    tr.offsets_size = sizeof(offsets);
+    tr.data.ptr.buffer = (unsigned long)payload;
+    tr.data.ptr.offsets = (unsigned long)offsets;
+
+    woff = 0;
+    cmd = BC_TRANSACTION;
+    *(unsigned int *)(wbuf + woff) = cmd; woff += 4;
+    for (i = 0; i < (int)sizeof(tr); i++)
+      wbuf[woff + i] = ((unsigned char *)&tr)[i];
+    woff += (int)sizeof(tr);
+    if (binder_wr(fd, wbuf, woff, 0, 0, 0) != 0)
+      sys6(SYS_exit_group, 5, 0,0,0,0,0);
+
+    sys6(SYS_close, fd, 0,0,0,0,0);
+    sys6(SYS_exit_group, 0, 0,0,0,0,0);
+  }
+
+  sys6(SYS_close, ready[1], 0,0,0,0,0);
+  sys6(SYS_close, go[0], 0,0,0,0,0);
+  {
+    char c;
+
+    if (sys6(SYS_read, ready[0], (long)&c, 1, 0,0,0) != 1)
+      fail("the client never became ready (fd)", 0);
+    if (sys6(SYS_write, go[1], (long)"g", 1, 0,0,0) != 1)
+      fail("releasing the client (fd)", 0);
+  }
+
+  got = 0;
+  for (spin = 0; spin < 10 && got == 0; spin++) {
+    consumed = 0;
+    if (binder_wr(fd, 0, 0, rbuf, sizeof(rbuf), &consumed) != 0)
+      break;
+    i = 0;
+    while (i + 4 <= (int)consumed) {
+      unsigned int c = *(unsigned int *)(rbuf + i);
+      i += 4;
+      if (c == BR_TRANSACTION) {
+        got = (struct binder_transaction_data *)(rbuf + i);
+        i += sizeof(tr);
+        break;
+      }
+    }
+  }
+  if (got == 0)
+    fail("BR_TRANSACTION with the descriptor (fd)", 0);
+  if (got->code != 45)
+    fail("the fd transaction code survived", got->code);
+  if (got->data.ptr.buffer < arena ||
+      got->data.ptr.buffer >= arena + ARENA_SIZE)
+    fail("the fd payload landed outside the owner's arena",
+         (long)got->data.ptr.buffer);
+
+  mcopy(&obj, (void *)got->data.ptr.buffer + 16, sizeof obj);
+  if (obj.type != BINDER_TYPE_FD)
+    fail("the object stayed a BINDER_TYPE_FD", obj.type);
+  if (obj.cookie != (unsigned long)child)
+    fail("the cookie carries the sender's pid", (long)obj.cookie);
+
+  /* The fd NABI substituted must be a real, usable descriptor: asking the
+   * client's open for its version answers protocol 8, exactly as stage_version
+   * checked on our own open. */
+  {
+    struct binder_version ver;
+
+    if (bioctl((int)obj.fd, BINDER_VERSION, &ver) != 0)
+      fail("the received descriptor answers ioctl", (long)obj.fd);
+    if (ver.protocol_version != 8)
+      fail("the received descriptor is the client's binder", ver.protocol_version);
+  }
+
+  woff = 0;
+  cmd = BC_FREE_BUFFER;
+  *(unsigned int *)(wbuf + woff) = cmd; woff += 4;
+  *(unsigned long *)(wbuf + woff) = got->data.ptr.buffer; woff += 8;
+  if (binder_wr(fd, wbuf, woff, 0, 0, 0) != 0)
+    fail("BC_FREE_BUFFER accepted (fd)", 0);
+
+  status = 0;
+  if (sys6(SYS_wait4, child, (long)&status, 0, 0, 0, 0) < 0)
+    fail("wait4 the client (fd)", 0);
+  if (((status >> 8) & 0xff) != 0)
+    fail("the client exited nonzero (fd)", status);
+
+  sys6(SYS_close, fd, 0,0,0,0,0);
+}
+
 void _start(void)
 {
   int fd;
@@ -670,6 +909,7 @@ void _start(void)
     stage_oneway();
     stage_epoll();
     stage_twoproc();
+    stage_fd();
     put("binderprobe ok\n");
   }
   sys6(SYS_exit_group, fd < 0 ? 77 : 0, 0,0,0,0,0);

@@ -315,6 +315,12 @@ int     epoll_registered_fds(int epfd, int *out, int max);
 /* Whether a descriptor is a binder device, which needs its read filter
  * registered with a NOTE_LOWAT of one (src/fs/fs.c). */
 bool    binder_fd(int fd);
+/* The BINDER_TYPE_FD broker (src/fs/binder_broker.c): a per-instance
+ * rendezvous socket that moves a descriptor from the sender to the receiver,
+ * because the driver can only stamp the sender's pid into the cookie. */
+int     binder_broker_init(void);
+int     binder_broker_register(uint32_t pid, uint32_t fd);
+int     binder_broker_request(uint32_t pid, uint32_t fd);
 /* pidfd (src/proc/pidfd.c). A pidfd is readable exactly when its process has
  * exited, which poll and select have to answer since Darwin has no descriptor
  * that does it. */

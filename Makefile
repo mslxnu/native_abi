@@ -142,6 +142,7 @@ COMMON_SRCS := src/main.c \
                src/fs/tee.c \
                src/sys/timer.c \
                src/fs/fs.c \
+               src/fs/binder_broker.c \
                src/fs/epoll.c \
                src/fs/procfs.c \
                src/sys/sys.c \

@@ -630,6 +630,15 @@ main(int argc, char *argv[], char **envp)
 
   init_vkernel(root);
 
+  /*
+   * The binder descriptor broker. The first process - the instance root -
+   * creates the rendezvous socket and its acceptor thread here, before any
+   * guest code runs and before any fork, so every descendant finds the path
+   * in its inherited environment. A failure is not fatal: it only means a
+   * BINDER_TYPE_FD transaction cannot be delivered.
+   */
+  binder_broker_init();
+
   open_debug_sinks(debug_paths);
 
   /*
