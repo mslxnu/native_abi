@@ -73,6 +73,7 @@ bool has_sigpending(void);
 bool sigrestart_wanted(void);
 int send_signal(pid_t pid, int sig);
 void signalfd_note_signal(int lsig);
+void signalfd_sender(int lsig, uint32_t *host_pid, uint32_t *host_uid);
 
 /* The architecture-specific half of signal delivery, in signal_x86.c /
  * signal_arm64.c. The signal frame is entirely arch-shaped: the x86 sigcontext

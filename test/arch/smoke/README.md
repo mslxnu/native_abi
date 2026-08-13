@@ -262,7 +262,11 @@ guest-code cache sync.
   handler. Readability is a byte held in a socketpair, so `poll` answers
   without knowing any of this — and the test drives the readiness through
   `ppoll` rather than `read`, since that is what an event loop does and it is
-  the difference between a descriptor and a file.
+  the difference between a descriptor and a file. The record also names the
+  sender, which is where an emulation lies most easily: a self-`kill` must read
+  back as the guest's own `getpid()`/`getuid()`, not as the host pid of the
+  `nabi` process and the account it runs under — an all-zero identity would
+  defeat every waitpid-style matcher built on `ssi_pid`.
 
 - `ipctest` — System V IPC: a segment created, attached, shared across a fork,
   detached and removed; keys resolving to ids; semaphore values through

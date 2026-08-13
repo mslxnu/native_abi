@@ -16,17 +16,62 @@
 #define SET_SIGBIT(sigbits, lsig) (atomic_fetch_or((sigbits), (1UL << ((lsig) - 1))))
 #define CLEAR_SIGBIT(sigbits, lsig) (atomic_fetch_and((sigbits), ~(1UL << ((lsig) - 1))))
 
+/*
+ * Sender identity of the most recent arrival of each signal, as the host
+ * reported it. The pending set is a bitmap - a signal is pending or it is not -
+ * and identity keeps the same shape: one record per signal, the last arrival
+ * wins, which is also what Linux keeps for non-realtime signals. The values are
+ * the host's own pid and uid, kept raw because the guest-space conversion
+ * (pidns_to_ns, host_uid_to_guest) does file work that a signal handler must
+ * not; signalfd_sender turns them into the guest's view at read time.
+ *
+ * The two stores from __host_signal_handler are deliberately not locked - the
+ * same lock-free array scan signalfd_note_signal makes - and process memory
+ * rather than checkpoint state, like the signalfd table: a forked child has no
+ * signalfds, so it has no use for what filled the records.
+ */
+struct signalfd_sender {
+  uint32_t pid, uid;
+};
+
+static struct signalfd_sender sigsenders[LINUX_NSIG];
+
 static void
 __host_signal_handler(int signum, siginfo_t *info, ucontext_t *context)
 {
   /* actually no need to do it atomically */
-  SET_SIGBIT(&task.sigpending, darwin_to_linux_signal(signum));
+  int lsig = darwin_to_linux_signal(signum);
+  SET_SIGBIT(&task.sigpending, lsig);
+  if (info != NULL) {
+    sigsenders[lsig - 1].pid = (uint32_t) info->si_pid;
+    sigsenders[lsig - 1].uid = (uint32_t) info->si_uid;
+  } else {
+    sigsenders[lsig - 1].pid = 0;
+    sigsenders[lsig - 1].uid = 0;
+  }
   /* A signalfd wanting this signal must see it as readable, which means a byte
    * in the socketpair underneath it. The poke is lock-free and nonblocking -
    * it runs inside a signal handler - and a lost one costs nothing, because
    * every signalfd read looks the pending set up again before deciding to
    * sleep. */
-  signalfd_note_signal(darwin_to_linux_signal(signum));
+  signalfd_note_signal(lsig);
+}
+
+/*
+ * The raw sender of `lsig`'s most recent arrival, as the host reported it.
+ * Reads under sig_lock so it pairs with the signal paths that take it.
+ */
+void
+signalfd_sender(int lsig, uint32_t *host_pid, uint32_t *host_uid)
+{
+  if (lsig <= 0 || lsig > LINUX_NSIG) {
+    *host_pid = *host_uid = 0;
+    return;
+  }
+  pthread_rwlock_rdlock(&proc.sig_lock);
+  *host_pid = sigsenders[lsig - 1].pid;
+  *host_uid = sigsenders[lsig - 1].uid;
+  pthread_rwlock_unlock(&proc.sig_lock);
 }
 
 int

@@ -613,9 +613,15 @@ signalfd_read(int fd, char *out, size_t size, int *ret)
 
       struct l_signalfd_siginfo si = { 0 };
       si.ssi_signo = (uint32_t) sig;
-      /* 0 is SI_USER. This path carries no sender identity - the pending set
-       * is a bitmap, not a queue of siginfo records - and the guests that
-       * matter only look at ssi_signo anyway. */
+      /* 0 is SI_USER; every arrival here came from the host's kill, which is
+       * that source. The sender is reported the way the guest names things:
+       * pidns_to_ns turns the host pid into the guest's namespace's (and is
+       * the identity when none is active), host_uid_to_guest turns the account
+       * nabi runs as into guest root, exactly as getuid answers. */
+      uint32_t hpid = 0, huid = 0;
+      signalfd_sender(sig, &hpid, &huid);
+      si.ssi_pid = (uint32_t) pidns_to_ns((int32_t) hpid);
+      si.ssi_uid = host_uid_to_guest((uid_t) huid);
       memcpy(out, &si, sizeof si);
       *ret = (int) sizeof si;
       return true;

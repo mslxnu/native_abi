@@ -14,7 +14,11 @@
  *    handler;
  *  - the descriptor must poll readable while a wanted signal is pending and
  *    not readable once it has been read, which is what the socketpair byte is
- *    for.
+ *    for;
+ *  - the record must name the sender as the guest names it - kill(self) is
+ *    getpid()/getuid() to the reader, not the host's pid and the account nabi
+ *    runs under, and an identity of all zeros would fail every waitpid-style
+ *    matcher systemd and its ilk build on ssi_pid.
  */
 typedef unsigned long ulong;
 static long sys6(long n,long a,long b,long c,long d,long e,long f){
@@ -37,6 +41,7 @@ static long sys6(long n,long a,long b,long c,long d,long e,long f){
 #define SYS_rt_sigprocmask 135
 #define SYS_rt_sigpending 136
 #define SYS_getpid 172
+#define SYS_getuid 174
 
 #define SIGUSR1 10
 #define SIGUSR2 12
@@ -78,13 +83,16 @@ static long sf_create(ulong mask, long flags)
   return sys6(SYS_signalfd4, -1, (long) &mask, sizeof mask, flags, 0, 0);
 }
 
-static long sf_read(int fd, ulong *signo)
+struct sfrec { unsigned int signo, pid, uid; };
+static long sf_read(int fd, struct sfrec *out)
 {
   char buf[SI_SIZE];
   long r = sys6(SYS_read, fd, (long) buf, sizeof buf, 0, 0, 0);
   if (r == SI_SIZE) {
-    unsigned int s = *(unsigned int *) buf;
-    *signo = s;
+    unsigned int *u = (unsigned int *) buf;
+    out->signo = u[0];          /* ssi_signo */
+    out->pid = u[3];            /* ssi_pid, 12 bytes in */
+    out->uid = u[4];            /* ssi_uid, 16 bytes in */
   }
   return r;
 }
@@ -92,7 +100,7 @@ static long sf_read(int fd, ulong *signo)
 void _start(void)
 {
   long r;
-  ulong signo;
+  struct sfrec rec;
 
   /* Nothing may default-terminate behind a failing signalfd: the test has to
    * be able to report its own failure. */
@@ -101,6 +109,7 @@ void _start(void)
   sys6(SYS_rt_sigaction, SIGUSR1, (long)act, 0, 8, 0, 0);
   sys6(SYS_rt_sigaction, SIGUSR2, (long)act, 0, 8, 0, 0);
   long pid = sys6(SYS_getpid, 0,0,0,0,0,0);
+  long uid = sys6(SYS_getuid, 0,0,0,0,0,0);
 
   /* Creation: a non-blocking, close-on-exec descriptor above the standard
    * three, that reads EAGAIN while nothing is pending. */
@@ -109,12 +118,14 @@ void _start(void)
     fail("signalfd4 create", fd);
   if (fd <= 2)
     fail("signalfd4 handed out a standard descriptor", fd);
-  if ((r = sf_read((int) fd, &signo)) != -EAGAIN)
+  if ((r = sf_read((int) fd, &rec)) != -EAGAIN)
     fail("read of an empty non-blocking signalfd", r);
 
   /* A signal that arrives while blocked is delivered to the descriptor: the
    * record names it, the read is a full record, and the signal is consumed -
-   * neither still pending nor handed to the handler. */
+   * neither still pending nor handed to the handler. The record names the
+   * sender as the guest names it - kill(self) must read back as getpid() and
+   * getuid(), not as the host's pid and the account nabi runs under. */
   ulong m = SIGUSR1_BIT;
   sys6(SYS_rt_sigprocmask, SIG_BLOCK, (long) &m, 0, 8, 0, 0);
   sys6(SYS_kill, pid, SIGUSR1, 0,0,0,0);
@@ -122,10 +133,14 @@ void _start(void)
   long bfd = sf_create(SIGUSR1_BIT, 0);       /* the blocking form */
   if (bfd < 0)
     fail("blocking signalfd4 create", bfd);
-  if ((r = sf_read((int) bfd, &signo)) != SI_SIZE)
+  if ((r = sf_read((int) bfd, &rec)) != SI_SIZE)
     fail("blocking read of a pending signalfd", r);
-  if (signo != SIGUSR1)
-    fail("ssi_signo", (long) signo);
+  if (rec.signo != SIGUSR1)
+    fail("ssi_signo", (long) rec.signo);
+  if (rec.pid != (unsigned) pid)
+    fail("ssi_pid names the guest", (long) rec.pid);
+  if (rec.uid != (unsigned) uid)
+    fail("ssi_uid names the guest", (long) rec.uid);
   sys6(SYS_rt_sigpending, (long) &m, 8, 0, 0, 0, 0);
   if (m & SIGUSR1_BIT)
     fail("signal still pending after signalfd read", (long) m);
@@ -150,7 +165,7 @@ void _start(void)
   }
   if (!ready)
     fail("a pending signalfd never polled readable", r);
-  if ((r = sf_read((int) bfd, &signo)) != SI_SIZE || signo != SIGUSR1)
+  if ((r = sf_read((int) bfd, &rec)) != SI_SIZE || rec.signo != SIGUSR1)
     fail("read after poll", r);
   pfd.revents = 0;
   if ((r = sys6(SYS_ppoll, (long) &pfd, 1, (long) &now, 0, 0, 0)) < 0)
@@ -168,10 +183,10 @@ void _start(void)
   long sfd = sf_create(SIGUSR2_BIT, 0);
   if (sfd < 0)
     fail("signalfd4 after raising", sfd);
-  if ((r = sf_read((int) sfd, &signo)) != SI_SIZE)
+  if ((r = sf_read((int) sfd, &rec)) != SI_SIZE)
     fail("read of a signal pending before creation", r);
-  if (signo != SIGUSR2)
-    fail("ssi_signo (pre-pending)", (long) signo);
+  if (rec.signo != SIGUSR2)
+    fail("ssi_signo (pre-pending)", (long) rec.signo);
   if (caught != 0)
     fail("pre-pending signal delivered instead of read", caught);
 
