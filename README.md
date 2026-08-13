@@ -32,10 +32,10 @@ replaced or omitted:
 | Piece | What it does | Where |
 |-------|--------------|-------|
 | **Syscall translation** | Linux system calls onto Darwin's, over `Hypervisor.framework` | **this repository** |
-| **Filesystem Hierarchy Standard** | The Linux filesystem layout, natively | [mSL/FHS](https://github.com/mslxnu/fhs) |
-| **procfs** | `/proc`, as a real filesystem | [mSL/ProcFS](https://github.com/mslxnu/procfs) |
-| **sysfs** | `/sys`, as a real filesystem | [mSL/SysFS](https://github.com/mslxnu/sysfs) |
-| **devfs** | `/dev` — already part of macOS | XNU |
+| **Filesystem Hierarchy Standard** | Native Linux-style filesystem layout | [mSL/FHS](https://github.com/mslxnu/fhs) |
+| **procfs** | `/proc`, as a native pseudo-filesystem | [mSL/ProcFS](https://github.com/mslxnu/procfs) |
+| **sysfs** | `/sys`, as a native pseudo-filesystem | [mSL/SysFS](https://github.com/mslxnu/sysfs) |
+| **devfs** | `/dev` driver add-ons for macOS | [mSL/DevFS](https://github.com/mslxnu/devfs) |
 
 **This repository is the ABI piece.** The rest of this document describes it.
 
