@@ -964,6 +964,16 @@ typedef char binder_abi_tr[sizeof(struct binder_transaction_wire) == 64 ? 1 : -1
 
 /* B_PACK_CHARS('f', 'd', '*', B_TYPE_LARGE) in mSL-DevFS's binder.h. */
 #define LINUX_BINDER_TYPE_FD 0x66642a85u
+/* B_PACK_CHARS('f', 'd', 'a', B_TYPE_LARGE) in mSL-DevFS's binder.h. */
+#define LINUX_BINDER_TYPE_FDA 0x6664612au
+
+/* The buffer object header, enough to walk the fd array a BINDER_TYPE_FDA
+ * names. The full struct is 40 bytes; we only need the first three fields. */
+struct binder_buffer_object {
+    uint32_t type;
+    uint32_t flags;
+    uint64_t buffer;
+};
 
 /* Per-descriptor state: the arena, in both address spaces, so pointers can
  * be translated either way. */
@@ -1137,6 +1147,43 @@ br_cmd_len(uint32_t cmd)
  * transaction, so the receiver always finds the descriptor waiting. Both
  * pointers were translated to host addresses just above. */
 static bool
+binder_scan_fd_array(const uint8_t *data, uint64_t off, uint64_t data_size,
+    uint32_t pid)
+{
+  uint64_t num_fds, parent, parent_offset;
+  uint64_t i;
+  struct binder_buffer_object pb;
+  uint64_t parent_host;
+
+  if (off + 32 > data_size)
+    return false;
+  memcpy(&num_fds, data + off + 8, sizeof num_fds);
+  memcpy(&parent, data + off + 16, sizeof parent);
+  memcpy(&parent_offset, data + off + 24, sizeof parent_offset);
+
+  if (!binder_guest_to_host(parent, &parent_host))
+    return false;
+  if (parent_host + sizeof pb > data_size)
+    return false;
+  memcpy(&pb, (const uint8_t *)parent_host, sizeof pb);
+
+  uint64_t fd_array_host;
+  if (!binder_guest_to_host(pb.buffer + parent_offset, &fd_array_host))
+    return false;
+
+  const uint8_t *fd_array = (const uint8_t *)fd_array_host;
+  for (i = 0; i < num_fds; i++) {
+    uint64_t fd;
+    memcpy(&fd, fd_array + i * sizeof(uint64_t), sizeof fd);
+    if (fcntl((int)fd, F_GETFD) < 0)
+      return false;
+    if (binder_broker_register(pid, (uint32_t)fd) != 0)
+      return false;
+  }
+  return true;
+}
+
+static bool
 binder_scan_fds(const struct binder_transaction_wire *tr)
 {
   uint64_t n = tr->offsets_size / sizeof(uint64_t);
@@ -1151,13 +1198,16 @@ binder_scan_fds(const struct binder_transaction_wire *tr)
     if (off + 24 > tr->data_size)
       return false;                 /* an offset outside the payload */
     memcpy(&type, data + off, sizeof type);
-    if (type != LINUX_BINDER_TYPE_FD)
-      continue;
-    memcpy(&fd, data + off + 8, sizeof fd);
-    if (fcntl((int)fd, F_GETFD) < 0)
-      return false;                 /* the object names a closed descriptor */
-    if (binder_broker_register(pid, fd) != 0)
-      return false;
+    if (type == LINUX_BINDER_TYPE_FD) {
+      memcpy(&fd, data + off + 8, sizeof fd);
+      if (fcntl((int)fd, F_GETFD) < 0)
+        return false;                 /* the object names a closed descriptor */
+      if (binder_broker_register(pid, fd) != 0)
+        return false;
+    } else if (type == LINUX_BINDER_TYPE_FDA) {
+      if (!binder_scan_fd_array(data, off, tr->data_size, pid))
+        return false;
+    }
   }
   return true;
 }
@@ -1167,13 +1217,48 @@ binder_scan_fds(const struct binder_transaction_wire *tr)
  * the descriptor, register it with this process's fd table - NABI's guest fd
  * numbers are the host ones, so the number it returns is the one the guest
  * will use - and rewrite the object in the arena, which is the host address
- * of what the guest reads through tr->buffer. */
+ * of what the guest reads through tr->buffer. For an fd array the driver
+ * stamped the sender's pid into the transaction header, not into the array
+ * (which has no cookie field). */
+static bool
+binder_materialize_fd_array(struct binder_transaction_wire *tr, uint64_t off,
+    uint32_t sender_pid)
+{
+  uint64_t num_fds, parent, parent_offset;
+  uint64_t i;
+  uint8_t *data = (uint8_t *)(uintptr_t)tr->buffer;
+  struct binder_buffer_object pb;
+
+  if (off + 32 > tr->data_size)
+    return false;
+  memcpy(&num_fds, data + off + 8, sizeof num_fds);
+  memcpy(&parent, data + off + 16, sizeof parent);
+  memcpy(&parent_offset, data + off + 24, sizeof parent_offset);
+
+  memcpy(&pb, data + parent, sizeof pb);
+  uint8_t *fd_array = data + pb.buffer + parent_offset;
+  for (i = 0; i < num_fds; i++) {
+    uint64_t fd;
+    memcpy(&fd, fd_array + i * sizeof(uint64_t), sizeof fd);
+    int nfd = binder_broker_request(sender_pid, (uint32_t)fd);
+    if (nfd < 0)
+      return false;
+    if (register_fd(nfd, false) != 0) {
+      close(nfd);
+      return false;
+    }
+    memcpy(fd_array + i * sizeof(uint64_t), &nfd, sizeof nfd);
+  }
+  return true;
+}
+
 static bool
 binder_materialize_fds(struct binder_transaction_wire *tr)
 {
   uint64_t n = tr->offsets_size / sizeof(uint64_t);
   const uint64_t *offp = (const uint64_t *)(uintptr_t)tr->offsets;
   uint8_t *data = (uint8_t *)(uintptr_t)tr->buffer;
+  uint32_t sender_pid = (uint32_t)tr->sender_pid;
 
   for (uint64_t i = 0; i < n; i++) {
     uint64_t off = offp[i];
@@ -1183,18 +1268,21 @@ binder_materialize_fds(struct binder_transaction_wire *tr)
     if (off + 24 > tr->data_size)
       return false;
     memcpy(&type, data + off, sizeof type);
-    if (type != LINUX_BINDER_TYPE_FD)
-      continue;
-    memcpy(&cookie, data + off + 16, sizeof cookie);
-    memcpy(&fd, data + off + 8, sizeof fd);
-    int nfd = binder_broker_request((uint32_t)(cookie & 0xffffffffu), fd);
-    if (nfd < 0)
-      return false;
-    if (register_fd(nfd, false) != 0) {
-      close(nfd);
-      return false;
+    if (type == LINUX_BINDER_TYPE_FD) {
+      memcpy(&cookie, data + off + 16, sizeof cookie);
+      memcpy(&fd, data + off + 8, sizeof fd);
+      int nfd = binder_broker_request((uint32_t)(cookie & 0xffffffffu), fd);
+      if (nfd < 0)
+        return false;
+      if (register_fd(nfd, false) != 0) {
+        close(nfd);
+        return false;
+      }
+      memcpy(data + off + 8, &nfd, sizeof nfd);
+    } else if (type == LINUX_BINDER_TYPE_FDA) {
+      if (!binder_materialize_fd_array(tr, off, sender_pid))
+        return false;
     }
-    memcpy(data + off + 8, &nfd, sizeof nfd);
   }
   return true;
 }

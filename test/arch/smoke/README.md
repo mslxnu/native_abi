@@ -59,6 +59,8 @@ guest-code cache sync.
   `BINDER_TYPE_FD` object in a transaction: NABI's broker moves the descriptor
   over `SCM_RIGHTS` (the manager registered with `FLAT_BINDER_FLAG_ACCEPTS_FDS`
   and receives a real, usable fd back, keyed by the sender's pid in the cookie).
+  Its fda stage sends a `BINDER_TYPE_FDA` array of two descriptors: the broker
+  moves each over `SCM_RIGHTS` and the manager substitutes them in the array.
 - `pathtest` — a guest path merely starting with a host-passthrough name
   (`/tmpmark` vs `/tmp`) must resolve in the rootfs, not on the host.
 - `protecttest` — `mprotect` a page read-only and write to it; the write must trap.

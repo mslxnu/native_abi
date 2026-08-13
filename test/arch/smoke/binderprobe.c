@@ -89,7 +89,25 @@ static long sys6(long n,long a,long b,long c,long d,long e,long f){
 /* B_PACK_CHARS('f', 'd', '*', B_TYPE_LARGE) and flat_binder_object.flags, from
  * mSL-DevFS's binder.h. */
 #define BINDER_TYPE_FD             0x66642a85u
+#define BINDER_TYPE_FDA            0x6664612au
 #define FLAT_BINDER_FLAG_ACCEPTS_FDS 0x0100u
+
+struct binder_buffer_object {
+  unsigned int type;
+  unsigned int flags;
+  unsigned long buffer;
+  unsigned long length;
+  unsigned long parent;
+  unsigned long parent_offset;
+}; /* 40 bytes */
+
+struct binder_fd_array_object {
+  unsigned int type;
+  unsigned int pad;
+  unsigned long num_fds;
+  unsigned long parent;
+  unsigned long parent_offset;
+}; /* 32 bytes */
 
 #define ARENA_SIZE (256u * 1024u)
 
@@ -910,6 +928,241 @@ void _start(void)
     stage_epoll();
     stage_twoproc();
     stage_fd();
+    stage_fda();
+    put("binderprobe ok\n");
+  }
+  sys6(SYS_exit_group, fd < 0 ? 77 : 0, 0,0,0,0,0);
+}
+  struct binder_transaction_data tr, *got;
+  struct binder_msl_arena a;
+  struct binder_buffer_object bob;
+  struct binder_fd_array_object fdao;
+  unsigned char payload[128];
+  unsigned char wbuf[256], rbuf[512];
+  unsigned long arena, consumed, offsets[1];
+  unsigned int cmd;
+  int ready[2], go[2], woff, fd1, fd2, spin, i;
+  int zero = 0;
+  long child, status, r;
+
+  fd1 = open_binder("/dev/binder");
+  if (fd1 < 0)
+    fail("open /dev/binder (fda)", fd1);
+  fd2 = open_binder("/dev/binder");
+  if (fd2 < 0)
+    fail("open second /dev/binder (fda)", fd2);
+
+  fd = open_binder("/dev/binder");
+  if (fd < 0)
+    fail("open /dev/binder (fda-mgr)", fd);
+
+  mzero(&obj, sizeof obj);
+  obj.flags = FLAT_BINDER_FLAG_ACCEPTS_FDS;
+  r = bioctl(fd, BINDER_SET_CONTEXT_MGR_EXT, &obj);
+  if (r != 0)
+    fail("become context manager with ACCEPTS_FDS (fda)", r);
+
+  arena = (unsigned long)sys6(SYS_mmap, 0, ARENA_SIZE,
+      PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if ((long)arena >= -4096 && (long)arena < 0)
+    fail("mmap arena (fda)", (long)arena);
+  a.addr = arena;
+  a.size = ARENA_SIZE;
+  r = bioctl(fd, BINDER_MSL_SET_ARENA, &a);
+  if (r != 0)
+    fail("register arena (fda)", r);
+
+  woff = 0;
+  cmd = BC_ACQUIRE;
+  *(unsigned int *)(wbuf + woff) = cmd; woff += 4;
+  *(unsigned int *)(wbuf + woff) = zero; woff += 4;
+  cmd = BC_ENTER_LOOPER;
+  *(unsigned int *)(wbuf + woff) = cmd; woff += 4;
+  if (binder_wr(fd, wbuf, woff, 0, 0, 0) != 0)
+    fail("BC_ACQUIRE/ENTER_LOOPER (fda)", 0);
+
+  if (sys6(SYS_pipe2, (long)ready, 0, 0,0,0,0) != 0)
+    fail("pipe(ready) (fda)", 0);
+  if (sys6(SYS_pipe2, (long)go, 0, 0,0,0,0) != 0)
+    fail("pipe(go) (fda)", 0);
+
+  child = sys6(SYS_clone, SIGCHLD, 0, 0, 0, 0, 0);
+  if (child < 0)
+    fail("fork (fda)", child);
+
+  if (child == 0) {
+    char c;
+    unsigned long fd_array[2];
+
+    sys6(SYS_close, fd, 0,0,0,0,0);
+    sys6(SYS_close, ready[0], 0,0,0,0,0);
+    sys6(SYS_close, go[1], 0,0,0,0,0);
+
+    fd = open_binder("/dev/binder");
+    if (fd < 0)
+      sys6(SYS_exit_group, 2, 0,0,0,0,0);
+
+    a.addr = (unsigned long)sys6(SYS_mmap, 0, ARENA_SIZE,
+        PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if ((long)a.addr >= -4096 && (long)a.addr < 0)
+      sys6(SYS_exit_group, 3, 0,0,0,0,0);
+    a.size = ARENA_SIZE;
+    r = bioctl(fd, BINDER_MSL_SET_ARENA, &a);
+    if (r != 0)
+      sys6(SYS_exit_group, 3, 0,0,0,0,0);
+
+    woff = 0;
+    cmd = BC_ACQUIRE;
+    *(unsigned int *)(wbuf + woff) = cmd; woff += 4;
+    *(unsigned int *)(wbuf + woff) = zero; woff += 4;
+    cmd = BC_ENTER_LOOPER;
+    *(unsigned int *)(wbuf + woff) = cmd; woff += 4;
+    if (binder_wr(fd, wbuf, woff, 0, 0, 0) != 0)
+      sys6(SYS_exit_group, 4, 0,0,0,0,0);
+
+    fd_array[0] = fd1;
+    fd_array[1] = fd2;
+
+    mzero(&bob, sizeof bob);
+    bob.type = BINDER_TYPE_PTR;
+    bob.flags = 0;
+    bob.buffer = (unsigned long)fd_array;
+    bob.length = 2 * sizeof(unsigned long);
+    bob.parent = 0;
+    bob.parent_offset = 0;
+
+    mzero(&fdao, sizeof fdao);
+    fdao.type = BINDER_TYPE_FDA;
+    fdao.pad = 0;
+    fdao.num_fds = 2;
+    fdao.parent = 16;
+    fdao.parent_offset = 0;
+
+    for (i = 0; i < (int)sizeof(payload); i++)
+      payload[i] = 0;
+    mcopy(payload, "fda-probe", 8);
+    mcopy(payload + 16, &bob, sizeof bob);
+    mcopy(payload + 56, &fdao, sizeof fdao);
+    offsets[0] = 56;
+
+    if (sys6(SYS_write, ready[1], (long)"g", 1, 0,0,0) != 1)
+      sys6(SYS_exit_group, 4, 0,0,0,0,0);
+    if (sys6(SYS_read, go[0], (long)&c, 1, 0,0,0) != 1)
+      sys6(SYS_exit_group, 4, 0,0,0,0,0);
+
+    for (i = 0; i < (int)sizeof(tr); i++)
+      ((unsigned char *)&tr)[i] = 0;
+    tr.target.handle = 0;
+    tr.code = 46;
+    tr.flags = TF_ONE_WAY;
+    tr.data_size = 16 + sizeof(bob) + sizeof(fdao);
+    tr.offsets_size = sizeof(offsets);
+    tr.data.ptr.buffer = (unsigned long)payload;
+    tr.data.ptr.offsets = (unsigned long)offsets;
+
+    woff = 0;
+    cmd = BC_TRANSACTION;
+    *(unsigned int *)(wbuf + woff) = cmd; woff += 4;
+    for (i = 0; i < (int)sizeof(tr); i++)
+      wbuf[woff + i] = ((unsigned char *)&tr)[i];
+    woff += (int)sizeof(tr);
+    if (binder_wr(fd, wbuf, woff, 0, 0, 0) != 0)
+      sys6(SYS_exit_group, 5, 0,0,0,0,0);
+
+    sys6(SYS_close, fd1, 0,0,0,0,0);
+    sys6(SYS_close, fd2, 0,0,0,0,0);
+    sys6(SYS_close, fd, 0,0,0,0,0);
+    sys6(SYS_exit_group, 0, 0,0,0,0,0);
+  }
+
+  sys6(SYS_close, fd1, 0,0,0,0,0);
+  sys6(SYS_close, fd2, 0,0,0,0,0);
+  sys6(SYS_close, ready[1], 0,0,0,0,0);
+  sys6(SYS_close, go[0], 0,0,0,0,0);
+  {
+    char c;
+
+    if (sys6(SYS_read, ready[0], (long)&c, 1, 0,0,0) != 1)
+      fail("the client never became ready (fda)", 0);
+    if (sys6(SYS_write, go[1], (long)"g", 1, 0,0,0) != 1)
+      fail("releasing the client (fda)", 0);
+  }
+
+  got = 0;
+  for (spin = 0; spin < 10 && got == 0; spin++) {
+    consumed = 0;
+    if (binder_wr(fd, 0, 0, rbuf, sizeof(rbuf), &consumed) != 0)
+      break;
+    i = 0;
+    while (i + 4 <= (int)consumed) {
+      unsigned int c = *(unsigned int *)(rbuf + i);
+      i += 4;
+      if (c == BR_TRANSACTION) {
+        got = (struct binder_transaction_data *)(rbuf + i);
+        i += sizeof(tr);
+        break;
+      }
+    }
+  }
+  if (got == 0)
+    fail("BR_TRANSACTION with the fda array (fda)", 0);
+  if (got->code != 46)
+    fail("the fda transaction code survived", got->code);
+  if (got->data.ptr.buffer < arena ||
+      got->data.ptr.buffer >= arena + ARENA_SIZE)
+    fail("the fda payload landed outside the owner's arena",
+         (long)got->data.ptr.buffer);
+
+  {
+    struct binder_fd_array_object *fdao =
+        (struct binder_fd_array_object *)(got->data.ptr.buffer + 56);
+    if (fdao->type != BINDER_TYPE_FDA)
+      fail("the object stayed a BINDER_TYPE_FDA", fdao->type);
+    if (fdao->num_fds != 2)
+      fail("the fd array has two entries", (long)fdao->num_fds);
+
+    unsigned long *fd_array =
+        (unsigned long *)(got->data.ptr.buffer + 88);
+    for (i = 0; i < 2; i++) {
+      struct binder_version ver;
+      if (bioctl((int)fd_array[i], BINDER_VERSION, &ver) != 0)
+        fail("received fd answers ioctl (fda)", (long)fd_array[i]);
+      if (ver.protocol_version != 8)
+        fail("received fd is /dev/binder (fda)", ver.protocol_version);
+    }
+  }
+
+  woff = 0;
+  cmd = BC_FREE_BUFFER;
+  *(unsigned int *)(wbuf + woff) = cmd; woff += 4;
+  *(unsigned long *)(wbuf + woff) = got->data.ptr.buffer; woff += 8;
+  if (binder_wr(fd, wbuf, woff, 0, 0, 0) != 0)
+    fail("BC_FREE_BUFFER accepted (fda)", 0);
+
+  status = 0;
+  if (sys6(SYS_wait4, child, (long)&status, 0, 0, 0, 0) < 0)
+    fail("wait4 the client (fda)", 0);
+  if (((status >> 8) & 0xff) != 0)
+    fail("the client exited nonzero (fda)", status);
+
+  sys6(SYS_close, fd, 0,0,0,0,0);
+}
+
+void _start(void)
+{
+  int fd;
+
+  fd = open_binder("/dev/binder");
+  if (fd >= 0) {
+    sys6(SYS_close, fd, 0,0,0,0,0);
+    stage_version();
+    stage_arena();
+    stage_manager();
+    stage_oneway();
+    stage_epoll();
+    stage_twoproc();
+    stage_fd();
+    stage_fda();
     put("binderprobe ok\n");
   }
   sys6(SYS_exit_group, fd < 0 ? 77 : 0, 0,0,0,0,0);
