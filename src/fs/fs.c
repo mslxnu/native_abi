@@ -1337,7 +1337,8 @@ binder_translate_write(struct binder_state *bs, uint8_t *buf, size_t len)
  * back into guest addresses, and the descriptors it cannot move into ones the
  * receiver owns. Returns false when a descriptor cannot be materialized. */
 static bool
-binder_translate_read(struct binder_state *bs, uint8_t *buf, size_t len)
+binder_translate_read(struct binder_state *bs, uint8_t *buf, size_t len,
+    uint64_t rguest)
 {
   size_t off = 0;
 
@@ -1368,9 +1369,15 @@ binder_translate_read(struct binder_state *bs, uint8_t *buf, size_t len)
       tr->buffer = binder_arena_to_guest(bs, tr->buffer);
       if (tr->offsets_size != 0)
         tr->offsets = binder_arena_to_guest(bs, tr->offsets);
-      /* secctx is a host pointer to a security-context string. Translating
-       * it requires guest memory for the copy; left as a TODO. */
-      (void)secctx;
+      if (*secctx != 0) {
+        uint64_t host_secctx = *secctx;
+        size_t slen = strlen((const char *)(uintptr_t)host_secctx) + 1;
+        char *dst = malloc(slen);
+        if (dst == NULL)
+          return false;
+        memcpy(dst, (const void *)(uintptr_t)host_secctx, slen);
+        *secctx = rguest + (host_secctx - (uint64_t)(uintptr_t)buf);
+      }
     }
     off += plen;
   }
@@ -1437,7 +1444,7 @@ binder_write_read(struct file *file, uint64_t arg, struct binder_state *bs)
     if (rsize != 0 && bwr.read_consumed != 0) {
       size_t n = bwr.read_consumed < rsize ? (size_t)bwr.read_consumed : rsize;
 
-      if (!binder_translate_read(bs, rbuf, n))
+      if (!binder_translate_read(bs, rbuf, n, rguest))
         r = -LINUX_EFAULT;
       if (copy_to_user(rguest, rbuf, n))
         r = -LINUX_EFAULT;
