@@ -53,7 +53,10 @@ guest-code cache sync.
   binder fd for `EPOLLIN` and checks the filter is exact both ways: silent
   before work arrives, woken by it, and silent again once drained - the
   NOTE_LOWAT-of-one registration NABI has to use for a device kqueue would
-  otherwise refuse.
+  otherwise refuse. Its twoproc stage sends a oneway transaction across a fork,
+  so the client is its own process with its own binder fd, arena and acquire,
+  and the manager receives the payload in its own arena - the per-process
+  binder state that the descriptor broker will build on.
 - `pathtest` — a guest path merely starting with a host-passthrough name
   (`/tmpmark` vs `/tmp`) must resolve in the rootfs, not on the host.
 - `protecttest` — `mprotect` a page read-only and write to it; the write must trap.

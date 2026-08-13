@@ -17,10 +17,15 @@
  *   oneway    a transaction to ourselves, which is the whole engine in one
  *             thread: allocate in the arena, translate, deliver, free
  *
- * The sync/poll/twoproc stages are left out because they need threads or a
- * fork, which binder-probe already covers on the host; the oneway stage
- * proves the ioctl numbers, the argument, and the arena all survive the
- * NABI layer, which is the thing being tested here.
+ * The sync/poll stages are left out because they need guest threads, which
+ * binder-probe already covers on the host; the oneway stage proves the
+ * ioctl numbers, the argument, and the arena all survive the NABI layer.
+ *
+ * twoproc is the same transaction across a fork: the client is its own
+ * process with its own binder fd, arena and acquire, and the owner - the
+ * context manager - receives the payload in *its* arena. That is the shape
+ * the descriptor broker will build on, and the two processes are where the
+ * per-process binder state is what separates them.
  *
  * epoll   is the looper path: a read filter on the binder fd, which kqueue
  * refuses as a plain filter and NABI has to register with NOTE_LOWAT of one.
@@ -44,6 +49,11 @@ static long sys6(long n,long a,long b,long c,long d,long e,long f){
 #define SYS_epoll_create1 20
 #define SYS_epoll_ctl 21
 #define SYS_epoll_pwait 22
+#define SYS_pipe2 59
+#define SYS_read 63
+#define SYS_clone 220
+#define SYS_wait4 260
+#define SIGCHLD 17
 #define AT_FDCWD -100
 #define O_RDWR 2
 #define PROT_READ 1
@@ -475,6 +485,178 @@ static void stage_epoll(void)
   sys6(SYS_close, fd, 0,0,0,0,0);
 }
 
+/* Two processes, the way binder is actually used: the owner is the context
+ * manager, the client - a fork, its own /dev/binder open, its own arena -
+ * sends it a oneway transaction. The delivery is what is on test: the client
+ * acquires a handle and queues work on the owner, and the owner reads the
+ * payload back out of its own arena. Each process's binder state is its own;
+ * the inherited descriptors are closed rather than shared. */
+static void stage_twoproc(void)
+{
+  struct binder_transaction_data tr, *got;
+  unsigned char payload[16] = "two-proc";
+  unsigned char wbuf[128], rbuf[512];
+  struct binder_msl_arena a;
+  unsigned long arena, consumed;
+  unsigned int cmd;
+  int ready[2], go[2], woff, fd, spin, i;
+  int zero = 0;
+  long child, status, r;
+
+  fd = open_binder("/dev/binder");
+  if (fd < 0)
+    fail("open /dev/binder (twoproc)", fd);
+  r = bioctl(fd, BINDER_SET_CONTEXT_MGR, &zero);
+  if (r != 0)
+    fail("become the context manager (twoproc)", r);
+
+  arena = (unsigned long)sys6(SYS_mmap, 0, ARENA_SIZE,
+      PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if ((long)arena >= -4096 && (long)arena < 0)
+    fail("mmap the arena (twoproc)", (long)arena);
+  a.addr = arena;
+  a.size = ARENA_SIZE;
+  r = bioctl(fd, BINDER_MSL_SET_ARENA, &a);
+  if (r != 0)
+    fail("register the arena (twoproc)", r);
+
+  woff = 0;
+  cmd = BC_ACQUIRE;
+  *(unsigned int *)(wbuf + woff) = cmd; woff += 4;
+  *(unsigned int *)(wbuf + woff) = zero; woff += 4;
+  cmd = BC_ENTER_LOOPER;
+  *(unsigned int *)(wbuf + woff) = cmd; woff += 4;
+  if (binder_wr(fd, wbuf, woff, 0, 0, 0) != 0)
+    fail("BC_ACQUIRE on handle 0 (twoproc)", 0);
+
+  if (sys6(SYS_pipe2, (long)ready, 0, 0,0,0,0) != 0)
+    fail("pipe(ready) (twoproc)", 0);
+  if (sys6(SYS_pipe2, (long)go, 0, 0,0,0,0) != 0)
+    fail("pipe(go) (twoproc)", 0);
+
+  child = sys6(SYS_clone, SIGCHLD, 0, 0, 0, 0, 0);   /* fork */
+  if (child < 0)
+    fail("fork (twoproc)", child);
+
+  if (child == 0) {
+    /* The client. The binder fd that came over the fork is the owner's
+     * process, not ours, and the pipe ends the owner holds would keep it
+     * from seeing our half-close. */
+    char c;
+
+    sys6(SYS_close, fd, 0,0,0,0,0);
+    sys6(SYS_close, ready[0], 0,0,0,0,0);
+    sys6(SYS_close, go[1], 0,0,0,0,0);
+
+    fd = open_binder("/dev/binder");
+    if (fd < 0)
+      sys6(SYS_exit_group, 2, 0,0,0,0,0);
+
+    a.addr = (unsigned long)sys6(SYS_mmap, 0, ARENA_SIZE,
+        PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if ((long)a.addr >= -4096 && (long)a.addr < 0)
+      sys6(SYS_exit_group, 3, 0,0,0,0,0);
+    a.size = ARENA_SIZE;
+    r = bioctl(fd, BINDER_MSL_SET_ARENA, &a);
+    if (r != 0)
+      sys6(SYS_exit_group, 3, 0,0,0,0,0);
+
+    woff = 0;
+    cmd = BC_ACQUIRE;
+    *(unsigned int *)(wbuf + woff) = cmd; woff += 4;
+    *(unsigned int *)(wbuf + woff) = zero; woff += 4;
+    cmd = BC_ENTER_LOOPER;
+    *(unsigned int *)(wbuf + woff) = cmd; woff += 4;
+    if (binder_wr(fd, wbuf, woff, 0, 0, 0) != 0)
+      sys6(SYS_exit_group, 4, 0,0,0,0,0);
+
+    /* Set up and ready; the owner releases us when it is reading. */
+    if (sys6(SYS_write, ready[1], (long)"g", 1, 0,0,0) != 1)
+      sys6(SYS_exit_group, 4, 0,0,0,0,0);
+    if (sys6(SYS_read, go[0], (long)&c, 1, 0,0,0) != 1)
+      sys6(SYS_exit_group, 4, 0,0,0,0,0);
+
+    for (i = 0; i < (int)sizeof(tr); i++)
+      ((unsigned char *)&tr)[i] = 0;
+    tr.target.handle = 0;
+    tr.code = 44;
+    tr.flags = TF_ONE_WAY;
+    tr.data_size = sizeof(payload);
+    tr.data.ptr.buffer = (unsigned long)payload;
+    tr.data.ptr.offsets = 0;
+
+    woff = 0;
+    cmd = BC_TRANSACTION;
+    *(unsigned int *)(wbuf + woff) = cmd; woff += 4;
+    for (i = 0; i < (int)sizeof(tr); i++)
+      wbuf[woff + i] = ((unsigned char *)&tr)[i];
+    woff += (int)sizeof(tr);
+    if (binder_wr(fd, wbuf, woff, 0, 0, 0) != 0)
+      sys6(SYS_exit_group, 5, 0,0,0,0,0);
+
+    sys6(SYS_close, fd, 0,0,0,0,0);
+    sys6(SYS_exit_group, 0, 0,0,0,0,0);
+  }
+
+  /* The owner: wait for the client's setup, then release it. */
+  sys6(SYS_close, ready[1], 0,0,0,0,0);
+  sys6(SYS_close, go[0], 0,0,0,0,0);
+  {
+    char c;
+
+    if (sys6(SYS_read, ready[0], (long)&c, 1, 0,0,0) != 1)
+      fail("the client never became ready", 0);
+    if (sys6(SYS_write, go[1], (long)"g", 1, 0,0,0) != 1)
+      fail("releasing the client", 0);
+  }
+
+  /* The transaction arrives in the owner's arena; read it as stage_oneway
+   * does. The first read may only deliver BR_TRANSACTION_COMPLETE. */
+  got = 0;
+  for (spin = 0; spin < 10 && got == 0; spin++) {
+    consumed = 0;
+    if (binder_wr(fd, 0, 0, rbuf, sizeof(rbuf), &consumed) != 0)
+      break;
+    i = 0;
+    while (i + 4 <= (int)consumed) {
+      unsigned int c = *(unsigned int *)(rbuf + i);
+      i += 4;
+      if (c == BR_TRANSACTION) {
+        got = (struct binder_transaction_data *)(rbuf + i);
+        i += sizeof(tr);
+        break;
+      }
+    }
+  }
+  if (got == 0)
+    fail("BR_TRANSACTION from the client", 0);
+  if (got->code != 44)
+    fail("the twoproc transaction code survived", got->code);
+  if (got->data.ptr.buffer < arena ||
+      got->data.ptr.buffer >= arena + ARENA_SIZE)
+    fail("the payload landed outside the owner's arena",
+         (long)got->data.ptr.buffer);
+  for (i = 0; i < (int)sizeof(payload); i++) {
+    if (((unsigned char *)got->data.ptr.buffer)[i] != payload[i])
+      fail("the twoproc payload bytes survived", 0);
+  }
+
+  woff = 0;
+  cmd = BC_FREE_BUFFER;
+  *(unsigned int *)(wbuf + woff) = cmd; woff += 4;
+  *(unsigned long *)(wbuf + woff) = got->data.ptr.buffer; woff += 8;
+  if (binder_wr(fd, wbuf, woff, 0, 0, 0) != 0)
+    fail("BC_FREE_BUFFER accepted (twoproc)", 0);
+
+  status = 0;
+  if (sys6(SYS_wait4, child, (long)&status, 0, 0, 0, 0) < 0)
+    fail("wait4 the client", 0);
+  if (((status >> 8) & 0xff) != 0)
+    fail("the client exited nonzero", status);
+
+  sys6(SYS_close, fd, 0,0,0,0,0);
+}
+
 void _start(void)
 {
   int fd;
@@ -487,6 +669,7 @@ void _start(void)
     stage_manager();
     stage_oneway();
     stage_epoll();
+    stage_twoproc();
     put("binderprobe ok\n");
   }
   sys6(SYS_exit_group, fd < 0 ? 77 : 0, 0,0,0,0,0);
