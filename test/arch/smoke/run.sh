@@ -900,6 +900,28 @@ else
     fail=1
 fi
 
+# binderprobe: the binder ioctl passthrough, spoken in a guest against a live
+# mSL/DevFS load. The guest opens /dev/binder through a symlink to the host's
+# node (a real device node needs root to mknod, and the guest root is a plain
+# directory); the numbers and argument pointers then travel through nabi to
+# the driver exactly as on the host. Skips (77) when the driver is not loaded.
+if [ -e /dev/binder ]; then
+    mkdir -p "$root/dev"
+    ln -s /dev/binder "$root/dev/binder"
+    cp "$here/binderprobe" "$root/"; chmod +x "$root/binderprobe"
+    out=$("$NABI" -m "$root" /binderprobe); rc=$?
+    if [ "$rc" -eq 0 ] && [ "$out" = "binderprobe ok" ]; then
+        echo "  ok  binderprobe -> \"$out\", exit 0"
+    elif [ "$rc" -eq 77 ]; then
+        echo "  ok  binderprobe -> skipped (no /dev/binder in the guest)"
+    else
+        echo "  FAIL binderprobe -> \"$out\", exit $rc"
+        fail=1
+    fi
+else
+    echo "  ok  binderprobe -> skipped (no /dev/binder on the host)"
+fi
+
 if [ "$fail" -eq 0 ]; then
     echo "smoke: PASS"
 else

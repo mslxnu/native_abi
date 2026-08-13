@@ -528,10 +528,13 @@ darwinfs_readv(struct file *file, struct iovec *iov, size_t iovcnt)
   return RETRY_ON_RESTARTABLE_EINTR(readv(file->fd, iov, iovcnt));
 }
 
+static void binder_forget(int fd);
+
 int
 darwinfs_close(struct file *file)
 {
   eventfd_forget(file->fd);
+  binder_forget(file->fd);
   procfs_close_fd(file->fd);
   if (file->dirp != NULL) {
     closedir(file->dirp);       /* takes the dup with it */
@@ -585,12 +588,500 @@ devpts_to_host(const char *name, char *buf, size_t len)
   return true;
 }
 
+/*
+ * Is this one of the binder command numbers?
+ *
+ * The binder devices are passed through to mSL/DevFS's driver, which
+ * implements the Linux binder ABI: the number the guest sends (Linux-
+ * encoded) is the number it expects, and translating it to a Darwin
+ * encoding would make the driver see a command it has never heard of. The
+ * argument, however, cannot go through untouched - see binder_write_read
+ * below - so the command numbers are recognised here and the shim handles
+ * the rest. On any other device these numbers are not recognised either,
+ * so the host answers ENOTTY rather than the EPERM a translated set of
+ * commands would have refused with.
+ */
+static bool
+binder_ioctl(int cmd)
+{
+  switch (cmd) {
+  case LINUX_BINDER_WRITE_READ:
+  case LINUX_BINDER_SET_IDLE_TIMEOUT:
+  case LINUX_BINDER_SET_MAX_THREADS:
+  case LINUX_BINDER_SET_IDLE_PRIORITY:
+  case LINUX_BINDER_SET_CONTEXT_MGR:
+  case LINUX_BINDER_THREAD_EXIT:
+  case LINUX_BINDER_VERSION:
+  case LINUX_BINDER_GET_NODE_DEBUG_INFO:
+  case LINUX_BINDER_GET_NODE_INFO_FOR_REF:
+  case LINUX_BINDER_SET_CONTEXT_MGR_EXT:
+  case LINUX_BINDER_FREEZE:
+  case LINUX_BINDER_GET_FROZEN_INFO:
+  case LINUX_BINDER_ENABLE_ONEWAY_SPAM_DETECTION:
+  case LINUX_BINDER_GET_EXTENDED_ERROR:
+  case LINUX_BINDERFS_CTL_ADD:
+  case LINUX_BINDER_MSL_SET_ARENA:
+  case LINUX_BINDER_MSL_ABI_VERSION:
+    return true;
+  default:
+    return false;
+  }
+}
+
+/*
+ * The guest's memory is not the host's: NABI lays the guest address space
+ * out in regions that map somewhere else in the host process (see
+ * guest_to_host in mm.c). A guest pointer is therefore no use to the
+ * driver, whose copyin/copyout and vm_map operate on host addresses, so
+ * every binder ioctl goes through a shim that copies the wire struct into
+ * NABI memory, translates the pointers inside it, and copies the struct
+ * back out - the same discipline the tty ioctls follow with their local
+ * buffers. Two things need translation:
+ *
+ *  - the transaction arena registered with BINDER_MSL_SET_ARENA. The
+ *    guest mmaps it, gets a guest address, and sends that; the driver must
+ *    be given the host address of the same memory. Once registered, NABI
+ *    remembers both spellings and uses the pair to translate every pointer
+ *    the driver hands back (buffers inside the arena, offsets into it) and
+ *    every one the guest sends back (BC_FREE_BUFFER, which names a buffer
+ *    the driver gave it);
+ *
+ *  - the payload pointers inside BC_TRANSACTION/BC_REPLY, which name
+ *    arbitrary guest memory the driver copies from, and the pointers the
+ *    driver returns in BR_TRANSACTION/BR_REPLY.
+ *
+ * Numbers without pointer fields - BINDER_VERSION, BINDER_SET_CONTEXT_MGR,
+ * the GET_* diagnostics - are just copied in and out.
+ */
+
+/* The wire structs, at the offsets the driver's binder.h lays them out at.
+ * Only the fields the shim walks are declared; the layout asserts pin the
+ * size, and the transaction struct is deliberately 64 bytes with the two
+ * data pointers at 48 and 56. */
+struct binder_write_read_wire {
+  uint64_t write_size, write_consumed, write_buffer;
+  uint64_t read_size, read_consumed, read_buffer;
+};
+struct binder_msl_arena_wire {
+  uint64_t addr, size;
+};
+struct binder_transaction_wire {
+  uint64_t target, cookie;
+  uint32_t code, flags;
+  uint32_t sender_pid, sender_euid;
+  uint64_t data_size, offsets_size;
+  uint64_t buffer, offsets;
+};
+typedef char binder_abi_wr[sizeof(struct binder_write_read_wire) == 48 ? 1 : -1];
+typedef char binder_abi_ar[sizeof(struct binder_msl_arena_wire) == 16 ? 1 : -1];
+typedef char binder_abi_tr[sizeof(struct binder_transaction_wire) == 64 ? 1 : -1];
+
+/* Per-descriptor state: the arena, in both address spaces, so pointers can
+ * be translated either way. */
+struct binder_state {
+  uint64_t arena_guest, arena_host, arena_size;
+};
+
+KHASH_MAP_INIT_INT(binder, struct binder_state)
+static khash_t(binder) *binder_states;
+
+static struct binder_state *
+binder_lookup(int fd)
+{
+  if (binder_states == NULL)
+    return NULL;
+  khiter_t k = kh_get(binder, binder_states, fd);
+  return k == kh_end(binder_states) ? NULL : &kh_value(binder_states, k);
+}
+
+/* The state is created lazily, on the first binder ioctl on the descriptor,
+ * and dropped when the descriptor closes. */
+static struct binder_state *
+binder_state_get(int fd)
+{
+  struct binder_state *bs = binder_lookup(fd);
+  if (bs != NULL)
+    return bs;
+  if (binder_states == NULL)
+    binder_states = kh_init(binder);
+  int ret;
+  khiter_t k = kh_put(binder, binder_states, fd, &ret);
+  kh_value(binder_states, k) = (struct binder_state){ 0, 0, 0 };
+  return &kh_value(binder_states, k);
+}
+
+static void
+binder_forget(int fd)
+{
+  if (binder_states == NULL)
+    return;
+  khiter_t k = kh_get(binder, binder_states, fd);
+  if (k == kh_end(binder_states))
+    return;
+  kh_del(binder, binder_states, k);
+}
+
+/* What the shim hands the driver. Every binder command goes out with both
+ * direction bits set: Linux's direction bits are the mirror image of BSD's,
+ * and XNU reads them itself before the driver sees the command, so a
+ * command Linux encodes as write-only would have its argument zeroed. The
+ * number also has to be widened from the 32-bit value the guest sent (cmd
+ * is int, so 0xC0306201 arrives negative) or the high bits would be
+ * sign-extended and the driver asked for a command it does not know. */
+static long
+binder_host_ioctl(int fd, int cmd, void *arg)
+{
+  return RETRY_ON_RESTARTABLE_EINTR(
+      ioctl(fd, (unsigned long)LINUX_BINDER_CMD_HOST(cmd), arg));
+}
+
+/* Translate a guest pointer to the host address of the same memory. */
+static bool
+binder_guest_to_host(uint64_t p, uint64_t *out)
+{
+  if (p == 0) {
+    *out = 0;
+    return true;
+  }
+  const void *h = guest_to_host(p);
+  if (h == NULL)
+    return false;
+  *out = (uint64_t)(uintptr_t)h;
+  return true;
+}
+
+/* The two arena spellings meet here. A pointer inside the arena is
+ * translated through the registered pair; anything else is ordinary guest
+ * memory. */
+static bool
+binder_ptr_to_host(struct binder_state *bs, uint64_t p, uint64_t *out)
+{
+  if (p == 0) {
+    *out = 0;
+    return true;
+  }
+  if (bs->arena_size != 0 && p >= bs->arena_guest &&
+      p < bs->arena_guest + bs->arena_size) {
+    *out = p - bs->arena_guest + bs->arena_host;
+    return true;
+  }
+  return binder_guest_to_host(p, out);
+}
+
+/* The driver addresses the arena in host space; the guest must see its own
+ * address for the same memory. Pointers that came from elsewhere are left
+ * alone. */
+static uint64_t
+binder_arena_to_guest(struct binder_state *bs, uint64_t p)
+{
+  if (p != 0 && bs->arena_size != 0 && p >= bs->arena_host &&
+      p < bs->arena_host + bs->arena_size)
+    return p - bs->arena_host + bs->arena_guest;
+  return p;
+}
+
+/* Payload lengths of the BC_ and BR_ commands, so a write or read buffer
+ * can be walked and its pointer fields found. Commands the shim does not
+ * translate are still listed - the walk must skip their payloads, not fall
+ * through them. */
+static size_t
+bc_cmd_len(uint32_t cmd)
+{
+  switch (cmd) {
+  case 0x40406300u:                       /* BC_TRANSACTION */
+  case 0x40406301u:                       /* BC_REPLY */
+    return 64;
+  case 0x40486311u:                       /* BC_TRANSACTION_SG */
+  case 0x40486312u:                       /* BC_REPLY_SG */
+    return 72;
+  case 0x40086303u:                       /* BC_FREE_BUFFER */
+  case 0x40086310u:                       /* BC_DEAD_BINDER_DONE */
+    return 8;
+  case 0x4008630Au:                       /* BC_ATTEMPT_ACQUIRE */
+    return 8;
+  case 0x40046302u:                       /* BC_ACQUIRE_RESULT */
+  case 0x40046304u:                       /* BC_INCREFS */
+  case 0x40046305u:                       /* BC_ACQUIRE */
+  case 0x40046306u:                       /* BC_RELEASE */
+  case 0x40046307u:                       /* BC_DECREFS */
+    return 4;
+  case 0x40106308u:                       /* BC_INCREFS_DONE */
+  case 0x40106309u:                       /* BC_ACQUIRE_DONE */
+    return 16;
+  case 0x400C630Eu:                       /* BC_REQUEST_DEATH_NOTIFICATION */
+  case 0x400C630Fu:                       /* BC_CLEAR_DEATH_NOTIFICATION */
+    return 12;
+  default:                                /* BC_ENTER_LOOPER & friends */
+    return 0;
+  }
+}
+
+static size_t
+br_cmd_len(uint32_t cmd)
+{
+  switch (cmd) {
+  case 0x80407202u:                       /* BR_TRANSACTION */
+  case 0x80407203u:                       /* BR_REPLY */
+    return 64;
+  case 0x80107207u:                       /* BR_INCREFS */
+  case 0x80107208u:                       /* BR_ACQUIRE */
+  case 0x80107209u:                       /* BR_RELEASE */
+  case 0x8010720Au:                       /* BR_DECREFS */
+    return 16;
+  case 0x8008720Fu:                       /* BR_DEAD_BINDER */
+  case 0x80087210u:                       /* BR_CLEAR_DEATH_NOTIFICATION_DONE */
+    return 8;
+  case 0x80047200u:                       /* BR_ERROR */
+  case 0x80047204u:                       /* BR_ACQUIRE_RESULT */
+    return 4;
+  default:                                /* BR_OK, BR_TRANSACTION_COMPLETE, ... */
+    return 0;
+  }
+}
+
+/* Walk the guest's write stream, rewriting the pointer fields to their host
+ * addresses. Works on a NABI-local copy, never on the guest's memory. */
+static bool
+binder_translate_write(struct binder_state *bs, uint8_t *buf, size_t len)
+{
+  size_t off = 0;
+
+  while (off + sizeof(uint32_t) <= len) {
+    uint32_t cmd;
+    size_t plen;
+
+    memcpy(&cmd, buf + off, sizeof(cmd));
+    off += sizeof(cmd);
+    plen = bc_cmd_len(cmd);
+    if (off + plen > len)
+      return false;                       /* truncated command */
+    if (cmd == 0x40406300u || cmd == 0x40406301u) {   /* TRANSACTION/REPLY */
+      struct binder_transaction_wire *tr = (void *)(buf + off);
+      uint64_t h;
+
+      if (tr->data_size != 0) {
+        if (!binder_guest_to_host(tr->buffer, &h))
+          return false;
+        tr->buffer = h;
+      }
+      if (tr->offsets_size != 0) {
+        if (!binder_guest_to_host(tr->offsets, &h))
+          return false;
+        tr->offsets = h;
+      }
+    } else if (cmd == 0x40086303u) {      /* BC_FREE_BUFFER: an arena buffer */
+      uint64_t *p = (void *)(buf + off);
+      uint64_t h;
+
+      if (binder_ptr_to_host(bs, *p, &h))
+        *p = h;
+    }
+    off += plen;
+  }
+  return off == len;
+}
+
+/* Walk the driver's read stream, rewriting the arena pointers it returned
+ * back into guest addresses. */
+static void
+binder_translate_read(struct binder_state *bs, uint8_t *buf, size_t len)
+{
+  size_t off = 0;
+
+  while (off + sizeof(uint32_t) <= len) {
+    uint32_t cmd;
+    size_t plen;
+
+    memcpy(&cmd, buf + off, sizeof(cmd));
+    off += sizeof(cmd);
+    plen = br_cmd_len(cmd);
+    if (off + plen > len)
+      return;
+    if (cmd == 0x80407202u || cmd == 0x80407203u) {   /* TRANSACTION/REPLY */
+      struct binder_transaction_wire *tr = (void *)(buf + off);
+
+      tr->buffer = binder_arena_to_guest(bs, tr->buffer);
+      if (tr->offsets_size != 0)
+        tr->offsets = binder_arena_to_guest(bs, tr->offsets);
+    }
+    off += plen;
+  }
+}
+
+static int
+binder_write_read(struct file *file, uint64_t arg, struct binder_state *bs)
+{
+  struct binder_write_read_wire bwr;
+  uint64_t wguest, rguest;
+  uint8_t *wbuf = NULL, *rbuf = NULL;
+  size_t wsize, rsize;
+  int fd = file->fd;
+  long r;
+
+  if (copy_from_user(&bwr, arg, sizeof bwr))
+    return -LINUX_EFAULT;
+  wguest = bwr.write_buffer;
+  rguest = bwr.read_buffer;
+  wsize = (size_t)bwr.write_size;
+  rsize = (size_t)bwr.read_size;
+
+  /* The write stream is copied to NABI memory so its pointers can be
+   * rewritten; the read stream is a fresh zeroed buffer the driver fills. */
+  if (wsize != 0) {
+    uint64_t dummy;
+
+    if (!binder_guest_to_host(wguest, &dummy))
+      return -LINUX_EFAULT;
+    wbuf = malloc(wsize);
+    if (wbuf == NULL)
+      return -LINUX_ENOMEM;
+    if (copy_from_user(wbuf, wguest, wsize)) {
+      free(wbuf);
+      return -LINUX_EFAULT;
+    }
+    if (!binder_translate_write(bs, wbuf, wsize)) {
+      free(wbuf);
+      return -LINUX_EFAULT;
+    }
+    bwr.write_buffer = (uint64_t)(uintptr_t)wbuf;
+  }
+  if (rsize != 0) {
+    uint64_t dummy;
+
+    if (!binder_guest_to_host(rguest, &dummy)) {
+      free(wbuf);
+      return -LINUX_EFAULT;
+    }
+    rbuf = calloc(1, rsize);
+    if (rbuf == NULL) {
+      free(wbuf);
+      return -LINUX_ENOMEM;
+    }
+    bwr.read_buffer = (uint64_t)(uintptr_t)rbuf;
+  }
+
+  r = binder_host_ioctl(fd, LINUX_BINDER_WRITE_READ, &bwr);
+
+  if (r >= 0) {
+    bwr.write_buffer = wguest;
+    bwr.read_buffer = rguest;
+    if (rsize != 0 && bwr.read_consumed != 0) {
+      size_t n = bwr.read_consumed < rsize ? (size_t)bwr.read_consumed : rsize;
+
+      binder_translate_read(bs, rbuf, n);
+      if (copy_to_user(rguest, rbuf, n))
+        r = -LINUX_EFAULT;
+    }
+    if (r >= 0 && copy_to_user(arg, &bwr, sizeof bwr))
+      r = -LINUX_EFAULT;
+  }
+  free(wbuf);
+  free(rbuf);
+  return (int)r;
+}
+
+static int
+binder_small_ioctl(struct file *file, int cmd, uint64_t arg,
+                   struct binder_state *bs, size_t size)
+{
+  uint8_t *buf;
+  long r;
+
+  buf = malloc(size);
+  if (buf == NULL)
+    return -LINUX_ENOMEM;
+  if (copy_from_user(buf, arg, size)) {
+    free(buf);
+    return -LINUX_EFAULT;
+  }
+
+  if (cmd == (int)LINUX_BINDER_MSL_SET_ARENA) {
+    struct binder_msl_arena_wire *a = (void *)buf;
+    uint64_t guest = a->addr;
+    uint64_t host;
+
+    if (guest != 0) {
+      /* The driver must be given the host address of the guest's mapping.
+       * A NULL arena is passed through, so the driver's own bounds checks
+       * answer it as binder-probe asserts. */
+      if (!binder_guest_to_host(guest, &host)) {
+        free(buf);
+        return -LINUX_EFAULT;
+      }
+      a->addr = host;
+    }
+    r = binder_host_ioctl(file->fd, cmd, buf);
+    if (r >= 0 && guest != 0) {
+      /* The driver accepted the arena; remember both spellings of it so
+       * every later pointer can be translated either way. The driver has
+       * not touched the address, but return the guest's own number. */
+      bs->arena_guest = guest;
+      bs->arena_host = host;
+      bs->arena_size = a->size;
+      a->addr = guest;
+    }
+    free(buf);
+    return (int)r;
+  }
+
+  r = binder_host_ioctl(file->fd, cmd, buf);
+  if (r >= 0 && copy_to_user(arg, buf, size))
+    r = -LINUX_EFAULT;
+  free(buf);
+  return (int)r;
+}
+
+/* The size Linux's _IOC embeds in each command number - what XNU will copy
+ * in and out for the driver. */
+static size_t
+binder_cmd_size(int cmd)
+{
+  switch (cmd) {
+  case LINUX_BINDER_WRITE_READ: return 48;
+  case LINUX_BINDER_SET_IDLE_TIMEOUT: return 8;
+  case LINUX_BINDER_SET_MAX_THREADS: return 4;
+  case LINUX_BINDER_SET_IDLE_PRIORITY: return 4;
+  case LINUX_BINDER_SET_CONTEXT_MGR: return 4;
+  case LINUX_BINDER_THREAD_EXIT: return 4;
+  case LINUX_BINDER_VERSION: return 4;
+  case LINUX_BINDER_GET_NODE_DEBUG_INFO: return 24;
+  case LINUX_BINDER_GET_NODE_INFO_FOR_REF: return 24;
+  case LINUX_BINDER_SET_CONTEXT_MGR_EXT: return 24;
+  case LINUX_BINDER_FREEZE: return 12;
+  case LINUX_BINDER_GET_FROZEN_INFO: return 12;
+  case LINUX_BINDER_ENABLE_ONEWAY_SPAM_DETECTION: return 4;
+  case LINUX_BINDER_GET_EXTENDED_ERROR: return 12;
+  case LINUX_BINDERFS_CTL_ADD: return 264;
+  case LINUX_BINDER_MSL_SET_ARENA: return 16;
+  case LINUX_BINDER_MSL_ABI_VERSION: return 4;
+  default: return 0;
+  }
+}
+
+static int
+binder_ioctl_host(struct file *file, int cmd, uint64_t val0)
+{
+  struct binder_state *bs = binder_state_get(file->fd);
+  size_t size = binder_cmd_size(cmd);
+
+  if (bs == NULL)
+    return -LINUX_ENOMEM;
+  if (size == 0)
+    return -LINUX_ENOTTY;
+  if (cmd == (int)LINUX_BINDER_WRITE_READ)
+    return binder_write_read(file, val0, bs);
+  return binder_small_ioctl(file, cmd, val0, bs, size);
+}
+
 int
 darwinfs_ioctl(struct file *file, int cmd, uint64_t val0)
 {
   uint64_t sys_fcntl(unsigned int fd, unsigned int cmd, unsigned long arg);
   int fd = file->fd;
   int r;
+
+  if (binder_ioctl(cmd))
+    return binder_ioctl_host(file, cmd, val0);
 
   switch (cmd) {
   case LINUX_TCGETS: {

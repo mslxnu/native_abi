@@ -781,6 +781,47 @@
 
 
 /*
+ * Android binder.
+ *
+ * The command numbers are Linux's own _IOC encoding, because the driver
+ * that answers them - mSL/DevFS's /dev/binder, /dev/hwbinder, /dev/vndbinder
+ * and the binderfs control node - implements the Linux binder ABI byte for
+ * byte (mSL-DevFS/include/fs/devfs/binder.h). A Linux guest handing these to
+ * a *Darwin* device would need them translated; here they must pass through
+ * unmodified, which is what darwinfs_ioctl does. That is why this set is
+ * deliberately not expressed through any of the Linux macros in this file.
+ */
+#define	LINUX_BINDER_WRITE_READ			0xC0306201
+#define	LINUX_BINDER_SET_IDLE_TIMEOUT		0x40086203
+#define	LINUX_BINDER_SET_MAX_THREADS		0x40046205
+#define	LINUX_BINDER_SET_IDLE_PRIORITY		0x40046206
+#define	LINUX_BINDER_SET_CONTEXT_MGR		0x40046207
+#define	LINUX_BINDER_THREAD_EXIT		0x40046208
+#define	LINUX_BINDER_VERSION			0xC0046209
+#define	LINUX_BINDER_GET_NODE_DEBUG_INFO	0xC018620B
+#define	LINUX_BINDER_GET_NODE_INFO_FOR_REF	0xC018620C
+#define	LINUX_BINDER_SET_CONTEXT_MGR_EXT	0x4018620D
+#define	LINUX_BINDER_FREEZE			0x400C620E
+#define	LINUX_BINDER_GET_FROZEN_INFO		0xC00C620F
+#define	LINUX_BINDER_ENABLE_ONEWAY_SPAM_DETECTION 0x40046210
+#define	LINUX_BINDER_GET_EXTENDED_ERROR		0xC00C6211
+#define	LINUX_BINDERFS_CTL_ADD			0xC1086201
+#define	LINUX_BINDER_MSL_SET_ARENA		0xC01062E0
+#define	LINUX_BINDER_MSL_ABI_VERSION		0xC00462E1
+
+/*
+ * The number to actually hand a Darwin ioctl(2). Linux's direction bits
+ * are the mirror image of BSD's: a Linux _IOW carries no IOC_IN, and XNU
+ * reads the bits itself, so the argument would be zeroed rather than copied
+ * in. Setting both bits makes XNU copy the buffer in and out, which is what
+ * the mSL/DevFS driver expects of every binder command (it masks the
+ * direction bits off before dispatching, so the two spellings are
+ * interchangeable to it). Applied here because a Linux guest always sends
+ * the plain Linux number.
+ */
+#define	LINUX_BINDER_CMD_HOST(cmd) ((unsigned int)((cmd) | 0xC0000000u))
+
+/*
  * Pluggable ioctl handlers
  */
 struct linux_ioctl_args;
