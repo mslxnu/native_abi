@@ -287,14 +287,14 @@
   SYSCALL(279, move_pages) \
   SYSCALL(280, utimensat) \
   SYSCALL(281, epoll_pwait) \
-  SYSCALL(282, unimplemented) \
+  SYSCALL(282, signalfd) \
   SYSCALL(283, timerfd_create) \
   SYSCALL(284, eventfd) \
   SYSCALL(285, fallocate) \
   SYSCALL(286, timerfd_settime) \
   SYSCALL(287, timerfd_gettime) \
   SYSCALL(288, accept4) \
-  SYSCALL(289, unimplemented) \
+  SYSCALL(289, signalfd4) \
   SYSCALL(290, eventfd2) \
   SYSCALL(291, epoll_create1) \
   SYSCALL(292, dup3) \

@@ -735,6 +735,20 @@ fail:;
   return -darwin_to_linux_errno(e);
 }
 
+#ifdef __x86_64__
+/*
+ * The 3-arg signalfd, which predates signalfd4 and is what it became: the
+ * same call with no flags. x86-64 has both (282 and 289); the generic table
+ * aarch64 uses has only signalfd4, so this wrapper is compiled only where the
+ * number exists - the strace hooks are indexed by LSYS_signalfd, which the
+ * aarch64 table does not define.
+ */
+DEFINE_SYSCALL(signalfd, int, fd, gaddr_t, mask_ptr, size_t, sizemask)
+{
+  return sys_signalfd4(fd, mask_ptr, sizemask, 0);
+}
+#endif
+
 static void
 signalfd_close(int fd)
 {
