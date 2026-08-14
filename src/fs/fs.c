@@ -95,7 +95,6 @@ struct file_operations {
 };
 
 static inline bool in_userfd(int fd);
-static void signalfds_init(void);
 static const int user_fdtable_initsize = 64;
 static const int vkern_fdtable_maxsize = 64;
 static const int fdtable_alloc_unit = 64; // must be a multiple of 64
@@ -533,7 +532,7 @@ static pthread_mutex_t signalfds_lock = PTHREAD_MUTEX_INITIALIZER;
  * at boot rather than on first use, because signalfd_note_signal runs from a
  * signal handler and may fire before any signalfd has been created - a slot
  * that still read fd 0 would make it write a byte to the guest's stdout. */
-static void
+void
 signalfds_init(void)
 {
   for (int i = 0; i < SIGNALFD_MAX; i++)

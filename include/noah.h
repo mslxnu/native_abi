@@ -229,6 +229,7 @@ bool stop_other_tasks(void);
 bool task_should_stop(void);
 noreturn void task_stop_self(void);
 void init_fileinfo(int rootfd);
+void signalfds_init(void);
 void init_host_passthrough(void);
 void report_host_passthrough(void);
 void report_rootfs_case(void);

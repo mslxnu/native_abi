@@ -165,6 +165,11 @@ checkpoint_restore(int ckpt_fd, int arena_fd)
   /* Host-derived, so it is probed here rather than carried in the checkpoint -
    * but it must be probed, because this process never ran init_fileinfo. */
   init_host_passthrough();
+  /* The signalfd table is a static array that starts all-fd-0, and a free slot
+   * is fd < 0: without this, init_fileinfo's invalidate never runs here, every
+   * slot still names fd 0, and the guest's real stdin is misread as a
+   * signalfd. */
+  signalfds_init();
 
   vmm_restore_vcpu(&hdr.vcpu);
 
