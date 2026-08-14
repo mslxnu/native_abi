@@ -690,6 +690,22 @@ else
     fail=1
 fi
 
+# lxctest: the LXC /dev setup in one pass - mknod placeholders whose stat
+# reports S_IFCHR with the right rdev and whose open answers ENXIO, a devtmpfs
+# mount that reaches the host's /dev, binderfs and devpts mount types, and a
+# cgroup2 mount whose cgroup.subtree_control refuses writes (the file's whole
+# contract is that no controller can be enabled). It unmounts what it mounted,
+# leaving the mount namespace as it found it.
+cp "$here/lxctest" "$root/"; chmod +x "$root/lxctest"
+out=$("$NABI" -m "$root" /lxctest); rc=$?
+if [ "$rc" -eq 0 ] && [ "$out" = "lxctest start
+lxctest ok" ]; then
+    echo "  ok  lxctest -> \"$out\", exit 0"
+else
+    echo "  FAIL lxctest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 # auxvtest: the auxiliary vector, walked off the process's own stack rather than
 # through getauxval - so it checks what NABI put there with no libc in between.
 # AT_SECURE is why it exists: getauxval sets errno for an entry that is absent,

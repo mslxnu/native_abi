@@ -411,6 +411,19 @@ guest-code cache sync.
   through the clone. `statmount` is read at the offsets it reports rather
   than at assumed ones.
 
+- `lxctest` — the LXC `/dev` setup in one pass, the pieces lxc-start needs
+  from a mount that Linux provides and a Mac does not. `mknod` for a character
+  node makes a placeholder the host can carry, whose `stat` reports `S_IFCHR`
+  with the right `rdev` and whose `open` answers `ENXIO` — the answer for a
+  node whose driver is not present — while `mknod` over an existing path is
+  `EEXIST` and a FIFO still works. A `devtmpfs` mount is backed by the host's
+  `/dev`, so a container's own `/dev` reaches the real devices (checked with
+  `/dev/null`); `binderfs` and `devpts` are mount types too, the binder
+  control file answering with the host's `/dev/binderfs`. A `cgroup2` mount
+  refuses writes to `cgroup.subtree_control` with `EINVAL`, which is the
+  file's whole contract (no controller can be enabled). It unmounts what it
+  mounted, so the mount namespace is left as it was found.
+
 - `auxvtest` — the auxiliary vector a process starts with, walked off its own
   stack rather than through `getauxval`, so it checks what NABI actually put
   there with no libc in between to paper over a gap. `AT_SECURE` is why it
@@ -482,5 +495,11 @@ are here for reference; rebuild with an aarch64-linux clang + ld.lld:
 
     clang -target aarch64-linux-gnu -c exit42.s -o exit42.o
     ld.lld -static -e _start exit42.o -o exit42
+
+`lxctest` needs its own `_start` plus the test itself, so it is two objects:
+
+    clang -target aarch64-linux-gnu -c lxcstart.s -o lxcstart.o
+    clang -target aarch64-linux-gnu -c lxctest.c -o lxctest.o
+    ld.lld -static -e _start lxcstart.o lxctest.o -o lxctest
 
 Run via `make check-smoke` (Apple Silicon only; needs a natively-built nabi).
