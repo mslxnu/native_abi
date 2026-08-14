@@ -964,7 +964,9 @@ typedef char binder_abi_tr[sizeof(struct binder_transaction_wire) == 64 ? 1 : -1
 /* B_PACK_CHARS('f', 'd', '*', B_TYPE_LARGE) in mSL-DevFS's binder.h. */
 #define LINUX_BINDER_TYPE_FD 0x66642a85u
 /* B_PACK_CHARS('f', 'd', 'a', B_TYPE_LARGE) in mSL-DevFS's binder.h. */
-#define LINUX_BINDER_TYPE_FDA 0x6664612au
+#define LINUX_BINDER_TYPE_FDA 0x66646185u
+/* B_PACK_CHARS('p', 't', '*', B_TYPE_LARGE) in mSL-DevFS's binder.h. */
+#define LINUX_BINDER_TYPE_PTR 0x70742a85u
 
 /* The buffer object header, enough to walk the fd array a BINDER_TYPE_FDA
  * names. The full struct is 40 bytes; we only need the first three fields. */
@@ -1162,10 +1164,9 @@ binder_scan_fd_array(const uint8_t *data, uint64_t off, uint64_t data_size,
   memcpy(&parent, data + off + 16, sizeof parent);
   memcpy(&parent_offset, data + off + 24, sizeof parent_offset);
 
-  if (!binder_guest_to_host(parent, &parent_host))
+  if (parent + sizeof pb > data_size)
     return false;
-  if (parent_host + sizeof pb > data_size)
-    return false;
+  parent_host = (uint64_t)(uintptr_t)(data + parent);
   memcpy(&pb, (const uint8_t *)parent_host, sizeof pb);
 
   uint64_t fd_array_host;
@@ -1189,7 +1190,7 @@ binder_scan_fds(const struct binder_transaction_wire *tr)
 {
   uint64_t n = tr->offsets_size / sizeof(uint64_t);
   const uint64_t *offp = (const uint64_t *)(uintptr_t)tr->offsets;
-  const uint8_t *data = (const uint8_t *)(uintptr_t)tr->buffer;
+  uint8_t *data = (uint8_t *)(uintptr_t)tr->buffer;
   uint32_t pid = (uint32_t)getpid();
 
   for (uint64_t i = 0; i < n; i++) {
@@ -1208,6 +1209,26 @@ binder_scan_fds(const struct binder_transaction_wire *tr)
     } else if (type == LINUX_BINDER_TYPE_FDA) {
       if (!binder_scan_fd_array(data, off, tr->data_size, pid))
         return false;
+    }
+  }
+  /* The driver copyins a nested buffer straight out of the PTR object's buffer
+   * field, so by the time it runs that field must name a host address. The FD
+   * array scan above had to see the guest value, which is why the rewrite is a
+   * second pass of its own. */
+  for (uint64_t i = 0; i < n; i++) {
+    uint32_t type;
+    uint64_t off = offp[i];
+
+    if (off + 24 > tr->data_size)
+      return false;
+    memcpy(&type, data + off, sizeof type);
+    if (type == LINUX_BINDER_TYPE_PTR) {
+      struct binder_buffer_object *bp = (struct binder_buffer_object *)(data + off);
+      uint64_t h;
+
+      if (!binder_guest_to_host(bp->buffer, &h))
+        return false;
+      bp->buffer = h;
     }
   }
   return true;
@@ -1237,7 +1258,7 @@ binder_materialize_fd_array(struct binder_transaction_wire *tr, uint64_t off,
   memcpy(&parent_offset, data + off + 24, sizeof parent_offset);
 
   memcpy(&pb, data + parent, sizeof pb);
-  uint8_t *fd_array = data + pb.buffer + parent_offset;
+  uint8_t *fd_array = (uint8_t *)(uintptr_t)pb.buffer + parent_offset;
   for (i = 0; i < num_fds; i++) {
     uint64_t fd;
     memcpy(&fd, fd_array + i * sizeof(uint64_t), sizeof fd);
@@ -1304,7 +1325,8 @@ binder_translate_write(struct binder_state *bs, uint8_t *buf, size_t len)
     plen = bc_cmd_len(cmd);
     if (off + plen > len)
       return false;                       /* truncated command */
-    if (cmd == 0x40406300u || cmd == 0x40406301u) {   /* TRANSACTION/REPLY */
+    if (cmd == 0x40406300u || cmd == 0x40406301u ||
+        cmd == 0x40486311u || cmd == 0x40486312u) {   /* TRANSACTION/REPLY, and their SG forms: same wire layout up to the payload pointer */
       struct binder_transaction_wire *tr = (void *)(buf + off);
       uint64_t h;
 
@@ -1368,8 +1390,18 @@ binder_translate_read(struct binder_state *bs, uint8_t *buf, size_t len,
       tr->buffer = binder_arena_to_guest(bs, tr->buffer);
       if (tr->offsets_size != 0)
         tr->offsets = binder_arena_to_guest(bs, tr->offsets);
-      if (*secctx != 0)
+      if (*secctx != 0) {
+        /* The driver appends the NUL-terminated security-context string
+         * after the struct; skip it so the command walk stays aligned. */
+        size_t sp = off + 72;
+
         *secctx = rguest + (*secctx - (uint64_t)(uintptr_t)buf);
+        while (sp < len && buf[sp] != 0)
+          sp++;
+        if (sp == len)
+          return false;
+        off += sp + 1 - (off + 72);
+      }
     }
     off += plen;
   }

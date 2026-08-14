@@ -82,14 +82,18 @@ static long sys6(long n,long a,long b,long c,long d,long e,long f){
 #define BC_ENTER_LOOPER            0x0000630Cu
 #define BC_FREE_BUFFER             0x40086303u
 #define BC_TRANSACTION             0x40406300u
+#define BC_TRANSACTION_SG          0x40486311u
 #define BR_TRANSACTION             0x80407202u
+#define BR_TRANSACTION_SEC_CTX     0x80487202u
 #define BR_TRANSACTION_COMPLETE    0x00007206u
 #define TF_ONE_WAY                 0x01u
 
-/* B_PACK_CHARS('f', 'd', '*', B_TYPE_LARGE) and flat_binder_object.flags, from
- * mSL-DevFS's binder.h. */
+/* B_PACK_CHARS('f', 'd', '*', B_TYPE_LARGE), B_PACK_CHARS('f', 'd', 'a',
+ * B_TYPE_LARGE) and B_PACK_CHARS('p', 't', '*', B_TYPE_LARGE) in mSL-DevFS's
+ * binder.h, and flat_binder_object.flags. */
 #define BINDER_TYPE_FD             0x66642a85u
-#define BINDER_TYPE_FDA            0x6664612au
+#define BINDER_TYPE_FDA            0x66646185u
+#define BINDER_TYPE_PTR            0x70742a85u
 #define FLAT_BINDER_FLAG_ACCEPTS_FDS 0x0100u
 
 struct binder_buffer_object {
@@ -162,6 +166,13 @@ struct binder_transaction_data_secctx {
 
 typedef char assert_secctx[sizeof(struct binder_transaction_data_secctx) == 72 ? 1 : -1];
 
+struct binder_transaction_data_sg {
+  struct binder_transaction_data transaction_data;
+  unsigned long buffers_size;
+}; /* 72 bytes */
+
+typedef char assert_sg[sizeof(struct binder_transaction_data_sg) == 72 ? 1 : -1];
+
 /* A binder object in a payload: the fd sits in the low 4 bytes of the union
  * at offset 8, the cookie at 16. */
 struct flat_binder_object {
@@ -203,6 +214,16 @@ static void mcopy(void *d, const void *s, unsigned long n)
   const unsigned char *b = s;
   unsigned long i;
   for (i = 0; i < n; i++) a[i] = b[i];
+}
+
+static int mcmp(const void *a, const void *b, unsigned long n)
+{
+  const unsigned char *x = a, *y = b;
+  unsigned long i;
+  for (i = 0; i < n; i++) {
+    if (x[i] != y[i]) return x[i] - y[i];
+  }
+  return 0;
 }
 
 static long bioctl(int fd, unsigned int cmd, void *arg)
@@ -377,7 +398,7 @@ static void stage_oneway(void)
     while (off + 4 <= consumed) {
       unsigned int c = *(unsigned int *)(rbuf + off);
       off += 4;
-      if (c == BR_TRANSACTION) {
+      if (c == BR_TRANSACTION || c == BR_TRANSACTION_SEC_CTX) {
         got = (struct binder_transaction_data *)(rbuf + off);
         off += sizeof(tr);
         break;
@@ -513,7 +534,7 @@ static void stage_epoll(void)
     while (off + 4 <= consumed) {
       unsigned int c = *(unsigned int *)(rbuf + off);
       off += 4;
-      if (c == BR_TRANSACTION) {
+      if (c == BR_TRANSACTION || c == BR_TRANSACTION_SEC_CTX) {
         got = (struct binder_transaction_data *)(rbuf + off);
         off += sizeof(tr);
         break;
@@ -685,7 +706,7 @@ static void stage_twoproc(void)
     while (i + 4 <= (int)consumed) {
       unsigned int c = *(unsigned int *)(rbuf + i);
       i += 4;
-      if (c == BR_TRANSACTION) {
+      if (c == BR_TRANSACTION || c == BR_TRANSACTION_SEC_CTX) {
         got = (struct binder_transaction_data *)(rbuf + i);
         i += sizeof(tr);
         break;
@@ -871,7 +892,7 @@ static void stage_fd(void)
     while (i + 4 <= (int)consumed) {
       unsigned int c = *(unsigned int *)(rbuf + i);
       i += 4;
-      if (c == BR_TRANSACTION) {
+      if (c == BR_TRANSACTION || c == BR_TRANSACTION_SEC_CTX) {
         got = (struct binder_transaction_data *)(rbuf + i);
         i += sizeof(tr);
         break;
@@ -921,6 +942,9 @@ static void stage_fd(void)
   sys6(SYS_close, fd, 0,0,0,0,0);
 }
 
+static void stage_fda(void);
+static void stage_secctx(void);
+
 void _start(void)
 {
   int fd;
@@ -936,19 +960,24 @@ void _start(void)
     stage_twoproc();
     stage_fd();
     stage_fda();
+    stage_secctx();
     put("binderprobe ok\n");
   }
   sys6(SYS_exit_group, fd < 0 ? 77 : 0, 0,0,0,0,0);
 }
+
+static void stage_fda(void)
+{
   struct binder_transaction_data tr, *got;
   struct binder_msl_arena a;
   struct binder_buffer_object bob;
   struct binder_fd_array_object fdao;
+  struct flat_binder_object obj;
   unsigned char payload[128];
   unsigned char wbuf[256], rbuf[512];
-  unsigned long arena, consumed, offsets[1];
+  unsigned long arena, consumed, offsets[2];
   unsigned int cmd;
-  int ready[2], go[2], woff, fd1, fd2, spin, i;
+  int ready[2], go[2], woff, fd1, fd2, fd, spin, i;
   int zero = 0;
   long child, status, r;
 
@@ -1000,6 +1029,7 @@ void _start(void)
   if (child == 0) {
     char c;
     unsigned long fd_array[2];
+    struct binder_transaction_data_sg sg;
 
     sys6(SYS_close, fd, 0,0,0,0,0);
     sys6(SYS_close, ready[0], 0,0,0,0,0);
@@ -1050,7 +1080,9 @@ void _start(void)
     mcopy(payload, "fda-probe", 8);
     mcopy(payload + 16, &bob, sizeof bob);
     mcopy(payload + 56, &fdao, sizeof fdao);
-    offsets[0] = 56;
+    offsets[0] = 16;   /* the BINDER_TYPE_PTR parent, so the driver copies
+                        * the array in and rewrites bob.buffer */
+    offsets[1] = 56;
 
     if (sys6(SYS_write, ready[1], (long)"g", 1, 0,0,0) != 1)
       sys6(SYS_exit_group, 4, 0,0,0,0,0);
@@ -1068,11 +1100,14 @@ void _start(void)
     tr.data.ptr.offsets = (unsigned long)offsets;
 
     woff = 0;
-    cmd = BC_TRANSACTION;
+    cmd = BC_TRANSACTION_SG;
     *(unsigned int *)(wbuf + woff) = cmd; woff += 4;
-    for (i = 0; i < (int)sizeof(tr); i++)
-      wbuf[woff + i] = ((unsigned char *)&tr)[i];
-    woff += (int)sizeof(tr);
+    mzero(&sg, sizeof sg);
+    mcopy(&sg.transaction_data, &tr, sizeof tr);
+    sg.buffers_size = sizeof(fd_array);
+    for (i = 0; i < (int)sizeof(sg); i++)
+      wbuf[woff + i] = ((unsigned char *)&sg)[i];
+    woff += (int)sizeof(sg);
     if (binder_wr(fd, wbuf, woff, 0, 0, 0) != 0)
       sys6(SYS_exit_group, 5, 0,0,0,0,0);
 
@@ -1104,7 +1139,7 @@ void _start(void)
     while (i + 4 <= (int)consumed) {
       unsigned int c = *(unsigned int *)(rbuf + i);
       i += 4;
-      if (c == BR_TRANSACTION) {
+      if (c == BR_TRANSACTION || c == BR_TRANSACTION_SEC_CTX) {
         got = (struct binder_transaction_data *)(rbuf + i);
         i += sizeof(tr);
         break;
@@ -1129,7 +1164,9 @@ void _start(void)
       fail("the fd array has two entries", (long)fdao->num_fds);
 
     unsigned long *fd_array =
-        (unsigned long *)(got->data.ptr.buffer + 88);
+        (unsigned long *)(got->data.ptr.buffer + 104);
+    /* 104 = BINDER_ALIGN(88 payload) + BINDER_ALIGN(16 offsets):
+       the driver appends the nested fd array after the offsets area. */
     for (i = 0; i < 2; i++) {
       struct binder_version ver;
       if (bioctl((int)fd_array[i], BINDER_VERSION, &ver) != 0)
@@ -1169,7 +1206,7 @@ static void stage_secctx(void)
   unsigned int cmd;
   int woff, fd, spin, i;
   int zero = 0;
-  long child, status;
+  long child, status, r;
 
   fd = open_binder("/dev/binder");
   if (fd < 0)
@@ -1198,7 +1235,7 @@ static void stage_secctx(void)
   if (binder_wr(fd, wbuf, woff, 0, 0, 0) != 0)
     fail("BC_ACQUIRE/ENTER_LOOPER (secctx)", 0);
 
-  child = sys6(SYS_clone, SIGCHLD, 0, 0, 0, 0);
+  child = sys6(SYS_clone, SIGCHLD, 0, 0, 0, 0, 0);
   if (child < 0)
     fail("fork (secctx)", child);
 
@@ -1240,7 +1277,7 @@ static void stage_secctx(void)
     while (i + 4 <= (int)consumed) {
       unsigned int c = *(unsigned int *)(rbuf + i);
       i += 4;
-      if (c == 0x80487202u) {   /* BR_TRANSACTION_SEC_CTX */
+      if (c == BR_TRANSACTION_SEC_CTX) {   /* BR_TRANSACTION_SEC_CTX */
         got = (struct binder_transaction_data_secctx *)(rbuf + i);
         i += sizeof(*got);
         break;
@@ -1259,7 +1296,7 @@ static void stage_secctx(void)
   if (got->secctx < (unsigned long)rbuf ||
       got->secctx >= (unsigned long)rbuf + sizeof(rbuf))
     fail("secctx pointer outside read buffer", (long)got->secctx);
-  if (strcmp((const char *)got->secctx, "u:r:untrusted_app:s0") != 0)
+  if (mcmp((const void *)got->secctx, "u:r:untrusted_app:s0", 19) != 0)
     fail("secctx string is not the placeholder", 0);
 
   woff = 0;
@@ -1277,25 +1314,4 @@ static void stage_secctx(void)
     fail("the client exited nonzero (secctx)", status);
 
   sys6(SYS_close, fd, 0,0,0,0,0);
-}
-
-void _start(void)
-{
-  int fd;
-
-  fd = open_binder("/dev/binder");
-  if (fd >= 0) {
-    sys6(SYS_close, fd, 0,0,0,0,0);
-    stage_version();
-    stage_arena();
-    stage_manager();
-    stage_oneway();
-    stage_epoll();
-    stage_twoproc();
-    stage_fd();
-    stage_fda();
-    stage_secctx();
-    put("binderprobe ok\n");
-  }
-  sys6(SYS_exit_group, fd < 0 ? 77 : 0, 0,0,0,0,0);
 }
