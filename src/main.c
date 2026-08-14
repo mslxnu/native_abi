@@ -364,10 +364,12 @@ elevate_privilege(uid_t owner_uid, gid_t owner_gid, mode_t mode)
   if (mode & S_ISUID) {
     proc.cred.euid = owner_uid;
     proc.cred.suid = proc.cred.euid;
+    proc.cred.fsuid = proc.cred.euid;
   }
   if (mode & S_ISGID) {
     proc.cred.egid = owner_gid;
     proc.cred.sgid = proc.cred.egid;
+    proc.cred.fsgid = proc.cred.egid;
   }
   pthread_rwlock_unlock(&proc.cred.lock);
 }
