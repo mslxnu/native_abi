@@ -2466,6 +2466,71 @@ guest_mode_record(int dirfd, const char *path, bool nofollow, uint32_t mode)
 }
 
 /*
+ * Device nodes the guest created that the host has no device for.
+ *
+ * Linux's mknod can make a character or block node for any driver; Darwin has
+ * no such thing - a Linux major number is meaningless to it and a node that
+ * names no driver is not a node at all - so the honest way to serve one is the
+ * way ownership and mode are served: keep a placeholder on the host and record
+ * the node's identity beside it. The guest sees a real node of the requested
+ * type with the right rdev, and an open answers ENXIO, which is what Linux
+ * answers for a node whose driver is not present.
+ *
+ * A node the host really does carry - /dev/binder, /dev/null - is never
+ * recorded: it is a host device already, and stat reports it from the host.
+ * Placeholders exist only for nodes that have no host counterpart.
+ */
+#define GUEST_DEV_XATTR "msl.nabi.dev"
+
+struct guest_dev {
+  uint32_t mode;                 /* S_IFCHR or S_IFBLK */
+  uint32_t dev;                  /* the Linux device number */
+};
+
+static bool
+guest_dev_read(const char *abs, struct guest_dev *out)
+{
+  return getxattr(abs, GUEST_DEV_XATTR, out, sizeof *out, 0, 0) ==
+         (ssize_t) sizeof *out;
+}
+
+static int
+guest_dev_record(int dirfd, const char *path, uint32_t mode, l_dev_t dev)
+{
+  char abs[PATH_MAX];
+  struct guest_dev d = { mode & S_IFMT, (uint32_t) dev };
+  if (!abs_path_at(dirfd, path, abs, sizeof abs))
+    return -LINUX_ENOENT;
+  if (setxattr(abs, GUEST_DEV_XATTR, &d, sizeof d, 0, 0) < 0)
+    return -darwin_to_linux_errno(errno);
+  return 0;
+}
+
+static void
+guest_dev_overlay(int dirfd, const char *path, bool nofollow,
+                  struct l_newstat *l_st)
+{
+  char abs[PATH_MAX];
+  struct guest_dev d;
+  if (!abs_path_at(dirfd, path, abs, sizeof abs))
+    return;
+  if (guest_dev_read(abs, &d)) {
+    l_st->st_mode = (l_st->st_mode & ~(uint32_t) S_IFMT) | d.mode;
+    l_st->st_rdev = (l_dev_t) d.dev;
+  }
+}
+
+static void
+guest_dev_overlay_fd(int fd, struct l_newstat *l_st)
+{
+  struct guest_dev d;
+  if (fgetxattr(fd, GUEST_DEV_XATTR, &d, sizeof d, 0, 0) == (ssize_t) sizeof d) {
+    l_st->st_mode = (l_st->st_mode & ~(uint32_t) S_IFMT) | d.mode;
+    l_st->st_rdev = (l_dev_t) d.dev;
+  }
+}
+
+/*
  * Adopt a mode that was already on disk when nabi could not use it.
  *
  * Trees built before any of this exists, and anything a package manager laid
@@ -2528,6 +2593,7 @@ guest_view_of_fd(int fd, uint32_t *uid, uint32_t *gid, uint32_t *mode)
   stat_darwin_to_linux(&dst, &st);
   guest_owner_overlay_fd(fd, &st);
   guest_mode_overlay_fd(fd, &st);
+  guest_dev_overlay_fd(fd, &st);
   if (uid)  *uid  = st.st_uid;
   if (gid)  *gid  = st.st_gid;
   if (mode) *mode = st.st_mode;
@@ -2563,6 +2629,7 @@ darwinfs_fstat(struct file *file, struct l_newstat *l_st)
   stat_darwin_to_linux(&st, l_st);
   guest_owner_overlay_fd(file->fd, l_st);
   guest_mode_overlay_fd(file->fd, l_st);
+  guest_dev_overlay_fd(file->fd, l_st);
   return ret;
 }
 
@@ -3000,6 +3067,14 @@ DEFINE_SYSCALL(write, int, fd, gaddr_t, buf_ptr, size_t, size)
   if (cgroup_write_procs(fd, buf, size, &r))
     goto out;
 
+  /*
+   * Writing to cgroup.subtree_control is asking to enable controllers, and the
+   * file's whole contract is that none can be - see cgroup.c. Without this a
+   * write would land in the host's empty file and report success.
+   */
+  if (cgroup_write_control(fd, buf, size, &r))
+    goto out;
+
   /* A write to a fanotify descriptor is the listener's verdict. It has to be
    * recognised: the descriptor underneath is the queue's own FIFO, and letting
    * it through would put the verdict into the event stream. */
@@ -3425,6 +3500,23 @@ darwinfs_openat(struct fs *fs, struct dir *dir, const char *path, int l_flags, i
   if (fd == -LINUX_EACCES && guest_mode_adopt(dir->fd, path))
     fd = syswrap(openat(dir->fd, path, flags, mode));
 
+  /*
+   * A placeholder device node has no driver - that is what makes it a
+   * placeholder - and opening it as the regular file underneath would hand the
+   * caller data where Linux hands it the device. ENXIO is what Linux answers
+   * for a node whose driver is not present. The real host devices are never
+   * recorded and never reach here.
+   */
+  if (fd >= 0 && !creating) {
+    char abs[PATH_MAX];
+    struct guest_dev d;
+    if (abs_path_at(dir->fd, path, abs, sizeof abs) &&
+        guest_dev_read(abs, &d)) {
+      close(fd);
+      fd = -LINUX_ENXIO;
+    }
+  }
+
   if (fd >= 0 && creating) {
     guest_owner_stamp_new(dir->fd, path);
     /* Created with a mode the host cannot carry - `mkstemp` then `fchmod 0600`
@@ -3535,6 +3627,7 @@ darwinfs_fstatat(struct fs *fs, struct dir *dir, const char *path, struct l_news
   stat_darwin_to_linux(&st, l_st);
   guest_owner_overlay(dir->fd, path, (flags & AT_SYMLINK_NOFOLLOW) != 0, l_st);
   guest_mode_overlay(dir->fd, path, (flags & AT_SYMLINK_NOFOLLOW) != 0, l_st);
+  guest_dev_overlay(dir->fd, path, (flags & AT_SYMLINK_NOFOLLOW) != 0, l_st);
   return ret;
 }
 
@@ -3917,6 +4010,13 @@ resolve_path(const struct dir *parent, const char *name, int flags, struct path 
 
     if (mount_resolve(name, mntpath, sizeof mntpath, &path->rdonly)) {
       name = mntpath;
+      /*
+       * A devtmpfs or devpts mount backed by the host's /dev lands on
+       * /dev/pts/<n>, which the same rewrite that serves the passthrough has
+       * to find - Darwin has no devpts, and its pty slaves are /dev/ttysNNN.
+       */
+      if (devpts_to_host(name, ptsname, sizeof ptsname))
+        name = ptsname;
     } else if (!is_host_passthrough(name)) {
       dir.fd = proc.fileinfo.rootfd;
       name++;
@@ -5290,6 +5390,36 @@ DEFINE_SYSCALL(mknodat, int, dirfd, gaddr_t, path_ptr, l_mode_t, mode, l_dev_t, 
       goto out;
     }
     r = syswrap(mkfifo(path.subpath, mode));
+    break;
+  }
+  case S_IFCHR:
+  case S_IFBLK: {
+    /*
+     * A character or block node. The host can neither carry one (its devices
+     * are the kernel's, and a Linux major number is meaningless to it) nor
+     * serve it, so a placeholder is recorded as the node's identity - see
+     * "Device nodes" above. A node that already exists, which is the common
+     * case when the container's /dev is backed by the host's, is EEXIST as
+     * Linux would answer.
+     */
+    if ((r = vfs_grab_dir_w(dirfd, name, 0, &path)) < 0) {
+      goto out;
+    }
+    mode_t host = host_mode_for((uint32_t) mode, false);
+    int fd = syswrap(openat(path.dir->fd, path.subpath,
+                            O_CREAT | O_EXCL | O_WRONLY, host));
+    if (fd < 0) {
+      r = fd;
+      break;
+    }
+    close(fd);
+    if ((r = guest_dev_record(path.dir->fd, path.subpath,
+                              (uint32_t) mode, dev)) < 0)
+      goto out;
+    /* The recorded mode keeps the permissions the guest asked for; type and
+     * rdev live in their own attribute. */
+    if ((mode & 07777) != (mode_t) host)
+      r = guest_mode_record(path.dir->fd, path.subpath, false, (uint32_t) mode);
     break;
   }
   default:

@@ -20,12 +20,19 @@
  *   tmpfs   A directory under TMPDIR. Its contents go when it is unmounted,
  *           which is the property anything mounting one is relying on.
  *
- *   proc, sysfs, devtmpfs, devpts
- *           Accepted and recorded, because nabi already serves all four and the
+ *   proc, sysfs, mqueue, securityfs, debugfs
+ *           Accepted and recorded, because nabi already serves them and the
  *           mount is asking for something that is already true. Recording it is
  *           not a formality: /proc/mounts is built from this table, and a
  *           container that mounts /proc and then cannot see it in the list
  *           concludes the mount failed.
+ *
+ *   devtmpfs, devpts, binderfs
+ *           Backed with the host's device tree. A devtmpfs mount is the
+ *           kernel's /dev, which is the host's /dev here, so a container's own
+ *           /dev reaches the real devices; devpts is served by the same
+ *           /dev/ttysNNN rewrite the passthrough uses; binderfs answers with
+ *           /dev/binderfs.
  *
  * Everything else - a real filesystem, overlay - is EINVAL or ENODEV rather
  * than a success that did nothing. There is no block device layer here to mount

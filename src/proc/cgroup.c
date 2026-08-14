@@ -13,7 +13,7 @@
  *   answers with it. All of that is bookkeeping nabi can keep honestly.
  *
  *   The controllers are not, and there are none. `cgroup.controllers` is empty
- *   and `cgroup.subtree_control` cannot be made non-empty, so there is no
+ *   and a write to `cgroup.subtree_control` is refused, so there is no
  *   memory.max, no cpu.max, no pids.max - not as files that accept a number and
  *   ignore it, but absent. Darwin gives an unprivileged process no CPU
  *   bandwidth control, no memory accounting it could enforce and no io control,
@@ -268,6 +268,35 @@ cgroup_write_procs(int fd, const char *buf, size_t size, int *out)
 
   int r = cgroup_move(rel, (int32_t) pid);
   *out = r < 0 ? r : (int) size;
+  return true;
+}
+
+/*
+ * Whether a write is a request to enable controllers, which is refused.
+ *
+ * cgroup.subtree_control is an ordinary empty file on the host, so a write
+ * would land in it and be reported as a success - the caller would believe
+ * controllers were enabled and nothing would ever say otherwise. The file's
+ * contract is that it cannot be made non-empty (see the header), so the
+ * request is answered the way Linux answers for a controller that does not
+ * exist: EINVAL. lxc-start reads the failure, logs it and continues.
+ */
+bool
+cgroup_write_control(int fd, const char *buf, size_t size, int *out)
+{
+  (void) buf;
+  (void) size;
+  char path[PATH_MAX];
+  if (fcntl(fd, F_GETPATH, path) < 0)
+    return false;
+  if (!cgroup_is_hierarchy_path(path))
+    return false;
+
+  char *base = strrchr(path, '/');
+  if (!base || strcmp(base, "/cgroup.subtree_control") != 0)
+    return false;
+
+  *out = -LINUX_EINVAL;
   return true;
 }
 

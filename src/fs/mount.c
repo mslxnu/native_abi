@@ -506,8 +506,38 @@ backing_for_type(const char *type, const char *source, struct mount_entry *e)
     snprintf(e->type, sizeof e->type, "cgroup2");
     return 0;
   }
+  if (type_is(type, "devtmpfs")) {
+    /*
+     * The kernel's device tree, which here is the host's /dev. Backing it with
+     * the real /dev is what makes a container's own /dev reach the same
+     * devices the passthrough /dev already does - /dev/binder, /dev/null, and
+     * the rest are the actual host objects, not copies of them.
+     */
+    snprintf(e->source, sizeof e->source, "%s", source);
+    snprintf(e->hostdir, sizeof e->hostdir, "%s", "/dev");
+    snprintf(e->type, sizeof e->type, "%s", type);
+    return 0;
+  }
+  if (type_is(type, "devpts")) {
+    /*
+     * The pty slave side, as the same rewrite that serves the passthrough /dev
+     * sees it: Darwin has no /dev/pts directory, so the number underneath is
+     * rewritten to the host's /dev/ttysNNN during path resolution. Backing
+     * with "/dev" is enough for the rewrite to find it.
+     */
+    snprintf(e->source, sizeof e->source, "%s", source);
+    snprintf(e->hostdir, sizeof e->hostdir, "%s", "/dev");
+    snprintf(e->type, sizeof e->type, "%s", type);
+    return 0;
+  }
+  if (type_is(type, "binderfs")) {
+    /* The binder control files, which live at /dev/binderfs on the host. */
+    snprintf(e->source, sizeof e->source, "%s", source);
+    snprintf(e->hostdir, sizeof e->hostdir, "%s", "/dev/binderfs");
+    snprintf(e->type, sizeof e->type, "%s", type);
+    return 0;
+  }
   if (type_is(type, "proc") || type_is(type, "sysfs") ||
-      type_is(type, "devtmpfs") || type_is(type, "devpts") ||
       type_is(type, "mqueue") || type_is(type, "securityfs") ||
       type_is(type, "debugfs")) {
     /*

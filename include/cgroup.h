@@ -34,4 +34,7 @@ void        cgroup_ns_create(uint64_t ino, const char *root);
 int  cgroup_move(const char *cgroup_path, int32_t nspid);
 bool cgroup_write_procs(int fd, const char *buf, size_t size, int *out);
 
+/* Writing to cgroup.subtree_control: refused, no controllers can be enabled. */
+bool cgroup_write_control(int fd, const char *buf, size_t size, int *out);
+
 #endif
