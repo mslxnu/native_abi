@@ -1068,7 +1068,7 @@
   SYSCALL(1056, pipe) \
   SYSCALL(1057, poll) \
   SYSCALL(1058, putpmsg) \
-  SYSCALL(1059, query_module) \
+  SYSCALL(1059, unimplemented) \
   SYSCALL(1060, readlink) \
   SYSCALL(1061, rename) \
   SYSCALL(1062, rmdir) \

@@ -600,7 +600,7 @@ DEFINE_SYSCALL(mremap, gaddr_t, old_addr, size_t, old_size, size_t, new_size, in
          * range. The sub-block tail is left allocated in a sparse,
          * hole-punched file, which costs nothing.
          */
-        size_t aligned = roundup(new_size, STAGE2_GRANULE);
+        size_t aligned = roundup(new_size, GUEST_MMAP_GRANULE);
         if (aligned < region->size)
           arena_free(region->arena_off + aligned, region->size - aligned);
       }
