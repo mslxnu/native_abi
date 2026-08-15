@@ -443,13 +443,11 @@ vmm_mmap(gaddr_t gaddr, size_t size, int prot, void *haddr)
 
   size_t s2_size = roundup(size, STAGE2_GRANULE);
 
-  /* One 16KiB-aligned IPA block for the whole region, reserved before any
-   * stage-1 page is mapped so table growth (which also draws from ipa_brk)
-   * cannot land inside it. */
   gaddr_t ipa = ipa_brk;
   ipa_brk += s2_size;
 
-  vmm_arm64_map_stage2(ipa, s2_size, prot, haddr);
+  int s2_prot = prot ? prot : HV_MEMORY_READ;
+  vmm_arm64_map_stage2(ipa, s2_size, s2_prot, haddr);
 
   for (size_t off = 0; off < size; off += PAGE_SIZEOF(PAGE_4KB))
     pt_map_page(gaddr + off, ipa + off, prot);

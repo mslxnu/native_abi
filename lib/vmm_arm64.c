@@ -107,14 +107,17 @@ vmm_arm64_map_stage2(gaddr_t ipa, size_t size, int prot, void *haddr)
   assert((ipa & (STAGE2_GRANULE - 1)) == 0);
   assert((size & (STAGE2_GRANULE - 1)) == 0);
 
-  hv_vm_unmap(ipa, size);
+  gaddr_t base = ipa & ~(STAGE2_GRANULE - 1);
+  khiter_t k = kh_get(s2, s2_map, base);
+  if (k != kh_end(s2_map)) {
+    hv_return_t unmap_ret = hv_vm_unmap(ipa, size);
+    if (unmap_ret != HV_SUCCESS && unmap_ret != HV_BAD_ARGUMENT) {
+      warnk("hv_vm_unmap returned %#x for ipa [%#llx, %#llx)\n",
+            unmap_ret, (unsigned long long) ipa, (unsigned long long) (ipa + size));
+    }
+  }
   hv_return_t err = hv_vm_map(haddr, ipa, size, prot);
   if (err != HV_SUCCESS) {
-    /* "hv_vm_map failed" on its own says nothing about which of the four
-     * arguments the framework objected to, and the answer is usually the IPA:
-     * it is handed out by a bump allocator, so a guest that maps and unmaps for
-     * long enough walks off the end of the address space the VM was created
-     * with. Print what was asked for, and how far up the IPA space it was. */
     panic("hv_vm_map failed: err %#x mapping ipa [%#llx, %#llx) "
           "to host %p prot %d (ipa space is %d bits)\n",
           err, (unsigned long long) ipa, (unsigned long long) (ipa + size),
@@ -305,19 +308,12 @@ vmm_create(void)
 
   ret = create_vm_with_max_ipa();
   if (ret != HV_SUCCESS) {
-    /* HV_DENIED here is almost always the entitlement, not a policy decision:
-     * hv_vm_create needs com.apple.security.hypervisor and a valid signature
-     * on Apple Silicon, unlike Intel where an unsigned binary could proceed. */
     panic("could not create the vm: error code %x%s", ret,
           ret == HV_DENIED ? " (missing com.apple.security.hypervisor?)" : "");
     return;
   }
 
-  printk("successfully created the vm\n");
-
   vmm_create_vcpu(NULL);
-
-  printk("successfully created a vcpu\n");
 }
 
 void
