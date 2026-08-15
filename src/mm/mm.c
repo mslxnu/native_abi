@@ -180,11 +180,23 @@ is_region_private(struct mm_region *region)
 void
 destroy_mm(struct mm *mm)
 {
+  /*
+   * Two passes. The first tears down every region's stage-1/2 mapping while
+   * all host memory is still resident: on arm64 a block that still backs a
+   * live page - a sibling left behind by an mprotect split - is re-established
+   * with hv_vm_map, which needs the whole 16KiB host range mapped. Unmapping a
+   * host slice first handed that flush a range with a hole in it, and it
+   * refused with HV_ERROR. Only once nothing is mapped is the host memory
+   * released, so no flush can ask for a range that has been cut up.
+   */
   struct list_head *list, *t;
   list_for_each_safe (list, t, &mm->mm_regions) {
     struct mm_region *r = list_entry(list, struct mm_region, list);
-    munmap(r->haddr, r->size);
     vmm_munmap(r->gaddr, r->size);
+  }
+  list_for_each_safe (list, t, &mm->mm_regions) {
+    struct mm_region *r = list_entry(list, struct mm_region, list);
+    munmap(r->haddr, r->size);
     if (r->arena_off >= 0)
       arena_free(r->arena_off, r->size);
     free(r);
