@@ -90,8 +90,16 @@ kind_name(enum vm_exit_kind k)
 void printk(const char *fmt, ...) { (void) fmt; }
 void warnk(const char *fmt, ...) { (void) fmt; }
 /* Not exercised here: these tests do not call vmm_sync_guest_code, but
- * vmm_arm64.c references guest_to_host. Return NULL - never reached. */
+ * vmm_arm64.c references guest_to_host, find_region and proc. Return
+ * NULL/empty - never reached. */
 void *guest_to_host(gaddr_t g) { (void) g; return NULL; }
+struct mm_region *find_region(gaddr_t gaddr, struct mm *mm)
+{
+  (void) gaddr;
+  (void) mm;
+  return NULL;
+}
+struct proc proc;
 
 void
 panic(const char *fmt, ...)

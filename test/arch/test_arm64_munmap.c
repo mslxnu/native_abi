@@ -63,6 +63,15 @@ kind_name(enum vm_exit_kind k)
 void printk(const char *fmt, ...) { (void) fmt; }
 void warnk(const char *fmt, ...) { (void) fmt; }
 void *guest_to_host(gaddr_t g) { (void) g; return NULL; }
+/* vmm_sync_guest_code in vmm_arm64.c also references find_region and proc;
+ * never reached here. */
+struct mm_region *find_region(gaddr_t gaddr, struct mm *mm)
+{
+  (void) gaddr;
+  (void) mm;
+  return NULL;
+}
+struct proc proc;
 void panic(const char *fmt, ...) {
   va_list ap; va_start(ap, fmt);
   printf("  PANIC: "); vprintf(fmt, ap); printf("\n"); va_end(ap); exit(2);

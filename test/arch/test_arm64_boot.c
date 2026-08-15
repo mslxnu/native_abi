@@ -87,6 +87,17 @@ guest_to_host(gaddr_t gaddr)
   return NULL;
 }
 
+/* vmm_sync_guest_code in vmm_arm64.c also references find_region and proc;
+ * this test does not link mm.c/process.c, and the boot guest never faults so
+ * the region walk is never reached. */
+struct mm_region *find_region(gaddr_t gaddr, struct mm *mm)
+{
+  (void) gaddr;
+  (void) mm;
+  return NULL;
+}
+struct proc proc;
+
 int
 main(void)
 {
