@@ -1340,6 +1340,17 @@ DEFINE_SYSCALL(prctl, int, option, unsigned long, arg1, unsigned long, arg2, uns
     pthread_setname_np(buf);
     return 0;
   }
+  case LINUX_PR_SET_VMA: {
+    char name[64] = {0};
+    if (arg1 != 0) {
+      if (copy_from_user(name, (gaddr_t)arg1, sizeof(name) - 1)) {
+        return -LINUX_EFAULT;
+      }
+      name[sizeof(name) - 1] = '\0';
+    }
+    warnk("prctl PR_SET_VMA: addr=%#lx len=%#lx name=%s\n", arg2, arg3, name);
+    return 0;
+  }
   /*
    * The seccomp options, which are prctl's older door into the same thing.
    * PR_SET_SECCOMP predates the seccomp syscall and is still what a program

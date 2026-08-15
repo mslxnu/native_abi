@@ -108,6 +108,8 @@ struct linux_robust_list_head {
 #define LINUX_PR_SET_TIMING                   14
 #define LINUX_PR_SET_NAME                     15
 #define LINUX_PR_GET_NAME                     16
+#define LINUX_PR_SET_VMA                      0x53564d41
+#define LINUX_PR_GET_VMA                      0x53564d42
 
 #define LINIX_PR_GET_ENDIAN                   19
 #define LINIX_PR_SET_ENDIAN                   20
