@@ -523,13 +523,28 @@ vmm_arm64_sync_guest_code(void *hva, size_t len)
  * Resolves the guest virtual address to its host backing and invalidates the
  * instruction cache over it. The region must already be mapped - the loader
  * maps a segment before writing it - so guest_to_host resolves.
+ *
+ * The range is walked region by region rather than assumed contiguous, because
+ * a segment can straddle two: when a segment is not granule-aligned the loader
+ * maps its shared first page inside the *previous* segment's region, so a
+ * segment's executable bytes begin in one host buffer and continue in another.
  */
 void
 vmm_sync_guest_code(gaddr_t gaddr, size_t len)
 {
-  void *hva = guest_to_host(gaddr);
-  if (hva)
-    vmm_arm64_sync_guest_code(hva, len);
+  while (len > 0) {
+    struct mm_region *r = find_region(gaddr, proc.mm);
+    if (!r) {
+      break;
+    }
+    size_t piece = MIN(len, r->gaddr + r->size - gaddr);
+    void *hva = guest_to_host(gaddr);
+    if (hva) {
+      vmm_arm64_sync_guest_code(hva, piece);
+    }
+    gaddr += piece;
+    len -= piece;
+  }
 }
 
 /* -------------------------------------------------------- trampoline */

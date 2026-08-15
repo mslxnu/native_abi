@@ -246,7 +246,7 @@
   SYSCALL(237, set_mempolicy) \
   SYSCALL(238, migrate_pages) \
   SYSCALL(239, move_pages) \
-  SYSCALL(240, unimplemented) \
+  SYSCALL(240, rt_tgsigqueueinfo) \
   SYSCALL(241, perf_event_open) \
   SYSCALL(242, accept4) \
   SYSCALL(243, unimplemented) \

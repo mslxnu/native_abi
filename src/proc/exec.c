@@ -43,6 +43,13 @@
 
 #include "linux/common.h"
 #include "linux/mman.h"
+
+/*
+ * mprotect(2), used by the ELF loader to union the permissions of two segments
+ * that share a granule-aligned page. Defined in src/mm/mmap.c; declared here
+ * because the loader is not a syscall path.
+ */
+uint64_t sys_mprotect(gaddr_t addr, size_t len, int prot);
 #include "linux/misc.h"
 #include "linux/time.h"
 #include "linux/fs.h"
@@ -92,6 +99,8 @@ load_elf_interp(const char *path, ulong load_addr)
 
   Elf64_Phdr *p = (Elf64_Phdr *)(data + h->e_phoff);
 
+  ulong last_end = 0;
+  int prev_prot = 0;
   for (int i = 0; i < h->e_phnum; i++) {
     if (p[i].p_type != PT_LOAD) {
       continue;
@@ -101,25 +110,49 @@ load_elf_interp(const char *path, ulong load_addr)
 
     ulong mask = LOAD_GRANULE - 1;
     ulong vaddr = p_vaddr & ~mask;
-    ulong offset = p_vaddr & mask;
-    ulong size = roundup(p[i].p_memsz + offset, LOAD_GRANULE);
+    ulong size = roundup(p[i].p_memsz + p_vaddr - vaddr, LOAD_GRANULE);
 
     int prot = 0;
     if (p[i].p_flags & PF_X) prot |= LINUX_PROT_EXEC;
     if (p[i].p_flags & PF_W) prot |= LINUX_PROT_WRITE;
     if (p[i].p_flags & PF_R) prot |= LINUX_PROT_READ;
 
-    assert(vaddr != 0);
-    do_mmap(vaddr, size, PROT_READ | PROT_WRITE, prot, LINUX_MAP_PRIVATE | LINUX_MAP_FIXED | LINUX_MAP_ANONYMOUS, -1, 0);
+    /*
+     * A segment that is not granule-aligned has its base rounded down to the
+     * granule, and when the segments are closer together than a granule that
+     * puts the next base inside the previous mapping. Replacing it with
+     * do_mmap's do_munmap would delete the previous segment's bytes and
+     * permissions on the page they share, so instead the mapping starts where
+     * the previous one ends. glibc's segments happen to be granule-aligned,
+     * which is why this only shows up on bionic's 4KiB-aligned layouts.
+     */
+    ulong map_vaddr = vaddr;
+    ulong map_size = size;
+    if (last_end > vaddr) {
+      map_vaddr = last_end;
+      map_size = roundup(p_vaddr + p[i].p_memsz - last_end, LOAD_GRANULE);
+      /*
+       * The shared page carries the earlier segment's tail and the later
+       * segment's head, so it has to answer to both: the tail is executed
+       * (bionic keeps code in it), the head is written (it is .data). Linux
+       * unions the two segments' permissions on the page; so does this.
+       */
+      sys_mprotect(vaddr, last_end - vaddr, prev_prot | prot);
+    }
 
-    copy_to_user(vaddr + offset, data + p[i].p_offset, p[i].p_filesz);
+    assert(map_vaddr != 0);
+    do_mmap(map_vaddr, map_size, PROT_READ | PROT_WRITE, prot, LINUX_MAP_PRIVATE | LINUX_MAP_FIXED | LINUX_MAP_ANONYMOUS, -1, 0);
+
+    copy_to_user(p_vaddr, data + p[i].p_offset, p[i].p_filesz);
 
     /* An executable segment the host just wrote is not visible to the guest's
      * instruction fetch on arm64 until the caches are reconciled; no-op on x86. */
     if (prot & LINUX_PROT_EXEC)
-      vmm_sync_guest_code(vaddr + offset, p[i].p_filesz);
+      vmm_sync_guest_code(p_vaddr, p[i].p_filesz);
 
-    map_top = MAX(map_top, roundup(vaddr + size, LOAD_GRANULE));
+    map_top = MAX(map_top, map_vaddr + map_size);
+    last_end = map_vaddr + map_size;
+    prev_prot = prot;
   }
 
   vmm_set_reg(VREG_PC, load_addr + h->e_entry);
@@ -168,6 +201,8 @@ load_elf(Elf64_Ehdr *ehdr, int argc, char *argv[], char **envp, bool secure,
     global_offset = 0x400000;   /* default base address */
   }
 
+  ulong last_end = 0;
+  int prev_prot = 0;
   for (int i = 0; i < ehdr->e_phnum; i++) {
     if (p[i].p_type != PT_LOAD) {
       continue;
@@ -177,28 +212,52 @@ load_elf(Elf64_Ehdr *ehdr, int argc, char *argv[], char **envp, bool secure,
 
     ulong mask = LOAD_GRANULE - 1;
     ulong vaddr = p_vaddr & ~mask;
-    ulong offset = p_vaddr & mask;
-    ulong size = roundup(p[i].p_memsz + offset, LOAD_GRANULE);
+    ulong size = roundup(p[i].p_memsz + p_vaddr - vaddr, LOAD_GRANULE);
 
     int prot = 0;
     if (p[i].p_flags & PF_X) prot |= LINUX_PROT_EXEC;
     if (p[i].p_flags & PF_W) prot |= LINUX_PROT_WRITE;
     if (p[i].p_flags & PF_R) prot |= LINUX_PROT_READ;
 
-    assert(vaddr != 0);
-    do_mmap(vaddr, size, PROT_READ | PROT_WRITE, prot, LINUX_MAP_PRIVATE | LINUX_MAP_FIXED | LINUX_MAP_ANONYMOUS, -1, 0);
+    /*
+     * A segment that is not granule-aligned has its base rounded down to the
+     * granule, and when the segments are closer together than a granule that
+     * puts the next base inside the previous mapping. Replacing it with
+     * do_mmap's do_munmap would delete the previous segment's bytes and
+     * permissions on the page they share, so instead the mapping starts where
+     * the previous one ends. glibc's segments happen to be granule-aligned,
+     * which is why this only shows up on bionic's 4KiB-aligned layouts.
+     */
+    ulong map_vaddr = vaddr;
+    ulong map_size = size;
+    if (last_end > vaddr) {
+      map_vaddr = last_end;
+      map_size = roundup(p_vaddr + p[i].p_memsz - last_end, LOAD_GRANULE);
+      /*
+       * The shared page carries the earlier segment's tail and the later
+       * segment's head, so it has to answer to both: the tail is executed
+       * (bionic keeps code in it), the head is written (it is .data). Linux
+       * unions the two segments' permissions on the page; so does this.
+       */
+      sys_mprotect(vaddr, last_end - vaddr, prev_prot | prot);
+    }
 
-    copy_to_user(vaddr + offset, (char *)ehdr + p[i].p_offset, p[i].p_filesz);
+    assert(map_vaddr != 0);
+    do_mmap(map_vaddr, map_size, PROT_READ | PROT_WRITE, prot, LINUX_MAP_PRIVATE | LINUX_MAP_FIXED | LINUX_MAP_ANONYMOUS, -1, 0);
+
+    copy_to_user(p_vaddr, (char *)ehdr + p[i].p_offset, p[i].p_filesz);
 
     /* See load_elf_interp: reconcile caches for host-written guest code. */
     if (prot & LINUX_PROT_EXEC)
-      vmm_sync_guest_code(vaddr + offset, p[i].p_filesz);
+      vmm_sync_guest_code(p_vaddr, p[i].p_filesz);
 
     if (! load_base_set) {
       load_base = p[i].p_vaddr - p[i].p_offset + global_offset;
       load_base_set = true;
     }
-    map_top = MAX(map_top, roundup(vaddr + size, LOAD_GRANULE));
+    map_top = MAX(map_top, map_vaddr + map_size);
+    last_end = map_vaddr + map_size;
+    prev_prot = prot;
   }
 
   assert(load_base_set);
@@ -435,11 +494,13 @@ init_userstack(int argc, char *argv[], char **envp, uint64_t exe_base,
     { AT_PHDR, exe_base + ehdr->e_phoff },
     { AT_PHENT, ehdr->e_phentsize },
     { AT_PHNUM, ehdr->e_phnum },
-#if defined(__arm64__)
-    { AT_PAGESZ, STAGE2_GRANULE },   /* Apple Silicon is a 16KiB-page machine */
-#else
+    /* The guest is a 4KiB-page machine. The 16KiB stage-2 granule is a
+     * hardware detail of Apple Silicon, not the page size the guest runs
+     * under - the mmap/load granules and the per-4KiB mprotect path already
+     * treat the guest address space as 4KiB, and reporting the true granule
+     * here kills the guest's allocator: this Android image's jemalloc accepts
+     * nothing but 4096 and bails out of its own malloc. */
     { AT_PAGESZ, PAGE_SIZEOF(PAGE_4KB) },
-#endif
     { AT_RANDOM, rand_ptr },
     /*
      * Whether this exec crossed a privilege boundary. Nonzero tells the dynamic

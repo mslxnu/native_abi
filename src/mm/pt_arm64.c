@@ -683,6 +683,24 @@ s2_prot_of(int prot)
   return f;
 }
 
+/*
+ * The inverse of prot_to_pte: what Linux permissions a descriptor currently
+ * grants. Needed because a stage-2 block is 16KiB but a guest page is 4KiB, so
+ * four descriptors can share one block with four different prot values.
+ */
+static int
+pte_to_prot(uint64_t pte)
+{
+  if ((pte & PTE_AP_RW_EL0) == 0)
+    return 0;                            /* PROT_NONE: no EL0 access at all */
+  int f = LINUX_PROT_READ;
+  if ((pte & PTE_AP_RO) == 0)
+    f |= LINUX_PROT_WRITE;
+  if ((pte & PTE_UXN) == 0)
+    f |= LINUX_PROT_EXEC;
+  return f;
+}
+
 void
 pt_protect(gaddr_t va, size_t size, int prot)
 {
@@ -695,10 +713,21 @@ pt_protect(gaddr_t va, size_t size, int prot)
    * refusing everything, and stage 1 cannot grant what stage 2 withholds: the
    * guest faults on memory that every table NABI keeps says is writable, and
    * keeps faulting, because nothing in the fault path changes the answer.
+   *
+   * A block is not necessarily all one segment, either. Two segments can land
+   * in the same 16KiB block when the later one is not granule-aligned - which
+   * the loader then maps at the previous region's end - and the permissions the
+   * block is established with must be what its *four* guest pages collectively
+   * need, not what the newest mprotect asked for. Otherwise a RELRO mprotect
+   * that covers only the later segment's head re-protects the whole block to
+   * read-only and the earlier segment's text tail - which shares the block -
+   * stops being executable, and the guest dies on its own code. So each block
+   * gets the union of its descriptors' permissions, computed after the range's
+   * descriptors are rewritten.
    */
-  int s2prot = s2_prot_of(prot);
   gaddr_t pagesz = PAGE_SIZEOF(PAGE_4KB);
   gaddr_t blocks[64];
+  gaddr_t block_va[64];
   size_t nr_blocks = 0;
 
   for (gaddr_t p = va; p < va + size; p += pagesz) {
@@ -716,16 +745,34 @@ pt_protect(gaddr_t va, size_t size, int prot)
     if (!seen) {
       if (nr_blocks == sizeof blocks / sizeof blocks[0]) {
         /* Rare: flush what we have and carry on rather than lose a block. */
-        for (size_t i = 0; i < nr_blocks; i++)
-          vmm_arm64_s2_reprotect(blocks[i], s2prot);
+        for (size_t i = 0; i < nr_blocks; i++) {
+          int u = 0;
+          for (size_t j = 0; j < PAGES_PER_CHUNK; j++) {
+            uint64_t *bp = walk_existing(block_va[i] + (gaddr_t) j * pagesz);
+            if (bp && (*bp & PTE_VALID) &&
+                ((*bp & PTE_ADDR_MASK) & ~(STAGE2_GRANULE - 1)) == blocks[i])
+              u |= pte_to_prot(*bp);
+          }
+          vmm_arm64_s2_reprotect(blocks[i], s2_prot_of(u));
+        }
         nr_blocks = 0;
       }
-      blocks[nr_blocks++] = block;
+      blocks[nr_blocks] = block;
+      block_va[nr_blocks] = p - (ipa & (STAGE2_GRANULE - 1));
+      nr_blocks++;
     }
   }
 
-  for (size_t i = 0; i < nr_blocks; i++)
-    vmm_arm64_s2_reprotect(blocks[i], s2prot);
+  for (size_t i = 0; i < nr_blocks; i++) {
+    int u = 0;
+    for (size_t j = 0; j < PAGES_PER_CHUNK; j++) {
+      uint64_t *bp = walk_existing(block_va[i] + (gaddr_t) j * pagesz);
+      if (bp && (*bp & PTE_VALID) &&
+          ((*bp & PTE_ADDR_MASK) & ~(STAGE2_GRANULE - 1)) == blocks[i])
+        u |= pte_to_prot(*bp);
+    }
+    vmm_arm64_s2_reprotect(blocks[i], s2_prot_of(u));
+  }
 }
 
 /*

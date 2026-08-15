@@ -387,6 +387,22 @@ else
     fail=1
 fi
 
+# mremapfixedtest: mremap with MREMAP_FIXED|MREMAP_MAYMOVE onto a pinned,
+# 4KiB-but-not-16KiB-aligned interior page of a reservation - the CFI
+# shadow-rewrite move. The answer must be the destination, the bytes must arrive
+# with the move, and the moved page must be mprotected writable and written
+# through afterwards. The source was isolated by an mprotect, so the 16KiB block
+# it shares with the tail it left behind must survive the move - this used to
+# panic in hv_vm_map when the source's host memory was freed first.
+cp "$here/mremapfixedtest" "$root/"; chmod +x "$root/mremapfixedtest"
+out=$("$NABI" -m "$root" /mremapfixedtest); rc=$?
+if [ "$rc" -eq 0 ] && [ "$out" = "mremapfixed ok" ]; then
+    echo "  ok  mremapfixedtest -> \"$out\", exit 0"
+else
+    echo "  FAIL mremapfixedtest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 # sharedmaptest: a MAP_SHARED write must reach the file (and a MAP_PRIVATE one
 # must not). Everything else file-backed is copied into guest memory, which
 # cannot give MAP_SHARED its meaning.

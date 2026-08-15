@@ -528,6 +528,35 @@ DEFINE_SYSCALL(kill, l_pid_t, pid, int, sig)
 }
 
 /*
+ * rt_tgsigqueueinfo: a signal with a siginfo payload, aimed at one thread.
+ *
+ * This is how bionic implements pthread_kill, so it is not an obscure corner:
+ * a pthread that cannot be signalled is a thread that cannot be cancelled,
+ * interrupted, or told to die. An unimplemented entry here is worse than a
+ * plain ENOSYS looks, because the caller cannot tell "not supported" from
+ * "not delivered" - bionic treats a failure as a bug and abort()s.
+ *
+ * The guest's siginfo is validated - a bad pointer is EFAULT, as the kernel
+ * reports it - but the payload is not carried any further. Delivery loses
+ * everything but the signal number: nabi raises it with the host's kill(),
+ * and the realtime signals that carry si_value are dropped by send_signal
+ * anyway, exactly as they are for kill and tgkill.
+ */
+DEFINE_SYSCALL(rt_tgsigqueueinfo, l_pid_t, tgid, l_pid_t, tid, int, sig, gaddr_t, uinfo)
+{
+  l_siginfo_t si;
+
+  if (tgid <= 0 || tid <= 0)
+    return -LINUX_EINVAL;
+  if (copy_from_user(&si, uinfo, sizeof si))
+    return -LINUX_EFAULT;
+  pid_t h = pidns_to_host(tid);
+  if (h < 0)
+    return -LINUX_ESRCH;
+  return send_signal(h, sig);
+}
+
+/*
  * Re-install the host's signal handlers to match the guest's dispositions.
  *
  * For a resumed process only. NABI routes a host signal into the guest through

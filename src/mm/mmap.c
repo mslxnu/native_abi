@@ -93,6 +93,21 @@ do_munmap(gaddr_t gaddr, size_t size)
   }
 
   struct mm_region key = {.gaddr = gaddr, .size = size};
+  /*
+   * find_region_range returns whichever overlapping node the tree search lands
+   * on; when a range straddles two regions it is not guaranteed to be the first
+   * one in address order, and the loop below only walks forward. Walk back to
+   * the earliest overlap first, or the predecessor - which still overlaps the
+   * range being unmapped - is never visited and the caller's record_region
+   * panics "recording overlapping regions".
+   */
+  while (overlapping->list.prev != &proc.mm->mm_regions) {
+    struct mm_region *prev = list_entry(overlapping->list.prev,
+                                        struct mm_region, list);
+    if (region_compare(&key, prev) != 0)
+      break;
+    overlapping = prev;
+  }
   while (region_compare(&key, overlapping) == 0) {
     if (overlapping->gaddr < gaddr) {
       split_region(proc.mm, overlapping, gaddr);
@@ -522,14 +537,22 @@ DEFINE_SYSCALL(mremap, gaddr_t, old_addr, size_t, old_size, size_t, new_size, in
     return -LINUX_EINVAL;
 
   /*
-   * Rounded to the guest's page granule, as the kernel rounds to its own -
-   * which on arm64 is the 16KiB stage-2 block, not 4KiB. Rounding to 4KiB here
-   * let a shrink hand vmm_munmap a size that is not a whole number of blocks,
-   * and the stage-2 layer cannot split one: it asserted, and took the guest
-   * down with it. dpkg's mremap on its unpack buffer is where that showed.
+   * Linux rounds to its own page, and the region bookkeeping is measured in
+   * that unit: mprotect and do_munmap split regions at 4KiB granularity, so a
+   * mapping a guest has mprotected part of away can be a 4KiB multiple that is
+   * not a 16KiB one. Rounding old_size to the 16KiB stage-2 block instead of
+   * the guest page hands such a trimmed region back EFAULT where Linux would
+   * succeed - the CFI shadow-rewrite flow hits exactly that, mremapping a
+   * 4KiB page that an mprotect has just isolated. The stage-2 layer maps and
+   * unmaps whole blocks, but vmm_mmap and vmm_munmap both walk the guest's
+   * 4KiB pages and handle a range that only partly covers a block, so the
+   * block granule is not a size to round to here. (It was rounded to before,
+   * when vmm_munmap could not split a block at all; dpkg's unpack-buffer
+   * mremap is what showed that. splitmunmaptest covers the since-added
+   * handling.)
    */
-  old_size = roundup(old_size, GUEST_MMAP_GRANULE);
-  new_size = roundup(new_size, GUEST_MMAP_GRANULE);
+  old_size = roundup(old_size, PAGE_SIZEOF(PAGE_4KB));
+  new_size = roundup(new_size, PAGE_SIZEOF(PAGE_4KB));
 
   gaddr_t ret = old_addr;
 
@@ -544,6 +567,9 @@ DEFINE_SYSCALL(mremap, gaddr_t, old_addr, size_t, old_size, size_t, new_size, in
   struct mm_region *region = find_region(old_addr, proc.mm);
   /* Linux requires old_addr is the exact address of start of vm_area  */
   if (!region || region->gaddr != old_addr) {
+    warnk("mremap EFAULT: old_addr 0x%llx old_size 0x%zx new_size 0x%zx new_addr 0x%llx region %p", old_addr, old_size, new_size, new_addr, (void *) region);
+    if (region)
+      warnk("  region->gaddr 0x%llx size 0x%zx", region->gaddr, region->size);
     ret = -LINUX_EFAULT;
     goto out;
   }
@@ -553,17 +579,39 @@ DEFINE_SYSCALL(mremap, gaddr_t, old_addr, size_t, old_size, size_t, new_size, in
     goto out;
   }
 
-  /* new_size <= old_size. We can just shrink */
-  if (new_size <= old_size) {
-    munmap(region->haddr + new_size, region->size - new_size);
-    vmm_munmap(region->gaddr + new_size, region->size - new_size);
-    if (region->arena_off >= 0)
-      arena_free(region->arena_off + new_size, region->size - new_size);
+  /*
+   * Where the region is going. A shrink with no MREMAP_FIXED stays where it is;
+   * everything else lands at a destination - MREMAP_FIXED pins it, otherwise
+   * alloc_region hands one out (which, from the top-down allocator, is old_addr
+   * itself when the region above is free, i.e. a grow in place).
+   */
+  if (!(flags & LINUX_MREMAP_FIXED) && new_size <= old_size) {
+    if (region->size > new_size) {
+      /* Stage 2 first, host memory after - see the move path below. */
+      vmm_munmap(region->gaddr + new_size, region->size - new_size);
+      if (region->arena_off < 0)
+        munmap(region->haddr + new_size, region->size - new_size);
+      if (region->arena_off >= 0) {
+        /*
+         * Free arena space only from the next 16KiB boundary onward. A region
+         * that mprotect or munmap has split shares its arena chunk with the
+         * sibling it left behind, so freeing from new_size directly - and arena
+         * rounding the size up to a block - could punch into the sibling's
+         * range. The sub-block tail is left allocated in a sparse,
+         * hole-punched file, which costs nothing.
+         */
+        size_t aligned = roundup(new_size, STAGE2_GRANULE);
+        if (aligned < region->size)
+          arena_free(region->arena_off + aligned, region->size - aligned);
+      }
+    }
     region->size = new_size;
     goto out;
   }
 
-  /* new_size > old_size */
+  gaddr_t dst = (flags & LINUX_MREMAP_FIXED) ? new_addr : alloc_region(new_size);
+
+  /* new_size > old_size, or moving to a new address */
   off_t moved_off = -1;
   void *moved_to;
 #if defined(__arm64__)
@@ -595,19 +643,59 @@ DEFINE_SYSCALL(mremap, gaddr_t, old_addr, size_t, old_size, size_t, new_size, in
   }
 #endif
 
+  /*
+   * A fixed move replaces whatever is mapped at the destination first - that is
+   * the meaning of MREMAP_FIXED, and the CFI shadow-rewrite flow parks a
+   * temporary page on top of a protected one this way. The copy is already done
+   * above, so the source bytes are safe even if this reaches into the source
+   * range; only a destination that overlaps the source region itself is
+   * refused, since that would free the region record still in use below.
+   */
+  if ((flags & LINUX_MREMAP_FIXED) && dst != old_addr) {
+    if (dst < region->gaddr + region->size && dst + new_size > region->gaddr) {
+      warnk("mremap: fixed destination 0x%llx overlaps source region [0x%llx, 0x%llx)\n",
+            dst, region->gaddr, region->gaddr + region->size);
+      ret = -LINUX_EINVAL;
+      goto out;
+    }
+    do_munmap(dst, new_size);
+  }
+
   /* Unmap the old page */
   if (old_size < region->size) {
     split_region(proc.mm, region, region->gaddr + old_size);
   }
   list_del(&region->list);
   RB_REMOVE(mm_region_tree, &proc.mm->mm_region_tree, region);
-  munmap(region->haddr, region->size);
+  /*
+   * Stage 2 is torn down first, and only then is the host memory handled.
+   *
+   * vmm_munmap may have to re-establish a 16KiB block that still backs a
+   * neighbouring region - the source was split by an mprotect and the tail
+   * still lives - and re-establishing remaps the whole block with hv_vm_map,
+   * which needs the block's host backing to be mapped. Unmapping the host
+   * memory first (as this did) handed hv_vm_map a host range with a hole in
+   * it and it refused with HV_ERROR, taking the guest down mid-mremap.
+   */
   vmm_munmap(region->gaddr, region->size);
-  if (region->arena_off >= 0)
-    arena_free(region->arena_off, region->size);
+  if (region->arena_off < 0) {
+    /* A real mapping (a shared file, or all of x86): the bytes belong to
+     * whatever it was mapped from, and the region owned all of them. */
+    munmap(region->haddr, region->size);
+  } else {
+    /*
+     * Arena memory is released only as a whole free chunk, and this region is
+     * not known to be one: an mprotect split leaves it sharing its 16KiB
+     * block - host range and file bytes alike - with the sibling it left
+     * behind. munmap would cut a hole in the block the sibling still reads
+     * through, and arena_free rounds its size up to the block and would punch
+     * a hole through the sibling's file bytes, which reads back as zeros.
+     * Dead arena storage is sparse and costs nothing, so it is left alone.
+     */
+  }
 
   /* Map new one */
-  ret = alloc_region(new_size);
+  ret = dst;
   struct mm_region *new = record_region(proc.mm, moved_to, ret, new_size, region->prot, region->mm_flags, region->mm_fd, region->pgoff);
   new->shm_id = region->shm_id;
   new->arena_off = moved_off;

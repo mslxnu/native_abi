@@ -45,6 +45,14 @@ guest-code cache sync.
 - `splitmunmaptest` — unmap part of a mapping so live pages remain inside the
   16KiB stage-2 blocks it partly emptied; survivors keep their contents and the
   unmapped pages fault. This case used to panic as needing "evacuation".
+- `mremapfixedtest` — `mremap` with `MREMAP_FIXED|MREMAP_MAYMOVE` and equal
+  sizes, the CFI shadow-rewrite move: the source is an interior 4KiB page of a
+  reservation (isolated by an `mprotect`), so it shares its 16KiB stage-2 block
+  with the tail it left behind. The answer must be the destination address, the
+  bytes must arrive with the move, and the moved page must be `mprotect`ed
+  writable and written through afterwards. Freeing the source's host memory
+  before the stage-2 teardown used to panic in `hv_vm_map`, because the
+  reflush of the shared block still needs the whole block's host backing.
 - `epolltest` — `epoll` over a self-pipe (translated to kqueue): the timeout
   path, a readable descriptor, the guest's opaque 64-bit data returned verbatim,
   and that `EPOLL_CTL_DEL` really unregisters.

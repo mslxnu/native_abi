@@ -159,8 +159,30 @@ main_loop(int return_on_sigret)
         case VM_ACCESS_UNKNOWN: break;
         }
         if (!addr_ok(exit.fault_addr, verify)) {
-          printk("page fault: caused by guest linear address 0x%llx\n",
-                 exit.fault_addr);
+          static const char *acc[] = { "?", "read", "write", "exec" };
+          uint64_t pc = 0;
+          vmm_get_reg(VREG_PC, &pc);
+          struct mm_region *r = find_region(exit.fault_addr, proc.mm);
+          printk("page fault: caused by guest linear address 0x%llx "
+                 "access=%s pc=0x%llx region=%s prot=%d flags=%#x "
+                 "base=0x%llx size=0x%llx\n",
+                 (unsigned long long) exit.fault_addr,
+                 acc[exit.fault_access <= 3 ? exit.fault_access : 0],
+                 (unsigned long long) pc,
+                 r ? "found" : "MISSING", r ? r->prot : -1,
+                 r ? r->mm_flags : 0,
+                 (unsigned long long)(r ? r->gaddr : 0),
+                 (unsigned long long)(r ? r->size : 0));
+          struct list_head *pos = proc.mm->mm_regions.next;
+          while (pos != &proc.mm->mm_regions) {
+            struct mm_region *walk = list_entry(pos, struct mm_region, list);
+            if (walk->gaddr >= 0x400000 && walk->gaddr < 0x600000)
+              printk("  region base=0x%llx size=0x%llx prot=%d flags=%#x\n",
+                     (unsigned long long) walk->gaddr,
+                     (unsigned long long) walk->size, walk->prot,
+                     walk->mm_flags);
+            pos = pos->next;
+          }
           send_signal(getpid(), LINUX_SIGSEGV);
           break;
         }
@@ -177,9 +199,14 @@ main_loop(int return_on_sigret)
          */
         if (exit.fault_addr == last_fault_addr) {
           if (++same_fault_count >= MAX_SAME_FAULTS) {
+            uint64_t pc = 0;
+            vmm_get_reg(VREG_PC, &pc);
             printk("page fault: no progress at 0x%llx after %d attempts "
-                   "(access %d); killing the guest rather than spinning\n",
-                   exit.fault_addr, same_fault_count, exit.fault_access);
+                   "(access %d, pc=0x%llx, esr=0x%llx); killing the guest "
+                   "rather than spinning\n",
+                   exit.fault_addr, same_fault_count, exit.fault_access,
+                   (unsigned long long) pc,
+                   (unsigned long long) exit.raw_reason);
             warnk("unresolvable page fault at 0x%llx\n", exit.fault_addr);
             {
               static const char *acc[] = { "?", "read", "write", "exec" };
