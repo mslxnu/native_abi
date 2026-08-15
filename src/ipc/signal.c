@@ -147,18 +147,17 @@ init_signal(void)
   /* import signal handlers registered on the host */
   for (int i = 0; i < LINUX_NSIG; i++) {
     struct sigaction oact;
-    sigaction(i + 1, NULL, &oact);
-    if (!(oact.sa_handler == SIG_IGN || oact.sa_handler == SIG_DFL)) {
-      /* Printed as a pointer: the old (int) cast truncated the handler
-       * address on a 64-bit host, so this diagnostic - which fires just
-       * before the assert below - reported a value that was not the
-       * handler. */
-      warnk("sa_handler:%p\n", (void *) oact.sa_handler);
+    l_handler_t handler = LINUX_SIG_DFL;
+    if (sigaction(i + 1, NULL, &oact) == 0) {
+      if (oact.sa_handler != SIG_IGN && oact.sa_handler != SIG_DFL) {
+        warnk("signal %d has a custom host handler %p - importing as SIG_DFL\n",
+              i + 1, (void *) oact.sa_handler);
+      }
+      handler = oact.sa_handler == SIG_IGN ? LINUX_SIG_IGN : LINUX_SIG_DFL;
     }
-    assert(oact.sa_handler == SIG_IGN || oact.sa_handler == SIG_DFL);
     // flags, restorer, and mask will be flushed in execve, so just leave them 0
     proc.sigaction[i] = (l_sigaction_t) {
-      .lsa_handler = oact.sa_handler == SIG_IGN ? LINUX_SIG_IGN : LINUX_SIG_DFL,
+      .lsa_handler = handler,
       .lsa_flags = 0,
       .lsa_restorer= 0,
       .lsa_mask = {0}
