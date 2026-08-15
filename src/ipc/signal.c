@@ -309,6 +309,9 @@ DEFINE_SYSCALL(rt_sigaction, int, sig, gaddr_t, act, gaddr_t, oact, size_t, size
   }
   linux_to_darwin_sigaction(&lact, &dact, handler);
   dsig = linux_to_darwin_signal(sig);
+  if (dsig == 0) {
+    return -LINUX_EINVAL;
+  }
   // TODO: make handlings of linux specific signals consistent
 
   int err = 0;

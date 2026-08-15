@@ -130,7 +130,15 @@ void
 vmm_arm64_unmap_stage2(gaddr_t ipa, size_t size)
 {
   assert((size & (STAGE2_GRANULE - 1)) == 0);
-  hv_vm_unmap(ipa, size);
+  gaddr_t base = ipa & ~(STAGE2_GRANULE - 1);
+  khiter_t k = kh_get(s2, s2_map, base);
+  if (k != kh_end(s2_map)) {
+    hv_return_t unmap_ret = hv_vm_unmap(ipa, size);
+    if (unmap_ret != HV_SUCCESS && unmap_ret != HV_BAD_ARGUMENT) {
+      warnk("hv_vm_unmap returned %#x for ipa [%#llx, %#llx)\n",
+            unmap_ret, (unsigned long long) ipa, (unsigned long long) (ipa + size));
+    }
+  }
   s2_forget(ipa, size);
 }
 

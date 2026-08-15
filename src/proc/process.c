@@ -1351,6 +1351,10 @@ DEFINE_SYSCALL(prctl, int, option, unsigned long, arg1, unsigned long, arg2, uns
     warnk("prctl PR_SET_VMA: addr=%#lx len=%#lx name=%s\n", arg2, arg3, name);
     return 0;
   }
+  case LINUX_PR_GET_DUMPABLE:
+    return 0;
+  case 55:
+    return 0;
   /*
    * The seccomp options, which are prctl's older door into the same thing.
    * PR_SET_SECCOMP predates the seccomp syscall and is still what a program
