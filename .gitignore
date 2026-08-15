@@ -10,3 +10,7 @@ out/
 # Scratch files the guest suite leaves behind in test/.
 test/noah-mv.*
 __pycache__/
+
+# Android vendor partition image for the waydroid / Android guest work.
+vendor.img
+vendor.zip

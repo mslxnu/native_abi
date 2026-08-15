@@ -135,13 +135,17 @@ load_elf_interp(const char *path, ulong load_addr)
        * The shared page carries the earlier segment's tail and the later
        * segment's head, so it has to answer to both: the tail is executed
        * (bionic keeps code in it), the head is written (it is .data). Linux
-       * unions the two segments' permissions on the page; so does this.
+       * unions the two segments' permissions on the page; so does this, and
+       * the union accumulates across segments that all land on one granule
+       * (prot is what prev_prot picks up at the end of the loop).
        */
       sys_mprotect(vaddr, last_end - vaddr, prev_prot | prot);
+      prot = prev_prot | prot;
     }
 
     assert(map_vaddr != 0);
-    do_mmap(map_vaddr, map_size, PROT_READ | PROT_WRITE, prot, LINUX_MAP_PRIVATE | LINUX_MAP_FIXED | LINUX_MAP_ANONYMOUS, -1, 0);
+    if (map_size != 0)
+      do_mmap(map_vaddr, map_size, PROT_READ | PROT_WRITE, prot, LINUX_MAP_PRIVATE | LINUX_MAP_FIXED | LINUX_MAP_ANONYMOUS, -1, 0);
 
     copy_to_user(p_vaddr, data + p[i].p_offset, p[i].p_filesz);
 
@@ -237,13 +241,17 @@ load_elf(Elf64_Ehdr *ehdr, int argc, char *argv[], char **envp, bool secure,
        * The shared page carries the earlier segment's tail and the later
        * segment's head, so it has to answer to both: the tail is executed
        * (bionic keeps code in it), the head is written (it is .data). Linux
-       * unions the two segments' permissions on the page; so does this.
+       * unions the two segments' permissions on the page; so does this, and
+       * the union accumulates across segments that all land on one granule
+       * (prot is what prev_prot picks up at the end of the loop).
        */
       sys_mprotect(vaddr, last_end - vaddr, prev_prot | prot);
+      prot = prev_prot | prot;
     }
 
     assert(map_vaddr != 0);
-    do_mmap(map_vaddr, map_size, PROT_READ | PROT_WRITE, prot, LINUX_MAP_PRIVATE | LINUX_MAP_FIXED | LINUX_MAP_ANONYMOUS, -1, 0);
+    if (map_size != 0)
+      do_mmap(map_vaddr, map_size, PROT_READ | PROT_WRITE, prot, LINUX_MAP_PRIVATE | LINUX_MAP_FIXED | LINUX_MAP_ANONYMOUS, -1, 0);
 
     copy_to_user(p_vaddr, (char *)ehdr + p[i].p_offset, p[i].p_filesz);
 
