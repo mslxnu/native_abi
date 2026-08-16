@@ -181,10 +181,22 @@ void
 destroy_mm(struct mm *mm)
 {
   struct list_head *list, *t;
+  /*
+   * Stage 2 out first, host memory after. Unmapping a region cuts a hole in
+   * the host range of the block it shares with its neighbour, and vmm_munmap
+   * re-establishes a block that still has a live page with hv_vm_map - which
+   * refuses a host range with a hole. So the sweep has to finish while every
+   * block's host range is still intact. Once all stage-2 blocks are gone no
+   * hv_vm_map can run over them, and the host mappings can be released in any
+   * order.
+   */
+  list_for_each_safe (list, t, &mm->mm_regions) {
+    struct mm_region *r = list_entry(list, struct mm_region, list);
+    vmm_munmap(r->gaddr, r->size);
+  }
   list_for_each_safe (list, t, &mm->mm_regions) {
     struct mm_region *r = list_entry(list, struct mm_region, list);
     munmap(r->haddr, r->size);
-    vmm_munmap(r->gaddr, r->size);
     if (r->arena_off >= 0)
       arena_free(r->arena_off, r->size);
     free(r);
@@ -351,13 +363,6 @@ DEFINE_SYSCALL(munlockall)
 DEFINE_SYSCALL(brk, unsigned long, brk)
 {
   uint64_t ret;
-  /* The granule the mapping behind the break is rounded to, not the guest's
-   * page size. Rounding to 4KiB while do_mmap rounded the mapping to 16KiB left
-   * the region reaching past current_brk, so the next brk started inside a
-   * region that already existed. The guest is told AT_PAGESZ is 16KiB anyway,
-   * so this is the size it already believes a page to be. */
-  brk = roundup(brk, GUEST_MMAP_GRANULE);
-
   pthread_rwlock_wrlock(&proc.mm->alloc_lock);
   if (brk < proc.mm->start_brk) {
     /*
@@ -382,26 +387,51 @@ DEFINE_SYSCALL(brk, unsigned long, brk)
   }
 
   if (brk < proc.mm->current_brk) {
-    do_munmap(brk, proc.mm->current_brk - brk);
+    /*
+     * Shrink. Only whole granules are given back (vmm_munmap works a 16KiB
+     * block at a time); the granule the new break lands in stays mapped and
+     * returns to the heap if the break grows again before it is unmapped.
+     */
+    gaddr_t unmap_from = roundup(brk, GUEST_MMAP_GRANULE);
+    gaddr_t unmap_to = roundup(proc.mm->current_brk, GUEST_MMAP_GRANULE);
+    if (unmap_to > unmap_from)
+      do_munmap(unmap_from, unmap_to - unmap_from);
     ret = proc.mm->current_brk = brk;
   } else if (brk > proc.mm->current_brk) {
     /*
-     * Stop at the first thing already mapped, and answer with the break as it
-     * stands.
+     * Grow. The break is tracked and answered at the guest's own 4KiB
+     * granularity - Linux brk(2) returns the break it was asked for, and glibc
+     * sizes the main-arena top chunk from MORECORE(0) while crediting
+     * system_mem only the amount it requested, so a rounded-up answer makes the
+     * two disagree and trips "malloc(): corrupted top size". Only the backing
+     * mapping is 16KiB-granular; a request that lands inside the granule already
+     * mapped behind the break just moves the break.
      *
-     * That is what Linux does, and returning the *old* break is the signal
-     * malloc uses to give up on the heap and switch to mmap - brk(2) reports
-     * the break it managed, not the one it was asked for. Growing regardless
-     * marched the heap straight into the mmap area: pacman took it from
-     * 0x488000 to 0xc0000000 in 2MiB steps and then recorded a region on top of
-     * a loaded image, which is a panic rather than an answer.
+     * Growing is stopped at the first thing already mapped, and answered with
+     * the break as it stands - that is what Linux does, and returning the *old*
+     * break is the signal malloc uses to give up on the heap and switch to
+     * mmap. brk(2) reports the break it managed, not the one it was asked for.
+     * Growing regardless marched the heap straight into the mmap area: pacman
+     * took it from 0x488000 to 0xc0000000 in 2MiB steps and then recorded a
+     * region on top of a loaded image, which is a panic rather than an answer.
      */
-    if (find_region_range(proc.mm->current_brk,
-                          brk - proc.mm->current_brk, proc.mm) != NULL) {
-      ret = proc.mm->current_brk;
-      goto out;
+    gaddr_t map_start = roundup(proc.mm->current_brk, GUEST_MMAP_GRANULE);
+    gaddr_t map_end = roundup(brk, GUEST_MMAP_GRANULE);
+    if (map_end > map_start) {
+      /* Start after the region the break already sits in: a previous grow may
+       * have rounded its mapping past the break, and that tail is the heap's
+       * own, not a foreign mapping to refuse. */
+      struct mm_region *cur = find_region(proc.mm->current_brk - 1, proc.mm);
+      if (cur && cur->gaddr + cur->size > map_start)
+        map_start = cur->gaddr + cur->size;
+      if (map_start < map_end &&
+          find_region_range(map_start, map_end - map_start, proc.mm) != NULL) {
+        ret = proc.mm->current_brk;
+        goto out;
+      }
+      if (map_start < map_end)
+        do_mmap(map_start, map_end - map_start, PROT_READ | PROT_WRITE, LINUX_PROT_READ | LINUX_PROT_WRITE, LINUX_MAP_PRIVATE | LINUX_MAP_FIXED | LINUX_MAP_ANONYMOUS, -1, 0);
     }
-    do_mmap(proc.mm->current_brk, brk - proc.mm->current_brk, PROT_READ | PROT_WRITE, LINUX_PROT_READ | LINUX_PROT_WRITE, LINUX_MAP_PRIVATE | LINUX_MAP_FIXED | LINUX_MAP_ANONYMOUS, -1, 0);
     ret = proc.mm->current_brk = brk;
   } else {
     ret = proc.mm->current_brk;
