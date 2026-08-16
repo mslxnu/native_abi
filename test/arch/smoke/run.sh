@@ -987,6 +987,21 @@ else
     fail=1
 fi
 
+# xattrdevtest: extended attributes on a filesystem that has none. macOS devfs
+# answers EPERM for listxattr on every device node; Linux devtmpfs answers with
+# an empty list, so passing the EPERM through made `ls -l /dev/binder` print
+# "Operation not permitted" about a node it then listed correctly. Checked in
+# both directions - a device node lists empty, and a path that does not exist is
+# still ENOENT rather than being swallowed into "no such attribute".
+cp "$here/xattrdevtest" "$root/"; chmod +x "$root/xattrdevtest"
+out=$("$NABI" -m "$root" /xattrdevtest); rc=$?
+if [ "$rc" -eq 0 ] && [ "$out" = "xattrdev ok" ]; then
+    echo "  ok  xattrdevtest -> \"$out\", exit 0"
+else
+    echo "  FAIL xattrdevtest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 if [ "$fail" -eq 0 ]; then
     echo "smoke: PASS"
 else

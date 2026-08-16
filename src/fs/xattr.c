@@ -27,6 +27,7 @@
  * attributes it set and no others, which is what it would see on Linux, where
  * this bookkeeping does not exist at all.
  */
+#include <stdbool.h>
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -115,6 +116,29 @@ filter_list(char *buf, ssize_t n, gaddr_t out, size_t size)
 
 /* ------------------------------------------------------------------- get */
 
+/*
+ * Darwin says EPERM where Linux says "this filesystem has no extended
+ * attributes at all".
+ *
+ * devfs is the case that matters and it is not a corner: listxattr on *any*
+ * device node - /dev/null and /dev/zero as much as /dev/binder - fails with
+ * EPERM on macOS, because devfs has no attribute store to consult. Linux's
+ * devtmpfs is tmpfs underneath and answers with an empty list, so `ls -l
+ * /dev/binder` prints nothing unusual there and printed "Operation not
+ * permitted" here - about a node it went on to list correctly on the next line.
+ *
+ * A guest reading that as a permission failure is being told something untrue,
+ * and it is the sort of untrue that stops a container runtime rather than
+ * merely looking untidy. EACCES is what Darwin returns when the caller may not
+ * read the attributes of something that has them, so it is left alone; EPERM
+ * and ENOTSUP both mean the store is not there.
+ */
+static bool
+xattr_unsupported(int e)
+{
+  return e == EPERM || e == ENOTSUP;
+}
+
 static int
 do_getxattr(const char *host, int fd, const char *name, gaddr_t value,
             size_t size, int options)
@@ -129,7 +153,9 @@ do_getxattr(const char *host, int fd, const char *name, gaddr_t value,
   ssize_t n = host ? getxattr(host, name, buf, size, 0, options)
                    : fgetxattr(fd, name, buf, size, 0, options);
   int r;
-  if (n < 0)
+  if (n < 0 && xattr_unsupported(errno))
+    r = -LINUX_ENODATA;         /* no store, so no such attribute */
+  else if (n < 0)
     r = -darwin_to_linux_errno(errno);
   else if (size == 0 || !copy_to_user(value, buf, (size_t) n))
     r = (int) n;
@@ -241,6 +267,8 @@ do_listxattr(const char *host, int fd, gaddr_t out, size_t size, int options)
    * because the size it is owed is the size *after* ours are removed. */
   ssize_t need = host ? listxattr(host, NULL, 0, options)
                       : flistxattr(fd, NULL, 0, options);
+  if (need < 0 && xattr_unsupported(errno))
+    return 0;                   /* nothing to list, which is not an error */
   if (need < 0)
     return -darwin_to_linux_errno(errno);
   if (need == 0)
@@ -251,7 +279,7 @@ do_listxattr(const char *host, int fd, gaddr_t out, size_t size, int options)
     return -LINUX_ENOMEM;
   ssize_t n = host ? listxattr(host, buf, (size_t) need, options)
                    : flistxattr(fd, buf, (size_t) need, options);
-  int r = n < 0 ? -darwin_to_linux_errno(errno)
+  int r = n < 0 ? (xattr_unsupported(errno) ? 0 : -darwin_to_linux_errno(errno))
                 : filter_list(buf, n, out, size);
   free(buf);
   return r;
