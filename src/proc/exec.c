@@ -22,6 +22,39 @@
 #include "elf.h"
 
 /*
+ * What to report as AT_PAGESZ. The truth unless an image is known to need
+ * otherwise; see the note at the call site.
+ */
+static uint64_t
+guest_pagesz(void)
+{
+#if defined(__arm64__)
+  uint64_t real = STAGE2_GRANULE;
+#else
+  uint64_t real = PAGE_SIZEOF(PAGE_4KB);
+#endif
+  const char *o = getenv("NABI_AT_PAGESZ");
+  if (o == NULL || *o == '\0')
+    return real;
+  char *end;
+  unsigned long v = strtoul(o, &end, 0);
+  /* A power of two, and never larger than the granule mappings really use: a
+   * guest told its pages are *bigger* than they are would round its own
+   * allocations past the end of them. */
+  if (*end != '\0' || v == 0 || (v & (v - 1)) != 0 || v > real) {
+    warnk("NABI_AT_PAGESZ=%s ignored; reporting %llu\n", o,
+          (unsigned long long) real);
+    return real;
+  }
+  if (v != real)
+    warnk("NABI_AT_PAGESZ=%lu: the guest is being told a page size mmap does "
+          "not use (%llu); its allocator may corrupt itself\n",
+          v, (unsigned long long) real);
+  return v;
+}
+
+
+/*
  * The page granule ELF segments are aligned to when loaded. Must match the
  * guest's AT_PAGESZ and the mmap granule (src/mm/mmap.c): 16KiB on Apple
  * Silicon, so a segment never shares a 16KiB stage-2 block with its neighbour
@@ -502,13 +535,31 @@ init_userstack(int argc, char *argv[], char **envp, uint64_t exe_base,
     { AT_PHDR, exe_base + ehdr->e_phoff },
     { AT_PHENT, ehdr->e_phentsize },
     { AT_PHNUM, ehdr->e_phnum },
-    /* The guest is a 4KiB-page machine. The 16KiB stage-2 granule is a
-     * hardware detail of Apple Silicon, not the page size the guest runs
-     * under - the mmap/load granules and the per-4KiB mprotect path already
-     * treat the guest address space as 4KiB, and reporting the true granule
-     * here kills the guest's allocator: this Android image's jemalloc accepts
-     * nothing but 4096 and bails out of its own malloc. */
-    { AT_PAGESZ, PAGE_SIZEOF(PAGE_4KB) },
+    /*
+     * The granule mmap actually works in, which on Apple Silicon is 16KiB.
+     *
+     * This read 4096 for a while, on the reasoning that 16KiB is a hardware
+     * detail of the host rather than the page size the guest runs under. It is
+     * not a detail an allocator can be lied to about: glibc's malloc sizes and
+     * releases its mmapped chunks in units of AT_PAGESZ, and nabi rounds every
+     * mapping to GUEST_MMAP_GRANULE - so a guest told 4096 computes boundaries
+     * the mm layer does not honour, releases ranges it did not allocate, and
+     * walks into its own free lists. On a Fedora tree that showed as
+     * `malloc(): unaligned fastbin chunk detected` from bash before the prompt,
+     * and further back as an outright abort on `corrupted top size`.
+     *
+     * Making it true the other way round does not work: setting
+     * GUEST_MMAP_GRANULE to 4096 as well leaves the corruption in place,
+     * because the host page really is 16KiB and nothing underneath can hand
+     * out a 4KiB mapping of its own.
+     *
+     * NABI_AT_PAGESZ exists for the Android work, where bionic's jemalloc
+     * refuses to initialise on anything but 4096. It is a workaround rather
+     * than a second opinion - a guest started with it has an allocator being
+     * told something untrue - so it warns, and is meant for an image known to
+     * need it.
+     */
+    { AT_PAGESZ, guest_pagesz() },
     { AT_RANDOM, rand_ptr },
     /*
      * Whether this exec crossed a privilege boundary. Nonzero tells the dynamic
