@@ -382,6 +382,15 @@ arena_snapshot(void)
  * For the resuming side of a fork: the child starts out seeing exactly the
  * bytes the parent had at handover and diverges copy-on-write from its first
  * write, which is what fork promises, without copying the address space.
+ *
+ * The caller can name the middle of a block: the mm layer splits a region when
+ * the guest unmaps part of one, and the pieces keep the arena offset of the
+ * allocation they came from, so a piece is an interior slice of a block. The
+ * host wants mmap offsets and lengths aligned to a block, and the bytes the
+ * piece needs are the whole block's anyway - so the block is mapped as a unit
+ * and the caller is answered from inside it. A block is mapped once no matter
+ * how many sibling pieces of the same allocation share it, or a write through
+ * one piece would be invisible through the other.
  */
 void *
 arena_map_private(off_t off, size_t size)
@@ -389,16 +398,25 @@ arena_map_private(off_t off, size_t size)
   if (arena_backing_fd < 0)
     panic("arena_map_private before the arena exists");
 
-  size = roundup(size, ARENA_GRANULE);
-  void *p = mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE,
-                 arena_backing_fd, off);
+  off_t block = off & ~(off_t)(ARENA_GRANULE - 1);
+  size_t block_size = roundup((size_t)(off - block) + size, ARENA_GRANULE);
+
+  for (size_t i = 0; i < nr_arena_spans; i++) {
+    if (block >= arena_spans[i].off &&
+        block + (off_t) block_size <=
+            arena_spans[i].off + (off_t) arena_spans[i].size)
+      return (char *) arena_spans[i].addr + (off - block);
+  }
+
+  void *p = mmap(NULL, block_size, PROT_READ | PROT_WRITE, MAP_PRIVATE,
+                 arena_backing_fd, block);
   if (p == MAP_FAILED)
     panic("could not privately map arena offset %lld: %s",
           (long long) off, strerror(errno));
   /* Registered like any other span, so the restore can look the mapping up by
    * offset and so a later handover from this process flushes it. */
-  arena_span_record(p, size, off);
-  return p;
+  arena_span_record(p, block_size, block);
+  return (char *) p + (off - block);
 }
 
 /* Adopt an arena handed over by another process (the exec'd child's side). */
