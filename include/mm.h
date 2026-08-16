@@ -86,6 +86,30 @@ struct mm {
   pthread_rwlock_t alloc_lock;
 };
 
+/*
+ * Drop an AArch64 pointer tag, the way Linux's untagged_addr() does.
+ *
+ * TCR_EL1.TBI0 tells the MMU to ignore the top byte of a user address, so
+ * hardware accesses through a tagged pointer already land in the right place.
+ * Nothing tells *this* program, though: a tagged pointer arriving as a syscall
+ * argument is translated here in software, and the tag has to come off first or
+ * the lookup misses every region and the call answers EFAULT. Android tags heap
+ * pointers as a matter of course, so `toybox echo` failed with "write: Bad
+ * address" on a buffer that was mapped and readable.
+ *
+ * The top byte only, and only on arm64: it is the byte TBI0 covers, and x86-64
+ * has no such thing.
+ */
+static inline gaddr_t
+untag_gaddr(gaddr_t a)
+{
+#if defined(__arm64__)
+  return a & 0x00ffffffffffffffULL;
+#else
+  return a;
+#endif
+}
+
 extern const gaddr_t user_addr_max;
 
 extern struct mm vkern_mm;

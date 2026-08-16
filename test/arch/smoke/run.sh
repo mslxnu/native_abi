@@ -971,6 +971,22 @@ else
     fail=1
 fi
 
+# tagtest: AArch64 pointer tags. The top byte of a user pointer is not part of
+# the address - TCR_EL1.TBI0 tells the MMU, and nabi's own guest_to_host has to
+# be told separately, because a syscall argument is resolved in software and
+# never reaches the MMU. Android tags every heap pointer, so both halves are
+# load-bearing there; each is checked on its own, since either alone looks like
+# it works until the other is needed.
+cp "$here/tagtest" "$root/"; chmod +x "$root/tagtest"
+out=$("$NABI" -m "$root" /tagtest); rc=$?
+if [ "$rc" -eq 0 ] && [ "$out" = "tagged-write-ok
+tag ok" ]; then
+    echo "  ok  tagtest -> \"tag ok\", exit 0"
+else
+    echo "  FAIL tagtest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 if [ "$fail" -eq 0 ]; then
     echo "smoke: PASS"
 else

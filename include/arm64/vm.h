@@ -169,6 +169,18 @@
 #define TCR_SH0_INNER   (3ull << 12)
 #define TCR_TG0_4K      (0ull << 14)
 #define TCR_EPD1        (1ull << 23)
+/*
+ * Top Byte Ignore for TTBR0. The top byte of a user address is not part of the
+ * address, and the MMU must drop it before translating.
+ *
+ * Linux sets this on arm64 and always has; it is what makes tagged pointers
+ * possible at all. Android relies on it heavily - bionic tags heap pointers, so
+ * an ordinary malloc result looks like 0xb4000000c4e00010 and the bytes it
+ * names are at 0xc4e00010. Without TBI0 the tag is translated as address bits,
+ * every tagged access faults on an address no region covers, and the guest dies
+ * on its first write to its own heap.
+ */
+#define TCR_TBI0        (1ull << 37)
 
 /*
  * IPS caps what stage 1 may *output*, and it has to agree with the size the VM
@@ -192,7 +204,7 @@
                                     (bits) >= 40 ? 2 : (bits) >= 36 ? 1 : 0) << 32)
 
 #define TCR_EL1_BASE    (TCR_T0SZ(25) | TCR_IRGN0_WBWA | TCR_ORGN0_WBWA | \
-                         TCR_SH0_INNER | TCR_TG0_4K | TCR_EPD1)
+                         TCR_SH0_INNER | TCR_TG0_4K | TCR_EPD1 | TCR_TBI0)
 #define TCR_EL1_FOR(bits) (TCR_EL1_BASE | TCR_IPS(bits))
 
 /* Stage-2 granularity, imposed by hv_vm_map. Measured, not assumed: it rejects

@@ -12,6 +12,7 @@
 bool
 addr_ok(gaddr_t addr, int access)
 {
+  addr = untag_gaddr(addr);
   if (addr >= user_addr_max) {
     return false;
   }
