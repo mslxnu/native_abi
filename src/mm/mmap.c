@@ -120,9 +120,29 @@ do_munmap(gaddr_t gaddr, size_t size)
     list_del(&overlapping->list);
     RB_REMOVE(mm_region_tree, &proc.mm->mm_region_tree, overlapping);
     vmm_munmap(overlapping->gaddr, overlapping->size);
-    munmap(overlapping->haddr, overlapping->size);
-    if (overlapping->arena_off >= 0)
-      arena_free(overlapping->arena_off, overlapping->size);
+    if (overlapping->arena_off < 0) {
+      /* A real mapping (a shared file, or all of x86): the bytes belong to
+       * whatever it was mapped from, and the region owned all of them. */
+      munmap(overlapping->haddr, overlapping->size);
+    } else {
+      /*
+       * Arena memory is released only as a whole chunk. A region that mprotect
+       * or munmap has split shares its 16KiB block - host range and file bytes
+       * alike - with the sibling it left behind. munmapping the host slice
+       * would cut a hole in the block's host range while the block is still
+       * live at stage 2; the next time a neighbour is unmapped the block is
+       * re-established with hv_vm_map over a host range with a hole, which
+       * refuses with HV_ERROR. arena_free rounds its size up to the block and
+       * would punch a hole through the sibling's file bytes, which reads back
+       * as zeros - so neither can go. A region that owns whole blocks has no
+       * sibling in them and releases normally.
+       */
+      if (overlapping->arena_off % GUEST_MMAP_GRANULE == 0 &&
+          overlapping->size % GUEST_MMAP_GRANULE == 0) {
+        munmap(overlapping->haddr, overlapping->size);
+        arena_free(overlapping->arena_off, overlapping->size);
+      }
+    }
     free(overlapping);
     if (next == &proc.mm->mm_regions)
       break;
