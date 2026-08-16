@@ -36,6 +36,7 @@
 #include <fcntl.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
@@ -77,7 +78,15 @@ static off_t  arena_capacity;   /* how far the file has been grown */
  * A flat array is enough - this is walked when a mapping is created or a
  * checkpoint is taken, never on a fault path.
  */
-struct arena_span { void *addr; size_t size; off_t off; };
+/*
+ * `priv` marks a span that arena_map_private created, and only those may be
+ * handed back to a later call. Every span looked alike, so a request could be
+ * answered with the mapping arena_alloc had already made - and a private
+ * mapping made *before* bytes were staged into the arena does not show them, so
+ * the caller started from the wrong memory. That is the handover property the
+ * arena test checks, and it is what a resumed child depends on.
+ */
+struct arena_span { void *addr; size_t size; off_t off; bool priv; };
 off_t arena_offset_of(void *addr);
 
 /*
@@ -100,7 +109,7 @@ static size_t nr_arena_spans;
 static size_t arena_spans_cap;
 
 static void
-arena_span_record(void *addr, size_t size, off_t off)
+arena_span_record(void *addr, size_t size, off_t off, bool priv)
 {
   if (nr_arena_spans == arena_spans_cap) {
     size_t want = arena_spans_cap ? arena_spans_cap * 2 : ARENA_INIT_SPANS;
@@ -110,7 +119,7 @@ arena_span_record(void *addr, size_t size, off_t off)
     arena_spans = bigger;
     arena_spans_cap = want;
   }
-  arena_spans[nr_arena_spans++] = (struct arena_span){ addr, size, off };
+  arena_spans[nr_arena_spans++] = (struct arena_span){ addr, size, off, priv };
 }
 
 /*
@@ -149,9 +158,10 @@ arena_span_forget(off_t off, size_t size)
         .addr = (char *) arena_spans[i].addr + (hi - slo),
         .size = (size_t)(shi - hi),
         .off  = hi,
+        .priv = arena_spans[i].priv,
       };
       arena_spans[i].size = (size_t)(lo - slo);
-      arena_span_record(tail.addr, tail.size, tail.off);
+      arena_span_record(tail.addr, tail.size, tail.off, tail.priv);
     }
   }
 }
@@ -280,7 +290,7 @@ arena_alloc(size_t size, off_t *off_out)
     panic("could not map guest memory arena offset %lld: %s",
           (long long) off, strerror(errno));
 
-  arena_span_record(p, size, off);
+  arena_span_record(p, size, off, false);
 
   if (off_out)
     *off_out = off;
@@ -402,10 +412,19 @@ arena_map_private(off_t off, size_t size)
   size_t block_size = roundup((size_t)(off - block) + size, ARENA_GRANULE);
 
   for (size_t i = 0; i < nr_arena_spans; i++) {
-    if (block >= arena_spans[i].off &&
+    if (arena_spans[i].priv &&
+        block >= arena_spans[i].off &&
         block + (off_t) block_size <=
             arena_spans[i].off + (off_t) arena_spans[i].size)
-      return (char *) arena_spans[i].addr + (off - block);
+      /*
+       * Offset from the span's own start, not from the block: the span may
+       * begin below this block, and subtracting the block instead hands back
+       * the span's first byte whatever offset was asked for. That is what the
+       * arena test calls "a private mapping does not start from the arena's
+       * bytes", and in a guest it is silent aliasing - two regions reading each
+       * other's memory.
+       */
+      return (char *) arena_spans[i].addr + (off - arena_spans[i].off);
   }
 
   void *p = mmap(NULL, block_size, PROT_READ | PROT_WRITE, MAP_PRIVATE,
@@ -415,7 +434,7 @@ arena_map_private(off_t off, size_t size)
           (long long) off, strerror(errno));
   /* Registered like any other span, so the restore can look the mapping up by
    * offset and so a later handover from this process flushes it. */
-  arena_span_record(p, block_size, block);
+  arena_span_record(p, block_size, block, true);
   return (char *) p + (off - block);
 }
 
