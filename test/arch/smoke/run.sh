@@ -1002,6 +1002,23 @@ else
     fail=1
 fi
 
+# binderpolltest: registering a binder descriptor with epoll. macOS refuses a
+# plain EVFILT_READ knote on a third-party character device and accepts only the
+# NOTE_LOWAT form, which is also the predicate the driver's selwakeup fires - so
+# readiness is exact and a looper neither spins nor sleeps through a pending
+# transaction. Android's looper is built on epoll, so getting this wrong reads
+# as "binder is broken" from inside the guest. Skips cleanly when the kext is
+# not loaded; the pipe checks either side tell a device-specific failure apart
+# from epoll being broken outright.
+cp "$here/binderpolltest" "$root/"; chmod +x "$root/binderpolltest"
+out=$("$NABI" -m "$root" /binderpolltest); rc=$?
+if [ "$rc" -eq 0 ] && { [ "$out" = "binderpoll ok" ] || [ "$out" = "binderpoll skipped (no /dev/binder)" ]; }; then
+    echo "  ok  binderpolltest -> \"$out\", exit 0"
+else
+    echo "  FAIL binderpolltest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 if [ "$fail" -eq 0 ]; then
     echo "smoke: PASS"
 else
