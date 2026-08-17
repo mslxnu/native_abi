@@ -95,6 +95,7 @@ static long sys6(long n,long a,long b,long c,long d,long e,long f){
 #define BINDER_TYPE_FDA            0x66646185u
 #define BINDER_TYPE_PTR            0x70742a85u
 #define FLAT_BINDER_FLAG_ACCEPTS_FDS 0x0100u
+#define FLAT_BINDER_FLAG_TXN_SECURITY_CTX 0x1000u
 
 struct binder_buffer_object {
   unsigned int type;
@@ -945,6 +946,22 @@ static void stage_fd(void)
 static void stage_fda(void);
 static void stage_secctx(void);
 
+/*
+ * Which stage is running, on stderr.
+ *
+ * Every stage was silent until the last one finished, so a stage that blocked
+ * produced no output at all - the whole run showed up as a timeout with an
+ * empty log, and finding the stage meant bisecting the source. A protocol
+ * change on the driver side is exactly the thing that makes one stage block,
+ * so it wants to say which. stderr, because run.sh compares stdout against
+ * "binderprobe ok" exactly.
+ */
+static void note(const char *m)
+{
+  int i = 0; while (m[i]) i++;
+  sys6(SYS_write, 2, (long) m, i, 0, 0, 0);
+}
+
 void _start(void)
 {
   int fd;
@@ -952,15 +969,16 @@ void _start(void)
   fd = open_binder("/dev/binder");
   if (fd >= 0) {
     sys6(SYS_close, fd, 0,0,0,0,0);
-    stage_version();
-    stage_arena();
-    stage_manager();
-    stage_oneway();
-    stage_epoll();
-    stage_twoproc();
-    stage_fd();
-    stage_fda();
-    stage_secctx();
+    note("  [version]\n");  stage_version();
+    note("  [arena]\n");    stage_arena();
+    note("  [manager]\n");  stage_manager();
+    note("  [oneway]\n");   stage_oneway();
+    note("  [epoll]\n");    stage_epoll();
+    note("  [twoproc]\n");  stage_twoproc();
+    note("  [fd]\n");       stage_fd();
+    note("  [fda]\n");      stage_fda();
+    note("  [secctx]\n");   stage_secctx();
+    note("  [done]\n");
     put("binderprobe ok\n");
   }
   sys6(SYS_exit_group, fd < 0 ? 77 : 0, 0,0,0,0,0);
@@ -1200,6 +1218,7 @@ static void stage_fda(void)
 static void stage_secctx(void)
 {
   struct binder_transaction_data_secctx *got;
+  struct flat_binder_object obj;
   unsigned char wbuf[128], rbuf[512];
   struct binder_msl_arena a;
   unsigned long arena, consumed;
@@ -1212,9 +1231,27 @@ static void stage_secctx(void)
   if (fd < 0)
     fail("open /dev/binder (secctx)", fd);
 
-  r = bioctl(fd, BINDER_SET_CONTEXT_MGR, &zero);
+  /*
+   * The security-context form is opt-in, and the manager opts in here: a node
+   * registered with FLAT_BINDER_FLAG_TXN_SECURITY_CTX receives every
+   * transaction as the 72-byte BR_TRANSACTION_SEC_CTX with the context string
+   * after it, and one registered without it receives the plain 64-byte
+   * BR_TRANSACTION.
+   *
+   * This stage used to register with plain BINDER_SET_CONTEXT_MGR while
+   * looking only for the SEC_CTX command, which worked for exactly as long as
+   * the driver sent that form unconditionally. When it stopped, the stage read
+   * a BR_TRANSACTION it did not match, went round for another read, and blocked
+   * there - the whole probe timed out with no output, which read as the driver
+   * hanging rather than as the two ends disagreeing about which form was asked
+   * for. The read buffer said otherwise: 0x0000720c 0x80407202, a BR_NOOP and a
+   * plain BR_TRANSACTION, delivered exactly as registered.
+   */
+  mzero(&obj, sizeof obj);
+  obj.flags = FLAT_BINDER_FLAG_TXN_SECURITY_CTX;
+  r = bioctl(fd, BINDER_SET_CONTEXT_MGR_EXT, &obj);
   if (r != 0)
-    fail("become the context manager (secctx)", r);
+    fail("become the context manager with TXN_SECURITY_CTX", r);
 
   arena = (unsigned long)sys6(SYS_mmap, 0, ARENA_SIZE,
       PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
