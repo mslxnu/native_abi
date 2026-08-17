@@ -130,6 +130,7 @@ COMMON_SRCS := src/main.c \
                src/ipc/msg.c \
                src/ipc/mqueue.c \
                src/fs/mount.c \
+               src/fs/diskimage.c \
                src/fs/inotify.c \
                src/fs/fanotify.c \
                src/fs/handle.c \

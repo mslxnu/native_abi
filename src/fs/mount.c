@@ -477,7 +477,8 @@ type_is(const char *type, const char *want)
  * of filesystems NABI claims to support.
  */
 static int
-backing_for_type(const char *type, const char *source, struct mount_entry *e)
+backing_for_type(const char *type, const char *source, unsigned long flags,
+                 bool probe_only, struct mount_entry *e)
 {
   if (type_is(type, "tmpfs")) {
     char dirtpl[PATH_MAX];
@@ -550,6 +551,50 @@ backing_for_type(const char *type, const char *source, struct mount_entry *e)
     snprintf(e->type, sizeof e->type, "%s", type);
     return 0;
   }
+  /*
+   * A filesystem in a file, which the host is asked to mount. Android ships
+   * this way and `waydroid session start` mounts system.img before it does
+   * anything else; there is no block layer here to give it any other way.
+   */
+  if (type_is(type, "ext4") || type_is(type, "ext3") || type_is(type, "ext2")) {
+    /*
+     * A type probe - fsopen naming a filesystem before it has been told what to
+     * mount - is answered on the type alone: there is nothing to attach yet,
+     * and calling the type unknown would send the caller away from something
+     * that does work once it says what to mount. Said explicitly rather than
+     * inferred from the source not looking like a path, which would also make
+     * mount(2) with a relative source succeed while mounting nothing.
+     */
+    if (probe_only) {
+      snprintf(e->type, sizeof e->type, "%s", type);
+      return 0;
+    }
+
+    char host_img[PATH_MAX];
+    if (source[0] != '/' ||
+        guest_to_host_path(source, host_img, sizeof host_img) != 0)
+      return -LINUX_ENOENT;
+
+    /*
+     * Read-only, and a writable mount is refused rather than downgraded. A
+     * guest told its mount succeeded would find out otherwise at the first
+     * write, somewhere else entirely.
+     */
+    if (!(flags & LINUX_MS_RDONLY))
+      return -LINUX_EROFS;
+
+    char dev[64], dir[PATH_MAX];
+    int r = image_mount_ro(host_img, dev, sizeof dev, dir, sizeof dir);
+    if (r < 0)
+      return r;
+
+    snprintf(e->source, sizeof e->source, "%s", source);
+    snprintf(e->hostdir, sizeof e->hostdir, "%s", dir);
+    snprintf(e->hostdev, sizeof e->hostdev, "%s", dev);
+    snprintf(e->type, sizeof e->type, "%s", type);
+    return 0;
+  }
+
   /* A real filesystem, and there is no block layer here to give it. */
   return -LINUX_ENODEV;
 }
@@ -734,7 +779,7 @@ DEFINE_SYSCALL(mount, gstr_t, source_ptr, gstr_t, target_ptr, gstr_t, type_ptr,
     /* Everything a filesystem *type* can be here, which is also everything
      * fsopen can name - so the two ask the same function rather than growing
      * two answers that could disagree. */
-    int br = backing_for_type(type, source, &e);
+    int br = backing_for_type(type, source, flags, false, &e);
     if (br < 0)
       return br;
   }
@@ -794,6 +839,11 @@ DEFINE_SYSCALL(umount2, gstr_t, target_ptr, int, flags)
      * anything that mounted one was relying on. */
     if (strcmp(t.m[i].type, "tmpfs") == 0 && t.m[i].hostdir[0])
       rmtree(t.m[i].hostdir);
+    /* An image mount is a host mount and an attached device, and both have to
+     * go - a detach that does not happen leaves the device attached for as long
+     * as the machine is up. */
+    if (t.m[i].hostdev[0])
+      image_unmount(t.m[i].hostdev, t.m[i].hostdir);
 
     struct mount_entry gone = t.m[i];
     uint32_t pp = parent_peer_of(&t, gone.target);
@@ -1089,7 +1139,8 @@ DEFINE_SYSCALL(fsopen, gstr_t, fsname_ptr, unsigned int, flags)
    */
   struct mount_entry probe;
   memset(&probe, 0, sizeof probe);
-  int r = backing_for_type(type, type, &probe);
+  /* A type check, with nothing yet named to mount. */
+  int r = backing_for_type(type, type, 0, true, &probe);
   if (r < 0)
     return r;
   /* Nothing is allocated yet - that probe may have made a tmpfs directory, and
@@ -1207,7 +1258,11 @@ DEFINE_SYSCALL(fsmount, int, fsfd, unsigned int, flags, unsigned int, attr_flags
 
   struct mount_entry e;
   memset(&e, 0, sizeof e);
-  if ((r = backing_for_type(h.type, h.source, &e)) < 0)
+  /* fsmount carries read-only as a mount attribute rather than a mount flag;
+   * the two mean the same thing to anything that has to honour it. */
+  if ((r = backing_for_type(h.type, h.source,
+                            (attr_flags & LINUX_MOUNT_ATTR_RDONLY)
+                              ? LINUX_MS_RDONLY : 0, false, &e)) < 0)
     return r;
   snprintf(e.source, sizeof e.source, "%s", h.source);
 

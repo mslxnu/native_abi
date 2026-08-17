@@ -277,10 +277,21 @@ void _start(void)
       fail("fsopen of tmpfs", ctx, 0);
 
     /* A filesystem this cannot provide is refused by the call that named it,
-     * rather than three calls later - which is why the API is split. */
-    { long bad = sys6(SYS_fsopen, (long) "ext4", 0, 0, 0, 0, 0);
+     * rather than three calls later - which is why the API is split.
+     *
+     * btrfs, and not ext4: ext4 used to be the example here and is no longer
+     * one, because an image can now be mounted by asking the host to do it.
+     * btrfs has nothing behind it and is what the check is actually about. */
+    { long bad = sys6(SYS_fsopen, (long) "btrfs", 0, 0, 0, 0, 0);
       if (bad != -ENODEV)
         fail("fsopen of a filesystem there is no block layer for", bad, -ENODEV); }
+
+    /* And ext4 is accepted on the type alone, with nothing named to mount
+     * yet - which is what fsopen is for. */
+    { long ok = sys6(SYS_fsopen, (long) "ext4", 0, 0, 0, 0, 0);
+      if (ok < 0)
+        fail("fsopen of ext4, which an image mount can provide", ok, 0);
+      sys6(SYS_close, ok, 0, 0, 0, 0, 0); }
 
     /* fsmount before the context is created has nothing to mount. */
     if ((r = sys6(SYS_fsmount, ctx, 0, 0, 0, 0, 0)) != -EINVAL)

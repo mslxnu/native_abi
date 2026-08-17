@@ -915,6 +915,22 @@ else
     fail=1
 fi
 
+# imagemounttest: mount(2) on a filesystem image, which the host is asked to
+# perform - nabi has no block layer to do it with. tiny.ext4 beside it is 1MiB
+# of ext4 with two known files in it. Checks that the files are readable through
+# the guest's mountpoint (a mount returning 0 over an empty directory is the
+# likely failure), that a writable mount is refused rather than downgraded, and
+# that a file which is not an image is refused before anything is attached.
+cp "$here/imagemounttest" "$here/tiny.ext4" "$root/"
+chmod +x "$root/imagemounttest"
+out=$("$NABI" -m "$root" /imagemounttest); rc=$?
+if [ "$rc" -eq 0 ] && [ "$out" = "imagemount ok" ]; then
+    echo "  ok  imagemounttest -> \"$out\", exit 0"
+else
+    echo "  FAIL imagemounttest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 # netlinktest: AF_NETLINK, which nabi had no address family for at all - so
 # `ip` and glibc's getifaddrs both stopped at socket(). Checks the socket, its
 # own sockaddr_nl name, the MSG_PEEK|MSG_TRUNC sizing every netlink reader

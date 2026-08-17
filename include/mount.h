@@ -168,6 +168,9 @@ struct mount_entry {
   char     target[MOUNT_PATH_MAX];   /* where it appears */
   char     type[16];
   char     hostdir[MOUNT_PATH_MAX];  /* what backs it, or "" */
+  /* The device an image mount was attached on, so unmounting can detach it
+   * again. Empty for every mount that is not one. See src/fs/diskimage.c. */
+  char     hostdev[64];
   uint32_t flags;
   uint32_t id;
   /*
