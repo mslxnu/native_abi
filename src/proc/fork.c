@@ -71,6 +71,29 @@ init_task(unsigned long clone_flags, gaddr_t child_tid, gaddr_t tls)
     fprintf(stderr, "nabi: fork: " fmt "\n", ##__VA_ARGS__);              \
   } while (0)
 
+/*
+ * Reset the handlers a child inherited, as flush_signal_handlers does.
+ *
+ * A disposition of SIG_IGN survives: a parent that deliberately ignored a
+ * signal is saying something the child should keep, and Linux keeps it - only
+ * *handlers* are reset, because a handler is an address in a program the child
+ * is about to stop being. Flags and masks go either way, since they described
+ * how to call a handler that is no longer there.
+ */
+void
+clear_sighand(void)
+{
+  pthread_rwlock_wrlock(&proc.sig_lock);
+  for (int i = 0; i < LINUX_NSIG; i++) {
+    if (proc.sigaction[i].lsa_handler != LINUX_SIG_IGN)
+      proc.sigaction[i].lsa_handler = LINUX_SIG_DFL;
+    proc.sigaction[i].lsa_flags = 0;
+    proc.sigaction[i].lsa_restorer = 0;
+    proc.sigaction[i].lsa_mask.__mask = 0;
+  }
+  pthread_rwlock_unlock(&proc.sig_lock);
+}
+
 #if defined(__arm64__)
 /*
  * fork by handing the guest to a fresh process.
@@ -212,6 +235,9 @@ resume_apply_clone(unsigned long clone_flags, gaddr_t child_tid, gaddr_t tls)
 
   if (clone_flags & LINUX_CLONE_SETTLS)
     vmm_set_tls(tls);
+
+  if (clone_flags & LINUX_CLONE_CLEAR_SIGHAND)
+    clear_sighand();
 }
 #endif /* __arm64__ */
 
@@ -261,6 +287,12 @@ __do_clone_process(unsigned long clone_flags, unsigned long newsp, gaddr_t paren
     /* INIT_LIST_HEAD(&proc.tasks); */
     /* list_add(&task.head, &proc.tasks); */
     init_task(clone_flags, child_tid, tls);
+    /* The same reset the exec route does in resume_apply_clone. This path is
+     * x86's always and arm64's whenever the exec route is not taken, and a
+     * flag accepted on one and ignored on the other is worse than one that is
+     * refused everywhere. */
+    if (clone_flags & LINUX_CLONE_CLEAR_SIGHAND)
+      clear_sighand();
   } else {
     if (clone_flags & LINUX_CLONE_PARENT_SETTID) {
       if (copy_to_user(parent_tid, &ret, sizeof ret)) {
@@ -390,6 +422,27 @@ do_clone(unsigned long clone_flags, unsigned long newsp, gaddr_t parent_tid, gad
    */
   if (clone_flags & LINUX_CLONE_VFORK)
     implemented |= LINUX_CLONE_VFORK | LINUX_CLONE_VM;
+  /*
+   * CLONE_CLEAR_SIGHAND: the child starts with the parent's handlers reset.
+   *
+   * glibc's posix_spawn asks for it - CLONE_VM|CLONE_VFORK|CLONE_CLEAR_SIGHAND
+   * - because between the clone and the exec the child is running in the
+   * parent's address space, and a handler inherited there would run on the
+   * parent's stack against half-torn state. Refusing it sent posix_spawn down
+   * its fallback path, which works but is not what the caller asked for and
+   * warned on every use.
+   *
+   * Nonsensical with CLONE_SIGHAND, which asks for the table to be *shared*:
+   * clearing it would clear the parent's too. Linux refuses that pair and so
+   * does this, rather than picking one of the two meanings.
+   */
+  if (clone_flags & LINUX_CLONE_CLEAR_SIGHAND) {
+    if (clone_flags & LINUX_CLONE_SIGHAND) {
+      FORKERR("CLONE_CLEAR_SIGHAND with CLONE_SIGHAND");
+      return -LINUX_EINVAL;
+    }
+    implemented |= LINUX_CLONE_CLEAR_SIGHAND;
+  }
   if ((clone_flags & ~implemented) || (clone_flags & needed) != needed) {
     FORKERR("unsupported clone_flags: %lx (implemented %lx)", clone_flags, implemented);
     return -LINUX_EINVAL;

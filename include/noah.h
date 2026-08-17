@@ -235,6 +235,7 @@ void report_host_passthrough(void);
 void report_rootfs_case(void);
 void init_host_ids(void);
 bool guest_in_group(l_gid_t gid);
+void clear_sighand(void);
 
 /* The guest's root, which pivot_root and chroot change; see src/fs/fs.c. */
 int  fs_root_open(const char *hostdir);

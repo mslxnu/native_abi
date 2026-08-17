@@ -185,6 +185,13 @@ struct l_pollfd {
 #define LINUX_CLONE_NEWNET         0x40000000
 #define LINUX_CLONE_NEWCGROUP      0x02000000
 #define LINUX_CLONE_PIDFD     0x00001000
+/*
+ * Reset the child's signal handlers. Bit 32, so it only fits a 64-bit flags
+ * word - which is why Linux takes it through clone3 and, on 64-bit, through
+ * clone as well. glibc's posix_spawn asks for it together with CLONE_VM and
+ * CLONE_VFORK.
+ */
+#define LINUX_CLONE_CLEAR_SIGHAND 0x100000000ULL
 #define LINUX_CLONE_NEWTIME        0x00000080
 #define LINUX_CLONE_IO             0x80000000
 

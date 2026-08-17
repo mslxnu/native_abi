@@ -901,6 +901,20 @@ else
     fail=1
 fi
 
+# clearsigtest: CLONE_CLEAR_SIGHAND, which glibc's posix_spawn asks for because
+# the child shares the parent's address space until the exec and an inherited
+# handler would run there. Checked on the child seeing SIG_DFL where the parent
+# installed a handler, on a SIG_IGN disposition surviving as Linux leaves it,
+# and on the parent's own table being unchanged.
+cp "$here/clearsigtest" "$root/"; chmod +x "$root/clearsigtest"
+out=$("$NABI" -m "$root" /clearsigtest); rc=$?
+if [ "$rc" -eq 0 ] && [ "$out" = "clearsig ok" ]; then
+    echo "  ok  clearsigtest -> \"$out\", exit 0"
+else
+    echo "  FAIL clearsigtest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 # seccomptest: seccomp, the setre*/setfs* credential calls and set_mempolicy.
 # seccomp is checked on syscalls actually being stopped, on a later filter being
 # unable to loosen an earlier one, and on the chain surviving a fork - which on
