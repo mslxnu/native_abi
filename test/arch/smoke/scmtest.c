@@ -41,6 +41,8 @@ static long sys6(long n, long a, long b, long c, long d, long e, long f){
 #define EBADF 9
 #define AF_UNIX 1
 #define SOCK_STREAM 1
+#define SOCK_NONBLOCK 0x800
+#define SOCK_CLOEXEC 0x80000
 #define SOL_SOCKET 1
 #define SCM_RIGHTS 1
 #define MSG_CMSG_CLOEXEC 0x40000000
@@ -72,6 +74,49 @@ void _start(void)
 {
   long r;
   int sv[2];
+
+  /*
+   * ---- the flag bits, which live in the type argument ----
+   *
+   * SOCK_NONBLOCK and SOCK_CLOEXEC are Linux's, packed into the same argument
+   * as the socket type. They have to come off before Darwin sees it - passed
+   * through, they name a type that does not exist and the call fails with
+   * EPROTONOSUPPORT. socket() always stripped them; socketpair() did not, and
+   * that is what stopped dbus-daemon starting: it builds its reload channel
+   * with socketpair(AF_UNIX, SOCK_STREAM|SOCK_CLOEXEC) and reported only
+   * "Could not create full-duplex pipe".
+   *
+   * Checked on both ends, because the flags describe each descriptor rather
+   * than the channel, and checked for being *applied* rather than merely
+   * tolerated - accepting the argument and dropping it is the other way to
+   * pass a test that only looks at the return value.
+   */
+  { int pair[2];
+    if ((r = sys6(SYS_socketpair, AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK,
+                  0, (long) pair, 0, 0)) != 0)
+      fail("socketpair with SOCK_CLOEXEC|SOCK_NONBLOCK", r);
+    for (int i = 0; i < 2; i++) {
+      if ((r = sys6(SYS_fcntl, pair[i], F_GETFD, 0, 0, 0, 0)) < 0 || !(r & FD_CLOEXEC))
+        fail("socketpair did not set close-on-exec", r);
+      if ((r = sys6(SYS_fcntl, pair[i], 3 /* F_GETFL */, 0, 0, 0, 0)) < 0 || !(r & 0x800))
+        fail("socketpair did not set O_NONBLOCK", r);
+    }
+    sys6(SYS_close, pair[0], 0,0,0,0,0); sys6(SYS_close, pair[1], 0,0,0,0,0);
+  }
+  /* And without them, neither is set - so the flags are read rather than
+   * always applied. */
+  { int pair[2];
+    if ((r = sys6(SYS_socketpair, AF_UNIX, SOCK_STREAM, 0, (long) pair, 0, 0)) != 0)
+      fail("socketpair with no flags", r);
+    for (int i = 0; i < 2; i++) {
+      if ((r = sys6(SYS_fcntl, pair[i], F_GETFD, 0, 0, 0, 0)) < 0 || (r & FD_CLOEXEC))
+        fail("socketpair set close-on-exec when it was not asked", r);
+      if ((r = sys6(SYS_fcntl, pair[i], 3 /* F_GETFL */, 0, 0, 0, 0)) < 0 || (r & 0x800))
+        fail("socketpair set O_NONBLOCK when it was not asked", r);
+    }
+    sys6(SYS_close, pair[0], 0,0,0,0,0); sys6(SYS_close, pair[1], 0,0,0,0,0);
+  }
+
   if ((r = sys6(SYS_socketpair, AF_UNIX, SOCK_STREAM, 0, (long) sv, 0, 0)) != 0)
     fail("socketpair", r);
 

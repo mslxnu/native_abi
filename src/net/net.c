@@ -1060,9 +1060,39 @@ DEFINE_SYSCALL(socketpair, int, family, int, type, int, protocol, gaddr_t, usock
 {
   int fds[2];
   pthread_rwlock_wrlock(&proc.fileinfo.fdtable_lock);
-  int ret = syswrap(socketpair(linux_to_darwin_sa_family(family), type, protocol, fds));
+  /*
+   * The flag bits come off before Darwin sees the type, exactly as socket()
+   * has always done. SOCK_NONBLOCK and SOCK_CLOEXEC are Linux's, packed into
+   * the same argument as the socket type; passing them through asks Darwin for
+   * a type number that does not exist and it answers EPROTONOSUPPORT.
+   *
+   * This is what stopped dbus-daemon starting: it makes its reload channel with
+   * socketpair(AF_UNIX, SOCK_STREAM|SOCK_CLOEXEC), failed with "Could not
+   * create full-duplex pipe", and took the session bus down with it - so
+   * `waydroid session start` could not reach its own session manager. The same
+   * call with the same type through socket() worked, which is what made it look
+   * like a socketpair-specific refusal rather than a flag being passed on.
+   */
+  int dtype = type & ~(LINUX_SOCK_NONBLOCK | LINUX_SOCK_CLOEXEC);
+  int ret = syswrap(socketpair(linux_to_darwin_sa_family(family), dtype, protocol, fds));
   if (ret < 0)
     goto err;
+  /*
+   * And the flags are then applied, which they never were: a caller asking for
+   * a non-blocking pair got a blocking one, and one asking for close-on-exec
+   * got descriptors that survived an exec. Both ends, since the pair is
+   * symmetric and the flags describe each descriptor rather than the channel.
+   */
+  for (int i = 0; i < 2; i++) {
+    int fl = (type & LINUX_SOCK_NONBLOCK) ? O_NONBLOCK : 0;
+    if (syswrap(fcntl(fds[i], F_SETFL, fl)) < 0 ||
+        syswrap(fcntl(fds[i], F_SETFD, (type & LINUX_SOCK_CLOEXEC) ? FD_CLOEXEC : 0)) < 0) {
+      close(fds[0]);
+      close(fds[1]);
+      ret = -LINUX_EINVAL;
+      goto err;
+    }
+  }
   int e = register_fd(fds[0], type & LINUX_SOCK_CLOEXEC);
   if (e < 0) {
     close(fds[0]);
