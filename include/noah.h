@@ -279,7 +279,7 @@ int  netlink_getsockname(int fd, void *addr, size_t *addrlen);
 bool image_is_ext(const char *host_path);
 int  image_mount_ro(const char *host_path, char *dev, size_t devsz,
                     char *dir, size_t dirsz);
-void image_unmount(const char *dev, const char *dir);
+bool image_unmount(const char *dev, const char *dir);
 int vkern_open_exec(const char *path);
 int procfs_open(const char *path, int *out_fd);
 void procfs_close_fd(int fd);

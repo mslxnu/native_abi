@@ -839,11 +839,15 @@ DEFINE_SYSCALL(umount2, gstr_t, target_ptr, int, flags)
      * anything that mounted one was relying on. */
     if (strcmp(t.m[i].type, "tmpfs") == 0 && t.m[i].hostdir[0])
       rmtree(t.m[i].hostdir);
-    /* An image mount is a host mount and an attached device, and both have to
-     * go - a detach that does not happen leaves the device attached for as long
-     * as the machine is up. */
-    if (t.m[i].hostdev[0])
-      image_unmount(t.m[i].hostdev, t.m[i].hostdir);
+    /*
+     * An image mount is a host mount and an attached device, and both have to
+     * go. If the filesystem is busy it does not go, and the mount stays: saying
+     * it was unmounted and dropping the record would strand the host mount and
+     * its device with nothing left that knows about them. EBUSY is what Linux
+     * answers for a mount something still has open.
+     */
+    if (t.m[i].hostdev[0] && !image_unmount(t.m[i].hostdev, t.m[i].hostdir))
+      return -LINUX_EBUSY;
 
     struct mount_entry gone = t.m[i];
     uint32_t pp = parent_peer_of(&t, gone.target);

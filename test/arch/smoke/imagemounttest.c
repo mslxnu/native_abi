@@ -42,6 +42,7 @@ static long sys6(long n, long a, long b, long c, long d, long e, long f){
 #define EROFS     30
 #define EINVAL    22
 #define ENOENT     2
+#define EBUSY     16
 
 static void put(const char*m){int i=0;while(m[i])i++;sys6(SYS_write,1,(long)m,i,0,0,0);}
 static void putd(long v){char b[24];int i=23;b[i--]=0;int g=v<0;if(g)v=-v;
@@ -103,6 +104,22 @@ void _start(void)
   if (n < 0) fail("opening a nested file inside the image", n, 1);
   if (!streq(buf, "nested\n"))
     fail("the contents of the nested file", n, 7);
+
+  /*
+   * A mount with a file open on it does not unmount, and has to say so. The
+   * host mount is what actually refuses; reporting success anyway would drop
+   * the record and strand the mount and its device with nothing left that knows
+   * they are there - invisible from in here, which is why it is checked.
+   */
+  { long held = sys6(SYS_openat, -100, (long) "/mnt/marker.txt", 0, 0, 0, 0);
+    if (held < 0)
+      fail("opening a file to hold the mount busy", held, 1);
+    if ((r = sys6(SYS_umount2, (long) "/mnt", 0, 0, 0, 0, 0)) != -EBUSY)
+      fail("unmounting a filesystem with a file open on it", r, -EBUSY);
+    /* Still there, because it was not unmounted. */
+    if (slurp("/mnt/sub/deep.txt") < 0)
+      fail("the mount after a refused unmount", -1, 7);
+    sys6(SYS_close, held, 0, 0, 0, 0, 0); }
 
   if ((r = sys6(SYS_umount2, (long) "/mnt", 0, 0, 0, 0, 0)) != 0)
     fail("unmounting", r, 0);

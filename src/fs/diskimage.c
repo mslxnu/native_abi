@@ -186,9 +186,21 @@ image_mount_ro(const char *host_path, char *dev, size_t devsz,
     return -darwin_to_linux_errno(e);
   }
 
+  /*
+   * noowners, which is what makes the contents reachable at all.
+   *
+   * An image built for another system carries that system's ownership, and
+   * Android's is root with modes to match - /system/build.prop is 0600 root.
+   * nabi runs as an ordinary account, so without this the files are present,
+   * traversable and unreadable, and the guest is told EACCES for the whole
+   * tree. noowners is macOS's own answer to a volume whose uids mean nothing
+   * here: everything is attributed to the mounting user. That is also the right
+   * answer for nabi in particular, because the account it runs as is precisely
+   * what the guest sees as root.
+   */
   char *const mnt[] = {
     (char *) "/sbin/mount", (char *) "-t", (char *) "ext2fs",
-    (char *) "-o", (char *) "rdonly", dev, dir, NULL
+    (char *) "-o", (char *) "rdonly,noowners", dev, dir, NULL
   };
   if (run_host(mnt, out, sizeof out) != 0) {
     char *const detach[] = {
@@ -208,14 +220,25 @@ image_mount_ro(const char *host_path, char *dev, size_t devsz,
   return 0;
 }
 
-/* Undo it. Best effort: there is nothing useful to do with a failure here, and
- * leaving the entry behind would be worse than leaking a device. */
-void
+/*
+ * Undo it, reporting whether the filesystem actually went away.
+ *
+ * A mount with a file still open on it cannot be unmounted, and that is not a
+ * detail to swallow: Linux answers EBUSY and the caller is expected to close
+ * what it is holding. Reporting success and dropping the record would leave the
+ * host mount and its device attached for as long as the machine is up, with
+ * nothing left that knows they are there.
+ *
+ * The detach only happens once the unmount has, for the same reason - detaching
+ * a device out from under a live mount is worse than leaving both.
+ */
+bool
 image_unmount(const char *dev, const char *dir)
 {
   if (dir != NULL && dir[0] != '\0') {
     char *const um[] = { (char *) "/sbin/umount", (char *) dir, NULL };
-    run_host(um, NULL, 0);
+    if (run_host(um, NULL, 0) != 0)
+      return false;
   }
   if (dev != NULL && dev[0] != '\0') {
     char *const detach[] = {
@@ -225,4 +248,5 @@ image_unmount(const char *dev, const char *dir)
   }
   if (dir != NULL && dir[0] != '\0')
     rmdir(dir);
+  return true;
 }
