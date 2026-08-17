@@ -34,6 +34,10 @@ static long sys6(long n, long a, long b, long c, long d, long e, long f){
 #define SYS_write       64
 #define SYS_exit        93
 #define SYS_socketpair 199
+#define SYS_getpid 172
+#define SYS_getgid 176
+#define SYS_getuid 174
+#define SYS_getsockopt 209
 #define SYS_sendmsg    211
 #define SYS_recvmsg    212
 #define SYS_memfd_create 279
@@ -44,6 +48,7 @@ static long sys6(long n, long a, long b, long c, long d, long e, long f){
 #define SOCK_NONBLOCK 0x800
 #define SOCK_CLOEXEC 0x80000
 #define SOL_SOCKET 1
+#define SO_PEERCRED 17
 #define SCM_RIGHTS 1
 #define MSG_CMSG_CLOEXEC 0x40000000
 #define F_GETFD 1
@@ -198,6 +203,49 @@ void _start(void)
   sys6(SYS_close, mfd, 0,0,0,0,0);
   sys6(SYS_close, sv[0], 0,0,0,0,0);
   sys6(SYS_close, sv[1], 0,0,0,0,0);
+  /*
+   * ---- SO_PEERCRED, in the guest's own terms ----
+   *
+   * Linux reports the peer's pid/uid/gid as the kernel saw them at connect
+   * time, which is what makes it usable as proof of identity rather than a
+   * claim. D-Bus's EXTERNAL authentication turns on it: the client writes its
+   * uid and the bus refuses if the socket disagrees.
+   *
+   * Darwin answers in host terms, and every guest process here runs as the one
+   * account nabi was started under while believing it is root - so the client
+   * said 0, the bus was told 501, and the bus answered REJECTED EXTERNAL. The
+   * ids have to come back through the same mapping the filesystem uses.
+   *
+   * Both ends of a socketpair are this process, so the answer is knowable
+   * exactly: it is this process's own uid, gid and pid.
+   */
+  {
+    int pr[2];
+    if ((r = sys6(SYS_socketpair, AF_UNIX, SOCK_STREAM, 0, (long) pr, 0, 0)) != 0)
+      fail("socketpair for peercred", r);
+    struct { int pid; unsigned uid, gid; } uc;
+    unsigned len = sizeof uc;
+    uc.pid = -1; uc.uid = 0xdeadbeef; uc.gid = 0xdeadbeef;
+    r = sys6(SYS_getsockopt, pr[0], SOL_SOCKET, SO_PEERCRED, (long) &uc, (long) &len, 0);
+    if (r != 0)
+      fail("getsockopt(SO_PEERCRED)", r);
+    if (len != sizeof uc)
+      fail("SO_PEERCRED length", (long) len);
+
+    long me_uid = sys6(SYS_getuid, 0,0,0,0,0,0);
+    long me_gid = sys6(SYS_getgid, 0,0,0,0,0,0);
+    long me_pid = sys6(SYS_getpid, 0,0,0,0,0,0);
+    /* The guest's own ids, not the host's - which is the whole point, and what
+     * a value of 501 here would mean. */
+    if ((long) uc.uid != me_uid)
+      fail("SO_PEERCRED uid is not the guest's", (long) uc.uid);
+    if ((long) uc.gid != me_gid)
+      fail("SO_PEERCRED gid is not the guest's", (long) uc.gid);
+    if (uc.pid != (int) me_pid)
+      fail("SO_PEERCRED pid is not this process", (long) uc.pid);
+    sys6(SYS_close, pr[0], 0,0,0,0,0); sys6(SYS_close, pr[1], 0,0,0,0,0);
+  }
+
   put("scm ok\n");
   sys6(SYS_exit, 0, 0,0,0,0,0);
 }

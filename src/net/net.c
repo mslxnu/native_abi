@@ -4,6 +4,7 @@
 
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <sys/ucred.h>
 #include <netinet/in.h>
 #include <stdlib.h>
 #include <string.h>
@@ -350,11 +351,72 @@ out:
   return r;
 }
 
+/*
+ * SO_PEERCRED: who is on the other end, in the guest's own terms.
+ *
+ * Linux hands back a struct ucred - pid, uid, gid - taken from the peer at the
+ * moment it connected, and it is the kernel saying so rather than the peer, so
+ * it is used as proof of identity. D-Bus's EXTERNAL authentication is exactly
+ * that: the client writes "AUTH EXTERNAL <uid in hex>" and the bus reads the
+ * socket's credentials and refuses if the two disagree.
+ *
+ * Darwin has the same idea in two pieces - LOCAL_PEERCRED for the ids and
+ * LOCAL_PEERPID for the process - and both answer in *host* terms. That is the
+ * disagreement: every guest process here runs as the one account nabi was
+ * started under, and believes it is root. The client said uid 0 and the bus was
+ * told 501, so the bus answered REJECTED EXTERNAL and closed the connection,
+ * which dbus reports to its caller as "Did not receive a reply" - the real
+ * answer having arrived, and been a refusal.
+ *
+ * So the ids come back through the same mapping the filesystem uses: the
+ * account nabi runs as is the guest's root, anything else keeps the id it has.
+ * That makes the credential the bus reads agree with the one the client
+ * asserts, because both are the guest's view of the same process. The pid goes
+ * through the pid namespace for the same reason.
+ */
+static int
+peercred_out(int fd, gaddr_t optval_ptr, gaddr_t optlen_ptr, l_socklen_t want)
+{
+  struct xucred xu;
+  socklen_t xl = sizeof xu;
+  if (getsockopt(fd, SOL_LOCAL, LOCAL_PEERCRED, &xu, &xl) < 0)
+    return syswrap(-1);
+
+  /* The pid is a separate option and a newer one; a peer that cannot be named
+   * is reported as 0, which is what Linux does for a socket whose peer has
+   * gone rather than an error. */
+  pid_t hpid = 0;
+  socklen_t pl = sizeof hpid;
+  if (getsockopt(fd, SOL_LOCAL, LOCAL_PEERPID, &hpid, &pl) < 0)
+    hpid = 0;
+
+  struct l_ucred {
+    int32_t  pid;
+    uint32_t uid;
+    uint32_t gid;
+  } uc;
+  uc.pid = hpid > 0 ? (int32_t) pidns_to_ns(hpid) : 0;
+  uc.uid = host_uid_to_guest(xu.cr_uid);
+  uc.gid = host_gid_to_guest(xu.cr_ngroups > 0 ? xu.cr_groups[0] : xu.cr_uid);
+
+  /* Linux truncates to the caller's buffer and reports how much it wrote. */
+  l_socklen_t n = want < (l_socklen_t) sizeof uc ? want : (l_socklen_t) sizeof uc;
+  if (copy_to_user(optval_ptr, &uc, n))
+    return -LINUX_EFAULT;
+  if (copy_to_user(optlen_ptr, &n, sizeof n))
+    return -LINUX_EFAULT;
+  return 0;
+}
+
 DEFINE_SYSCALL(getsockopt, int, fd, int, level, int, optname, gaddr_t, optval_ptr, gaddr_t, optlen_ptr)
 {
   l_socklen_t l_optlen;
   if (copy_from_user(&l_optlen, optlen_ptr, sizeof l_optlen))
     return -LINUX_EFAULT;
+
+  if (level == LINUX_SOL_SOCKET && optname == LINUX_SO_PEERCRED)
+    return peercred_out(fd, optval_ptr, optlen_ptr, l_optlen);
+
   char *optval = malloc(l_optlen);
   unsigned int optlen = l_optlen;
   // Darwin's optval is compatible with that of Linux
