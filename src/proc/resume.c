@@ -140,6 +140,9 @@ checkpoint_restore(int ckpt_fd, int arena_fd)
   proc.cred.sgid = hdr.sgid;
   proc.cred.fsuid = hdr.fsuid;
   proc.cred.fsgid = hdr.fsgid;
+  /* A resumed child is a new host pid wearing its parent's credentials, and
+   * nothing else will publish them for it. */
+  cred_publish(proc.cred.euid, proc.cred.egid);
   memcpy(proc.sigaction, sigactions,
          hdr.nr_sigactions * sizeof proc.sigaction[0]);
   proc.pfutex = kh_init(pfutex);

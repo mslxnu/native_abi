@@ -215,6 +215,9 @@ do_setresuid(l_uid_t ruid, l_uid_t euid, l_uid_t suid)
    * does this so that setfsuid is the only way the two can differ, which is
    * what makes it safe for the filesystem checks to consult fsuid alone. */
   proc.cred.fsuid = proc.cred.euid;
+  /* Republished so a peer asking about this process after it changed ids is
+   * told what it is now rather than what it started as. */
+  cred_publish(proc.cred.euid, proc.cred.egid);
   return 0;
 }
 
@@ -227,6 +230,7 @@ do_setresgid(l_gid_t rgid, l_gid_t egid, l_gid_t sgid)
   if (egid != (l_gid_t) -1) proc.cred.egid = egid;
   if (sgid != (l_gid_t) -1) proc.cred.sgid = sgid;
   proc.cred.fsgid = proc.cred.egid;
+  cred_publish(proc.cred.euid, proc.cred.egid);
   return 0;
 }
 

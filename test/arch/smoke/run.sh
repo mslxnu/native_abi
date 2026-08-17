@@ -901,6 +901,20 @@ else
     fail=1
 fi
 
+# sockcredtest: who a bound unix socket belongs to, and who SO_PEERCRED says a
+# peer is. Run with --user, and it refuses to run as root: both answers are
+# produced by mapping the host account, which the guest sees as root, so as root
+# the wrong answer and the right one are the same number.
+cp "$here/sockcredtest" "$root/"; chmod +x "$root/sockcredtest"
+chmod 777 "$root"
+out=$("$NABI" --user 1000:1000 -m "$root" /sockcredtest); rc=$?
+if [ "$rc" -eq 0 ] && [ "$out" = "sockcred ok" ]; then
+    echo "  ok  sockcredtest -> \"$out\", exit 0"
+else
+    echo "  FAIL sockcredtest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 # clearsigtest: CLONE_CLEAR_SIGHAND, which glibc's posix_spawn asks for because
 # the child shares the parent's address space until the exec and an inherited
 # handler would run there. Checked on the child seeing SIG_DFL where the parent

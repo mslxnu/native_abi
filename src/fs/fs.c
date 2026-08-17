@@ -2635,8 +2635,11 @@ guest_view_of_fd(int fd, uint32_t *uid, uint32_t *gid, uint32_t *mode)
  * Called after the guest creates something. Only when it is not root: a root
  * guest's files are the host account's, which is what an absent attribute
  * already means.
+ *
+ * Not static, because bind(2) creates a filesystem entry too and the socket
+ * calls live in another file.
  */
-static void
+void
 guest_owner_stamp_new(int dirfd, const char *path)
 {
   l_uid_t uid;

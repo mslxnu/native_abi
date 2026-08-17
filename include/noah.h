@@ -258,6 +258,12 @@ const l_gid_t *guest_groups_ptr(void);
 void guest_groups_set(const l_gid_t *g, int n);
 void elevate_privilege(uid_t owner_uid, gid_t owner_gid, mode_t mode);
 void guest_view_of_fd(int fd, uint32_t *uid, uint32_t *gid, uint32_t *mode);
+void guest_owner_stamp_new(int dirfd, const char *path);
+
+/* The guest credentials a process publishes so its socket peers can name it.
+ * See src/proc/credtab.c. */
+void cred_publish(uint32_t uid, uint32_t gid);
+bool cred_of_host_pid(int32_t pid, uint32_t *uid, uint32_t *gid);
 int vkern_open_exec(const char *path);
 int procfs_open(const char *path, int *out_fd);
 void procfs_close_fd(int fd);

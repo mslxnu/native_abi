@@ -287,6 +287,9 @@ __do_clone_process(unsigned long clone_flags, unsigned long newsp, gaddr_t paren
     /* INIT_LIST_HEAD(&proc.tasks); */
     /* list_add(&task.head, &proc.tasks); */
     init_task(clone_flags, child_tid, tls);
+    /* A fresh host pid with the parent's credentials, same as a resumed
+     * child - see cred_publish's callers. */
+    cred_publish(proc.cred.euid, proc.cred.egid);
     /* The same reset the exec route does in resume_apply_clone. This path is
      * x86's always and arm64's whenever the exec route is not taken, and a
      * flag accepted on one and ignored on the other is worse than one that is

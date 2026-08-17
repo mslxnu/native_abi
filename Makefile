@@ -117,6 +117,7 @@ COMMON_SRCS := src/main.c \
                src/proc/process.c \
                src/proc/namespace.c \
                src/proc/pidns.c \
+               src/proc/credtab.c \
                src/proc/cgroup.c \
                src/proc/rseq.c \
                src/proc/ptrace.c \

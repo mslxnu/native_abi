@@ -396,8 +396,27 @@ peercred_out(int fd, gaddr_t optval_ptr, gaddr_t optlen_ptr, l_socklen_t want)
     uint32_t gid;
   } uc;
   uc.pid = hpid > 0 ? (int32_t) pidns_to_ns(hpid) : 0;
-  uc.uid = host_uid_to_guest(xu.cr_uid);
-  uc.gid = host_gid_to_guest(xu.cr_ngroups > 0 ? xu.cr_groups[0] : xu.cr_uid);
+
+  /*
+   * What the peer says it is, and only failing that what the host says.
+   *
+   * Darwin's answer is about the host account, which every guest process
+   * shares, so translating it gives the same id for every peer alive - root,
+   * since that is what the account nabi runs as maps to. A guest running as an
+   * ordinary user therefore asked about its own socket and was told root; the
+   * ids disagreed, and dbus-daemon's EXTERNAL auth stopped there. The peer's
+   * own published credential is the one that answers the question; the host's
+   * is kept for a peer that never published one, which is a peer that is not a
+   * guest process at all.
+   */
+  uint32_t puid, pgid;
+  if (hpid > 0 && cred_of_host_pid((int32_t) hpid, &puid, &pgid)) {
+    uc.uid = puid;
+    uc.gid = pgid;
+  } else {
+    uc.uid = host_uid_to_guest(xu.cr_uid);
+    uc.gid = host_gid_to_guest(xu.cr_ngroups > 0 ? xu.cr_groups[0] : xu.cr_uid);
+  }
 
   /* Linux truncates to the caller's buffer and reports how much it wrote. */
   l_socklen_t n = want < (l_socklen_t) sizeof uc ? want : (l_socklen_t) sizeof uc;
@@ -1058,6 +1077,23 @@ DEFINE_SYSCALL(bind, int, sockfd, gaddr_t, addr_ptr, int, addrlen)
     return -LINUX_EINVAL;
   }
   int ret = syswrap(bind(sockfd, sockaddr, sockaddr->sa_len));
+
+  /*
+   * A bound AF_UNIX socket is a file the guest just created, and every other
+   * way of creating one stamps the guest's ownership beside it. This did not,
+   * so a socket bound by an ordinary user was owned by root - the host account,
+   * which is what an absent attribute means - and the user could then neither
+   * chmod it nor unlink it out of a sticky /tmp. dbus-daemon chmods its socket
+   * on startup and gave up on the EPERM, which is as far as a session bus got.
+   *
+   * The path here is the host's: linux_to_darwin_sockaddr rewrote it on the way
+   * in. An abstract socket has no filesystem entry to stamp.
+   */
+  if (ret == 0 && sockaddr->sa_family == AF_UNIX) {
+    const struct sockaddr_un *sun = (const struct sockaddr_un *) sockaddr;
+    if (sun->sun_path[0] != '\0')
+      guest_owner_stamp_new(AT_FDCWD, sun->sun_path);
+  }
 
   free(sockaddr);
   free(addr);

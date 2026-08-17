@@ -334,6 +334,9 @@ init_first_proc(const char *root)
     .gid = initial_gid, .egid = initial_gid, .sgid = initial_gid,
     .fsuid = initial_uid, .fsgid = initial_gid,
   };
+  /* Published before any guest code runs, so a peer that asks about this
+   * process finds an answer whether or not it ever changes ids. */
+  cred_publish(initial_uid, initial_gid);
 
   task.tid = getpid();
 }
@@ -398,6 +401,7 @@ elevate_privilege(uid_t owner_uid, gid_t owner_gid, mode_t mode)
     proc.cred.sgid = proc.cred.egid;
     proc.cred.fsgid = proc.cred.egid;
   }
+  cred_publish(proc.cred.euid, proc.cred.egid);
   pthread_rwlock_unlock(&proc.cred.lock);
 }
 
