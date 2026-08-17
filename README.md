@@ -4,7 +4,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Platform](https://img.shields.io/badge/Platform-macOS-lightgrey)](#requirements)
 ![Architecture](https://img.shields.io/badge/arch-arm64e%20%7C%20x86__64-blue.svg)
-[![GitHub stars](https://img.shields.io/github/stars/mslxnu/native_abi.svg?style=social&label=Star&maxAge=2592000)](https://GitHub.com/mslxnu/native_abi/stargazers/)
+![GitHub Repo stars](https://img.shields.io/github/stars/mslxnu/native_abi)
 
 **macOS Subsystem for Linux / Native ABI** — Linux binaries running as ordinary
 macOS processes.
