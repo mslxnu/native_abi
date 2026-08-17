@@ -122,6 +122,7 @@ COMMON_SRCS := src/main.c \
                src/proc/rseq.c \
                src/proc/ptrace.c \
                src/net/net.c \
+               src/net/netlink.c \
                src/ipc/futex.c \
                src/ipc/signal.c \
                src/ipc/sem.c \

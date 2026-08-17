@@ -915,6 +915,20 @@ else
     fail=1
 fi
 
+# netlinktest: AF_NETLINK, which nabi had no address family for at all - so
+# `ip` and glibc's getifaddrs both stopped at socket(). Checks the socket, its
+# own sockaddr_nl name, the MSG_PEEK|MSG_TRUNC sizing every netlink reader
+# does, a link dump that actually names interfaces, and that creating a link is
+# refused as an NLMSG_ERROR rather than by a broken socket.
+cp "$here/netlinktest" "$root/"; chmod +x "$root/netlinktest"
+out=$("$NABI" -m "$root" /netlinktest); rc=$?
+if [ "$rc" -eq 0 ] && [ "$out" = "netlink ok" ]; then
+    echo "  ok  netlinktest -> \"$out\", exit 0"
+else
+    echo "  FAIL netlinktest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 # privdroptest: prctl's shape, PR_SET_KEEPCAPS, and dropping capabilities
 # without holding any - the sequence libcap performs for a daemon giving up
 # privilege. Under --user: captest covers the same calls as root, and the point

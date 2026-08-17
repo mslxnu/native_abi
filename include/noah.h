@@ -264,6 +264,15 @@ void guest_owner_stamp_new(int dirfd, const char *path);
  * See src/proc/credtab.c. */
 void cred_publish(uint32_t uid, uint32_t gid);
 bool cred_of_host_pid(int32_t pid, uint32_t *uid, uint32_t *gid);
+
+/* Netlink, which has no host counterpart and is served here. See
+ * src/net/netlink.c. */
+int  netlink_socket(int type, int protocol, int flags);
+bool netlink_is(int fd);
+void netlink_close(int fd);
+int  netlink_send(int fd, const void *buf, size_t len);
+int  netlink_bind(int fd, const void *addr, size_t addrlen);
+int  netlink_getsockname(int fd, void *addr, size_t *addrlen);
 int vkern_open_exec(const char *path);
 int procfs_open(const char *path, int *out_fd);
 void procfs_close_fd(int fd);

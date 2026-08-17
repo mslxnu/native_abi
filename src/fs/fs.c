@@ -820,6 +820,7 @@ darwinfs_close(struct file *file)
 {
   eventfd_forget(file->fd);
   binder_forget(file->fd);
+  netlink_close(file->fd);
   procfs_close_fd(file->fd);
   if (file->dirp != NULL) {
     closedir(file->dirp);       /* takes the dup with it */
@@ -1893,6 +1894,45 @@ darwinfs_ioctl(struct file *file, int cmd, uint64_t val0)
     }
     pthread_rwlock_unlock(&proc.fileinfo.fdtable_lock);
     return r;
+  }
+  /*
+   * An interface's name from its index, and back. glibc's if_indextoname and
+   * if_nametoindex are these two ioctls, and an unhandled ioctl is EPERM here -
+   * so a program translating an index it had just been given was told it was
+   * not allowed to. The host answers both directly.
+   */
+  case LINUX_SIOCGIFNAME: {
+    struct l_ifreq r;
+    if (copy_from_user(&r, val0, sizeof r))
+      return -LINUX_EFAULT;
+    /* The index arrives in the same union the name comes back in, so it is
+     * read out before anything is written over it. */
+    unsigned idx;
+    memcpy(&idx, &r.ifr_ifru, sizeof idx);
+    char name[LINUX_IFNAMSIZ];
+    if (if_indextoname(idx, name) == NULL)
+      return -LINUX_ENODEV;
+    memset(&r, 0, sizeof r);
+    strlcpy(r.ifr_ifrn.ifrn_name, name, sizeof r.ifr_ifrn.ifrn_name);
+    if (copy_to_user(val0, &r, sizeof r))
+      return -LINUX_EFAULT;
+    return 0;
+  }
+  case LINUX_SIOCGIFINDEX: {
+    struct l_ifreq r;
+    if (copy_from_user(&r, val0, sizeof r))
+      return -LINUX_EFAULT;
+    char name[LINUX_IFNAMSIZ + 1];
+    memcpy(name, r.ifr_ifrn.ifrn_name, LINUX_IFNAMSIZ);
+    name[LINUX_IFNAMSIZ] = '\0';
+    unsigned idx = if_nametoindex(name);
+    if (idx == 0)
+      return -LINUX_ENODEV;
+    uint32_t v = idx;
+    memcpy(&r.ifr_ifru, &v, sizeof v);
+    if (copy_to_user(val0, &r, sizeof r))
+      return -LINUX_EFAULT;
+    return 0;
   }
   default:
     warnk("unhandled darwinfs ioctl (fd = %08x, cmd = 0x%08x)\n", fd, cmd);

@@ -17,6 +17,7 @@
 
 #include "linux/common.h"
 #include "linux/socket.h"
+#include "linux/netlink.h"
 #include "linux/misc.h"
 
 /*
@@ -71,6 +72,12 @@ guest_sa_family(const char *addr, size_t addrlen)
 
 DEFINE_SYSCALL(socket, int, family, int, type, int, protocol)
 {
+  /* Netlink has no host socket behind it; it is answered here. Taken before the
+   * fdtable lock, because netlink_socket registers its own descriptor. */
+  if (family == LINUX_AF_NETLINK)
+    return netlink_socket(type & ~(LINUX_SOCK_NONBLOCK | LINUX_SOCK_CLOEXEC),
+                          protocol, type);
+
   int ret;
   pthread_rwlock_wrlock(&proc.fileinfo.fdtable_lock);
   int fd = syswrap(socket(linux_to_darwin_sa_family(family), type & ~(LINUX_SOCK_NONBLOCK | LINUX_SOCK_CLOEXEC), protocol));
@@ -467,7 +474,16 @@ DEFINE_SYSCALL(sendto, int, socket, gaddr_t, buf_ptr, int, length, int, flags, g
   struct sockaddr *sockaddr = NULL;
   struct l_sockaddr l_sockaddr;
 
-  if (addr_ptr != 0) {
+  /*
+   * A netlink destination is a sockaddr_nl, which has no Darwin counterpart to
+   * translate to - and the translation is what runs first, so a send that named
+   * where it was going failed before reaching the netlink code at all. glibc
+   * addresses its requests that way and got EINVAL for every one; `ip` passes no
+   * address and so slipped past.
+   */
+  bool to_netlink = netlink_is(socket);
+
+  if (addr_ptr != 0 && !to_netlink) {
     if (copy_from_user(&l_sockaddr, addr_ptr, addrlen))
       return -LINUX_EFAULT;
     if (netns_blocks((int) l_sockaddr.sa_family))
@@ -485,7 +501,10 @@ DEFINE_SYSCALL(sendto, int, socket, gaddr_t, buf_ptr, int, length, int, flags, g
     ret = -LINUX_EFAULT;
     goto out;
   }
-  ret = syswrap(sendto(socket, buf, length, flags, sockaddr, addrlen));
+  if (to_netlink)
+    ret = netlink_send(socket, buf, length);
+  else
+    ret = syswrap(sendto(socket, buf, length, flags, sockaddr, addrlen));
 
  out:
   free(buf);
@@ -559,6 +578,66 @@ linux_to_darwin_msg_flags(l_int flags)
   return ret;
 }
 
+/*
+ * Flags a receive handles itself, which must not reach the flag converter -
+ * it refuses anything it does not recognise, and these have no Darwin
+ * counterpart to convert to.
+ *
+ * MSG_CMSG_CLOEXEC is read straight from the argument where the passed
+ * descriptors are registered; MSG_TRUNC is Linux's "how big was it" and is
+ * served by peeking; MSG_NOSIGNAL is about a send. Passing the first of those
+ * to the converter turned every recvmsg carrying it into EOPNOTSUPP, which is
+ * every recvmsg that receives a descriptor.
+ */
+#define RECV_FLAGS_HANDLED_HERE \
+  (LINUX_MSG_TRUNC | LINUX_MSG_CMSG_CLOEXEC | LINUX_MSG_NOSIGNAL)
+
+/*
+ * The real size of the datagram at the head of the queue.
+ *
+ * Linux's MSG_TRUNC, given *to* a receive, means "tell me how big the datagram
+ * was even if it did not fit"; Darwin has no such input flag - its MSG_TRUNC is
+ * something a receive reports back, and passing it in means nothing. The two
+ * were being mapped onto each other, so a caller asking the size was told the
+ * number of bytes that happened to fit, which for the zero-length buffer such a
+ * caller uses is none of them.
+ *
+ * iproute2 sizes every netlink reply this way: recvmsg with MSG_PEEK|MSG_TRUNC
+ * and nowhere to put the data, then a real receive into a buffer that big. It
+ * reads 0 as the socket having closed - "EOF on netlink" - and gives up.
+ *
+ * Peeking is how the size is found, since the datagram has to stay where it is
+ * for the caller's own receive to follow.
+ */
+static ssize_t
+peek_datagram_len(int fd, int dflags)
+{
+  size_t cap = 8192;
+  char *scratch = malloc(cap);
+  if (scratch == NULL)
+    return -1;
+  for (;;) {
+    /* MSG_WAITALL would wait for a full buffer that is never coming. */
+    ssize_t n = recv(fd, scratch, cap, (dflags & ~MSG_WAITALL) | MSG_PEEK);
+    if (n < 0) {
+      free(scratch);
+      return -1;
+    }
+    if ((size_t) n < cap) {
+      free(scratch);
+      return n;
+    }
+    size_t want = cap * 2;
+    char *bigger = realloc(scratch, want);
+    if (bigger == NULL) {
+      free(scratch);
+      return n;                 /* the best answer available */
+    }
+    scratch = bigger;
+    cap = want;
+  }
+}
+
 DEFINE_SYSCALL(recvfrom, int, socket, gaddr_t, buf_ptr, int, length, int, flags, gaddr_t, addr_ptr, gaddr_t, addrlen_ptr)
 {
   socklen_t *socklen_ptr = NULL;
@@ -571,8 +650,22 @@ DEFINE_SYSCALL(recvfrom, int, socket, gaddr_t, buf_ptr, int, length, int, flags,
     *socklen_ptr = addrbuflen;
     sock_ptr = alloca(addrbuflen);
   }
+  /* The flags were being handed to Darwin unconverted. They are not the same
+   * numbers: Linux's MSG_DONTWAIT is 0x40, which is Darwin's MSG_WAITALL, so a
+   * receive asked not to block was asked to block until the buffer filled. */
+  int dflags = linux_to_darwin_msg_flags(flags & ~RECV_FLAGS_HANDLED_HERE);
+  if (dflags < 0)
+    return dflags;
+
+  ssize_t whole = -1;
+  if (flags & LINUX_MSG_TRUNC) {
+    whole = peek_datagram_len(socket, dflags);
+    if (whole < 0)
+      return syswrap(-1);
+  }
+
   char *buf = alloca(length);
-  int ret = syswrap(recvfrom(socket, buf, length, flags, sock_ptr, socklen_ptr));
+  int ret = syswrap(recvfrom(socket, buf, length, dflags, sock_ptr, socklen_ptr));
   if (ret < 0)
     return ret;
   if (copy_to_user(buf_ptr, buf, ret))
@@ -585,7 +678,8 @@ DEFINE_SYSCALL(recvfrom, int, socket, gaddr_t, buf_ptr, int, length, int, flags,
     if (copy_to_user(addrlen_ptr, socklen_ptr, sizeof *socklen_ptr))
       return -LINUX_EFAULT;
   }
-  return ret;
+  /* What was there, not what fitted. */
+  return whole >= 0 ? (int) whole : ret;
 }
 
 /* ---------------------------------------------------------------------------
@@ -803,6 +897,31 @@ do_sendmsg(int sockfd, const struct l_msghdr *msg, int flags)
       return -LINUX_EFAULT;
   }
 
+  /*
+   * A netlink send is answered here rather than handed to Darwin. The request
+   * is gathered into one buffer first: netlink counts in messages, and a
+   * message is free to straddle two iovecs - `ip` builds its requests exactly
+   * that way, with the header in one and the attributes in another.
+   */
+  if (netlink_is(sockfd)) {
+    size_t total = 0;
+    for (int i = 0; i < hdr.msg_iovlen; ++i)
+      total += hdr.msg_iov[i].iov_len;
+    if (total == 0)
+      return -LINUX_EINVAL;
+    uint8_t *flat = malloc(total);
+    if (flat == NULL)
+      return -LINUX_ENOMEM;
+    size_t at = 0;
+    for (int i = 0; i < hdr.msg_iovlen; ++i) {
+      memcpy(flat + at, hdr.msg_iov[i].iov_base, hdr.msg_iov[i].iov_len);
+      at += hdr.msg_iov[i].iov_len;
+    }
+    int nr = netlink_send(sockfd, flat, total);
+    free(flat);
+    return nr;
+  }
+
   void *ctl = NULL;
   int cr = cmsg_to_host(msg->msg_control, msg->msg_controllen, &hdr, &ctl);
   if (cr < 0)
@@ -901,12 +1020,54 @@ DEFINE_SYSCALL(recvmsg, int, sockfd, gaddr_t, msg_ptr, int, flags)
   dmsg.msg_control = msg_control;
   dmsg.msg_controllen = lmsg.msg_controllen;
   dmsg.msg_flags = linux_to_darwin_msg_flags(lmsg.msg_flags);
-  r = syswrap(recvmsg(sockfd, &dmsg, flags));
+
+  /* MSG_TRUNC asks for the datagram's real size; see peek_datagram_len.
+   * Declared before the first goto below, which would otherwise jump past its
+   * initialiser and leave the return value reading it uninitialised. */
+  ssize_t whole = -1;
+
+  /* Converted, for the reason recvfrom's are: the numbers differ, and Linux's
+   * MSG_DONTWAIT is Darwin's MSG_WAITALL. */
+  int dflags = linux_to_darwin_msg_flags(flags & ~RECV_FLAGS_HANDLED_HERE);
+  if (dflags < 0) {
+    r = dflags;
+    goto out;
+  }
+
+  if (flags & LINUX_MSG_TRUNC) {
+    whole = peek_datagram_len(sockfd, dflags);
+    if (whole < 0) {
+      r = syswrap(-1);
+      goto out;
+    }
+  }
+
+  r = syswrap(recvmsg(sockfd, &dmsg, dflags));
   if (r < 0) {
     goto out;
   }
+
+  /*
+   * Who a netlink reply came from. The descriptor underneath is a unix
+   * socketpair, so Darwin names the sender with a sockaddr_un - and a netlink
+   * reader checks the length it was given against sizeof(struct sockaddr_nl)
+   * before it will look at the message. iproute2 says "sender address length
+   * == 16" and stops. The sender is the kernel, which is port id 0.
+   */
+  bool is_nl = netlink_is(sockfd);
+  struct l_sockaddr_nl from_nl;
+  if (is_nl) {
+    memset(&from_nl, 0, sizeof from_nl);
+    from_nl.nl_family = LINUX_AF_NETLINK;
+    dmsg.msg_namelen = sizeof from_nl;
+  }
+
   if (lmsg.msg_name != 0) {
-    if (copy_to_user(lmsg.msg_name, dmsg.msg_name, dmsg.msg_namelen)) {
+    const void *name = is_nl ? (const void *) &from_nl : dmsg.msg_name;
+    socklen_t namelen = dmsg.msg_namelen;
+    if ((l_int) namelen > lmsg.msg_namelen)
+      namelen = lmsg.msg_namelen;
+    if (copy_to_user(lmsg.msg_name, name, namelen)) {
       r = -LINUX_EFAULT;
       goto out;
     }
@@ -950,6 +1111,10 @@ DEFINE_SYSCALL(recvmsg, int, sockfd, gaddr_t, msg_ptr, int, flags)
     l_uint mflags = darwin_to_linux_msg_flags(dmsg.msg_flags);
     if (truncated)
       mflags |= LINUX_MSG_CTRUNC;
+    /* And say so when the data itself did not fit, which is the other half of
+     * what MSG_TRUNC is for. */
+    if (whole >= 0 && (size_t) whole > iov_total_len)
+      mflags |= LINUX_MSG_TRUNC;
     if (copy_to_user(msg_ptr + offsetof(struct l_msghdr, msg_flags),
                      &mflags, sizeof mflags)) {
       r = -LINUX_EFAULT;
@@ -962,7 +1127,8 @@ out:
   free(msg_iov);
   free(iov_buf);
   free(msg_control);
-  return r;
+  /* What was there, not what fitted. */
+  return whole >= 0 && r >= 0 ? (int) whole : r;
 }
 
 DEFINE_SYSCALL(listen, int, socket, int, backlog)
@@ -1073,6 +1239,12 @@ DEFINE_SYSCALL(bind, int, sockfd, gaddr_t, addr_ptr, int, addrlen)
     return -LINUX_EADDRNOTAVAIL;
   }
 
+  if (netlink_is(sockfd)) {
+    int r = netlink_bind(sockfd, addr, addrlen);
+    free(addr);
+    return r;
+  }
+
   if (linux_to_darwin_sockaddr(&sockaddr, (struct l_sockaddr *) addr, addrlen) < 0) {
     return -LINUX_EINVAL;
   }
@@ -1112,6 +1284,25 @@ DEFINE_SYSCALL(getsockname, int, sockfd, gaddr_t, addr_ptr, gaddr_t, addrlen_ptr
     *socklen_ptr = addrbuflen;
     sock_ptr = alloca(addrbuflen);
   }
+  if (netlink_is(sockfd)) {
+    /* Darwin has no sockaddr for this; the answer is built whole. */
+    struct l_sockaddr_nl snl;
+    size_t n = sizeof snl;
+    int r = netlink_getsockname(sockfd, &snl, &n);
+    if (r < 0 || addr_ptr == 0)
+      return r;
+    l_socklen_t want;
+    if (copy_from_user(&want, addrlen_ptr, sizeof want))
+      return -LINUX_EFAULT;
+    l_socklen_t give = want < (l_socklen_t) n ? want : (l_socklen_t) n;
+    if (copy_to_user(addr_ptr, &snl, give))
+      return -LINUX_EFAULT;
+    l_socklen_t told = (l_socklen_t) n;   /* Linux reports the full size */
+    if (copy_to_user(addrlen_ptr, &told, sizeof told))
+      return -LINUX_EFAULT;
+    return 0;
+  }
+
   int ret = syswrap(getsockname(sockfd, sock_ptr, socklen_ptr));
   if (ret < 0) {
     return ret;
