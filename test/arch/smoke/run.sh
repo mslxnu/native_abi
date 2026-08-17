@@ -915,6 +915,19 @@ else
     fail=1
 fi
 
+# privdroptest: prctl's shape, PR_SET_KEEPCAPS, and dropping capabilities
+# without holding any - the sequence libcap performs for a daemon giving up
+# privilege. Under --user: captest covers the same calls as root, and the point
+# here is what a process that is *not* root may do.
+cp "$here/privdroptest" "$root/"; chmod +x "$root/privdroptest"
+out=$("$NABI" --user 1000:1000 -m "$root" /privdroptest); rc=$?
+if [ "$rc" -eq 0 ] && [ "$out" = "privdrop ok" ]; then
+    echo "  ok  privdroptest -> \"$out\", exit 0"
+else
+    echo "  FAIL privdroptest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 # clearsigtest: CLONE_CLEAR_SIGHAND, which glibc's posix_spawn asks for because
 # the child shares the parent's address space until the exec and an inherited
 # handler would run there. Checked on the child seeing SIG_DFL where the parent

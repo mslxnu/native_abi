@@ -892,6 +892,21 @@ static uint64_t cap_permitted   = ~0ULL;
 static uint64_t cap_inheritable = 0;
 static pthread_mutex_t cap_lock = PTHREAD_MUTEX_INITIALIZER;
 
+/*
+ * PR_SET_KEEPCAPS, which says whether the permitted set survives a transition
+ * to all-non-zero uids.
+ *
+ * Held and reported, and that is the whole of it, because there is nothing here
+ * for it to change: capget answers from the euid at the moment it is asked - not
+ * root, not capable - so no stored set is carried across a uid change for the
+ * flag to protect. What the flag is actually used for is the sequence libcap
+ * performs on behalf of a daemon dropping privilege: set it, change uid, set the
+ * reduced set, clear it. Refusing the first step failed the whole sequence, and
+ * dbus-daemon's system bus stopped at "Failed to drop capabilities" - a
+ * capability model it would have been satisfied by either way.
+ */
+static int cap_keepcaps = 0;
+
 /* The whole set, bounded by the last capability that exists. */
 #define CAP_FULL_SET  ((LINUX_CAP_LAST_CAP >= 63) ? ~0ULL \
                        : ((1ULL << (LINUX_CAP_LAST_CAP + 1)) - 1))
@@ -1017,17 +1032,24 @@ DEFINE_SYSCALL(capset, gaddr_t, header_ptr, gaddr_t, data_ptr)
   pthread_rwlock_rdlock(&proc.cred.lock);
   root = proc.cred.euid == 0;
   pthread_rwlock_unlock(&proc.cred.lock);
-  if (!root)
-    return -LINUX_EPERM;
 
   pthread_mutex_lock(&cap_lock);
   /*
    * The two rules Linux enforces and a caller can be wrong about: the effective
    * set cannot exceed the permitted one, and neither may gain a capability the
    * process does not already hold. A set is a thing you drop.
+   *
+   * Held is what capget would report, which for anyone but root is nothing -
+   * so a process that is not root may still call this, and the only call that
+   * succeeds is one asking for nothing. Refusing it outright was wrong: Linux
+   * needs a capability only to *raise* a set, and dropping is what the call is
+   * for. libcap drops privilege by setting KEEPCAPS, changing uid, and only
+   * then reducing the set; that last step arrives as a non-root caller asking
+   * for the empty set, and dbus-daemon's system bus got EPERM for it.
    */
+  uint64_t held = root ? cap_permitted : 0;
   int ret = 0;
-  if ((eff & ~perm) || (perm & ~cap_permitted) || (inh & ~cap_permitted)) {
+  if ((eff & ~perm) || (perm & ~held) || (inh & ~held)) {
     ret = -LINUX_EPERM;
   } else {
     cap_permitted   = perm & CAP_FULL_SET;
@@ -1331,7 +1353,21 @@ DEFINE_SYSCALL(uname, gaddr_t, buf_ptr)
   return 0;
 }
 
-DEFINE_SYSCALL(prctl, int, option, unsigned long, arg1, unsigned long, arg2, unsigned long, arg3, unsigned long, arg4, unsigned long, arg5)
+/*
+ * prctl takes an option and four arguments, not five.
+ *
+ * Linux declares it SYSCALL_DEFINE5 - option plus arg2..arg5 - so the last
+ * register a caller sets is the fourth argument. This read one more, and then
+ * checked it: every option that requires its unused arguments to be zero, as
+ * Linux does, was testing a register nobody had written. glibc's prctl is
+ * variadic and sets only what it was given, so the value there is whatever the
+ * last call left behind, and the checks failed or passed by luck.
+ *
+ * PR_SET_KEEPCAPS is where that showed. libcap sets it as the first step of
+ * dropping privilege, the garbage in the sixth register failed the check, and
+ * dbus-daemon's system bus refused to start.
+ */
+DEFINE_SYSCALL(prctl, int, option, unsigned long, arg1, unsigned long, arg2, unsigned long, arg3, unsigned long, arg4)
 {
   switch (option) {
   case LINUX_PR_SET_NAME: {
@@ -1357,6 +1393,21 @@ DEFINE_SYSCALL(prctl, int, option, unsigned long, arg1, unsigned long, arg2, uns
   }
   case LINUX_PR_GET_DUMPABLE:
     return 0;
+  case LINUX_PR_SET_KEEPCAPS:
+    if (arg1 > 1 || arg2 || arg3 || arg4)
+      return -LINUX_EINVAL;
+    pthread_mutex_lock(&cap_lock);
+    cap_keepcaps = (int) arg1;
+    pthread_mutex_unlock(&cap_lock);
+    return 0;
+  case LINUX_PR_GET_KEEPCAPS: {
+    if (arg1 || arg2 || arg3 || arg4)
+      return -LINUX_EINVAL;
+    pthread_mutex_lock(&cap_lock);
+    int keep = cap_keepcaps;
+    pthread_mutex_unlock(&cap_lock);
+    return keep;
+  }
   case 55:
     return 0;
   /*
@@ -1366,11 +1417,11 @@ DEFINE_SYSCALL(prctl, int, option, unsigned long, arg1, unsigned long, arg2, uns
    * to a second implementation that could drift from it.
    */
   case LINIX_PR_SET_NO_NEW_PRIVS:
-    if (arg1 != 1 || arg2 || arg3 || arg4 || arg5)
+    if (arg1 != 1 || arg2 || arg3 || arg4)
       return -LINUX_EINVAL;     /* it can only be set, and only to one */
     return seccomp_no_new_privs_set();
   case LINIX_PR_GET_NO_NEW_PRIVS:
-    if (arg1 || arg2 || arg3 || arg4 || arg5)
+    if (arg1 || arg2 || arg3 || arg4)
       return -LINUX_EINVAL;
     return seccomp_no_new_privs_get();
   case LINIX_PR_SET_SECCOMP:
