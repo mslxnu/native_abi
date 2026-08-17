@@ -810,6 +810,10 @@ darwinfs_readv(struct file *file, struct iovec *iov, size_t iovcnt)
   struct eventfd_state *ev = eventfd_lookup(file->fd);
   if (ev != NULL)
     return eventfd_do_read(file, ev, iov, iovcnt);
+  /* A mount context carries messages, not the header nabi keeps in it; there
+   * are never any, and EAGAIN is how Linux says so. */
+  if (mount_is_context_fd(file->fd))
+    return -LINUX_EAGAIN;
   return RETRY_ON_RESTARTABLE_EINTR(readv(file->fd, iov, iovcnt));
 }
 
@@ -821,6 +825,7 @@ darwinfs_close(struct file *file)
   eventfd_forget(file->fd);
   binder_forget(file->fd);
   netlink_close(file->fd);
+  loop_close(file->fd);
   procfs_close_fd(file->fd);
   if (file->dirp != NULL) {
     closedir(file->dirp);       /* takes the dup with it */
@@ -1895,6 +1900,17 @@ darwinfs_ioctl(struct file *file, int cmd, uint64_t val0)
     pthread_rwlock_unlock(&proc.fileinfo.fdtable_lock);
     return r;
   }
+  /*
+   * A loop device's ioctls, which are the whole of its interface: nothing
+   * reads or writes one here, it only names a file for mount to pick up.
+   */
+  default:
+    if (loop_is(fd))
+      return loop_ioctl(fd, cmd, val0);
+    break;
+  }
+
+  switch (cmd) {
   /*
    * An interface's name from its index, and back. glibc's if_indextoname and
    * if_nametoindex are these two ioctls, and an unhandled ioctl is EPERM here -
@@ -4553,7 +4569,11 @@ user_openat(int atdirfd, const char *name, int flags, int mode)
   pthread_rwlock_wrlock(&proc.fileinfo.fdtable_lock);
   /* A few /proc files describe the guest rather than the nabi running it, and
    * only NABI can answer those. Anything else falls through to the host's. */
-  if (procfs_open(name, &fd) < 0) {
+  /* A loop device, which is a name nabi answers rather than a node the host
+   * has - /dev is a passthrough and these cannot be created in it. */
+  if (loop_open(name, &fd) == 0) {
+    ;
+  } else if (procfs_open(name, &fd) < 0) {
     fd = do_openat(atdirfd, name, flags, mode);
     if (fd < 0) {
       char target[LINUX_PATH_MAX];
@@ -4823,6 +4843,23 @@ DEFINE_SYSCALL(newfstatat, int, dirfd, gstr_t, path_ptr, gaddr_t, st_ptr, int, f
   }
   struct l_newstat st;
   int r;
+
+  /* A loop device, for the same reason: util-linux stats one before it opens
+   * it, and calls a missing one a failure to set up the device. */
+  {
+    uint32_t lmode; uint64_t lrdev, lino;
+    if (loop_stat(pathname, &lmode, &lrdev, &lino)) {
+      memset(&st, 0, sizeof st);
+      st.st_mode = lmode;
+      st.st_rdev = lrdev;
+      st.st_ino = lino;
+      st.st_nlink = 1;
+      st.st_blksize = 4096;
+      if (copy_to_user(st_ptr, &st, sizeof st))
+        return -LINUX_EFAULT;
+      return 0;
+    }
+  }
 
   /* A /proc entry nabi serves itself, which the host has no file for. */
   {

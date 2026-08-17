@@ -280,6 +280,17 @@ bool image_is_ext(const char *host_path);
 int  image_mount_ro(const char *host_path, char *dev, size_t devsz,
                     char *dir, size_t dirsz);
 bool image_unmount(const char *dev, const char *dir);
+
+/* Loop devices, which have nothing behind them but a name for a backing file.
+ * See src/fs/loop.c. */
+bool loop_path_index(const char *path, int *idx);
+bool loop_stat(const char *path, uint32_t *mode, uint64_t *rdev, uint64_t *ino);
+int  loop_open(const char *path, int *out_fd);
+bool loop_is(int fd);
+void loop_close(int fd);
+int  loop_ioctl(int fd, int cmd, uint64_t arg);
+bool loop_backing(const char *path, char *out, size_t outsz);
+bool mount_is_context_fd(int fd);
 int vkern_open_exec(const char *path);
 int procfs_open(const char *path, int *out_fd);
 void procfs_close_fd(int fd);

@@ -364,8 +364,26 @@ void _start(void)
     sys6(SYS_umount2, (long) "/mclone", 0, 0, 0, 0, 0);
     sys6(SYS_unlinkat, AT_FDCWD, (long) "/mclone", AT_REMOVEDIR, 0, 0, 0);
 
-    if ((r = sys6(SYS_open_tree, AT_FDCWD, (long) "/nowhere", OPEN_TREE_CLONE, 0, 0, 0)) != -EINVAL)
-      fail("open_tree of something that is not a mount", r, -EINVAL); }
+    /*
+     * A path that is not there is ENOENT, which is what Linux says. It used to
+     * be EINVAL here, from a version that would only clone an existing mount
+     * point - and the path being absent was never the reason.
+     */
+    if ((r = sys6(SYS_open_tree, AT_FDCWD, (long) "/nowhere", OPEN_TREE_CLONE, 0, 0, 0)) != -ENOENT)
+      fail("open_tree of a path that does not exist", r, -ENOENT);
+
+    /*
+     * A path that *is* there but is not a mount point clones the mount
+     * containing it, which comes back as a detached bind of the path itself.
+     * A plain file is a legitimate thing to bind that way, and it is how
+     * `mount -o bind` places one file over another - waydroid puts its
+     * waydroid.prop into the read-only vendor image exactly so.
+     */
+    { long tf = sys6(SYS_open_tree, AT_FDCWD, (long) "/mounttest",
+                     OPEN_TREE_CLONE, 0, 0, 0);
+      if (tf < 0)
+        fail("open_tree of a file that is not a mount point", tf, 0);
+      sys6(SYS_close, tf, 0, 0, 0, 0, 0); } }
 
   sys6(SYS_umount2, (long) "/mdst", 0, 0, 0, 0, 0);
   sys6(SYS_unlinkat, AT_FDCWD, (long) "/msrc/f", 0, 0, 0, 0);

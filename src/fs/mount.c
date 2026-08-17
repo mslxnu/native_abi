@@ -570,10 +570,18 @@ backing_for_type(const char *type, const char *source, unsigned long flags,
       return 0;
     }
 
+    /*
+     * A loop device names the file it was bound to, and that name is already
+     * the host's - it was taken from the descriptor at the time. This is the
+     * form util-linux arrives in: it binds the device itself and then mounts
+     * the device, never the file.
+     */
     char host_img[PATH_MAX];
-    if (source[0] != '/' ||
-        guest_to_host_path(source, host_img, sizeof host_img) != 0)
-      return -LINUX_ENOENT;
+    if (!loop_backing(source, host_img, sizeof host_img)) {
+      if (source[0] != '/' ||
+          guest_to_host_path(source, host_img, sizeof host_img) != 0)
+        return -LINUX_ENOENT;
+    }
 
     /*
      * Read-only, and a writable mount is refused rather than downgraded. A
@@ -1085,6 +1093,28 @@ struct detached_hdr {
   struct mount_entry e;
 };
 
+/*
+ * Whether a descriptor is one of the objects above.
+ *
+ * They are backed by temp files holding a header nabi wrote, and a guest that
+ * reads one gets those bytes - its own kernel's bookkeeping, served as file
+ * contents. On Linux, reading an fs_context descriptor returns the messages the
+ * filesystem produced while being configured, and EAGAIN when there are none.
+ *
+ * util-linux reads it after every step. Handed nabi's header it read the magic,
+ * then read 0 for ever after and never stopped asking - a mount that hung
+ * rather than failed, and only reachable once fsopen started accepting a
+ * filesystem it could really provide.
+ */
+bool
+mount_is_context_fd(int fd)
+{
+  uint32_t magic;
+  if (pread(fd, &magic, sizeof magic, 0) != (ssize_t) sizeof magic)
+    return false;
+  return magic == FSCTX_MAGIC || magic == DETACHED_MAGIC;
+}
+
 /* A file nothing else can reach, whose descriptor is the object. */
 static int
 anon_file(const char *what)
@@ -1319,7 +1349,32 @@ DEFINE_SYSCALL(open_tree, int, dfd, gstr_t, path_ptr, unsigned int, flags)
     e.id = 0;
     return detach(&e, (flags & LINUX_OPEN_TREE_CLOEXEC) != 0);
   }
-  return -LINUX_EINVAL;         /* not a mount point */
+
+  /*
+   * Not a mount point, which is not a failure: Linux clones the mount that
+   * *contains* the path, and what comes back is a detached bind of the path
+   * itself. Everything is inside the root mount here, so that is a bind of
+   * whatever the path names - and a plain file is a legitimate thing to bind,
+   * which is how a single file is put over another.
+   *
+   * This is the form util-linux uses for every bind it performs. Refusing it
+   * left `mount -o bind` on a file reporting a bad superblock, and waydroid
+   * cannot place its waydroid.prop into the read-only vendor image without it.
+   */
+  char host[PATH_MAX];
+  int gr = guest_to_host_path(path, host, sizeof host);
+  if (gr < 0)
+    return gr;
+  struct stat st;
+  if (stat(host, &st) < 0)
+    return -darwin_to_linux_errno(errno);
+
+  struct mount_entry e;
+  memset(&e, 0, sizeof e);
+  snprintf(e.source, sizeof e.source, "%s", path);
+  snprintf(e.hostdir, sizeof e.hostdir, "%s", host);
+  snprintf(e.type, sizeof e.type, "none");
+  return detach(&e, (flags & LINUX_OPEN_TREE_CLOEXEC) != 0);
 }
 
 DEFINE_SYSCALL(move_mount, int, from_dfd, gstr_t, from_ptr, int, to_dfd,

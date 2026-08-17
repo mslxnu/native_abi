@@ -915,6 +915,21 @@ else
     fail=1
 fi
 
+# looptest: loop devices, which is how anything actually mounts an image -
+# util-linux's mount sets one up in userspace and never calls mount(2) on a
+# regular file at all. Checks the control device, the block-device stat, that a
+# bound device *reads as its backing file* (the ext4 magic, which is what a
+# filesystem probe looks for), mounting through it, and that unbinding gives
+# the number back.
+cp "$here/looptest" "$here/tiny.ext4" "$root/"; chmod +x "$root/looptest"
+out=$("$NABI" -m "$root" /looptest); rc=$?
+if [ "$rc" -eq 0 ] && [ "$out" = "loop ok" ]; then
+    echo "  ok  looptest -> \"$out\", exit 0"
+else
+    echo "  FAIL looptest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 # imagemounttest: mount(2) on a filesystem image, which the host is asked to
 # perform - nabi has no block layer to do it with. tiny.ext4 beside it is 1MiB
 # of ext4 with two known files in it. Checks that the files are readable through

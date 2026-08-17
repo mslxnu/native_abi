@@ -5,9 +5,9 @@
  * file had nothing to do and answered ENODEV. Android ships as ext4 images and
  * `waydroid session start` mounts system.img before anything else.
  *
- * The image beside this file is 1MiB of ext4 holding two known files. It is
- * built without the 64bit feature on purpose: the host driver refuses one that
- * has it, with an error about devices that says nothing about why.
+ * The image beside this file is 1MiB of ext4 holding two known files, made by
+ * mke2fs with its own defaults - so it carries metadata_csum and 64bit, which
+ * is what anyone building an image gets and what a real one has.
  *
  * What is checked:
  *
