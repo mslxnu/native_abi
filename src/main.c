@@ -223,7 +223,25 @@ main_loop(int return_on_sigret)
                       (unsigned long long)(r ? r->size : 0),
                       (unsigned long long) exit.raw_reason, pte_note());
             }
-            send_signal(getpid(), LINUX_SIGSEGV);
+            /*
+             * Forced, and not merely sent. send_signal only makes the signal
+             * pending, and the guest is entitled to block it, ignore it, or
+             * handle it and return - at which point the same instruction
+             * faults again, this branch fires again, and nothing has changed
+             * except that another line has been written.
+             *
+             * That is not hypothetical. A forked Android child faulted on one
+             * address forever at full CPU, and by the time it was looked at it
+             * had put 36 million identical lines - two gigabytes - into its
+             * warning log, with its parent still waiting on it. The message
+             * here has always said "killing the guest rather than spinning";
+             * this is what makes that true.
+             *
+             * It is also what Linux does with a fault: force_sig resets the
+             * disposition and unblocks, because a synchronous fault the
+             * process will not deal with cannot be allowed to resume.
+             */
+            die_with_forcedsig(LINUX_SIGSEGV);
           }
         } else {
           last_fault_addr = exit.fault_addr;
