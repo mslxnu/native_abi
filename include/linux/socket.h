@@ -75,6 +75,10 @@
 #define	LINUX_SO_SNDTIMEO	21
 #define	LINUX_SO_TIMESTAMP	29
 #define	LINUX_SO_ACCEPTCONN	30
+/* The privileged forms of SO_SNDBUF/SO_RCVBUF: same option, but allowed past
+ * the rmem_max/wmem_max ceiling for a caller with CAP_NET_ADMIN. */
+#define	LINUX_SO_SNDBUFFORCE	32
+#define	LINUX_SO_RCVBUFFORCE	33
 
 #define	LINUX_IP_TOS		1
 #define	LINUX_IP_TTL		2

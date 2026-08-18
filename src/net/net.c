@@ -551,6 +551,23 @@ to_host_sockopt_name(int name)
     return SO_TIMESTAMP;
   case LINUX_SO_ACCEPTCONN:
     return SO_ACCEPTCONN;
+  /*
+   * The forced buffer sizes are the same options, asked for by a caller
+   * entitled to go past the system's ceiling. Darwin has no separate name for
+   * that and no ceiling of Linux's to go past, so the plain option is the
+   * whole of what can be done - and getting the size the host is willing to
+   * give is what the caller wanted.
+   *
+   * Refusing them stopped Android's ueventd dead. libcutils asks for a large
+   * receive buffer, reads back what it was actually given, and falls back to
+   * SO_RCVBUFFORCE when that is short; the fallback failing is fatal, so it
+   * logged "Could not open uevent socket" and aborted - and a critical service
+   * dying is what sent init to the bootloader instead of to a boot.
+   */
+  case LINUX_SO_SNDBUFFORCE:
+    return SO_SNDBUF;
+  case LINUX_SO_RCVBUFFORCE:
+    return SO_RCVBUF;
   default:
     warnk("Unsupported sockopt name: 0x%x\n", name);
     return -1;
@@ -614,6 +631,36 @@ DEFINE_SYSCALL(setsockopt, int, fd, int, level, int, optname, gaddr_t, optval_pt
   }
   // Darwin's optval is compatible with that of Linux
   r = syswrap(setsockopt(fd, linux_to_darwin_sockopt_level(level), host_name, optval, opt_len));
+
+  /*
+   * A buffer size is a request, not a demand. Linux clamps it - SO_RCVBUF to
+   * the system's rmem_max, the forced form to a much higher ceiling - and the
+   * call succeeds either way; what the socket actually got is what a later
+   * getsockopt reports. Darwin refuses outright with ENOBUFS instead, and a
+   * caller written against Linux has no path for a failure that cannot happen
+   * there.
+   *
+   * Android's ueventd asks for sixteen megabytes on its netlink socket and
+   * treats the refusal as fatal, so it logged "Could not open uevent socket"
+   * and aborted - and a critical service dying is what sent init to the
+   * bootloader rather than to a boot.
+   *
+   * Halving down to what the host will take is the clamp Linux would have
+   * applied. The floor is there so this cannot become a long loop on a socket
+   * that is refusing for some other reason.
+   */
+  if (r == -LINUX_ENOBUFS && level == LINUX_SOL_SOCKET && opt_len == sizeof(int) &&
+      (optname == LINUX_SO_RCVBUF || optname == LINUX_SO_SNDBUF ||
+       optname == LINUX_SO_RCVBUFFORCE || optname == LINUX_SO_SNDBUFFORCE)) {
+    int want;
+    memcpy(&want, optval, sizeof want);
+    for (int try = want / 2; try >= 4096; try /= 2) {
+      r = syswrap(setsockopt(fd, linux_to_darwin_sockopt_level(level), host_name,
+                             &try, sizeof try));
+      if (r == 0)
+        break;
+    }
+  }
 out:
   free(optval);
   return r;
