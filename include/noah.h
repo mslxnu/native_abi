@@ -299,6 +299,8 @@ void rtsig_init(void);
 /* Abstract unix sockets, which are files here. See src/net/net.c. */
 void abstract_close(int fd);
 void seqpacket_close(int fd);
+bool signalfd_wants(int lsig);
+void signalfd_arm(int lsig);
 int seqpacket_eof(int fd, int ret);
 bool seqpacket_gone(int fd, int *ret);
 

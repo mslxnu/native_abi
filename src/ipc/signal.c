@@ -228,6 +228,56 @@ rtsig_init(void)
   sigaction(RTSIG_DOORBELL, &sa, NULL);
 }
 
+/*
+ * Signals a signalfd is watching have to reach us whatever the guest's
+ * disposition says.
+ *
+ * __host_signal_handler is the one place nabi learns that a signal arrived,
+ * and it was installed only for signals the guest had a real handler for. That
+ * is backwards for signalfd, whose entire point is not needing a handler: the
+ * ordinary use is to block the signal, leave the disposition at SIG_DFL, and
+ * read it off a descriptor. Such a signal kept its host disposition, was
+ * blocked on the host as well, and arrived nowhere - so the descriptor stayed
+ * unreadable for good.
+ *
+ * Android's init sits exactly there. It blocks SIGCHLD, never handles it, and
+ * waits on a signalfd inside epoll to hear that a service exited, so every
+ * service it started was "Exec service is hung? Waited 10.0023 with no
+ * response" while the child had already run and exited.
+ *
+ * Arming does not change what the guest sees. nabi's own delivery still
+ * honours the guest's mask and disposition; this only ensures the arrival is
+ * recorded, which is the thing a blocked signal on Linux does for itself by
+ * becoming pending.
+ */
+void
+signalfd_arm(int lsig)
+{
+  if (lsig <= 0 || lsig >= LINUX_SIGRTMIN)
+    return;                     /* nothing on the host raises an RT signal */
+  int dsig = linux_to_darwin_signal(lsig);
+  if (dsig == 0 || dsig == SIGKILL || dsig == SIGSTOP)
+    return;
+
+  l_handler_t h = proc.sigaction[lsig - 1].lsa_handler;
+  if (h != LINUX_SIG_DFL && h != LINUX_SIG_IGN)
+    return;                     /* the guest's own handler is already ours */
+
+  struct sigaction dact;
+  memset(&dact, 0, sizeof dact);
+  dact.sa_sigaction = (void (*)(int, siginfo_t *, void *)) __host_signal_handler;
+  dact.sa_flags = SA_SIGINFO | SA_RESTART;
+  sigemptyset(&dact.sa_mask);
+  sigaction(dsig, &dact, NULL);
+
+  /* And it must not be blocked underneath us: the guest blocking a signal is
+   * what makes it pending on Linux, not what makes it vanish. */
+  sigset_t un;
+  sigemptyset(&un);
+  sigaddset(&un, dsig);
+  pthread_sigmask(SIG_UNBLOCK, &un, NULL);
+}
+
 int
 send_signal(pid_t pid, int signum)
 {
@@ -478,6 +528,11 @@ DEFINE_SYSCALL(rt_sigaction, int, sig, gaddr_t, act, gaddr_t, oact, size_t, size
   void *handler;
   if (lact.lsa_handler == LINUX_SIG_DFL || lact.lsa_handler == LINUX_SIG_IGN) {
     handler = lact.lsa_handler == LINUX_SIG_DFL ? SIG_DFL : SIG_IGN;
+    /* Unless a signalfd is watching it, in which case nabi keeps its own: the
+     * guest setting a disposition it does not use must not silence a
+     * descriptor that is still waiting on the signal. */
+    if (signalfd_wants(sig))
+      handler = __host_signal_handler;
   } else {
     lact.lsa_flags |= LINUX_SA_SIGINFO;
     handler = __host_signal_handler;
@@ -571,6 +626,11 @@ DEFINE_SYSCALL(rt_sigprocmask, int, how, gaddr_t, nset, gaddr_t, oset, size_t, s
       continue;
     l_handler_t h = proc.sigaction[sig - 1].lsa_handler;
     if (h != LINUX_SIG_DFL && h != LINUX_SIG_IGN)
+      continue;
+    /* ...and one a signalfd is watching is handled too, by nabi rather than by
+     * the guest. Blocking it here would swallow exactly what the descriptor
+     * exists to report. */
+    if (signalfd_wants(sig))
       continue;
     sigaddset(&dset, linux_to_darwin_signal(sig));
   }

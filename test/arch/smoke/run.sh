@@ -1060,6 +1060,21 @@ else
     fail=1
 fi
 
+# sigchldfdtest: a signalfd for a signal the guest never handles, which is the
+# ordinary use of signalfd and the one nabi did not cover - the arrival was
+# only ever recorded for signals that had a guest handler, so the descriptor
+# stayed unreadable, and the wait that would have seen it returned EINTR.
+# Android's init blocks SIGCHLD, handles it nowhere, and learns of a service
+# exiting from a signalfd inside epoll. Checks both waits and both sources.
+cp "$here/sigchldfdtest" "$root/"; chmod +x "$root/sigchldfdtest"
+out=$("$NABI" -m "$root" /sigchldfdtest 2>&1 | tail -1); rc=$?
+if [ "$out" = "sigchldfd ok" ]; then
+    echo "  ok  sigchldfdtest -> \"$out\""
+else
+    echo "  FAIL sigchldfdtest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 # procchmodtest: chmod on a passed-through /proc, which the host module serving
 # it refuses - and Android's first-stage init treats a failed chmod of
 # /proc/cmdline as fatal. Checks that it succeeds by path and by dirfd, that a

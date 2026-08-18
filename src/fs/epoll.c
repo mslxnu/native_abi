@@ -338,7 +338,38 @@ epoll_wait_common(int epfd, gaddr_t events_ptr, int maxevents, int timeout)
     }
   }
 
-  int n = kevent(epfd, NULL, 0, kev, maxevents * 2, tsp);
+  /*
+   * Restarted for a signal the guest cannot receive, exactly as poll is. A
+   * signal nabi noticed on the guest's behalf runs a host handler and returns,
+   * and kevent gives up with EINTR - where Linux, the signal being blocked and
+   * unhandled, would have gone on waiting. sigrestart_wanted() tells the two
+   * apart.
+   *
+   * This is where Android's init waits: its signalfd for SIGCHLD sits in an
+   * epoll, so the arrival that should have reported a service exiting broke
+   * the wait that would have seen it instead.
+   */
+  int n;
+  for (;;) {
+    struct timespec t0, t1;
+    bool timed = tsp != NULL && (tsp->tv_sec != 0 || tsp->tv_nsec != 0);
+    if (timed)
+      clock_gettime(CLOCK_MONOTONIC, &t0);
+    n = kevent(epfd, NULL, 0, kev, maxevents * 2, tsp);
+    if (n >= 0 || errno != EINTR || !sigrestart_wanted())
+      break;
+    if (timed) {
+      clock_gettime(CLOCK_MONOTONIC, &t1);
+      long long spent = (long long)(t1.tv_sec - t0.tv_sec) * 1000000000LL +
+                        (t1.tv_nsec - t0.tv_nsec);
+      long long left = (long long) ts.tv_sec * 1000000000LL + ts.tv_nsec - spent;
+      if (left < 0)
+        left = 0;
+      ts.tv_sec = (time_t)(left / 1000000000LL);
+      ts.tv_nsec = (long)(left % 1000000000LL);
+      tsp = &ts;
+    }
+  }
   if (n < 0) {
     int e = errno;
     free(kev); free(out);

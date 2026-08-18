@@ -543,6 +543,22 @@ signalfds_init(void)
     signalfds[i].fd = -1;
 }
 
+/* Whether any signalfd is waiting on `lsig`, which decides whether nabi has to
+ * hear about it regardless of what the guest's disposition says. */
+bool
+signalfd_wants(int lsig)
+{
+  if (lsig <= 0 || lsig > LINUX_NSIG)
+    return false;
+  uint64_t bit = 1UL << (lsig - 1);
+  bool want = false;
+  pthread_mutex_lock(&signalfds_lock);
+  for (int i = 0; i < SIGNALFD_MAX && !want; i++)
+    want = signalfds[i].fd >= 0 && (signalfds[i].mask.__mask & bit) != 0;
+  pthread_mutex_unlock(&signalfds_lock);
+  return want;
+}
+
 static struct signalfd_state *
 signalfd_lookup(int fd)
 {
@@ -653,6 +669,16 @@ signalfd_read(int fd, char *out, size_t size, int *ret)
   }
 }
 
+/* Every signal in a mask has to reach nabi for the descriptor to report it,
+ * whatever the guest's disposition says. */
+static void
+signalfd_arm_mask(const l_sigset_t *mask)
+{
+  for (int sig = 1; sig <= LINUX_NSIG; sig++)
+    if (mask->__mask & (1UL << (sig - 1)))
+      signalfd_arm(sig);
+}
+
 DEFINE_SYSCALL(signalfd4, int, fd, gaddr_t, mask_ptr, size_t, sizemask, int, flags)
 {
   if (flags & ~(LINUX_O_NONBLOCK | LINUX_O_CLOEXEC))
@@ -680,6 +706,7 @@ DEFINE_SYSCALL(signalfd4, int, fd, gaddr_t, mask_ptr, size_t, sizemask, int, fla
     }
     sf->mask = mask;
     pthread_mutex_unlock(&signalfds_lock);
+    signalfd_arm_mask(&mask);
     return fd;
   }
 
@@ -726,6 +753,10 @@ DEFINE_SYSCALL(signalfd4, int, fd, gaddr_t, mask_ptr, size_t, sizemask, int, fla
   signalfds[slot].mask = mask;
   signalfds[slot].fd = sv[0];
   pthread_mutex_unlock(&signalfds_lock);
+
+  /* After the slot is published, so signalfd_wants already answers yes for
+   * these and nothing can undo the arming between the two. */
+  signalfd_arm_mask(&mask);
 
   /* A signal that arrived before this descriptor existed left a pending bit
    * with no byte behind it; put the byte there now, or the first read would
@@ -6731,7 +6762,37 @@ poll_common(gaddr_t fds_ptr, int nfds, int timeout)
       timeout = 0;
   }
 
-  r = syswrap(poll(d_fds, nfds, timeout));
+  /*
+   * A signal nabi noticed on the guest's behalf is not an interruption the
+   * guest asked for. Its host handler runs and returns, the host poll gives up
+   * with EINTR, and on Linux nothing would have happened at all: the signal is
+   * blocked, no handler runs, and the wait carries on until something is
+   * actually ready. sigrestart_wanted() is what tells the two apart, and it is
+   * already what reads and writes use.
+   *
+   * This is the second half of making a signalfd work for a signal the guest
+   * does not handle. Arming the signal makes the descriptor readable; without
+   * this, the very wait that would have seen it readable returns EINTR first -
+   * so Android's init learned of a child's exit by having its epoll fail.
+   *
+   * The remaining timeout is carried across, or a wait interrupted often
+   * enough would never expire.
+   */
+  for (;;) {
+    struct timespec t0, t1;
+    bool timed = timeout > 0;
+    if (timed)
+      clock_gettime(CLOCK_MONOTONIC, &t0);
+    r = syswrap(poll(d_fds, nfds, timeout));
+    if (r != -LINUX_EINTR || !sigrestart_wanted())
+      break;
+    if (timed) {
+      clock_gettime(CLOCK_MONOTONIC, &t1);
+      long spent = (t1.tv_sec - t0.tv_sec) * 1000 +
+                   (t1.tv_nsec - t0.tv_nsec) / 1000000;
+      timeout = spent >= timeout ? 0 : timeout - (int) spent;
+    }
+  }
   if (r < 0)
     goto out;
 
