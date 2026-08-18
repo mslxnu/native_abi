@@ -40,6 +40,9 @@ meta_strace_hook *strace_post_hooks[NR_SYSCALLS];
  * before the fault turned out to be here, in the instrument, on fsconfig's
  * arguments. Nothing that only observes may ever be able to do that.
  */
+/* How much of a read's or write's buffer to show; see print_arg. */
+#define STRACE_BUF_MAX 256
+
 void
 print_gstr(gstr_t str, int maxlen)
 {
@@ -82,7 +85,16 @@ print_arg(int syscall_num, int arg_idx, const char *arg_name, const char *type_n
     fprintf(strace_sink, "%s: ", arg_name);
 
     if (strcmp(type_name, "gstr_t") == 0) {
-      print_gstr(val, 50);
+      /*
+       * 256 rather than 50, because a guest's own diagnostics arrive here as
+       * the buffer of a write() and fifty characters cuts every one of them
+       * mid-sentence. Android's init logs to /dev/kmsg, which nothing can read
+       * back, so the trace is the only place its messages exist at all - and
+       * "Service 'apexd-bootstrap' (pid 45775) rec" is not enough to say what
+       * happened to it. Paths longer than fifty characters were being cut in
+       * half too.
+       */
+      print_gstr(val, 256);
 
     } else if (strcmp(type_name, "gaddr_t") == 0) {
       fprintf(strace_sink, "0x%016llx [host: 0x%016llx]", val, (uint64_t)guest_to_host(val));
@@ -248,7 +260,7 @@ trace_read_post(int syscall_num, int argc, char *argnames[6], char *typenames[6]
     }
     if (i == 1) {
       fprintf(strace_sink, "%s: ", argnames[1]);
-      print_gstr(vals[1], MIN(50, ret)); // Print buf as string
+      print_gstr(vals[1], MIN(STRACE_BUF_MAX, ret)); // Print buf as string
     } else {
       print_arg(syscall_num, i, argnames[i], typenames[i], vals[i]);
     }
@@ -266,7 +278,7 @@ trace_write_pre(int syscall_num, int argc, char *argnames[6], char *typenames[6]
     }
     if (i == 1) {
       fprintf(strace_sink, "%s: ", argnames[1]);
-      print_gstr(vals[1], MIN(50, vals[2])); // Print buf as string
+      print_gstr(vals[1], MIN(STRACE_BUF_MAX, vals[2])); // Print buf as string
     } else {
       print_arg(syscall_num, i, argnames[i], typenames[i], vals[i]);
     }
@@ -289,7 +301,7 @@ trace_recvfrom_post(int syscall_num, int argc, char *argnames[6], char *typename
     }
     if (i == 1) {
       fprintf(strace_sink, "%s: ", argnames[1]);
-      print_gstr(vals[1], MIN(50, ret)); // Print buf as string
+      print_gstr(vals[1], MIN(STRACE_BUF_MAX, ret)); // Print buf as string
     } else {
       print_arg(syscall_num, i, argnames[i], typenames[i], vals[i]);
     }
@@ -307,7 +319,7 @@ trace_sendto_pre(int syscall_num, int argc, char *argnames[6], char *typenames[6
     }
     if (i == 1) {
       fprintf(strace_sink, "%s: ", argnames[1]);
-      print_gstr(vals[1], MIN(50, vals[2])); // Print buf as string
+      print_gstr(vals[1], MIN(STRACE_BUF_MAX, vals[2])); // Print buf as string
     } else {
       print_arg(syscall_num, i, argnames[i], typenames[i], vals[i]);
     }
