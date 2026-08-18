@@ -3,6 +3,8 @@
 #include <stdbool.h>
 #include <sys/mman.h>
 #include <strings.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 #include "common.h"
 #include "util/list.h"
@@ -121,7 +123,19 @@ split_region(struct mm *mm, struct mm_region *region, gaddr_t gaddr)
   tail->size = region->size - offset;
   tail->prot = region->prot;
   tail->mm_flags = region->mm_flags;
+  /* Each half needs a descriptor it may close on its own, so the one that is
+   * owned is duplicated rather than shared between them. */
   tail->mm_fd = region->mm_fd;
+  tail->owns_fd = false;
+  if (region->owns_fd && region->mm_fd >= 0) {
+    tail->mm_fd = dup(region->mm_fd);
+    if (tail->mm_fd < 0)
+      tail->mm_fd = region->mm_fd;       /* shared, and neither half closes it */
+    else {
+      fcntl(tail->mm_fd, F_SETFD, 0);    /* must survive the child's exec */
+      tail->owns_fd = true;
+    }
+  }
   tail->pgoff = region->pgoff;
   tail->shm_id = region->shm_id;
   /* Both halves of a sealed region stay sealed; splitting is not a way out. */
@@ -147,6 +161,7 @@ record_region(struct mm *mm, void *haddr, gaddr_t gaddr, size_t size, int prot, 
     .prot = prot,
     .mm_flags = mm_flags,
     .mm_fd = mm_fd,
+    .owns_fd = false,     /* do_mmap takes this on for a shared file mapping */
     .pgoff = pgoff
   };
 
@@ -200,6 +215,8 @@ destroy_mm(struct mm *mm)
     munmap(r->haddr, r->size);
     if (r->arena_off >= 0)
       arena_free(r->arena_off, r->size);
+    if (r->owns_fd && r->mm_fd >= 0)
+      close(r->mm_fd);
     free(r);
   }
   RB_INIT(&mm->mm_region_tree);

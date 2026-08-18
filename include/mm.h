@@ -65,6 +65,22 @@ struct mm_region {
   int mm_flags;        /* mm flags in the form of LINUX_MAP_* */
   int mm_fd;
   /*
+   * Whether mm_fd is this region's own descriptor rather than the guest's.
+   *
+   * A shared file mapping has to be re-mappable after a fork, and on arm64 a
+   * fork is an exec - so the descriptor has to still be open then. The guest's
+   * is not: mapping a file and closing the descriptor straight afterwards is
+   * the ordinary way to do it, and bionic's property area does exactly that.
+   * The mapping outlives the descriptor for the process that made it, and the
+   * recorded number goes stale without anything noticing until a child tries
+   * to use it.
+   *
+   * So a shared file mapping keeps a duplicate of its own, which it closes
+   * when the region goes. Nothing else does: a private mapping's bytes are in
+   * the arena and its mm_fd is only a record of where they came from.
+   */
+  bool owns_fd;
+  /*
    * The shared-memory segment this region is an attachment to, or -1.
    *
    * Kept on the region rather than in a table beside it because the region *is*

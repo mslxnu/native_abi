@@ -143,6 +143,8 @@ do_munmap(gaddr_t gaddr, size_t size)
         arena_free(overlapping->arena_off, overlapping->size);
       }
     }
+    if (overlapping->owns_fd && overlapping->mm_fd >= 0)
+      close(overlapping->mm_fd);
     free(overlapping);
     if (next == &proc.mm->mm_regions)
       break;
@@ -202,6 +204,9 @@ do_mmap(gaddr_t addr, size_t len, int d_prot, int l_prot, int l_flags, int fd, o
 
   void *ptr;
   off_t arena_off = -1;
+  /* A shared file mapping's own descriptor; arm64 only, since only its fork
+   * has to re-map the file in another process. */
+  int owned_fd = -1;
 #if defined(__arm64__)
   /*
    * Every guest region comes out of the arena, so that a descriptor names it and
@@ -255,6 +260,19 @@ do_mmap(gaddr_t addr, size_t len, int d_prot, int l_prot, int l_flags, int fd, o
     ptr = mmap(0, len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, offset);
     if (ptr == MAP_FAILED)
       return -darwin_to_linux_errno(errno);
+    /*
+     * And a descriptor of our own for it. The guest is free to close its own
+     * the moment the mapping exists - that is the ordinary way to map a file,
+     * and bionic's property area does it - after which the number recorded
+     * here names nothing. The parent never notices, because its mapping holds
+     * its own reference; the child does, because a fork on arm64 is an exec
+     * and the resumed child re-maps the file from this descriptor. Every fork
+     * in Android's init died on that, one panic deep in the child, with no
+     * trace of its own because the sinks are opened after the restore.
+     */
+    owned_fd = dup(fd);
+    if (owned_fd >= 0)
+      fcntl(owned_fd, F_SETFD, 0);        /* must survive the child's exec */
   } else {
     ptr = arena_alloc(len, &arena_off);
     if (fd >= 0 && pread(fd, ptr, len, offset) < 0) {
@@ -274,8 +292,10 @@ do_mmap(gaddr_t addr, size_t len, int d_prot, int l_prot, int l_flags, int fd, o
 
   do_munmap(addr, len);
   struct mm_region *recorded =
-      record_region(proc.mm, ptr, addr, len, l_prot, l_flags, fd, offset);
+      record_region(proc.mm, ptr, addr, len, l_prot, l_flags,
+                    owned_fd >= 0 ? owned_fd : fd, offset);
   recorded->arena_off = arena_off;
+  recorded->owns_fd = owned_fd >= 0;
 
   vmm_mmap(addr, len, linux_mprot_to_hv_mflag(l_prot), ptr);
 
@@ -719,6 +739,9 @@ DEFINE_SYSCALL(mremap, gaddr_t, old_addr, size_t, old_size, size_t, new_size, in
   struct mm_region *new = record_region(proc.mm, moved_to, ret, new_size, region->prot, region->mm_flags, region->mm_fd, region->pgoff);
   new->shm_id = region->shm_id;
   new->arena_off = moved_off;
+  /* The descriptor moves with the mapping rather than being closed and
+   * reopened: this is the same mapping at a new address. */
+  new->owns_fd = region->owns_fd;
   vmm_mmap(new->gaddr, new->size, new->prot, new->haddr);
 
   free(region);

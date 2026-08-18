@@ -184,8 +184,14 @@ clone_process_by_exec(unsigned long clone_flags, gaddr_t parent_tid,
     char *argv[] = { self, (char *) "--resume", ckpt_arg, arena_arg,
                      flags_arg, ctid_arg, tls_arg, NULL };
     execv(self, argv);
-    /* Only here if exec failed; the guest state is intact in the parent, so the
-     * only honest thing this child can do is disappear. */
+    /*
+     * Only here if exec failed; the guest state is intact in the parent, so the
+     * only honest thing this child can do is disappear - but not quietly. A
+     * child that vanishes here leaves a parent whose fork *succeeded*, waiting
+     * on a process that never ran, and no trace of its own to say why: the
+     * sinks are opened by resume_main, which this never reached.
+     */
+    FORKERR("cannot exec %s: %s", self, strerror(errno));
     _exit(127);
   }
 
