@@ -102,13 +102,37 @@ checkpoint_restore(int ckpt_fd, int arena_fd)
   for (uint32_t i = 0; i < hdr.nr_regions; i++) {
     if (regions[i].arena_off >= 0)
       continue;
-    gaddr_t ipa = pt_ipa_of(regions[i].gaddr);
-    if (ipa == 0)
-      panic("resuming shared region 0x%llx: no stage-1 mapping",
-            (unsigned long long) regions[i].gaddr);
-    vmm_arm64_map_stage2(ipa, roundup(regions[i].size, STAGE2_GRANULE),
-                         linux_mprot_to_hv_mflag(regions[i].prot),
-                         region_hva[i]);
+    /*
+     * A page at a time, because a region is no longer one stage-2 block's
+     * worth of anything. A block belongs to a host page and is shared by
+     * whatever guest pages land in it, so a region's span covers several
+     * blocks and may share the ones at its ends with its neighbours. Mapping
+     * the whole span in one call asks hv_vm_map for a range that overlaps
+     * blocks already established for other regions, and it refuses the lot
+     * with a bare HV_ERROR - which killed every resumed child before it had
+     * opened a trace sink to say so.
+     *
+     * The IPA is taken from stage 1 rather than recomputed: the parent
+     * decided where each page lives and those descriptors came across intact.
+     */
+    gaddr_t last_base = (gaddr_t) -1;
+    for (size_t off = 0; off < regions[i].size; off += PAGE_SIZEOF(PAGE_4KB)) {
+      gaddr_t ipa = pt_ipa_of(regions[i].gaddr + off);
+      if (ipa == 0) {
+        if (off == 0)
+          panic("resuming shared region 0x%llx: no stage-1 mapping",
+                (unsigned long long) regions[i].gaddr);
+        continue;              /* a hole the guest unmapped; nothing to remap */
+      }
+      gaddr_t base = ipa & ~(gaddr_t)(STAGE2_GRANULE - 1);
+      if (base == last_base)
+        continue;
+      last_base = base;
+      char *hp = (char *) region_hva[i] + off;
+      char *block = (char *) ((uintptr_t) hp & ~(uintptr_t)(STAGE2_GRANULE - 1));
+      vmm_arm64_map_stage2(base, STAGE2_GRANULE,
+                           linux_mprot_to_hv_mflag(regions[i].prot), block);
+    }
   }
 
   /* The mm layer's own view of the same memory. */
