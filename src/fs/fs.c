@@ -73,6 +73,10 @@
 struct file {
   struct file_operations *ops;
   int fd;
+  /* Set only for an O_PATH descriptor on something the host will not open at
+   * all; the name is then the whole of what the descriptor is. NULL for every
+   * ordinary file, which is identified by its host descriptor. */
+  char *path;
   /* Live directory stream, opened on the first getdents and kept until close.
    * NULL for anything that is not being read as a directory. */
   DIR *dirp;
@@ -2927,6 +2931,159 @@ test_fdbit(struct fdtable *table, uint64_t *fdbits, int fd)
   return fdbits[idx_table] & (1ULL << (idx_bit));
 }
 
+
+/* ---------------------------------------------------------------------------
+ * O_PATH on something the host will not open
+ *
+ * Linux's O_PATH opens the *name*, not the object behind it: the descriptor
+ * cannot be read or written, and exists to be passed to the *at() calls and to
+ * fstat. That is how a program refers to a file it has just created without
+ * racing whoever might replace the name in between, and it works on anything a
+ * name can point at - a socket, a fifo, a device with no driver.
+ *
+ * Darwin will not open a socket at all. Every flag was tried against a bound
+ * one and each answers EOPNOTSUPP: O_RDONLY, O_SYMLINK, O_EVTONLY, with and
+ * without O_NONBLOCK. There is no host descriptor to be had, so there is no
+ * translation to make - only a descriptor to invent.
+ *
+ * Which is what this is: a carrier descriptor on /dev/null so the guest has a
+ * number that closes and dups like any other, and the name kept beside it. The
+ * operations O_PATH permits are answered from the name; the ones it forbids
+ * are refused with EBADF, which is what Linux answers for a read of one.
+ *
+ * Android's init is what needed it. Having bound /dev/socket/property_service
+ * it reopens it O_PATH|O_NOFOLLOW to set the mode without a window in which
+ * the name could point somewhere else - and treated the failure as fatal, so
+ * "start_property_service socket creation failed" was the end of second-stage
+ * init even with the socket itself successfully bound.
+ */
+static int
+pathfd_ebadf(void)
+{
+  return -LINUX_EBADF;
+}
+
+static int
+pathfd_readv(struct file *f, struct iovec *iov, size_t iovcnt)
+{
+  (void) f; (void) iov; (void) iovcnt;
+  return pathfd_ebadf();
+}
+
+static int
+pathfd_writev(struct file *f, const struct iovec *iov, size_t iovcnt)
+{
+  (void) f; (void) iov; (void) iovcnt;
+  return pathfd_ebadf();
+}
+
+static int
+pathfd_lseek(struct file *f, l_off_t offset, int whence)
+{
+  (void) f; (void) offset; (void) whence;
+  return pathfd_ebadf();
+}
+
+static int
+pathfd_getdents(struct file *f, char *buf, uint count, bool is64)
+{
+  (void) f; (void) buf; (void) count; (void) is64;
+  return -LINUX_ENOTDIR;
+}
+
+static int
+pathfd_ioctl(struct file *f, int cmd, uint64_t val0)
+{
+  (void) f; (void) cmd; (void) val0;
+  return pathfd_ebadf();
+}
+
+static int
+pathfd_fsync(struct file *f)
+{
+  (void) f;
+  return pathfd_ebadf();
+}
+
+static int
+pathfd_close(struct file *f)
+{
+  free(f->path);
+  f->path = NULL;
+  return syswrap(close(f->fd));
+}
+
+/* By name, and never following: the descriptor was opened O_NOFOLLOW on a name
+ * that is a socket, and a symlink appearing there afterwards is exactly what
+ * holding the descriptor is meant to rule out. */
+static int
+pathfd_fstat(struct file *f, struct l_newstat *l_st)
+{
+  struct stat st;
+  int ret = syswrap(lstat(f->path, &st));
+  if (ret < 0)
+    return ret;
+  stat_darwin_to_linux(&st, l_st);
+  guest_owner_overlay(AT_FDCWD, f->path, true, l_st);
+  guest_mode_overlay(AT_FDCWD, f->path, true, l_st);
+  return ret;
+}
+
+static int
+pathfd_fchmod(struct file *f, l_mode_t mode)
+{
+  return guest_mode_record(AT_FDCWD, f->path, true, mode);
+}
+
+static int
+pathfd_fchown(struct file *f, l_uid_t uid, l_gid_t gid)
+{
+  return guest_owner_record(AT_FDCWD, f->path, true, uid, gid);
+}
+
+static int
+pathfd_fstatfs(struct file *f, struct l_statfs *buf)
+{
+  struct statfs st;
+  int r = syswrap(statfs(f->path, &st));
+  if (r < 0)
+    return r;
+  statfs_darwin_to_linux(&st, buf);
+  return r;
+}
+
+/*
+ * Make the descriptor the guest was given a path descriptor. Called with the
+ * fdtable lock held and after register_fd, which allocates the slot and would
+ * otherwise put the ordinary operations back.
+ */
+static int
+pathfd_adopt(int fd, const char *abs)
+{
+  static struct file_operations ops = {
+    pathfd_readv,
+    pathfd_writev,
+    pathfd_close,
+    pathfd_ioctl,
+    pathfd_lseek,
+    pathfd_getdents,
+    darwinfs_fcntl,             /* F_GETFD/F_SETFD are the descriptor's own */
+    pathfd_fsync,
+    pathfd_fstat,
+    pathfd_fstatfs,
+    pathfd_fchown,
+    pathfd_fchmod,
+  };
+  struct fdtable *t = &proc.fileinfo.fdtable;
+  int offset = fd - t->start;
+  struct file *file = &t->files[offset / fdtable_alloc_unit][offset % fdtable_alloc_unit];
+  file->path = strdup(abs);
+  if (file->path == NULL)
+    return -LINUX_ENOMEM;
+  file->ops = &ops;
+  return 0;
+}
+
 static void
 alloc_file(struct fdtable *table, int fd)
 {
@@ -2951,6 +3108,7 @@ alloc_file(struct fdtable *table, int fd)
   file->fd = fd;
   /* A recycled slot must not inherit the previous descriptor's stream. */
   file->dirp = NULL;
+  file->path = NULL;
 }
 
 /*
@@ -4745,6 +4903,20 @@ user_openat(int atdirfd, const char *name, int flags, int mode)
         procfs_open(target, &fd);
     }
   }
+  /*
+   * A name the host cannot open at all, asked for as a name. Only for O_PATH,
+   * and only for the host's own refusal to open the object - anything else
+   * that failed failed for a reason the guest should hear.
+   */
+  bool as_path = false;
+  char pathabs[PATH_MAX];
+  if (fd == -LINUX_EOPNOTSUPP && (flags & LINUX_O_PATH) &&
+      (lookup[0] == '/'
+         ? guest_to_host_path(lookup, pathabs, sizeof pathabs) == 0
+         : abs_path_at(atdirfd, name, pathabs, sizeof pathabs))) {
+    fd = syswrap(open("/dev/null", O_RDONLY | O_CLOEXEC));
+    as_path = fd >= 0;
+  }
   if (fd < 0) {
     goto out;
   }
@@ -4762,6 +4934,9 @@ user_openat(int atdirfd, const char *name, int flags, int mode)
   if (err < 0) {
     fd = err;
     close(fd);
+  } else if (as_path && (err = pathfd_adopt(fd, pathabs)) < 0) {
+    close(fd);
+    fd = err;
   }
 
 out:

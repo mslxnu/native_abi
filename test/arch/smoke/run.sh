@@ -1046,6 +1046,20 @@ else
     fail=1
 fi
 
+# opathsocktest: O_PATH on a socket, which Darwin will not open by any flag -
+# so nabi invents the descriptor and answers from the name. Android's init
+# reopens its bound property_service socket this way to set the mode. Checks
+# the open, fchmod and fstat through it, that it names the socket itself, that
+# a read is EBADF, and that O_PATH on an ordinary file is unaffected.
+cp "$here/opathsocktest" "$root/"; chmod +x "$root/opathsocktest"
+out=$("$NABI" -m "$root" /opathsocktest 2>&1 | tail -1); rc=$?
+if [ "$out" = "opathsock ok" ]; then
+    echo "  ok  opathsocktest -> \"$out\""
+else
+    echo "  FAIL opathsocktest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 # procchmodtest: chmod on a passed-through /proc, which the host module serving
 # it refuses - and Android's first-stage init treats a failed chmod of
 # /proc/cmdline as fatal. Checks that it succeeds by path and by dirfd, that a
