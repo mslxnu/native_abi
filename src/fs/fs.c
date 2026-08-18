@@ -2582,6 +2582,39 @@ struct guest_dev {
   uint32_t dev;                  /* the Linux device number */
 };
 
+/*
+ * The host device a guest's device number names, or NULL.
+ *
+ * Linux fixes these numbers, so a node the guest made with mknod can be
+ * recognised by them alone rather than by the name it was given - which matters
+ * because the name is the guest's to choose and /dev/__null__ is as valid as
+ * /dev/null.
+ *
+ * kmsg is the one that is not a straight mapping: it is the kernel's log, there
+ * is no kernel here to have one, and what a writer wants is for the write to be
+ * accepted and go nowhere. That is /dev/null exactly. Reading it back would be
+ * a lie, but nothing reads kmsg expecting its own writes.
+ */
+static const char *
+host_device_for(uint32_t mode, uint32_t dev)
+{
+  if ((mode & S_IFMT) != S_IFCHR)
+    return NULL;
+  unsigned maj = dev >> 8, min = dev & 0xff;
+  if (maj == 1) {
+    switch (min) {
+    case 3:  return "/dev/null";
+    case 5:  return "/dev/zero";
+    case 8:  return "/dev/random";
+    case 9:  return "/dev/urandom";
+    case 11: return "/dev/null";        /* kmsg; see above */
+    }
+  }
+  if (maj == 5 && min == 0)
+    return "/dev/tty";
+  return NULL;
+}
+
 static bool
 guest_dev_read(const char *abs, struct guest_dev *out)
 {
@@ -3611,7 +3644,8 @@ darwinfs_openat(struct fs *fs, struct dir *dir, const char *path, int l_flags, i
     if (abs_path_at(dir->fd, path, abs, sizeof abs) &&
         guest_dev_read(abs, &d)) {
       close(fd);
-      fd = -LINUX_ENXIO;
+      const char *host = host_device_for(d.mode, d.dev);
+      fd = host ? syswrap(open(host, flags, mode)) : -LINUX_ENXIO;
     }
   }
 

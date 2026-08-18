@@ -1,7 +1,10 @@
 /* freestanding: the LXC-facing gaps in one pass.
  *
  *   - mknodat for a character node makes a placeholder whose stat reports
- *     S_IFCHR with the right rdev, and whose open answers ENXIO - the answer
+ *     S_IFCHR with the right rdev, and whose open reaches the host's device
+ *     when the numbers name one - a node made with 1:3 is /dev/null on Linux
+ *     and has to behave like it, which is what Android's init makes and then
+ *     uses. A node naming a device nothing has is still ENXIO, the answer
  *     Linux gives for a node with no driver present.
  *   - a devtmpfs mount is backed by the host's /dev, so a container mounting
  *     its own /dev reaches the real devices (checked with /dev/null).
@@ -129,7 +132,25 @@ int main(void) {
   if ((st.st_mode & S_IFMT) != S_IFCHR) fail("node reports S_IFCHR", st.st_mode);
   if (st.st_rdev != makedev(1, 3)) fail("node reports rdev", st.st_rdev);
   if (major(st.st_rdev) != 1 || minor(st.st_rdev) != 3) fail("node rdev split", st.st_rdev);
+  /* 1:3 is /dev/null, and a node carrying those numbers is that device: a
+   * write is swallowed whole and a read is immediately end-of-file. */
   r = sys6(SYS_openat, AT_FDCWD, (long) "/dn/c", O_RDWR, 0, 0, 0);
+  if (r < 0) fail("open 1:3 node", r);
+  {
+    long nfd = r;
+    char b1[4];
+    r = sys6(SYS_write, nfd, (long) "abcd", 4, 0, 0, 0);
+    if (r != 4) fail("write to 1:3 node", r);
+    r = sys6(SYS_read, nfd, (long) b1, sizeof b1, 0, 0, 0);
+    if (r != 0) fail("read of 1:3 node is EOF", r);
+    sys6(SYS_close, nfd, 0, 0, 0, 0, 0);
+  }
+
+  /* And a node whose numbers name nothing is still ENXIO. */
+  r = sys6(SYS_mknodat, AT_FDCWD, (long) "/dn/nodev", S_IFCHR | 0600,
+           makedev(200, 1), 0, 0);
+  if (r < 0) fail("mknod nodev", r);
+  r = sys6(SYS_openat, AT_FDCWD, (long) "/dn/nodev", O_RDWR, 0, 0, 0);
   if (r != -ENXIO) fail("open node ENXIO", r);
   if (r >= 0) sys6(SYS_close, r, 0, 0, 0, 0, 0);
 
