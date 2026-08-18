@@ -305,13 +305,49 @@ int main(void) {
         if (f >= 0) sys6(SYS_close, f, 0, 0, 0, 0, 0);
       }
 
-      /* BENEATH without NO_SYMLINKS cannot be kept, and says so. */
+      /*
+       * BENEATH on its own, which is how LXC asks. It does not need
+       * NO_SYMLINKS: symlinks are followed and the result has to be inside,
+       * which is what Linux does and what refusing this used to prevent - the
+       * container stopped at its first mount because of it.
+       */
       how.resolve = RESOLVE_BENEATH;
       f = sys6(SYS_openat2, dir, (long) "cgroup.procs", (long) &how, sizeof how, 0, 0);
-      if (f != -EINVAL) {
-        fail("openat2 with BENEATH but no NO_SYMLINKS", f);
+      if (f < 0)
+        fail("openat2 with BENEATH alone, as LXC asks", f);
+      else
+        sys6(SYS_close, f, 0, 0, 0, 0, 0);
+
+      /* Escaping is still refused with it alone. */
+      f = sys6(SYS_openat2, dir, (long) "../cg", (long) &how, sizeof how, 0, 0);
+      if (f != -EXDEV) {
+        fail("openat2 escaping with BENEATH alone", f);
         if (f >= 0) sys6(SYS_close, f, 0, 0, 0, 0, 0);
       }
+
+      /*
+       * And a symlink that leads out, which is the case the string cannot
+       * answer: ".." and a leading slash are visible in the path, a symlink is
+       * not. It is caught by asking where the descriptor landed, so this is
+       * what checks that the asking happens at all.
+       */
+      sys6(SYS_mkdirat, AT_FDCWD, (long) "/bdir", 0755, 0, 0, 0);
+      sys6(SYS_unlinkat, AT_FDCWD, (long) "/bdir/out", 0, 0, 0, 0);
+      if (sys6(SYS_symlinkat, (long) "/", AT_FDCWD, (long) "/bdir/out", 0, 0, 0) == 0) {
+        long bd = sys6(SYS_openat, AT_FDCWD, (long) "/bdir", O_RDONLY | O_DIRECTORY, 0, 0, 0);
+        if (bd >= 0) {
+          how.flags = O_RDONLY | O_DIRECTORY;
+          how.resolve = RESOLVE_BENEATH;
+          f = sys6(SYS_openat2, bd, (long) "out", (long) &how, sizeof how, 0, 0);
+          if (f != -EXDEV) {
+            fail("openat2 following a symlink out with BENEATH", f);
+            if (f >= 0) sys6(SYS_close, f, 0, 0, 0, 0, 0);
+          }
+          sys6(SYS_close, bd, 0, 0, 0, 0, 0);
+        }
+        sys6(SYS_unlinkat, AT_FDCWD, (long) "/bdir/out", 0, 0, 0, 0);
+      }
+      sys6(SYS_unlinkat, AT_FDCWD, (long) "/bdir", 0x200 /*AT_REMOVEDIR*/, 0, 0, 0);
       sys6(SYS_close, dir, 0, 0, 0, 0, 0);
     }
 

@@ -45,6 +45,7 @@ static long sys6(long n, long a, long b, long c, long d, long e, long f){
 #define PROT_WRITE 2
 #define MAP_SHARED 1
 #define MAP_POPULATE 0x8000
+#define EXDEV        18
 #define EINVAL    22
 #define EOPNOTSUPP 95
 #define ENXIO      6
@@ -909,8 +910,14 @@ void _start(void)
     if ((r = sys6(SYS_io_uring_enter, fd, 1, 1, IORING_ENTER_GETEVENTS, 0, 0)) != 1)
       fail("io_uring_enter for an openat2 with RESOLVE_BENEATH", r, 1);
     struct cqe c3 = pop("a completion for that openat2");
-    if (c3.res != -EINVAL)
-      fail("an unenforceable resolve flag must be refused", c3.res, -EINVAL); }
+    /*
+     * EXDEV, not EINVAL: RESOLVE_BENEATH is enforced now rather than refused,
+     * and an absolute path escapes the directory it was told to stay under -
+     * which is what Linux answers EXDEV for. It was EINVAL when nothing could
+     * keep the guarantee and every resolve flag was turned away.
+     */
+    if (c3.res != -EXDEV)
+      fail("an absolute path under RESOLVE_BENEATH", c3.res, -EXDEV); }
 
   /*
    * ---- registered files ----

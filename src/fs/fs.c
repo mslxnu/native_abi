@@ -4755,10 +4755,25 @@ resolve_check(int dirfd, const char *path, uint64_t resolve)
    * EXDEV is the error Linux gives for escaping.
    */
   if (resolve & LINUX_RESOLVE_BENEATH) {
-    if (!(resolve & LINUX_RESOLVE_NO_SYMLINKS))
-      return -LINUX_EINVAL;     /* cannot be kept without it; say so */
+    /*
+     * An absolute path starts somewhere else by definition, and that much is
+     * decidable from the string. Everything subtler - "..", and a symlink that
+     * leads out - is checked after the open instead, by asking where the
+     * descriptor actually landed; see beneath_check.
+     *
+     * This used to require NO_SYMLINKS alongside and refuse the request
+     * otherwise, on the grounds that BENEATH could not be kept without it.
+     * Linux keeps it perfectly well with symlinks allowed - it follows them and
+     * then requires the result to be inside - and LXC asks for exactly that
+     * combination, so refusing it stopped the container at its first mount.
+     */
     if (path[0] == '/')
       return -LINUX_EXDEV;
+    /*
+     * And ".." outright, which is what Linux does: the walk leaves the subtree
+     * at that component even if a later one comes back into it, and BENEATH is
+     * about the walk rather than about where it ends up.
+     */
     for (size_t i = 0; i < n; i++)
       if (path[i] == '.' && path[i + 1] == '.' &&
           (i == 0 || path[i - 1] == '/') &&
@@ -4896,7 +4911,31 @@ DEFINE_SYSCALL(openat2, int, dirfd, gstr_t, path_ptr, gaddr_t, how_ptr,
   if (rc < 0)
     return rc;
 
-  return user_openat(dirfd, path, (int) how.flags, (int) how.mode);
+  int fd = user_openat(dirfd, path, (int) how.flags, (int) how.mode);
+  if (fd >= 0 && (how.resolve & LINUX_RESOLVE_BENEATH) &&
+      dirfd != LINUX_AT_FDCWD) {
+    /*
+     * Where it landed, rather than where it was asked to go. F_GETPATH answers
+     * for the descriptor that came back, so a "..", a symlink out, or anything
+     * else that left the subtree shows up as a path that is not underneath the
+     * one it started from - which is the guarantee BENEATH is, stated exactly.
+     */
+    char base[PATH_MAX], got[PATH_MAX];
+    if (fcntl(dirfd, F_GETPATH, base) == 0 &&
+        fcntl(fd, F_GETPATH, got) == 0) {
+      size_t bl = strlen(base);
+      /* "/" is its own prefix without a separator; everything else needs one. */
+      if (bl > 0 && base[bl - 1] == '/')
+        bl--;
+      bool inside = strncmp(got, base, bl) == 0 &&
+                    (got[bl] == '\0' || got[bl] == '/');
+      if (!inside) {
+        close(fd);
+        return -LINUX_EXDEV;
+      }
+    }
+  }
+  return fd;
 }
 
 DEFINE_SYSCALL(openat, int, dirfd, gstr_t, path_ptr, int, flags, int, mode)
