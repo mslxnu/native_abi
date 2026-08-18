@@ -1,5 +1,7 @@
 #include "noah.h"
+#include <sys/stat.h>
 #include "namespace.h"
+#include "util/khash.h"
 #include "common.h"
 
 #include <sys/socket.h>
@@ -113,6 +115,147 @@ err:
   return ret;
 }
 
+/*
+ * The abstract unix socket namespace, which Darwin does not have.
+ *
+ * A Linux abstract socket has a name beginning with a NUL and no filesystem
+ * entry at all: it is not created, not looked up by path, and it vanishes when
+ * the last descriptor on it closes. Darwin has only pathname sockets, so the
+ * name is mapped onto one - in a directory of nabi's own, under the boot tag,
+ * so two boots cannot collide and nothing outside is touched.
+ *
+ * The name is hashed rather than escaped. Darwin's sun_path is 104 bytes and an
+ * abstract name may be a hundred bytes of arbitrary binary, so escaping it into
+ * a filename overflows the field the moment the name is anything but short -
+ * and it is exactly the long ones that matter: LXC's per-container command
+ * socket is its full lxcpath with the container name on the end.
+ *
+ * They were previously not translated at all. The bind kept the leading NUL and
+ * asked Darwin to create a file whose name was empty, which fails, so `lxc-info`
+ * could not reach a running container and `lxc-start` reported one that was not
+ * there as already running.
+ */
+#define ABSTRACT_DIR_FMT "/tmp/.nabi-abs-%s"
+
+static uint64_t
+abstract_hash(const char *p, size_t n)
+{
+  uint64_t h = 1469598103934665603ULL;          /* FNV-1a */
+  for (size_t i = 0; i < n; i++) {
+    h ^= (unsigned char) p[i];
+    h *= 1099511628211ULL;
+  }
+  return h;
+}
+
+/*
+ * The host path standing in for an abstract name. The directory is created on
+ * demand; a failure to create it is left to the bind that follows, which will
+ * report it in terms of the socket rather than of a directory the guest has
+ * never heard of.
+ */
+static void
+abstract_to_host(const char *name, size_t namelen, char *out, size_t outsz)
+{
+  char dir[64];
+  snprintf(dir, sizeof dir, ABSTRACT_DIR_FMT, nabi_boot_tag());
+  mkdir(dir, 0700);
+  snprintf(out, outsz, "%s/%016llx", dir,
+           (unsigned long long) abstract_hash(name, namelen));
+}
+
+/*
+ * Which bound abstract sockets this process owns, so they can be removed again.
+ *
+ * An abstract socket has no filesystem presence and so needs no unlinking on
+ * Linux; here it is a file, and a file left behind is a name that stays taken.
+ * The descriptor is the handle, exactly as it is for the ones nabi emulates
+ * next door.
+ */
+struct abstract_bound {
+  char *path;
+  int   lock_fd;                /* held for as long as the name is ours */
+};
+
+KHASH_MAP_INIT_INT(absfd, struct abstract_bound)
+static khash_t(absfd) *abstract_fds;
+
+static void
+abstract_forget(khiter_t k)
+{
+  struct abstract_bound *b = &kh_value(abstract_fds, k);
+  unlink(b->path);
+  if (b->lock_fd >= 0) {
+    char lock[PATH_MAX];
+    snprintf(lock, sizeof lock, "%s.lock", b->path);
+    unlink(lock);
+    close(b->lock_fd);          /* releases the flock with it */
+  }
+  free(b->path);
+  kh_del(absfd, abstract_fds, k);
+}
+
+static void
+abstract_note(int fd, const char *path, int lock_fd)
+{
+  if (abstract_fds == NULL)
+    abstract_fds = kh_init(absfd);
+  int ret;
+  khiter_t k = kh_put(absfd, abstract_fds, fd, &ret);
+  if (ret == 0) {               /* rebinding a descriptor: drop the old name */
+    free(kh_value(abstract_fds, k).path);
+    if (kh_value(abstract_fds, k).lock_fd >= 0)
+      close(kh_value(abstract_fds, k).lock_fd);
+  }
+  kh_value(abstract_fds, k).path = strdup(path);
+  kh_value(abstract_fds, k).lock_fd = lock_fd;
+}
+
+void
+abstract_close(int fd)
+{
+  if (abstract_fds == NULL)
+    return;
+  khiter_t k = kh_get(absfd, abstract_fds, fd);
+  if (k == kh_end(abstract_fds))
+    return;
+  abstract_forget(k);
+}
+
+/*
+ * Claim an abstract name, or say who has it.
+ *
+ * Ownership is a lock file beside the socket rather than a probe of the socket
+ * itself. The obvious test - connect to it and see whether anyone answers -
+ * works, and costs too much: against a name that *is* live it leaves a real
+ * connection sitting in the owner's accept queue, so a server hands out a
+ * session to a caller that was only asking whether the name was free. It cost
+ * this test its own first connection before it cost anything else.
+ *
+ * A flock is the right shape instead. The host releases it when the holder
+ * dies, however it dies, so a name left behind by a killed process is free
+ * again and one still held is not - which is what an abstract name does on
+ * Linux, where the kernel owns the lifetime.
+ *
+ * Returns the lock descriptor, or -1 if somebody else holds the name.
+ */
+static int
+abstract_claim(const char *path)
+{
+  char lock[PATH_MAX];
+  snprintf(lock, sizeof lock, "%s.lock", path);
+  int fd = open(lock, O_RDWR | O_CREAT, 0600);
+  if (fd < 0)
+    return -1;
+  if (flock(fd, LOCK_EX | LOCK_NB) < 0) {
+    close(fd);
+    return -1;                  /* somebody has it */
+  }
+  /* Ours: anything left at the socket path is from an owner that is gone. */
+  unlink(path);
+  return fd;
+}
+
 int
 linux_to_darwin_sockaddr(struct sockaddr **sockaddr, const struct l_sockaddr *l_sockaddr, size_t l_sockaddr_len)
 {
@@ -146,9 +289,18 @@ linux_to_darwin_sockaddr(struct sockaddr **sockaddr, const struct l_sockaddr *l_
     struct sockaddr_un *sockaddr_un = (struct sockaddr_un*)*sockaddr;
 
     if (sockaddr_un->sun_path[0] == '\0') {
-      // Linux abstract namespace starts with NULL, which we do not support yet
-      printk("Abstract namespace: %20s\n", &sockaddr_un->sun_path[1]);
-      slen = strnlen(&sockaddr_un->sun_path[1], l_sockaddr_len - offsetof(struct sockaddr_un, sun_path) - 1);
+      /* An abstract name, which is the bytes the guest gave and not a string:
+       * it may contain NULs and is not terminated, so its length comes from
+       * the address length and nowhere else. */
+      size_t off = offsetof(struct sockaddr_un, sun_path);
+      size_t namelen = l_sockaddr_len > off + 1 ? l_sockaddr_len - off - 1 : 0;
+      char host_path[sizeof sockaddr_un->sun_path];
+      abstract_to_host(&sockaddr_un->sun_path[1], namelen,
+                       host_path, sizeof host_path);
+      if (strlcpy(sockaddr_un->sun_path, host_path,
+                  sizeof sockaddr_un->sun_path) >= sizeof sockaddr_un->sun_path)
+        goto err;
+      slen = strnlen(sockaddr_un->sun_path, sizeof sockaddr_un->sun_path);
     } else {
       /* A filesystem socket names a path, and a guest path means nothing to the
        * host: /etc/pacman.d/gnupg/S.gpg-agent is inside the rootfs, not at the
@@ -236,7 +388,28 @@ DEFINE_SYSCALL(connect, int, sockfd, gaddr_t, addr_ptr, uint64_t, addrlen)
   }
 
   r = syswrap(connect(sockfd, sockaddr, sockaddr->sa_len));
-  
+
+  /*
+   * An abstract name nobody is listening on is ECONNREFUSED, not ENOENT.
+   *
+   * The two errors mean different things to a caller and Linux is precise about
+   * which it gives: a *pathname* socket that is not there is ENOENT, because
+   * the path is not there; an abstract name that is not bound is ECONNREFUSED,
+   * because the namespace is always present and simply has nothing in it. Here
+   * an abstract name is a file, so its absence surfaced as ENOENT and said the
+   * wrong thing.
+   *
+   * lxc-info asks a container's command socket whether it is running. It reads
+   * ECONNREFUSED as "stopped" and anything else as a failure to ask, so a
+   * container that was not running came back as INVALID STATE - and lxc-start,
+   * seeing no clean answer, refused to start one on the grounds that it was
+   * already running.
+   */
+  if (r == -LINUX_ENOENT && sockaddr->sa_family == AF_UNIX &&
+      addrlen > offsetof(struct l_sockaddr, sa_data) &&
+      addr[offsetof(struct l_sockaddr, sa_data)] == '\0')
+    r = -LINUX_ECONNREFUSED;
+
   free(sockaddr);
 err:
   free(addr);
@@ -1248,7 +1421,39 @@ DEFINE_SYSCALL(bind, int, sockfd, gaddr_t, addr_ptr, int, addrlen)
   if (linux_to_darwin_sockaddr(&sockaddr, (struct l_sockaddr *) addr, addrlen) < 0) {
     return -LINUX_EINVAL;
   }
-  int ret = syswrap(bind(sockfd, sockaddr, sockaddr->sa_len));
+  /* Whether the guest asked for an abstract name, which is decided by the
+   * address it gave and not by the path that came out of the translation. */
+  bool abstract = sockaddr->sa_family == AF_UNIX &&
+                  addrlen > (int) offsetof(struct l_sockaddr, sa_data) &&
+                  addr[offsetof(struct l_sockaddr, sa_data)] == '\0';
+
+  int lock_fd = -1;
+  int ret;
+  if (abstract) {
+    /* The name is claimed before the socket is bound, so a stale file from a
+     * dead owner is cleared and a live one is refused without touching it. */
+    const struct sockaddr_un *sun = (const struct sockaddr_un *) sockaddr;
+    lock_fd = abstract_claim(sun->sun_path);
+    if (lock_fd < 0) {
+      free(sockaddr);
+      free(addr);
+      return -LINUX_EADDRINUSE;
+    }
+  }
+
+  ret = syswrap(bind(sockfd, sockaddr, sockaddr->sa_len));
+
+  /* Remembered so closing the descriptor takes the name with it, which is what
+   * having no filesystem entry means on Linux. */
+  if (ret == 0 && abstract) {
+    abstract_note(sockfd, ((struct sockaddr_un *) sockaddr)->sun_path, lock_fd);
+  } else if (lock_fd >= 0) {
+    char lock[PATH_MAX];
+    snprintf(lock, sizeof lock, "%s.lock",
+             ((struct sockaddr_un *) sockaddr)->sun_path);
+    unlink(lock);
+    close(lock_fd);
+  }
 
   /*
    * A bound AF_UNIX socket is a file the guest just created, and every other

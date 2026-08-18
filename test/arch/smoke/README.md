@@ -419,6 +419,8 @@ guest-code cache sync.
   through the clone. `statmount` is read at the offsets it reports rather
   than at assumed ones.
 
+- `abstracttest` — the abstract unix socket namespace: bind, connect, uniqueness,
+  release on close, and an unbound name refusing with ECONNREFUSED
 - `lxctest` — the LXC `/dev` setup in one pass, the pieces lxc-start needs
   from a mount that Linux provides and a Mac does not. `mknod` for a character
   node makes a placeholder the host can carry, whose `stat` reports `S_IFCHR`

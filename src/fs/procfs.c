@@ -165,7 +165,7 @@ build_maps(size_t *len_out)
  * is another guest, its state lives in a different nabi.
  */
 enum procfs_file { PROCFS_NONE, PROCFS_MAPS, PROCFS_CMDLINE, PROCFS_COMM,
-                   PROCFS_EXE, PROCFS_FD, PROCFS_MOUNTS, PROCFS_FDDIR,
+                   PROCFS_EXE, PROCFS_FD, PROCFS_MOUNTS, PROCFS_FDDIR, PROCFS_TASKDIR,
                    PROCFS_RANDOM_UUID, PROCFS_RANDOM_BOOT_ID, PROCFS_NS, PROCFS_NSDIR,
                    PROCFS_SYSVIPC_SHM, PROCFS_SYSVIPC_SEM, PROCFS_SYSVIPC_MSG,
                    PROCFS_NS_FORCHILDREN, PROCFS_TIMENS_OFFSETS,
@@ -289,7 +289,15 @@ own_procfs_file_n(const char *path, int *fd_out)
     if (fd_out) *fd_out = (int) getpid();
     return PROCFS_STAT;
   }
-  if (pidns_active() && strcmp(slash, "/status") == 0) {
+  /*
+   * status is ours whether or not a pid namespace is active, which stat is not.
+   * The pid lines are the reason for the namespace test and they rewrite to
+   * themselves outside one - pidns_to_ns is the identity there - but Threads:
+   * is wrong in either case, because the host counts nabi's threads and not the
+   * guest's. Leaving it to the host meant /proc/self/task and
+   * /proc/self/status disagreed about the same process.
+   */
+  if (strcmp(slash, "/status") == 0) {
     if (fd_out) *fd_out = (int) getpid();
     return PROCFS_STATUS;
   }
@@ -325,6 +333,22 @@ own_procfs_file_n(const char *path, int *fd_out)
   if (strcmp(slash, "/fd") == 0 || strcmp(slash, "/fd/") == 0 ||
       strcmp(slash, "/fd/.") == 0)
     return PROCFS_FDDIR;
+
+  /*
+   * /proc/<pid>/task, which is how a program counts its own threads.
+   *
+   * The host's answer describes nabi: its threads are the ones running the
+   * guest's vcpu and its own machinery, and the guest has never heard of them.
+   * A single-threaded guest was told it had two.
+   *
+   * That is not cosmetic. LXC refuses to start a container in the foreground
+   * from a threaded process - it counts the entries here - so `lxc-start -F`,
+   * which is what waydroid runs, reported "Cannot start non-daemonized
+   * container when threaded" and stopped.
+   */
+  if (strcmp(slash, "/task") == 0 || strcmp(slash, "/task/") == 0 ||
+      strcmp(slash, "/task/.") == 0)
+    return PROCFS_TASKDIR;
 
   /* The directory itself, which `ls /proc/self/ns` reads and which anything
    * enumerating a process's namespaces starts from. */
@@ -601,6 +625,23 @@ build_status(int host_pid, size_t *len_out)
     else if (strncmp(line, "Tgid:", 5) == 0)
       written = snprintf(out + len, cap - len, "Tgid:\t%d\n",
                          (int) pidns_to_ns(host_pid));
+    else if (strncmp(line, "Threads:", 8) == 0) {
+      /*
+       * The host's count is nabi's threads, not the guest's - the same
+       * mismatch /proc/<pid>/task carries, and read by the same programs.
+       *
+       * Counted from the task list rather than taken from proc.nr_tasks,
+       * because the two disagree: nr_tasks is not reset along the resume path,
+       * so a freshly exec'd child reported three threads while its list held
+       * one. The list is what /proc/<pid>/task is built from, and the two files
+       * describing the same thing differently is worse than either being wrong.
+       */
+      int n = 0;
+      struct list_head *tp;
+      list_for_each (tp, &proc.tasks)
+        n++;
+      written = snprintf(out + len, cap - len, "Threads:\t%d\n", n > 0 ? n : 1);
+    }
     else if (strncmp(line, "PPid:", 5) == 0)
       /* Translate the parent the host reported, rather than assuming it is
        * ours - this file is served for any member of the namespace. A parent
@@ -1182,6 +1223,38 @@ procfs_open(const char *path, int *out_fd)
   int fdno = -1;
 
   switch (own_procfs_file_n(path, &fdno)) {
+  case PROCFS_TASKDIR: {
+    /*
+     * One entry per guest task, named by its thread id, as directories -
+     * which is what they are on Linux, and what anything walking into
+     * /proc/self/task/<tid> expects to find.
+     */
+    char dirtpl[PATH_MAX];
+    const char *tmpd = getenv("TMPDIR");
+    snprintf(dirtpl, sizeof dirtpl, "%s/nabi-taskdir-XXXXXX",
+             tmpd && *tmpd ? tmpd : "/tmp");
+    if (mkdtemp(dirtpl) == NULL)
+      return -1;
+
+    struct list_head *p;
+    list_for_each (p, &proc.tasks) {
+      struct task *t = list_entry(p, struct task, head);
+      char name[PATH_MAX];
+      snprintf(name, sizeof name, "%s/%d", dirtpl,
+               (int) pidns_to_ns((int32_t) t->tid));
+      (void) mkdir(name, 0555);
+    }
+
+    int dfd = open(dirtpl, O_RDONLY | O_DIRECTORY);
+    if (dfd < 0) {
+      procfs_rmtree(dirtpl);
+      return -1;
+    }
+    procfs_remember_tmpdir(dfd, dirtpl);
+    *out_fd = dfd;
+    return 0;
+  }
+
   case PROCFS_FDDIR: {
     /*
      * /proc/self/fd as a directory, which is how a program finds out what it

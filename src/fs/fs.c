@@ -832,6 +832,7 @@ darwinfs_close(struct file *file)
   binder_forget(file->fd);
   netlink_close(file->fd);
   loop_close(file->fd);
+  abstract_close(file->fd);
   procfs_close_fd(file->fd);
   if (file->dirp != NULL) {
     closedir(file->dirp);       /* takes the dup with it */
@@ -4716,6 +4717,61 @@ close_cloexec()
  * hand back a file the caller believes was proven safe, which is a worse answer
  * than EINVAL: the caller can handle EINVAL, and cannot handle being lied to.
  */
+/*
+ * Whether any component of a guest path is a symlink, or names one of the magic
+ * links nabi serves itself.
+ *
+ * This is what makes RESOLVE_NO_SYMLINKS and RESOLVE_NO_MAGICLINKS answerable
+ * rather than merely refusable. Each prefix is looked up without following its
+ * last component - which is exactly the question "is *this* a symlink" - so a
+ * path is refused at the same component Linux would refuse it at, and with the
+ * error Linux gives, which is ELOOP.
+ *
+ * Only what the flags name is checked. The magic links that matter here are the
+ * ones nabi answers, /proc/<pid>/exe and /proc/<pid>/fd/<n>, because those are
+ * the ones a guest can reach; the host's /proc is not the guest's.
+ */
+static int
+resolve_check(int dirfd, const char *path, uint64_t resolve)
+{
+  if ((resolve & (LINUX_RESOLVE_NO_SYMLINKS | LINUX_RESOLVE_NO_MAGICLINKS)) == 0)
+    return 0;
+
+  char prefix[LINUX_PATH_MAX];
+  size_t n = strlen(path);
+  if (n >= sizeof prefix)
+    return -LINUX_ENAMETOOLONG;
+
+  for (size_t i = 1; i <= n; i++) {
+    if (i != n && path[i] != '/')
+      continue;
+    memcpy(prefix, path, i);
+    prefix[i] = '\0';
+
+    if (resolve & LINUX_RESOLVE_NO_MAGICLINKS) {
+      if (procfs_fd_number(prefix) >= 0)
+        return -LINUX_ELOOP;
+      size_t plen = strlen(prefix);
+      if (plen > 4 && strncmp(prefix, "/proc/", 6) == 0 &&
+          strcmp(prefix + plen - 4, "/exe") == 0)
+        return -LINUX_ELOOP;
+    }
+
+    if (resolve & LINUX_RESOLVE_NO_SYMLINKS) {
+      struct path pp;
+      if (vfs_grab_dir(dirfd, prefix, LOOKUP_NOFOLLOW, &pp) < 0)
+        continue;               /* not there; the open itself will say so */
+      struct stat st;
+      bool link = fstatat(pp.dir->fd, pp.subpath, &st,
+                          AT_SYMLINK_NOFOLLOW) == 0 && S_ISLNK(st.st_mode);
+      vfs_ungrab_dir(&pp);
+      if (link)
+        return -LINUX_ELOOP;
+    }
+  }
+  return 0;
+}
+
 DEFINE_SYSCALL(openat2, int, dirfd, gstr_t, path_ptr, gaddr_t, how_ptr,
                size_t, size)
 {
@@ -4740,8 +4796,22 @@ DEFINE_SYSCALL(openat2, int, dirfd, gstr_t, path_ptr, gaddr_t, how_ptr,
       return -LINUX_E2BIG;
   }
 
-  if (how.resolve != 0)
-    return -LINUX_EINVAL;       /* see above: a guarantee that cannot be kept */
+  /*
+   * The resolve flags are restrictions, and the two that can be enforced are
+   * enforced rather than refused - see resolve_check. The rest still cannot be:
+   * BENEATH and IN_ROOT need resolution performed against a root nabi does not
+   * control, NO_XDEV needs the mount a walk crosses to be known during it, and
+   * CACHED is a promise about not going to disk. Refusing those is what a
+   * caller can recover from; openat2 exists so a program can ask and be told no.
+   *
+   * Refusing *all* of them was too broad. LXC opens /sys/fs/cgroup with
+   * NO_MAGICLINKS|NO_SYMLINKS and treats the refusal as fatal, so no container
+   * could start at all.
+   */
+  static const uint64_t resolve_known =
+      LINUX_RESOLVE_NO_SYMLINKS | LINUX_RESOLVE_NO_MAGICLINKS;
+  if (how.resolve & ~resolve_known)
+    return -LINUX_EINVAL;
 
   static const uint64_t known =
       LINUX_O_ACCMODE | LINUX_O_CREAT | LINUX_O_EXCL | LINUX_O_NOCTTY |
@@ -4763,6 +4833,11 @@ DEFINE_SYSCALL(openat2, int, dirfd, gstr_t, path_ptr, gaddr_t, how_ptr,
   char path[LINUX_PATH_MAX];
   if (strncpy_from_user(path, path_ptr, sizeof path) < 0)
     return -LINUX_EFAULT;
+
+  int rc = resolve_check(dirfd, path, how.resolve);
+  if (rc < 0)
+    return rc;
+
   return user_openat(dirfd, path, (int) how.flags, (int) how.mode);
 }
 

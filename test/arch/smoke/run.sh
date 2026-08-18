@@ -961,6 +961,21 @@ else
     fail=1
 fi
 
+# abstracttest: the abstract unix socket namespace, which Darwin does not have
+# and which was not translated at all - the leading NUL was kept and the host
+# was asked to create a file with an empty name. Checks bind, connect and data,
+# that the name is unique and released on close, that an unbound name refuses
+# with ECONNREFUSED rather than ENOENT (which is what lxc-info reads to decide
+# a container is stopped), and that it has no filesystem entry.
+cp "$here/abstracttest" "$root/"; chmod +x "$root/abstracttest"
+out=$("$NABI" -m "$root" /abstracttest); rc=$?
+if [ "$rc" -eq 0 ] && [ "$out" = "abstract ok" ]; then
+    echo "  ok  abstracttest -> \"$out\", exit 0"
+else
+    echo "  FAIL abstracttest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 # netlinktest: AF_NETLINK, which nabi had no address family for at all - so
 # `ip` and glibc's getifaddrs both stopped at socket(). Checks the socket, its
 # own sockaddr_nl name, the MSG_PEEK|MSG_TRUNC sizing every netlink reader

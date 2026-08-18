@@ -295,6 +295,9 @@ bool mount_is_context_fd(int fd);
 /* The doorbell that carries real-time signals between processes. See
  * src/ipc/signal.c. */
 void rtsig_init(void);
+
+/* Abstract unix sockets, which are files here. See src/net/net.c. */
+void abstract_close(int fd);
 int vkern_open_exec(const char *path);
 int procfs_open(const char *path, int *out_fd);
 void procfs_close_fd(int fd);

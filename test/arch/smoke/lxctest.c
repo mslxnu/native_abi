@@ -9,6 +9,13 @@
  *     control file opens.
  *   - writing to cgroup.subtree_control is refused with EINVAL rather than
  *     landing in the host's empty file and reporting success.
+ *   - /proc/self/task describes the *guest's* threads, and /proc/self/status
+ *     agrees with it. The host's answer is nabi's own threads, and LXC refuses
+ *     to start a foreground container from a threaded process - which is what
+ *     `lxc-start -F` is, and what waydroid runs.
+ *   - openat2 honours the resolve restrictions it can answer and refuses the
+ *     rest. LXC opens /sys/fs/cgroup with NO_MAGICLINKS|NO_SYMLINKS and treats
+ *     a refusal as fatal, so refusing all of them stopped every container.
  */
 static long sys6(long n, long a, long b, long c, long d, long e, long f){
   register long x8 asm("x8")=n; register long x0 asm("x0")=a; register long x1 asm("x1")=b;
@@ -25,6 +32,10 @@ static long sys6(long n, long a, long b, long c, long d, long e, long f){
 #define SYS_mount      40
 #define SYS_umount2    39
 #define SYS_fstatat    79
+#define SYS_getdents64 61
+#define SYS_read       63
+#define SYS_openat2   437
+#define SYS_symlinkat  36
 
 #define AT_FDCWD   -100
 #define O_RDONLY   0
@@ -41,6 +52,14 @@ static long sys6(long n, long a, long b, long c, long d, long e, long f){
 #define S_IFREG  0100000
 
 #define MS_BIND  4096
+#define ELOOP    40
+#define O_DIRECTORY 0x4000
+#define O_PATH   0x200000
+#define RESOLVE_NO_MAGICLINKS 0x02
+#define RESOLVE_NO_SYMLINKS   0x04
+#define RESOLVE_BENEATH       0x08
+
+struct open_how { unsigned long long flags, mode, resolve; };
 
 struct linux_stat {
   unsigned long st_dev, st_ino;
@@ -156,6 +175,106 @@ int main(void) {
   r = sys6(SYS_write, fd, (long) "+memory", 7, 0, 0, 0);
   if (r != -EINVAL) fail("write subtree_control EINVAL", r);
   sys6(SYS_close, fd, 0, 0, 0, 0, 0);
+
+  /*
+   * The guest's own threads, not nabi's.
+   *
+   * Counted by reading the directory, which is what LXC's am_single_threaded
+   * does; a count of anything but one here is what made it refuse to start a
+   * foreground container. /proc/self/status has to agree, or two files describe
+   * the same process differently - which they did, because one was nabi's and
+   * one was the guest's.
+   */
+  {
+    long d = sys6(SYS_openat, AT_FDCWD, (long) "/proc/self/task",
+                  O_RDONLY | O_DIRECTORY, 0, 0, 0);
+    if (d < 0) {
+      fail("open /proc/self/task", d);
+    } else {
+      static char dbuf[4096];
+      long n = sys6(SYS_getdents64, d, (long) dbuf, sizeof dbuf, 0, 0, 0);
+      sys6(SYS_close, d, 0, 0, 0, 0, 0);
+      int count = 0;
+      for (long off = 0; off < n; ) {
+        /* struct linux_dirent64: d_ino(8) d_off(8) d_reclen(2) d_type(1) name */
+        unsigned short reclen = *(unsigned short *) (dbuf + off + 16);
+        const char *nm = dbuf + off + 19;
+        if (!(nm[0] == '.' && (nm[1] == '\0' || (nm[1] == '.' && nm[2] == '\0'))))
+          count++;
+        if (reclen == 0) break;
+        off += reclen;
+      }
+      if (count != 1)
+        fail("threads the guest is told it has", count);
+    }
+
+    long sf = sys6(SYS_openat, AT_FDCWD, (long) "/proc/self/status", O_RDONLY, 0, 0, 0);
+    if (sf < 0) {
+      fail("open /proc/self/status", sf);
+    } else {
+      static char sbuf[8192];
+      long n = sys6(SYS_read, sf, (long) sbuf, sizeof sbuf - 1, 0, 0, 0);
+      sys6(SYS_close, sf, 0, 0, 0, 0, 0);
+      if (n > 0) {
+        sbuf[n] = '\0';
+        int threads = -1;
+        for (long i = 0; i + 8 < n; i++)
+          if (sbuf[i] == 'T' && sbuf[i+1] == 'h' && sbuf[i+2] == 'r' &&
+              sbuf[i+3] == 'e' && sbuf[i+4] == 'a' && sbuf[i+5] == 'd' &&
+              sbuf[i+6] == 's' && sbuf[i+7] == ':') {
+            long j = i + 8;
+            while (sbuf[j] == ' ' || sbuf[j] == '\t') j++;
+            threads = 0;
+            while (sbuf[j] >= '0' && sbuf[j] <= '9')
+              threads = threads * 10 + (sbuf[j++] - '0');
+            break;
+          }
+        if (threads != 1)
+          fail("Threads: in /proc/self/status", threads);
+      }
+    }
+  }
+
+  /*
+   * openat2's resolve restrictions.
+   *
+   * The two that are questions about a path are answered; a symlink in the way
+   * is ELOOP, exactly where Linux would say so. The ones that need a guarantee
+   * nabi cannot make are still refused, because a caller can recover from that
+   * and cannot recover from being told a restriction was applied when it was
+   * not.
+   */
+  {
+    struct open_how how;
+    how.flags = O_RDONLY | O_DIRECTORY | O_PATH;
+    how.mode = 0;
+    how.resolve = RESOLVE_NO_MAGICLINKS | RESOLVE_NO_SYMLINKS;
+    long f = sys6(SYS_openat2, AT_FDCWD, (long) "/cg", (long) &how, sizeof how, 0, 0);
+    if (f < 0)
+      fail("openat2 of a plain directory with NO_SYMLINKS", f);
+    else
+      sys6(SYS_close, f, 0, 0, 0, 0, 0);
+
+    /* A symlink in the path is refused, and refused as ELOOP. */
+    sys6(SYS_unlinkat, AT_FDCWD, (long) "/cglink", 0, 0, 0, 0);
+    r = sys6(SYS_symlinkat, (long) "/cg", AT_FDCWD, (long) "/cglink", 0, 0, 0);
+    if (r == 0) {
+      f = sys6(SYS_openat2, AT_FDCWD, (long) "/cglink", (long) &how, sizeof how, 0, 0);
+      if (f != -ELOOP) {
+        fail("openat2 of a symlink with NO_SYMLINKS", f);
+        if (f >= 0) sys6(SYS_close, f, 0, 0, 0, 0, 0);
+      }
+      sys6(SYS_unlinkat, AT_FDCWD, (long) "/cglink", 0, 0, 0, 0);
+    }
+
+    /* One that cannot be honoured is still refused. */
+    how.resolve = RESOLVE_BENEATH;
+    f = sys6(SYS_openat2, AT_FDCWD, (long) "/cg", (long) &how, sizeof how, 0, 0);
+    if (f != -EINVAL) {
+      fail("openat2 with a restriction nabi cannot keep", f);
+      if (f >= 0) sys6(SYS_close, f, 0, 0, 0, 0, 0);
+    }
+  }
 
   if (failed) { puts("lxctest FAIL\n"); _cleanup(); return 1; }
   puts("lxctest ok\n");
