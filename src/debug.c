@@ -33,6 +33,20 @@ init_sink(const char *fn, FILE **sinkp, const char *name)
   *sinkp = fdopen(vkern_dup_fd(fd, false), "w");
   close(fd);
 
+  /*
+   * Line buffered, because the interesting end of a log is the end.
+   *
+   * A FILE on a file is fully buffered by default, so the last few kilobytes
+   * are still in the buffer when a process dies abruptly - killed, or exiting
+   * through a path that does not flush. That is precisely the moment a trace is
+   * being read for, and it is silently missing: the log appears to stop at the
+   * last call that *returned*, which reads as a process still blocked in the
+   * next one. waydroid's container was diagnosed three different ways off that
+   * illusion.
+   */
+  if (*sinkp != NULL)
+    setvbuf(*sinkp, NULL, _IOLBF, 0);
+
   /* Everything that writes to a sink already treats NULL as "not enabled", so
    * losing the log is survivable; writing the banner to a NULL FILE is not. */
   if (*sinkp == NULL) {
