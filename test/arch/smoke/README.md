@@ -419,6 +419,7 @@ guest-code cache sync.
   through the clone. `statmount` is read at the offsets it reports rather
   than at assumed ones.
 
+- `pdeathtest` — PR_SET_PDEATHSIG, checked on an orphan that has to die of it
 - `clonenstest` — clone with a namespace flag, and the parent restored afterwards
 - `abstracttest` — the abstract unix socket namespace: bind, connect, uniqueness,
   release on close, and an unbound name refusing with ECONNREFUSED

@@ -961,6 +961,20 @@ else
     fail=1
 fi
 
+# pdeathtest: PR_SET_PDEATHSIG, and the signal actually arriving. Darwin has no
+# parent-death signal, so nabi watches for one with kqueue. Checked on a
+# grandchild that asks to be killed when its parent goes and is orphaned: a
+# prctl that stored the number and delivered nothing would round-trip perfectly
+# and leave the process running, which is what LXC uses it to prevent.
+cp "$here/pdeathtest" "$root/"; chmod +x "$root/pdeathtest"
+out=$("$NABI" -m "$root" /pdeathtest); rc=$?
+if [ "$rc" -eq 0 ] && [ "$out" = "pdeath ok" ]; then
+    echo "  ok  pdeathtest -> \"$out\", exit 0"
+else
+    echo "  FAIL pdeathtest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 # clonenstest: clone with a namespace flag, which had never worked - the
 # namespaces were created and then do_clone refused the flags that asked for
 # them. Checks the clone succeeds, the child is in its own uts namespace, and

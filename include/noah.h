@@ -298,6 +298,9 @@ void rtsig_init(void);
 
 /* Abstract unix sockets, which are files here. See src/net/net.c. */
 void abstract_close(int fd);
+
+/* PR_SET_PDEATHSIG, forgotten in a child as Linux forgets it. */
+void pdeathsig_clear(void);
 int vkern_open_exec(const char *path);
 int procfs_open(const char *path, int *out_fd);
 void procfs_close_fd(int fd);

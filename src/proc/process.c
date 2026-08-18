@@ -9,6 +9,7 @@
 #include <sys/wait.h>
 #include <sys/resource.h>
 #include <pthread.h>
+#include <sys/event.h>   /* kqueue, for PR_SET_PDEATHSIG */
 #include <assert.h>
 
 #include "common.h"
@@ -935,6 +936,95 @@ static int proc_dumpable = 1;
  */
 static int thp_disabled = 0;
 
+/*
+ * PR_SET_PDEATHSIG: the signal this process wants when its parent dies.
+ *
+ * Darwin has nothing like it, so it is watched for. kqueue can say when a
+ * process exits - EVFILT_PROC with NOTE_EXIT - and a thread waiting on that is
+ * the whole mechanism; when it fires the signal is raised here, through the
+ * same path anything else would raise one.
+ *
+ * Not storing-and-forgetting, which for this flag would be worse than refusing
+ * it: what asks for it is asking to be killed if it is orphaned. LXC sets
+ * SIGKILL on the container's first process precisely so that a container cannot
+ * outlive the lxc-start that owns it, and a container left running with nothing
+ * holding it is the failure the flag exists to prevent.
+ *
+ * What this does not reproduce is Linux's exactness about *which* death counts.
+ * There it is the thread that created this process, not the process; here it is
+ * the parent process, because that is what nabi's children have and what kqueue
+ * can watch.
+ */
+static int pdeath_sig = 0;
+static bool pdeath_watching = false;
+static pthread_mutex_t pdeath_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void *
+pdeath_watch(void *arg)
+{
+  pid_t parent = (pid_t) (intptr_t) arg;
+
+  int kq = kqueue();
+  if (kq < 0)
+    return NULL;
+
+  struct kevent ev;
+  EV_SET(&ev, (uintptr_t) parent, EVFILT_PROC, EV_ADD | EV_ONESHOT,
+         NOTE_EXIT, 0, NULL);
+  bool gone = false;
+  if (kevent(kq, &ev, 1, NULL, 0, NULL) < 0) {
+    /* ESRCH: it died between getppid and here, which is exactly the case the
+     * flag is for - so it counts as the death rather than as a failure. */
+    gone = errno == ESRCH;
+    if (!gone) {
+      close(kq);
+      return NULL;
+    }
+  }
+
+  while (!gone) {
+    struct kevent out;
+    int n = kevent(kq, NULL, 0, &out, 1, NULL);
+    if (n < 0) {
+      if (errno == EINTR)
+        continue;
+      break;
+    }
+    if (n > 0) {
+      gone = true;
+      break;
+    }
+  }
+  close(kq);
+
+  if (!gone)
+    return NULL;
+
+  pthread_mutex_lock(&pdeath_lock);
+  int sig = pdeath_sig;
+  pdeath_watching = false;
+  pthread_mutex_unlock(&pdeath_lock);
+
+  if (sig > 0)
+    send_signal(getpid(), sig);
+  return NULL;
+}
+
+/*
+ * Forget it, which is what Linux does in a child: the flag is about *this*
+ * process's parent, and a child's parent is somebody else. The watcher thread
+ * does not survive a fork either, so a child that kept the setting would be
+ * waiting on a death nothing was watching for.
+ */
+void
+pdeathsig_clear(void)
+{
+  pthread_mutex_lock(&pdeath_lock);
+  pdeath_sig = 0;
+  pdeath_watching = false;
+  pthread_mutex_unlock(&pdeath_lock);
+}
+
 /* The whole set, bounded by the last capability that exists. */
 #define CAP_FULL_SET  ((LINUX_CAP_LAST_CAP >= 63) ? ~0ULL \
                        : ((1ULL << (LINUX_CAP_LAST_CAP + 1)) - 1))
@@ -1417,6 +1507,39 @@ DEFINE_SYSCALL(prctl, int, option, unsigned long, arg1, unsigned long, arg2, uns
       name[sizeof(name) - 1] = '\0';
     }
     warnk("prctl PR_SET_VMA: addr=%#lx len=%#lx name=%s\n", arg2, arg3, name);
+    return 0;
+  }
+  case LINUX_PR_SET_PDEATHSIG: {
+    if (arg1 > LINUX_NSIG || arg2 || arg3 || arg4)
+      return -LINUX_EINVAL;
+    pthread_mutex_lock(&pdeath_lock);
+    pdeath_sig = (int) arg1;
+    bool start = pdeath_sig > 0 && !pdeath_watching;
+    if (start)
+      pdeath_watching = true;
+    pthread_mutex_unlock(&pdeath_lock);
+
+    if (start) {
+      pthread_t t;
+      if (pthread_create(&t, NULL, pdeath_watch,
+                         (void *) (intptr_t) getppid()) != 0) {
+        pthread_mutex_lock(&pdeath_lock);
+        pdeath_watching = false;
+        pthread_mutex_unlock(&pdeath_lock);
+        return -LINUX_EAGAIN;
+      }
+      pthread_detach(t);
+    }
+    return 0;
+  }
+  case LINUX_PR_GET_PDEATHSIG: {
+    if (arg2 || arg3 || arg4)
+      return -LINUX_EINVAL;
+    pthread_mutex_lock(&pdeath_lock);
+    int sig = pdeath_sig;
+    pthread_mutex_unlock(&pdeath_lock);
+    if (copy_to_user((gaddr_t) arg1, &sig, sizeof sig))
+      return -LINUX_EFAULT;
     return 0;
   }
   case LINUX_PR_GET_DUMPABLE:

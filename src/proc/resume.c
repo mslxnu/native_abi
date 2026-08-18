@@ -143,6 +143,8 @@ checkpoint_restore(int ckpt_fd, int arena_fd)
   /* A resumed child is a new host pid wearing its parent's credentials, and
    * nothing else will publish them for it. */
   cred_publish(proc.cred.euid, proc.cred.egid);
+  /* The parent-death signal is not inherited; see pdeathsig_clear. */
+  pdeathsig_clear();
   memcpy(proc.sigaction, sigactions,
          hdr.nr_sigactions * sizeof proc.sigaction[0]);
   proc.pfutex = kh_init(pfutex);

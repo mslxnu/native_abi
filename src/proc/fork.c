@@ -290,6 +290,9 @@ __do_clone_process(unsigned long clone_flags, unsigned long newsp, gaddr_t paren
     /* A fresh host pid with the parent's credentials, same as a resumed
      * child - see cred_publish's callers. */
     cred_publish(proc.cred.euid, proc.cred.egid);
+    /* And a fresh parent, so the death this was waiting for is not its own
+     * parent's any more. Linux clears it in the child for the same reason. */
+    pdeathsig_clear();
     /* The same reset the exec route does in resume_apply_clone. This path is
      * x86's always and arm64's whenever the exec route is not taken, and a
      * flag accepted on one and ignored on the other is worse than one that is
