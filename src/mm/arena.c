@@ -350,6 +350,8 @@ arena_free(off_t off, size_t size)
  * Offsets are preserved exactly, so the checkpoint's offsets mean the same thing
  * on both sides.
  */
+#define ARENA_WRITE_MAX ((size_t) 1 << 30)
+
 int
 arena_snapshot(void)
 {
@@ -368,12 +370,25 @@ arena_snapshot(void)
     return -1;
   }
 
+  /*
+   * Chunked, because Darwin will not take a single write of INT_MAX or more:
+   * pwrite checks the count against INT_MAX before it looks at anything else
+   * and answers EINVAL, whatever the file and however much room there is.
+   *
+   * A guest span that big is not exotic. Android's runtime reserves 0x80000000
+   * in one mapping - two gigabytes, one byte over the limit - so every fork in
+   * the guest failed with "arena snapshot failed: Invalid argument", and
+   * init's first subcontext was as far as it got. The size that fails is a
+   * property of the call rather than of the span, so the loop that was already
+   * here for short writes is the right place for it.
+   */
   for (size_t i = 0; i < nr_arena_spans; i++) {
     const char *p = arena_spans[i].addr;
     size_t left = arena_spans[i].size;
     off_t off = arena_spans[i].off;
     while (left > 0) {
-      ssize_t n = pwrite(fd, p, left, off);
+      size_t want = left > ARENA_WRITE_MAX ? ARENA_WRITE_MAX : left;
+      ssize_t n = pwrite(fd, p, want, off);
       if (n < 0) {
         if (errno == EINTR)
           continue;
