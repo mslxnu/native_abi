@@ -907,6 +907,34 @@ static pthread_mutex_t cap_lock = PTHREAD_MUTEX_INITIALIZER;
  */
 static int cap_keepcaps = 0;
 
+/*
+ * PR_SET_DUMPABLE, which says whether this process may be core-dumped and
+ * inspected.
+ *
+ * It was answered with a flat 0 - "not dumpable" - for a process that had never
+ * said so, and Linux's default is 1. A program reading it back to decide
+ * whether it had already hardened itself was told it had.
+ *
+ * Held and reported, and that is all it can be here. What the flag gates on
+ * Linux is the core dump, and the ownership of /proc/<pid>, and who may ptrace
+ * it. There is no core dump to suppress - nabi is the process the host would
+ * dump - and nothing here consults it for the rest, so the honest description
+ * is that this remembers an answer rather than enforcing one.
+ */
+static int proc_dumpable = 1;
+
+/*
+ * PR_SET_THP_DISABLE: do not back this process's memory with huge pages.
+ *
+ * Held and reported for the same reason and with less regret, because there is
+ * nothing to disable: guest memory here is an mmap of a file the host manages,
+ * and transparent huge pages are a Linux memory-manager behaviour that has no
+ * counterpart in it. A program that sets this is asking not to be given
+ * something it was never going to be given, and telling it EINVAL would send it
+ * down a path meant for kernels too old to have the option.
+ */
+static int thp_disabled = 0;
+
 /* The whole set, bounded by the last capability that exists. */
 #define CAP_FULL_SET  ((LINUX_CAP_LAST_CAP >= 63) ? ~0ULL \
                        : ((1ULL << (LINUX_CAP_LAST_CAP + 1)) - 1))
@@ -1392,7 +1420,28 @@ DEFINE_SYSCALL(prctl, int, option, unsigned long, arg1, unsigned long, arg2, uns
     return 0;
   }
   case LINUX_PR_GET_DUMPABLE:
+    if (arg1 || arg2 || arg3 || arg4)
+      return -LINUX_EINVAL;
+    return proc_dumpable;
+  case LINUX_PR_SET_DUMPABLE:
+    /* 0 and 1 are the only values a process may set. 2 exists - dumpable only
+     * for root - but Linux reserves it to the fs.suid_dumpable sysctl and
+     * refuses it here, so refusing it is what a caller is prepared for. */
+    if (arg1 > 1 || arg2 || arg3 || arg4)
+      return -LINUX_EINVAL;
+    proc_dumpable = (int) arg1;
     return 0;
+  case LINIX_PR_SET_THP_DISABLE:
+    /* arg2 carries flags in newer kernels; none are defined that this could
+     * honour, so a request for one is refused rather than ignored. */
+    if (arg2 || arg3 || arg4)
+      return -LINUX_EINVAL;
+    thp_disabled = arg1 != 0;
+    return 0;
+  case LINIX_PR_GET_THP_DISABLE:
+    if (arg1 || arg2 || arg3 || arg4)
+      return -LINUX_EINVAL;
+    return thp_disabled;
   case LINUX_PR_SET_KEEPCAPS:
     if (arg1 > 1 || arg2 || arg3 || arg4)
       return -LINUX_EINVAL;

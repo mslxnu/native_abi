@@ -8,6 +8,9 @@
 #include <stdio.h>
 #include <string.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
+#include <sys/file.h>
 #include <signal.h>
 #include <assert.h>
 #include <stdatomic.h>
@@ -74,12 +77,175 @@ signalfd_sender(int lsig, uint32_t *host_pid, uint32_t *host_uid)
   pthread_rwlock_unlock(&proc.sig_lock);
 }
 
+/* ------------------------------------------------------------------------
+ * Real-time signals.
+ *
+ * Darwin's signals stop at 31 and Linux's real-time ones start at 32, so there
+ * is no host signal to carry them: kill(2) cannot express the number. They were
+ * therefore not sent at all - send_signal warned and returned success, so a
+ * process that raised SIGRTMIN was told it had, and nothing was ever delivered.
+ *
+ * Delivery inside a process needs nothing from the host: the pending set is
+ * already sixty-four bits and nabi runs the handler itself. Only the crossing
+ * between processes needs a mechanism, and it is the one the credential table
+ * uses - a file keyed by host pid, in TMPDIR under the boot tag - plus a host
+ * signal to wake the target and make it look. SIGINFO is what that signal is:
+ * Darwin has it, Linux has nothing that maps onto it, and so no guest signal
+ * can be confused with the doorbell.
+ *
+ * What this does not reproduce is *queueing*. Linux queues real-time signals -
+ * several instances of the same number, each with its own value, delivered in
+ * the order they were sent - and this is a bitmask, so two arrivals of one
+ * number before it is handled become one. That is the property RT signals are
+ * chosen for over ordinary ones, and half of it is missing here. It is the same
+ * shape as the pending set for standard signals, which is why it is what it is;
+ * a queue would want the value from rt_sigqueueinfo carried too.
+ * ------------------------------------------------------------------------ */
+
+#define RTSIG_DOORBELL SIGINFO
+#define RTSIG_MAX 512
+
+struct rtsig_file {
+  uint32_t n;
+  struct { int32_t pid; uint64_t pending; } e[RTSIG_MAX];
+};
+
+static void
+rtsig_path(char *out, size_t n)
+{
+  const char *tmp = getenv("TMPDIR");
+  snprintf(out, n, "%s/nabi-rtsig-%s", tmp && *tmp ? tmp : "/tmp",
+           nabi_boot_tag());
+}
+
+static int
+rtsig_open(bool lock)
+{
+  char path[PATH_MAX];
+  rtsig_path(path, sizeof path);
+  int fd = open(path, O_RDWR | O_CREAT, 0600);
+  if (fd < 0)
+    return -1;
+  if (lock && flock(fd, LOCK_EX) < 0) {
+    close(fd);
+    return -1;
+  }
+  return fd;
+}
+
+static bool
+rtsig_read(int fd, struct rtsig_file *f)
+{
+  ssize_t n = pread(fd, f, sizeof *f, 0);
+  if (n == (ssize_t) sizeof *f)
+    return true;
+  memset(f, 0, sizeof *f);
+  return n >= 0;
+}
+
+/* Mark `sig` pending for `pid`, for that process to collect. */
+static int
+rtsig_post(pid_t pid, int sig)
+{
+  int fd = rtsig_open(true);
+  if (fd < 0)
+    return -LINUX_EAGAIN;
+
+  struct rtsig_file f;
+  int r = -LINUX_EAGAIN;
+  if (rtsig_read(fd, &f)) {
+    uint32_t slot = f.n;
+    for (uint32_t i = 0; i < f.n; i++)
+      if (f.e[i].pid == (int32_t) pid) { slot = i; break; }
+    /* A full table is made room in by dropping an entry whose process is gone,
+     * the same way the credential table does. */
+    if (slot == f.n && f.n == RTSIG_MAX) {
+      for (uint32_t i = 0; i < f.n; i++)
+        if (kill(f.e[i].pid, 0) < 0 && errno == ESRCH) { slot = i; break; }
+      if (slot < f.n)
+        f.e[slot].pending = 0;
+    }
+    if (slot < RTSIG_MAX) {
+      if (slot == f.n) { f.e[slot].pid = (int32_t) pid; f.e[slot].pending = 0; f.n++; }
+      f.e[slot].pending |= 1ULL << (sig - 1);
+      pwrite(fd, &f, sizeof f, 0);
+      r = 0;
+    }
+  }
+  flock(fd, LOCK_UN);
+  close(fd);
+  return r;
+}
+
+/*
+ * Collect whatever was posted for this process. Called from the doorbell's
+ * handler, so it must be prepared to do nothing.
+ */
+static void
+rtsig_collect(void)
+{
+  int fd = rtsig_open(true);
+  if (fd < 0)
+    return;
+
+  struct rtsig_file f;
+  if (rtsig_read(fd, &f)) {
+    int32_t me = (int32_t) getpid();
+    for (uint32_t i = 0; i < f.n; i++) {
+      if (f.e[i].pid != me || f.e[i].pending == 0)
+        continue;
+      uint64_t got = f.e[i].pending;
+      f.e[i].pending = 0;
+      pwrite(fd, &f, sizeof f, 0);
+      for (int sig = LINUX_SIGRTMIN; sig <= LINUX_SIGRTMAX; sig++)
+        if (got & (1ULL << (sig - 1))) {
+          SET_SIGBIT(&task.sigpending, sig);
+          signalfd_note_signal(sig);
+        }
+      break;
+    }
+  }
+  flock(fd, LOCK_UN);
+  close(fd);
+}
+
+static void
+rtsig_doorbell(int signum, siginfo_t *info, void *ctx)
+{
+  (void) signum; (void) info; (void) ctx;
+  rtsig_collect();
+}
+
+/* Installed once, before any guest code runs. */
+void
+rtsig_init(void)
+{
+  struct sigaction sa;
+  memset(&sa, 0, sizeof sa);
+  sa.sa_sigaction = rtsig_doorbell;
+  sa.sa_flags = SA_SIGINFO | SA_RESTART;
+  sigemptyset(&sa.sa_mask);
+  sigaction(RTSIG_DOORBELL, &sa, NULL);
+}
+
 int
 send_signal(pid_t pid, int signum)
 {
   if (signum >= LINUX_SIGRTMIN) {
-    warnk("RT signal is raised: %d\n", signum);
-    return 0;
+    /*
+     * Sending to ourselves needs no host signal at all: the pending set is
+     * right here, and the main loop delivers from it on the way back to the
+     * guest. Anyone else is posted to and rung.
+     */
+    if (pid == getpid()) {
+      SET_SIGBIT(&task.sigpending, signum);
+      signalfd_note_signal(signum);
+      return 0;
+    }
+    int r = rtsig_post(pid, signum);
+    if (r < 0)
+      return r;
+    return syswrap(kill(pid, RTSIG_DOORBELL));
   }
   int dsignum = (signum == 0) ? 0 : linux_to_darwin_signal(signum);
   return syswrap(kill(pid, dsignum));
@@ -143,6 +309,8 @@ init_signal(void)
 #define ATOMIC_INT_LOCK_FREE ATOMIC_INT_T_LOCK_FREE
 #endif
   static_assert(ATOMIC_INT_LOCK_FREE == 2, "The compiler must support lock-free atomic int");
+
+  rtsig_init();
 
   /* import signal handlers registered on the host */
   for (int i = 0; i < LINUX_NSIG; i++) {
@@ -208,8 +376,15 @@ pop_signal()
   pending &= ~LINUX_SIGSET_TO_UI64(&task.sigmask);
   if (pending == 0)
     return 0;
-  int sig = __builtin_ffs(pending);
-  assert(0 < sig && sig < 32);
+  /*
+   * ffsll, and a bound of NSIG rather than 32. The pending set has always been
+   * sixty-four bits wide and every other part of this file treats it as one,
+   * but the scan was ffs on an int: the top half was invisible, so a real-time
+   * signal could be marked pending and never be found - and the assert below
+   * would have aborted on one if it had been.
+   */
+  int sig = __builtin_ffsll((long long) pending);
+  assert(0 < sig && sig <= LINUX_NSIG);
   CLEAR_SIGBIT(&task.sigpending, sig);
   return sig;
 }
@@ -308,16 +483,28 @@ DEFINE_SYSCALL(rt_sigaction, int, sig, gaddr_t, act, gaddr_t, oact, size_t, size
     handler = __host_signal_handler;
   }
   linux_to_darwin_sigaction(&lact, &dact, handler);
-  dsig = linux_to_darwin_signal(sig);
-  if (dsig == 0) {
-    return -LINUX_EINVAL;
+
+  /*
+   * A real-time signal has no host signal to install a handler for - Darwin's
+   * numbering stops at 31 - and it does not need one: nothing on the host ever
+   * raises it. It is delivered entirely by nabi, from the pending set, so the
+   * disposition is recorded and no host sigaction is called. Refusing it here,
+   * which is what a dsig of 0 used to do, made every RT handler fail to
+   * install while kill() cheerfully reported the signal sent.
+   */
+  bool rt = sig >= LINUX_SIGRTMIN;
+  if (!rt) {
+    dsig = linux_to_darwin_signal(sig);
+    if (dsig == 0) {
+      return -LINUX_EINVAL;
+    }
   }
   // TODO: make handlings of linux specific signals consistent
 
   int err = 0;
   pthread_rwlock_wrlock(&proc.sig_lock);
 
-  err = syswrap(sigaction(dsig, &dact, &doact));
+  err = rt ? 0 : syswrap(sigaction(dsig, &dact, &doact));
   if (err >= 0) {
     proc.sigaction[sig - 1] = lact;
   }
@@ -570,9 +757,19 @@ DEFINE_SYSCALL(rt_tgsigqueueinfo, l_pid_t, tgid, l_pid_t, tid, int, sig, gaddr_t
 void
 reinstall_host_sigactions(void)
 {
+  /* The doorbell first, and unconditionally: exec cleared it with everything
+   * else, and a resumed child that cannot hear it would take no real-time
+   * signal for the rest of its life. It is nabi's own handler, so it does not
+   * depend on any guest disposition being set. */
+  rtsig_init();
+
   for (int i = 0; i < LINUX_NSIG; i++) {
     l_sigaction_t *lact = &proc.sigaction[i];
     if (lact->lsa_handler == LINUX_SIG_DFL || lact->lsa_handler == LINUX_SIG_IGN)
+      continue;
+    /* A real-time signal has no host disposition to reinstall; it is delivered
+     * from the pending set by nabi itself. */
+    if (i + 1 >= LINUX_SIGRTMIN)
       continue;
     struct sigaction dact;
     linux_to_darwin_sigaction(lact, &dact, __host_signal_handler);

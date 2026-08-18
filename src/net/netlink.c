@@ -33,11 +33,20 @@
  *     which is a truthful answer and a different one from "netlink does not
  *     exist".
  *
- *   - Other protocols - uevent, audit, sock_diag - open and stay silent. That
- *     is what a socket bound to a group nothing publishes on looks like, and it
- *     is what a caller that subscribes and waits should see. Refusing the open
- *     instead sends callers down error paths for a facility that has no events
- *     rather than no implementation.
+ *   - The kernel-event multicast, which a subscriber joins and then waits on.
+ *     Silence is a truthful answer there: nothing publishes, so nothing
+ *     arrives, and that is what a machine with no events looks like.
+ *
+ *   - Every other protocol is refused at socket(), with the error a kernel
+ *     built without that subsystem gives. This was not the first answer: they
+ *     opened and answered requests with EOPNOTSUPP, on the reasoning that a
+ *     socket which says nothing is gentler than one that will not open. It is
+ *     not. libaudit opens NETLINK_AUDIT and takes a *successful* open as the
+ *     audit subsystem being there; the error that came back to its first
+ *     request was one it had no path for, so PAM reported "System error" and
+ *     su would not run at all. A refusal at open is what such a caller is
+ *     written to handle, because it is what it meets on a kernel without the
+ *     option compiled in.
  */
 #include <errno.h>
 #include <fcntl.h>
@@ -584,6 +593,16 @@ netlink_socket(int type, int protocol, int flags)
 {
   if (type != LINUX_SOCK_RAW && type != LINUX_SOCK_DGRAM)
     return -LINUX_ESOCKTNOSUPPORT;
+
+  /*
+   * Only what can actually be answered. EPROTONOSUPPORT is what a kernel
+   * without the subsystem returns, and the callers that ask are written for it;
+   * a socket that opens and then refuses everything is the worse answer, and
+   * the one that stopped su from running.
+   */
+  if (protocol != LINUX_NETLINK_ROUTE &&
+      protocol != LINUX_NETLINK_KOBJECT_UEVENT)
+    return -LINUX_EPROTONOSUPPORT;
 
   int sv[2];
   if (socketpair(AF_UNIX, SOCK_DGRAM, 0, sv) < 0)

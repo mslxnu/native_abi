@@ -915,6 +915,21 @@ else
     fail=1
 fi
 
+# rtsigtest: real-time signals, and the two prctl options beside them. Darwin's
+# signals stop at 31, so there is no host signal to carry one - they were not
+# carried at all, and the sender was told they had been. Checks a handler being
+# installed, delivery to this process and from another one, that blocking holds
+# one, and that the number arrives intact. Queueing is not implemented and not
+# checked; see the note in the source.
+cp "$here/rtsigtest" "$root/"; chmod +x "$root/rtsigtest"
+out=$("$NABI" -m "$root" /rtsigtest); rc=$?
+if [ "$rc" -eq 0 ] && [ "$out" = "rtsig ok" ]; then
+    echo "  ok  rtsigtest -> \"$out\", exit 0"
+else
+    echo "  FAIL rtsigtest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 # looptest: loop devices, which is how anything actually mounts an image -
 # util-linux's mount sets one up in userspace and never calls mount(2) on a
 # regular file at all. Checks the control device, the block-device stat, that a

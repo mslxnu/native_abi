@@ -40,6 +40,9 @@ static long sys6(long n, long a, long b, long c, long d, long e, long f){
 #define AF_NETLINK       16
 #define SOCK_RAW          3
 #define NETLINK_ROUTE     0
+#define NETLINK_AUDIT     9
+#define NETLINK_UEVENT   15
+#define EPROTONOSUPPORT  93
 #define MSG_PEEK          2
 #define MSG_TRUNC      0x20
 
@@ -97,6 +100,26 @@ void _start(void)
   if (me.family != AF_NETLINK) fail("getsockname family", me.family, AF_NETLINK);
   if (melen != (int) sizeof me) fail("getsockname length", melen, (int) sizeof me);
   if (me.pid == 0) fail("getsockname port id", me.pid, 1);
+
+  /*
+   * A protocol nothing here can answer is refused at open, with the error a
+   * kernel built without that subsystem gives.
+   *
+   * This is a regression check with a name on it. These used to open and then
+   * answer every request with an error, which reads as the gentler choice and
+   * is not: libaudit takes a successful open as the audit subsystem being
+   * present, had no path for the error that came back, and PAM turned it into
+   * "System error" - su would not run at all, which is every `msl login`.
+   */
+  { long bad = sys6(SYS_socket, AF_NETLINK, SOCK_RAW, NETLINK_AUDIT, 0, 0, 0);
+    if (bad != -EPROTONOSUPPORT)
+      fail("socket(NETLINK_AUDIT) on a system with no audit", bad, -EPROTONOSUPPORT); }
+
+  /* The event multicast opens, because waiting on it is answerable: nothing
+   * publishes, so nothing arrives. */
+  { long ue = sys6(SYS_socket, AF_NETLINK, SOCK_RAW, NETLINK_UEVENT, 0, 0, 0);
+    if (ue < 0)
+      fail("socket(NETLINK_KOBJECT_UEVENT)", ue, 0); }
 
   /* Ask for every link. */
   struct nlmsghdr *h = (struct nlmsghdr *) req;
