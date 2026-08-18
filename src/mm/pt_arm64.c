@@ -147,22 +147,6 @@ chunk_record(struct s2_chunk c)
   chunks[nr_chunks++] = c;
 }
 
-/*
- * Hand out a fresh 16KiB block of guest-physical space.
- *
- * The cursor lives here rather than beside the stage-2 registry because it is
- * checkpoint state: pt_snapshot carries it and pt_restore puts it back, so a
- * resumed child goes on assigning IPAs where its parent left off instead of
- * handing out addresses that are already in use.
- */
-gaddr_t
-pt_ipa_alloc_block(void)
-{
-  gaddr_t ipa = ipa_brk;
-  ipa_brk += STAGE2_GRANULE;
-  return ipa;
-}
-
 static void *
 ipa_to_host(gaddr_t ipa)
 {
@@ -480,8 +464,13 @@ vmm_mmap(gaddr_t gaddr, size_t size, int prot, void *haddr)
   for (size_t off = 0; off < size; off += PAGE_SIZEOF(PAGE_4KB)) {
     char *hp = (char *) haddr + off;
     char *block = (char *) ((uintptr_t) hp & ~(uintptr_t)(STAGE2_GRANULE - 1));
+    /* The cursor is only spent if a block was actually made: the IPA is
+     * offered, and taken up only when this host page had none. */
+    bool created = false;
     gaddr_t base = vmm_arm64_s2_block_for(block, prot ? prot : HV_MEMORY_READ,
-                                          NULL);
+                                          ipa_brk, &created);
+    if (created)
+      ipa_brk += STAGE2_GRANULE;
     pt_map_page(gaddr + off, base + (gaddr_t)(hp - block), prot);
   }
 }

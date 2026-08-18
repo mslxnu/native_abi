@@ -43,10 +43,6 @@
  * VM state, are lost and must be replayed. Keyed by IPA so map/unmap/replay are
  * all O(1) per granule and independent of pt_arm64.c's IPA layout.
  */
-/* Defined in src/mm/pt_arm64.c, which owns the cursor because it is
- * checkpoint state. */
-gaddr_t pt_ipa_alloc_block(void);
-
 struct s2_ent { void *haddr; int prot; unsigned refs; };
 KHASH_MAP_INIT_INT64(s2, struct s2_ent)
 
@@ -138,6 +134,12 @@ s2_forget(gaddr_t ipa, size_t size)
  * descriptors at; the second caller to ask about the same host page gets the
  * same block rather than a new mapping of it, which is the thing HVF refuses.
  *
+ * The IPA to use if a block has to be made is supplied by the caller rather
+ * than allocated here, and *created says whether it was taken. The cursor it
+ * comes from is checkpoint state belonging to the stage-1 allocator, and this
+ * file is built on its own by the backend test - so the dependency runs one
+ * way, from the page tables to the framework, and not back.
+ *
  * The block's own permissions are widened to the union of what its callers
  * asked for, and never narrowed. That is not a weakening: on this
  * architecture the effective permission is the intersection of the two
@@ -147,7 +149,8 @@ s2_forget(gaddr_t ipa, size_t size)
  * permissions away from a neighbour that never asked for that.
  */
 gaddr_t
-vmm_arm64_s2_block_for(void *hostpage, int prot, bool *created)
+vmm_arm64_s2_block_for(void *hostpage, int prot, gaddr_t fresh_ipa,
+                       bool *created)
 {
   assert(((uintptr_t) hostpage & (STAGE2_GRANULE - 1)) == 0);
 
@@ -166,11 +169,10 @@ vmm_arm64_s2_block_for(void *hostpage, int prot, bool *created)
     }
   }
 
-  gaddr_t ipa = pt_ipa_alloc_block();
-  vmm_arm64_map_stage2(ipa, STAGE2_GRANULE, prot ? prot : HV_MEMORY_READ,
-                       hostpage);
+  vmm_arm64_map_stage2(fresh_ipa, STAGE2_GRANULE,
+                       prot ? prot : HV_MEMORY_READ, hostpage);
   if (created) *created = true;
-  return ipa;
+  return fresh_ipa;
 }
 
 /*
