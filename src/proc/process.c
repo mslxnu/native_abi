@@ -1680,6 +1680,101 @@ int linux_to_darwin_waitopts(int options)
   return opts;
 }
 
+/*
+ * waitid: the same wait, said precisely.
+ *
+ * wait4 encodes the outcome in a status word the caller picks apart with
+ * macros; waitid states it - exited, killed, stopped, continued - in a siginfo,
+ * and can look at a child *without* reaping it. That last part is why lxc-start
+ * uses it, and why this is served by Darwin's own waitid rather than built out
+ * of wait4: WNOWAIT has no expression in wait4 at all.
+ *
+ * Both directions of the pid namespace are translated, as wait4 does: the id
+ * asked about is this namespace's, and the pid reported back has to be too.
+ */
+DEFINE_SYSCALL(waitid, int, idtype, int, id, gaddr_t, infop, int, options,
+               gaddr_t, rusage_ptr)
+{
+  /* Linux insists the caller says which states it wants to hear about. */
+  if (!(options & (LINUX_WEXITED | LINUX_WSTOPPED | LINUX_WCONTINUED)))
+    return -LINUX_EINVAL;
+  if (options & ~(LINUX_WNOHANG | LINUX_WEXITED | LINUX_WSTOPPED |
+                  LINUX_WCONTINUED | LINUX_WNOWAIT))
+    return -LINUX_EINVAL;
+
+  idtype_t did;
+  id_t hid = (id_t) id;
+  switch (idtype) {
+  case LINUX_P_ALL:
+    did = P_ALL;
+    hid = 0;
+    break;
+  case LINUX_P_PID: {
+    did = P_PID;
+    int32_t h = pidns_to_host(id);
+    if (h < 0)
+      return -LINUX_ECHILD;
+    hid = (id_t) h;
+    break;
+  }
+  case LINUX_P_PGID: {
+    did = P_PGID;
+    /* A process group is named by its leader, so it translates as a pid. */
+    int32_t h = pidns_to_host(id);
+    if (h < 0)
+      return -LINUX_ECHILD;
+    hid = (id_t) h;
+    break;
+  }
+  default:
+    /* P_PIDFD wants a descriptor rather than a number, and nothing here can
+     * turn one into the other yet. */
+    return -LINUX_EINVAL;
+  }
+
+  int dopts = 0;
+  if (options & LINUX_WNOHANG)    dopts |= WNOHANG;
+  if (options & LINUX_WEXITED)    dopts |= WEXITED;
+  if (options & LINUX_WSTOPPED)   dopts |= WSTOPPED;
+  if (options & LINUX_WCONTINUED) dopts |= WCONTINUED;
+  if (options & LINUX_WNOWAIT)    dopts |= WNOWAIT;
+
+  siginfo_t info;
+  memset(&info, 0, sizeof info);
+  int r = syswrap(waitid(did, hid, &info, dopts));
+  if (r < 0)
+    return r;
+
+  /*
+   * WNOHANG with nothing to report is success with an empty siginfo, and si_pid
+   * of zero is how the caller is told so - not an error, which is what makes
+   * the zeroing above load-bearing.
+   */
+  if (infop != 0) {
+    l_siginfo_t li;
+    memset(&li, 0, sizeof li);
+    if (info.si_pid != 0) {
+      li.lsi_signo = LINUX_SIGCHLD;
+      li.lsi_code = info.si_code;   /* CLD_* agree on both systems */
+      li.lsi_pid = (l_pid_t) pidns_to_ns((int32_t) info.si_pid);
+      li.lsi_uid = (l_uid_t) host_uid_to_guest(info.si_uid);
+      li.lsi_status = info.si_status;
+    }
+    if (copy_to_user(infop, &li, sizeof li))
+      return -LINUX_EFAULT;
+  }
+
+  /* Linux's waitid takes a fifth argument for rusage, which glibc does not
+   * pass; it is filled only when asked for. */
+  if (rusage_ptr != 0) {
+    struct rusage ru;
+    memset(&ru, 0, sizeof ru);
+    if (copy_to_user(rusage_ptr, &ru, sizeof ru))
+      return -LINUX_EFAULT;
+  }
+  return 0;
+}
+
 DEFINE_SYSCALL(wait4, int, pid, gaddr_t, status_ptr, int, options, gaddr_t, rusage_ptr)
 {
   int status;

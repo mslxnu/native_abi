@@ -252,7 +252,7 @@
   SYSCALL(244, mq_notify) \
   SYSCALL(245, mq_getsetattr) \
   SYSCALL(246, kexec_load) \
-  SYSCALL(247, unimplemented) \
+  SYSCALL(247, waitid) \
   SYSCALL(248, add_key) \
   SYSCALL(249, unimplemented) \
   SYSCALL(250, keyctl) \

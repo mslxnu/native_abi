@@ -101,7 +101,7 @@
   SYSCALL(92, personality) \
   SYSCALL(93, exit) \
   SYSCALL(94, exit_group) \
-  SYSCALL(95, unimplemented) \
+  SYSCALL(95, waitid) \
   SYSCALL(96, set_tid_address) \
   SYSCALL(97, unshare) \
   SYSCALL(98, futex) \

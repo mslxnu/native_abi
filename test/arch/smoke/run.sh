@@ -961,6 +961,19 @@ else
     fail=1
 fi
 
+# waitidtest: waitid, and WNOWAIT in particular - reporting a child without
+# consuming it, which wait4 cannot express and lxc-start relies on. An
+# implementation that quietly reaped would return the same siginfo and differ
+# only in what happens next, so the check is that the child is still reapable.
+cp "$here/waitidtest" "$root/"; chmod +x "$root/waitidtest"
+out=$("$NABI" -m "$root" /waitidtest); rc=$?
+if [ "$rc" -eq 0 ] && [ "$out" = "waitid ok" ]; then
+    echo "  ok  waitidtest -> \"$out\", exit 0"
+else
+    echo "  FAIL waitidtest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 # renametest: renameat2's flags. NOREPLACE must refuse and leave both names
 # alone; EXCHANGE must swap both ways at once - checked on the file contents,
 # because a NOREPLACE that quietly replaced and an EXCHANGE that renamed one way
