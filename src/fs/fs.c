@@ -3856,12 +3856,22 @@ darwinfs_openat(struct fs *fs, struct dir *dir, const char *path, int l_flags, i
    * placeholder by every test here, and answering ENXIO for it stops the boot
    * on a device every system is entitled to assume works.
    */
-  if (fd >= 0 && !creating) {
+  /*
+   * Reached whether or not the placeholder itself opened. Its host permissions
+   * are an artifact of how nabi stores a device node, not something Linux would
+   * consult: the guest's own mode was already checked above, against the mode
+   * the guest gave the node. A node created 0600 is stored as a file the host
+   * will not open for writing, so opening /dev/kmsg - which Android's init
+   * creates exactly that way and then writes every log line to - failed with
+   * EACCES for root, and init aborted before it could say why.
+   */
+  if (!creating) {
     char abs[PATH_MAX];
     struct guest_dev d;
     if (abs_path_at(dir->fd, path, abs, sizeof abs) &&
         guest_dev_read(abs, &d)) {
-      close(fd);
+      if (fd >= 0)
+        close(fd);
       const char *host = host_device_for(d.mode, d.dev);
       fd = host ? syswrap(open(host, flags, mode)) : -LINUX_ENXIO;
     }
