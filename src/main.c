@@ -246,7 +246,24 @@ main_loop(int return_on_sigret)
     }
   }
 
-  __builtin_unreachable();
+  /*
+   * task_run failed, which this used to declare unreachable.
+   *
+   * It is not. The vcpu can stop for reasons that are not a guest exit - the
+   * framework refusing to run it, a state it will not accept - and the loop
+   * above ends when it does. Declaring that impossible did not make it so: it
+   * made the consequence undefined, so control did not return to the caller and
+   * the process ended without passing any of the places that would have said
+   * why. A guest that stopped here left a trace ending mid-flight, no exit
+   * syscall, no signal, no crash, and nothing in any log - which is exactly the
+   * shape of waydroid's container, diagnosed as a hang, then a kill, then an
+   * unexplained termination over three rounds of looking.
+   *
+   * So it says so, and then ends in a way that can be observed.
+   */
+  warnk("vcpu stopped and cannot be run again (last exit kind %d) - ending\n",
+        (int) exit.kind);
+  _exit(1);
 }
 
 /*
