@@ -3817,8 +3817,13 @@ darwinfs_openat(struct fs *fs, struct dir *dir, const char *path, int l_flags, i
    * A placeholder device node has no driver - that is what makes it a
    * placeholder - and opening it as the regular file underneath would hand the
    * caller data where Linux hands it the device. ENXIO is what Linux answers
-   * for a node whose driver is not present. The real host devices are never
-   * recorded and never reach here.
+   * for a node whose driver is not present.
+   *
+   * Unless the number names one the host does have. A guest that mounts its own
+   * /dev - which is what an Android init does, first thing - shadows the
+   * passthrough and then makes its own /dev/null with mknod; that is a
+   * placeholder by every test here, and answering ENXIO for it stops the boot
+   * on a device every system is entitled to assume works.
    */
   if (fd >= 0 && !creating) {
     char abs[PATH_MAX];
