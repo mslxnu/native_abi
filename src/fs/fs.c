@@ -740,19 +740,25 @@ fail:;
   return -darwin_to_linux_errno(e);
 }
 
-#ifdef __x86_64__
 /*
- * The 3-arg signalfd, which predates signalfd4 and is what it became: the
- * same call with no flags. x86-64 has both (282 and 289); the generic table
- * aarch64 uses has only signalfd4, so this wrapper is compiled only where the
- * number exists - the strace hooks are indexed by LSYS_signalfd, which the
- * aarch64 table does not define.
+ * The 3-arg signalfd, which predates signalfd4 and is what it became: the same
+ * call with no flags. Only x86-64 has a number for it - the generic table
+ * aarch64 uses has signalfd4 alone - but both dispatch tables carry the *name*,
+ * because the aarch64 one lists the calls that exist only on x86 above the real
+ * numbers so that strace can name them. So the handler is built for both, and
+ * LSYS_signalfd is defined in both.
+ *
+ * It used to be built only under __x86_64__, with a comment saying the aarch64
+ * table did not define LSYS_signalfd. That was true of the aarch64 table as it
+ * stood and not of the x86 one beside it: the two had been generated at
+ * different times and disagreed about which calls existed. Regenerating both
+ * from one pair of headers is what keeps them from drifting, and it is why the
+ * Makefile writes all three files in a single target.
  */
 DEFINE_SYSCALL(signalfd, int, fd, gaddr_t, mask_ptr, size_t, sizemask)
 {
   return sys_signalfd4(fd, mask_ptr, sizemask, 0);
 }
-#endif
 
 static void
 signalfd_close(int fd)

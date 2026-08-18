@@ -1,6 +1,6 @@
 /*
  * aarch64 syscall table - GENERATED, do not edit by hand.
- * Regenerate: util/gen_syscall_table.py <unistd_generic.h>
+ * Regenerate: util/gen_syscall_table.py <unistd.h>
  * See PORTING-arm64.md section 3.2.
  */
 #include <stdint.h>
@@ -1068,13 +1068,13 @@
   SYSCALL(1056, pipe) \
   SYSCALL(1057, poll) \
   SYSCALL(1058, putpmsg) \
-  SYSCALL(1059, unimplemented) \
-  SYSCALL(1060, readlink) \
-  SYSCALL(1061, rename) \
-  SYSCALL(1062, rmdir) \
-  SYSCALL(1063, security) \
-  SYSCALL(1064, select) \
-  SYSCALL(1065, set_thread_area) \
+  SYSCALL(1059, readlink) \
+  SYSCALL(1060, rename) \
+  SYSCALL(1061, rmdir) \
+  SYSCALL(1062, security) \
+  SYSCALL(1063, select) \
+  SYSCALL(1064, set_thread_area) \
+  SYSCALL(1065, signalfd) \
   SYSCALL(1066, stat) \
   SYSCALL(1067, symlink) \
   SYSCALL(1068, sysfs) \

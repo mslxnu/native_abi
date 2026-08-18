@@ -183,7 +183,7 @@
   SYSCALL(175, init_module) \
   SYSCALL(176, delete_module) \
   SYSCALL(177, get_kernel_syms) \
-  SYSCALL(178, rt_tgsigqueueinfo) \
+  SYSCALL(178, unimplemented) \
   SYSCALL(179, unimplemented) \
   SYSCALL(180, nfsservctl) \
   SYSCALL(181, getpmsg) \
@@ -302,7 +302,7 @@
   SYSCALL(294, inotify_init1) \
   SYSCALL(295, preadv) \
   SYSCALL(296, pwritev) \
-  SYSCALL(297, unimplemented) \
+  SYSCALL(297, rt_tgsigqueueinfo) \
   SYSCALL(298, perf_event_open) \
   SYSCALL(299, unimplemented) \
   SYSCALL(300, fanotify_init) \
