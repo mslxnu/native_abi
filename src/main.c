@@ -408,6 +408,22 @@ elevate_privilege(uid_t owner_uid, gid_t owner_gid, mode_t mode)
 noreturn void
 die_with_forcedsig(int sig)
 {
+  /*
+   * Say so before dying.
+   *
+   * This is how a guest leaves when nabi kills it - a fault it cannot handle, a
+   * failed sigframe, an assertion in the emulator - and it leaves without an
+   * exit_group, because no syscall is made. So a trace of the guest simply
+   * stops: the last line is the last call that returned, and nothing says the
+   * process was killed or why. That is indistinguishable, from the trace alone,
+   * from a process still blocked in a call that never came back.
+   *
+   * waydroid's container died exactly this way for several rounds of debugging,
+   * and the absence was read first as a hang and then as an unexplained
+   * termination. One line here would have named it.
+   */
+  warnk("guest killed by signal %d (nabi forced the default action)\n", sig);
+
   // TODO: Termination processing
 
   /* Force default signal action */
@@ -546,6 +562,14 @@ resume_main(int ckpt_fd, int arena_fd, unsigned long clone_flags,
   resume_apply_clone(clone_flags, child_tid, tls);
 
   main_loop(0);
+  /*
+   * The other way a guest leaves without saying so. main_loop returns when the
+   * vcpu stops for a reason that is not the guest exiting - and then this exits
+   * 0, with no exit_group in the trace and nothing said anywhere. A guest that
+   * ends here looks exactly like one still running, which is how waydroid's
+   * container was read as hung and then as killed before it was read as this.
+   */
+  warnk("guest ended: main_loop returned without an exit syscall\n");
   vmm_destroy();
   exit(0);
 }
