@@ -1134,7 +1134,10 @@ static int
 read_hdr(int fd, void *hdr, size_t n, uint32_t magic)
 {
   if (pread(fd, hdr, n, 0) != (ssize_t) n)
-    return -LINUX_EINVAL;
+    /* A descriptor that is not one at all is EBADF, which is what Linux says
+     * and what a caller probing for the syscall's existence is written to
+     * expect; EINVAL is for a descriptor that exists and is the wrong kind. */
+    return errno == EBADF ? -LINUX_EBADF : -LINUX_EINVAL;
   uint32_t got;
   memcpy(&got, hdr, sizeof got);
   if (got != magic)
