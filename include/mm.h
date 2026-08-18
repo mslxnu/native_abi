@@ -101,6 +101,21 @@ struct mm_region {
    * when the region goes. Nothing else does: a private mapping's bytes are in
    * the arena and its mm_fd is only a record of where they came from.
    */
+  /*
+   * Address space the guest has reserved but cannot touch: an anonymous
+   * PROT_NONE mapping, with no host memory and no stage-2 block behind it.
+   *
+   * Linux reserves address space for these and backs nothing until something
+   * becomes accessible, and a guest that reserves gigabytes - Android's init
+   * takes two in one call - is relying on that. Backing it for real cost the
+   * memory, and cost far more on the way out: tearing the mapping down is a
+   * hypercall per 16KiB block and a page-table walk per 4KiB page, which took
+   * long enough that init gave up on the service doing it and called it hung.
+   *
+   * Materialised by mprotect when part of it is made accessible; replaced
+   * piecemeal by MAP_FIXED, which is how a linker or an allocator uses one.
+   */
+  bool reserved;
   bool owns_fd;
   /*
    * The shared-memory segment this region is an attachment to, or -1.

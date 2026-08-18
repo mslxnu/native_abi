@@ -119,6 +119,9 @@ do_munmap(gaddr_t gaddr, size_t size)
     struct list_head *next = overlapping->list.next;
     list_del(&overlapping->list);
     RB_REMOVE(mm_region_tree, &proc.mm->mm_region_tree, overlapping);
+    if (overlapping->reserved) {
+      /* Nothing was ever mapped or allocated for it. */
+    } else {
     vmm_munmap(overlapping->gaddr, overlapping->size);
     if (overlapping->arena_off < 0) {
       /* A real mapping (a shared file, or all of x86): the bytes belong to
@@ -146,6 +149,7 @@ do_munmap(gaddr_t gaddr, size_t size)
         munmap(overlapping->haddr, overlapping->size);
         arena_free(overlapping->arena_off, overlapping->size);
       }
+    }
     }
     if (overlapping->owns_fd && overlapping->mm_fd >= 0)
       close(overlapping->mm_fd);
@@ -211,6 +215,13 @@ do_mmap(gaddr_t addr, size_t len, int d_prot, int l_prot, int l_flags, int fd, o
   /* A shared file mapping's own descriptor; arm64 only, since only its fork
    * has to re-map the file in another process. */
   int owned_fd = -1;
+  /*
+   * A reservation is address space and nothing else: anonymous, private and
+   * unreadable, so there is nothing for it to hold and nothing the guest can
+   * do with it until it says otherwise. See mm_region::reserved.
+   */
+  bool reserve_only = (l_prot == LINUX_PROT_NONE) && fd < 0 &&
+                      !(l_flags & LINUX_MAP_SHARED);
 #if defined(__arm64__)
   /*
    * Every guest region comes out of the arena, so that a descriptor names it and
@@ -260,7 +271,9 @@ do_mmap(gaddr_t addr, size_t len, int d_prot, int l_prot, int l_flags, int fd, o
                      (offset & (GUEST_MMAP_GRANULE - 1)) == 0 &&
                      !(l_prot & LINUX_PROT_EXEC) && fd_writable;
 
-  if (shared_file) {
+  if (reserve_only) {
+    ptr = NULL;
+  } else if (shared_file) {
     ptr = mmap(0, len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, offset);
     if (ptr == MAP_FAILED)
       return -darwin_to_linux_errno(errno);
@@ -300,8 +313,10 @@ do_mmap(gaddr_t addr, size_t len, int d_prot, int l_prot, int l_flags, int fd, o
                     owned_fd >= 0 ? owned_fd : fd, offset);
   recorded->arena_off = arena_off;
   recorded->owns_fd = owned_fd >= 0;
+  recorded->reserved = reserve_only;
 
-  vmm_mmap(addr, len, linux_mprot_to_hv_mflag(l_prot), ptr);
+  if (!reserve_only)
+    vmm_mmap(addr, len, linux_mprot_to_hv_mflag(l_prot), ptr);
 
 #if defined(__arm64__)
   /*
@@ -442,6 +457,30 @@ DEFINE_SYSCALL(mincore, gaddr_t, addr, size_t, length, gaddr_t, vec_ptr)
     ret = -LINUX_EFAULT;
   free(out);
   return ret;
+}
+
+/*
+ * Give a reservation real memory, because something is about to be allowed to
+ * touch it.
+ *
+ * The bytes read as zero, which is what an anonymous mapping owes its first
+ * reader, and the arena gives that for free. Failure leaves the region as it
+ * was - still a reservation, still unreachable - so a guest that cannot be
+ * given the memory it asked to use is told, rather than handed a mapping that
+ * faults later.
+ */
+static int
+region_materialize(struct mm_region *r, int hvprot)
+{
+  off_t off = -1;
+  void *ptr = arena_alloc(r->size, &off);
+  if (ptr == NULL)
+    return -LINUX_ENOMEM;
+  r->haddr = ptr;
+  r->arena_off = off;
+  r->reserved = false;
+  vmm_mmap(r->gaddr, r->size, hvprot, ptr);
+  return 0;
 }
 
 /*
@@ -824,8 +863,17 @@ DEFINE_SYSCALL(mprotect, gaddr_t, addr, size_t, len, int, prot)
     region = list_entry(region->list.next, struct mm_region, list);
   }
   while (region->gaddr + region->size <= end) {
-    NABI_VM_PROTECT(region);
-    NABI_HOST_PROTECT(region, prot);
+    /* A reservation being made accessible has to become real first; one being
+     * set to PROT_NONE again is already exactly that and stays cheap. */
+    if (region->reserved && prot != LINUX_PROT_NONE) {
+      int r = region_materialize(region, hvprot);
+      if (r < 0)
+        return r;
+    }
+    if (!region->reserved) {
+      NABI_VM_PROTECT(region);
+      NABI_HOST_PROTECT(region, prot);
+    }
     region->prot = hvprot;
 
     /*
@@ -850,8 +898,21 @@ DEFINE_SYSCALL(mprotect, gaddr_t, addr, size_t, len, int, prot)
   }
   if (region->gaddr < end) {
     split_region(proc.mm, region, end);
-    NABI_VM_PROTECT(region);
-    NABI_HOST_PROTECT(region, prot);
+    /* The same as the loop body: the last piece is a region like any other,
+     * and a reservation being opened up here has to become real too. This is
+     * the shape a linker uses - reserve the whole span, then make the middle
+     * of it accessible - so it is the common case, not the leftover one. */
+    if (region->reserved && prot != LINUX_PROT_NONE) {
+      int r = region_materialize(region, hvprot);
+      if (r < 0) {
+        ret = r;
+        goto out;
+      }
+    }
+    if (!region->reserved) {
+      NABI_VM_PROTECT(region);
+      NABI_HOST_PROTECT(region, prot);
+    }
     region->prot = hvprot;
   }
 

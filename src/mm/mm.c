@@ -68,6 +68,12 @@ guest_to_host(gaddr_t gaddr)
   if (!region) {
     return NULL;
   }
+  /* A reservation has no bytes anywhere. The guest cannot reach it either -
+   * it is PROT_NONE - so anything asking for a host pointer into one is asking
+   * about memory that does not exist, and must be told so rather than handed
+   * an offset from NULL. */
+  if (region->reserved)
+    return NULL;
   return region->haddr + gaddr - region->gaddr;
 }
 
@@ -136,6 +142,7 @@ split_region(struct mm *mm, struct mm_region *region, gaddr_t gaddr)
       tail->owns_fd = true;
     }
   }
+  tail->reserved = region->reserved;
   tail->pgoff = region->pgoff;
   tail->shm_id = region->shm_id;
   /* Both halves of a sealed region stay sealed; splitting is not a way out. */
@@ -161,6 +168,7 @@ record_region(struct mm *mm, void *haddr, gaddr_t gaddr, size_t size, int prot, 
     .prot = prot,
     .mm_flags = mm_flags,
     .mm_fd = mm_fd,
+    .reserved = false,    /* do_mmap sets this for a PROT_NONE reservation */
     .owns_fd = false,     /* do_mmap takes this on for a shared file mapping */
     .pgoff = pgoff
   };

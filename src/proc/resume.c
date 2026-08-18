@@ -77,9 +77,20 @@ checkpoint_restore(int ckpt_fd, int arena_fd)
      * whoever else has it, which is what MAP_SHARED means and what fork owes a
      * shared mapping.
      */
-    if (regions[i].mm_fd < 0)
-      panic("region 0x%llx is neither arena-backed nor file-backed",
-            (unsigned long long) regions[i].gaddr);
+    /*
+     * Neither the arena nor a file: an address-space reservation, which has
+     * nothing behind it to re-establish. It needs no host memory and no
+     * stage-2 block on this side either - see mm_region::reserved - so it is
+     * simply left unbacked, and the mm bookkeeping below marks it as such.
+     *
+     * The two existing fields already say this without a new one: a region
+     * that is neither arena-backed nor file-backed can only be a reservation,
+     * which is why this used to be a panic.
+     */
+    if (regions[i].mm_fd < 0) {
+      region_hva[i] = NULL;
+      continue;
+    }
     region_hva[i] = mmap(NULL, regions[i].size, PROT_READ | PROT_WRITE,
                          MAP_SHARED, regions[i].mm_fd, regions[i].pgoff);
     if (region_hva[i] == MAP_FAILED)
@@ -100,8 +111,8 @@ checkpoint_restore(int ckpt_fd, int arena_fd)
    * stage 2 could not be replayed for them along with the rest.
    */
   for (uint32_t i = 0; i < hdr.nr_regions; i++) {
-    if (regions[i].arena_off >= 0)
-      continue;
+    if (regions[i].arena_off >= 0 || region_hva[i] == NULL)
+      continue;                /* arena-backed, or a reservation backing nothing */
     /*
      * A page at a time, because a region is no longer one stage-2 block's
      * worth of anything. A block belongs to a host page and is shared by
@@ -147,6 +158,7 @@ checkpoint_restore(int ckpt_fd, int arena_fd)
                                         regions[i].mm_flags, regions[i].mm_fd,
                                         regions[i].pgoff);
     r->arena_off = regions[i].arena_off;
+    r->reserved = regions[i].arena_off < 0 && regions[i].mm_fd < 0;
     r->shm_id = regions[i].shm_id;
     r->sealed = regions[i].sealed != 0;
   }
