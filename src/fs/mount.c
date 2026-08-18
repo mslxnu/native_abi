@@ -32,12 +32,58 @@
    LINUX_MS_RELATIME | LINUX_MS_STRICTATIME | LINUX_MS_PRIVATE |              \
    LINUX_MS_SHARED | LINUX_MS_SLAVE | LINUX_MS_UNBINDABLE)
 
+/*
+ * A tag for the rootfs this process serves.
+ *
+ * The table is keyed by the mount namespace it belongs to, which is an inode
+ * number - and the *initial* mount namespace has the same inode number in every
+ * guest. So two guests of different images, sharing nothing but a boot tag,
+ * shared a mount table: mounting a tmpfs on /dev while bringing up an Android
+ * image put that tmpfs, and everything else Android mounted, into an unrelated
+ * Fedora guest's /dev. Its login shell then found /dev/null was a regular file
+ * it had no permission to write, which is a long way from anything the user
+ * did.
+ *
+ * The image is identified by the device and inode of its root rather than by
+ * the path it was named with, so two spellings of the same rootfs still share -
+ * which is the point of the table - and two different rootfs never do.
+ *
+ * Taken once and then carried in the environment, for two reasons. A resumed
+ * child re-execs and would otherwise have to derive it again; and pivot_root
+ * changes what the root descriptor points at without changing the mount
+ * namespace, so deriving it afresh later would move a guest to a new empty
+ * table halfway through its life - which is exactly what LXC does on its way
+ * into a container.
+ */
+const char *
+nabi_rootfs_tag(void)
+{
+  static char tag[64];
+  if (tag[0] != '\0')
+    return tag;
+
+  const char *inherited = getenv("NABI_ROOTFS_TAG");
+  if (inherited != NULL && *inherited != '\0') {
+    snprintf(tag, sizeof tag, "%s", inherited);
+    return tag;
+  }
+
+  struct stat st;
+  if (fstat(proc.fileinfo.rootfd, &st) == 0)
+    snprintf(tag, sizeof tag, "%llx_%llx",
+             (unsigned long long) st.st_dev, (unsigned long long) st.st_ino);
+  else
+    snprintf(tag, sizeof tag, "nofs");   /* keyed together, but never silently */
+  setenv("NABI_ROOTFS_TAG", tag, 1);
+  return tag;
+}
+
 static void
 table_path(uint64_t ino, char *out, size_t n)
 {
   const char *tmp = getenv("TMPDIR");
-  snprintf(out, n, "%s/nabi-mnt-%s-%llu",
-           tmp && *tmp ? tmp : "/tmp", nabi_boot_tag(),
+  snprintf(out, n, "%s/nabi-mnt-%s-%s-%llu",
+           tmp && *tmp ? tmp : "/tmp", nabi_boot_tag(), nabi_rootfs_tag(),
            (unsigned long long) ino);
 }
 
@@ -152,9 +198,10 @@ static int
 each_table(uint64_t skip_ino, uint64_t *inos, int max)
 {
   const char *tmp = getenv("TMPDIR");
-  char base[PATH_MAX], prefix[64];
+  char base[PATH_MAX], prefix[128];
   snprintf(base, sizeof base, "%s", tmp && *tmp ? tmp : "/tmp");
-  snprintf(prefix, sizeof prefix, "nabi-mnt-%s-", nabi_boot_tag());
+  snprintf(prefix, sizeof prefix, "nabi-mnt-%s-%s-", nabi_boot_tag(),
+           nabi_rootfs_tag());
 
   DIR *d = opendir(base);
   if (!d)

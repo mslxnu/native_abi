@@ -1101,6 +1101,28 @@ else
     fail=1
 fi
 
+# mntkeytest: a mount table belongs to one image, not to one boot. The initial
+# mount namespace has the same inode number in every guest, so two guests of
+# different images shared a table - mounting a tmpfs on /dev for an Android
+# image put it, and everything else Android mounted, into an unrelated Fedora
+# guest whose login shell then could not write /dev/null. Both halves are
+# checked: a second run of the same image must see the first one's mount, and a
+# different image must see nothing.
+cp "$here/mntkeytest" "$root/"; chmod +x "$root/mntkeytest"
+root2=$(mktemp -d)
+cp "$here/mntkeytest" "$root2/"; chmod +x "$root2/mntkeytest"
+a1=$("$NABI" -m "$root" /mntkeytest 2>&1 | head -1)
+a2=$("$NABI" -m "$root" /mntkeytest 2>&1 | head -1)
+b1=$("$NABI" -m "$root2" /mntkeytest 2>&1 | head -1)
+rm -rf "$root2"
+if [ "$a1" = "mntkey: /mnt absent" ] && [ "$a2" = "mntkey: /mnt present" ] &&
+   [ "$b1" = "mntkey: /mnt absent" ]; then
+    echo "  ok  mntkeytest -> same image shares, different image does not"
+else
+    echo "  FAIL mntkeytest -> first=\"$a1\" second=\"$a2\" other-image=\"$b1\""
+    fail=1
+fi
+
 # procchmodtest: chmod on a passed-through /proc, which the host module serving
 # it refuses - and Android's first-stage init treats a failed chmod of
 # /proc/cmdline as fatal. Checks that it succeeds by path and by dirfd, that a

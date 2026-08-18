@@ -175,6 +175,8 @@ struct nsproxy {
 /* The current boot session, short and filename-safe. Namespace state is kept in
  * files, and none of it should outlive the machine. */
 const char *nabi_boot_tag(void);
+/* Identifies the rootfs, so guests of different images never share a table. */
+const char *nabi_rootfs_tag(void);
 
 const char *ns_type_name(enum ns_type type);
 bool ns_type_from_name(const char *name, enum ns_type *out);

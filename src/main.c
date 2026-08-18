@@ -731,6 +731,12 @@ main(int argc, char *argv[], char **envp)
    */
   binder_broker_init();
 
+  /* Taken now, while the root descriptor still points at the image named on
+   * the command line: it is carried in the environment from here, and a guest
+   * that pivot_roots later must not be moved to a different mount table for
+   * it. See nabi_rootfs_tag. */
+  (void) nabi_rootfs_tag();
+
   open_debug_sinks(debug_paths);
 
   /*
