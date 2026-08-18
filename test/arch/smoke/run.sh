@@ -1123,6 +1123,21 @@ else
     fail=1
 fi
 
+# splitblocktest: unmapping part of a stage-2 block. Guest mappings are 4KiB
+# and the blocks under them are 16KiB, so a guest unmapping one page splits a
+# block: the survivors must keep working and the hole must fault, and the block
+# must not be released until the last page in it has gone. Checks the survivors
+# keep their contents and stay writable, that the unmapped page faults, and
+# that the space is reusable and reads back as zero afterwards.
+cp "$here/splitblocktest" "$root/"; chmod +x "$root/splitblocktest"
+out=$("$NABI" -m "$root" /splitblocktest 2>&1 | tail -1); rc=$?
+if [ "$out" = "splitblock ok" ]; then
+    echo "  ok  splitblocktest -> \"$out\""
+else
+    echo "  FAIL splitblocktest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 # procchmodtest: chmod on a passed-through /proc, which the host module serving
 # it refuses - and Android's first-stage init treats a failed chmod of
 # /proc/cmdline as fatal. Checks that it succeeds by path and by dirfd, that a

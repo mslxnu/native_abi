@@ -89,6 +89,14 @@ uint32_t vmm_arm64_ipa_bits(void);
 void vmm_arm64_unmap_stage2(gaddr_t ipa, size_t size);
 void vmm_arm64_replay_stage2(void);
 void vmm_arm64_s2_reflush(gaddr_t ipa);
+/* The stage-2 block backing a host page, made if there is not one yet. One
+ * block per host page: HVF will not have a host page live at two IPAs. */
+gaddr_t vmm_arm64_s2_block_for(void *hostpage, int prot, bool *created);
+/* How many stage-1 descriptors point into a block. unref returns true when the
+ * last one has gone and the block can be released. */
+void vmm_arm64_s2_ref(gaddr_t ipa);
+bool vmm_arm64_s2_unref(gaddr_t ipa);
+void vmm_arm64_s2_clear_refs(void);
 void vmm_arm64_s2_reprotect(gaddr_t ipa, int prot);
 void vmm_arm64_install_trampoline(void *hva, gaddr_t ipa);
 void vmm_arm64_init_vcpu(void);

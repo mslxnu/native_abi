@@ -147,6 +147,22 @@ chunk_record(struct s2_chunk c)
   chunks[nr_chunks++] = c;
 }
 
+/*
+ * Hand out a fresh 16KiB block of guest-physical space.
+ *
+ * The cursor lives here rather than beside the stage-2 registry because it is
+ * checkpoint state: pt_snapshot carries it and pt_restore puts it back, so a
+ * resumed child goes on assigning IPAs where its parent left off instead of
+ * handing out addresses that are already in use.
+ */
+gaddr_t
+pt_ipa_alloc_block(void)
+{
+  gaddr_t ipa = ipa_brk;
+  ipa_brk += STAGE2_GRANULE;
+  return ipa;
+}
+
 static void *
 ipa_to_host(gaddr_t ipa)
 {
@@ -311,7 +327,12 @@ pt_map_page(gaddr_t va, gaddr_t ipa, int prot)
   assert((ipa & (PAGE_SIZEOF(PAGE_4KB) - 1)) == 0);
 
   uint64_t *l3e = walk_to_l3(va);
+  /* A descriptor being replaced was a reference to whatever block it pointed
+   * at; the block must not go on believing it is still there. */
+  if (*l3e & PTE_VALID)
+    (void) vmm_arm64_s2_unref(*l3e & PTE_ADDR_MASK);
   *l3e = (ipa & PTE_ADDR_MASK) | prot_to_pte(prot) | PTE_PAGE | PTE_VALID;
+  vmm_arm64_s2_ref(ipa);
 }
 
 /*
@@ -441,16 +462,28 @@ vmm_mmap(gaddr_t gaddr, size_t size, int prot, void *haddr)
   assert((gaddr & (PAGE_SIZEOF(PAGE_4KB) - 1)) == 0);
   assert(((uintptr_t) haddr & (STAGE2_GRANULE - 1)) == 0);
 
-  size_t s2_size = roundup(size, STAGE2_GRANULE);
-
-  gaddr_t ipa = ipa_brk;
-  ipa_brk += s2_size;
-
-  int s2_prot = prot ? prot : HV_MEMORY_READ;
-  vmm_arm64_map_stage2(ipa, s2_size, s2_prot, haddr);
-
-  for (size_t off = 0; off < size; off += PAGE_SIZEOF(PAGE_4KB))
-    pt_map_page(gaddr + off, ipa + off, prot);
+  /*
+   * A stage-2 block per *host page*, not per region.
+   *
+   * The IPA is an attribute of the host memory: HVF will not have one host
+   * page live at two IPAs, so once two guest regions can share a host page -
+   * which is what mapping at a finer granularity than the 16KiB block means -
+   * giving each region its own block is rejected outright, with a bare
+   * HV_ERROR from inside the framework.
+   *
+   * So the block is asked for by host address and shared, and each 4KiB guest
+   * page is pointed at its own offset within it. Stage 1 still carries the
+   * exact permissions of the page it maps; the block holds the union, which
+   * costs nothing because the effective permission is the intersection of the
+   * two stages.
+   */
+  for (size_t off = 0; off < size; off += PAGE_SIZEOF(PAGE_4KB)) {
+    char *hp = (char *) haddr + off;
+    char *block = (char *) ((uintptr_t) hp & ~(uintptr_t)(STAGE2_GRANULE - 1));
+    gaddr_t base = vmm_arm64_s2_block_for(block, prot ? prot : HV_MEMORY_READ,
+                                          NULL);
+    pt_map_page(gaddr + off, base + (gaddr_t)(hp - block), prot);
+  }
 }
 
 /*
@@ -497,24 +530,23 @@ walk_existing(gaddr_t va)
  * descriptor is untouched, and the cleared pages now fault because theirs are
  * gone and the stale translations went with the flush.
  *
+ * Which of the two it is comes from the block's reference count rather than
+ * from looking at the four guest pages sharing its virtual address. Once a
+ * block can be shared by regions that are nowhere near each other in the
+ * guest's address space, there is no single virtual address to scan from.
+ *
  * This is what the code used to panic over as needing "evacuation" - moving the
  * survivor to a fresh block. Nothing has to move: what was actually needed was a
  * way to invalidate a block without leaving it unmapped, which is the same
  * unmap-and-remap that makes mprotect take effect.
  */
 static void
-finish_unmapped_block(gaddr_t base_ipa, gaddr_t base_va)
+finish_unmapped_block(gaddr_t base_ipa, bool now_unused)
 {
-  for (int i = 0; i < (int)(STAGE2_GRANULE / PAGE_SIZEOF(PAGE_4KB)); i++) {
-    uint64_t *pte = walk_existing(base_va + (gaddr_t) i * PAGE_SIZEOF(PAGE_4KB));
-    if (pte && (*pte & PTE_VALID) &&
-        (*pte & PTE_ADDR_MASK) >= base_ipa &&
-        (*pte & PTE_ADDR_MASK) <  base_ipa + STAGE2_GRANULE) {
-      vmm_arm64_s2_reflush(base_ipa);      /* a survivor: keep it, flush it */
-      return;
-    }
-  }
-  vmm_arm64_unmap_stage2(base_ipa, STAGE2_GRANULE);
+  if (now_unused)
+    vmm_arm64_unmap_stage2(base_ipa, STAGE2_GRANULE);
+  else
+    vmm_arm64_s2_reflush(base_ipa);        /* a survivor: keep it, flush it */
 }
 
 /*
@@ -542,8 +574,9 @@ vmm_munmap(gaddr_t gaddr, size_t size)
   gaddr_t va_hi = gaddr + size;
   gaddr_t pagesz = PAGE_SIZEOF(PAGE_4KB);
 
-  /* Blocks touched, and where each one's four guest pages begin. */
-  gaddr_t block_ipa[64], block_va[64];
+  /* Blocks touched, and whether the last descriptor into each has now gone. */
+  gaddr_t block_ipa[64];
+  bool block_free[64];
   size_t nr_blocks = 0;
 
   for (gaddr_t va = va_lo; va < va_hi; va += pagesz) {
@@ -553,28 +586,32 @@ vmm_munmap(gaddr_t gaddr, size_t size)
 
     gaddr_t ipa = *pte & PTE_ADDR_MASK;
     gaddr_t base_ipa = ipa & ~(STAGE2_GRANULE - 1);
-    gaddr_t base_va  = va - (ipa & (STAGE2_GRANULE - 1));
 
     *pte = 0;
+    bool freed = vmm_arm64_s2_unref(ipa);
 
     bool seen = false;
     for (size_t i = 0; i < nr_blocks; i++)
-      if (block_ipa[i] == base_ipa) { seen = true; break; }
+      if (block_ipa[i] == base_ipa) {
+        block_free[i] = freed;   /* the latest answer is the live one */
+        seen = true;
+        break;
+      }
     if (!seen) {
       if (nr_blocks == sizeof block_ipa / sizeof block_ipa[0]) {
         /* Flush what we have rather than lose a block, and start again. */
         for (size_t i = 0; i < nr_blocks; i++)
-          finish_unmapped_block(block_ipa[i], block_va[i]);
+          finish_unmapped_block(block_ipa[i], block_free[i]);
         nr_blocks = 0;
       }
       block_ipa[nr_blocks] = base_ipa;
-      block_va[nr_blocks] = base_va;
+      block_free[nr_blocks] = freed;
       nr_blocks++;
     }
   }
 
   for (size_t i = 0; i < nr_blocks; i++)
-    finish_unmapped_block(block_ipa[i], block_va[i]);
+    finish_unmapped_block(block_ipa[i], block_free[i]);
 }
 
 /*
@@ -647,6 +684,33 @@ pt_restore(uint64_t saved_ipa_brk, uint64_t l1_ipa,
    * snapshot, which carries TTBR0 as well; setting it here keeps the tables and
    * the register consistent even before that restore runs. */
   vmm_arm64_write_sysreg(HV_SYS_REG_TTBR0_EL1, l1_ipa);
+
+  /*
+   * And count the descriptors again.
+   *
+   * A block is released when the last stage-1 descriptor into it goes, so the
+   * counts are what decide whether a munmap releases host memory the guest can
+   * still reach. They are derived from the tables rather than carried in the
+   * checkpoint: the tables *are* the truth, they came across intact, and a
+   * count that travelled separately could disagree with them. A child that
+   * started from zero would free a block on its first munmap while other pages
+   * were still pointing into it.
+   */
+  vmm_arm64_s2_clear_refs();
+  for (uint64_t i = 0; i < NR_PAGE_ENTRY; i++) {
+    uint64_t l1e = l1_table.entries[i];
+    if ((l1e & PTE_VALID) == 0)
+      continue;
+    uint64_t *l2 = ipa_to_host(l1e & PTE_ADDR_MASK);
+    for (uint64_t j = 0; j < NR_PAGE_ENTRY; j++) {
+      if ((l2[j] & PTE_VALID) == 0)
+        continue;
+      uint64_t *l3 = ipa_to_host(l2[j] & PTE_ADDR_MASK);
+      for (uint64_t k = 0; k < NR_PAGE_ENTRY; k++)
+        if (l3[k] & PTE_VALID)
+          vmm_arm64_s2_ref(l3[k] & PTE_ADDR_MASK);
+    }
+  }
 }
 
 /*

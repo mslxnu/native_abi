@@ -43,8 +43,24 @@
  * VM state, are lost and must be replayed. Keyed by IPA so map/unmap/replay are
  * all O(1) per granule and independent of pt_arm64.c's IPA layout.
  */
-struct s2_ent { void *haddr; int prot; };
+/* Defined in src/mm/pt_arm64.c, which owns the cursor because it is
+ * checkpoint state. */
+gaddr_t pt_ipa_alloc_block(void);
+
+struct s2_ent { void *haddr; int prot; unsigned refs; };
 KHASH_MAP_INIT_INT64(s2, struct s2_ent)
+
+/*
+ * The reverse of the registry: which stage-2 block backs a given host page.
+ *
+ * An IPA is ours to assign, and the natural thing to assign it to is a *host
+ * page*, not a guest region. hv_vm_map refuses to have one host page live at
+ * two IPAs, so as soon as two guest regions can share a host page - which is
+ * what a mapping granularity finer than the 16KiB stage-2 block means - a
+ * block per region is not merely wasteful but rejected outright.
+ */
+KHASH_MAP_INIT_INT64(hblk, gaddr_t)
+static khash_t(hblk) *hblk_index;
 static khash_t(s2) *s2_map;
 
 struct vcpu {
@@ -86,7 +102,14 @@ s2_record(gaddr_t ipa, size_t size, int prot, void *haddr)
   for (size_t off = 0; off < size; off += STAGE2_GRANULE) {
     int ret;
     khiter_t k = kh_put(s2, s2_map, ipa + off, &ret);
-    kh_value(s2_map, k) = (struct s2_ent){ (char *) haddr + off, prot };
+    unsigned refs = ret == 0 ? kh_value(s2_map, k).refs : 0;
+    kh_value(s2_map, k) = (struct s2_ent){ (char *) haddr + off, prot, refs };
+    int hret;
+    if (hblk_index == NULL)
+      hblk_index = kh_init(hblk);
+    khiter_t h = kh_put(hblk, hblk_index,
+                        (uint64_t)(uintptr_t)((char *) haddr + off), &hret);
+    kh_value(hblk_index, h) = ipa + off;
   }
 }
 
@@ -95,9 +118,98 @@ s2_forget(gaddr_t ipa, size_t size)
 {
   for (size_t off = 0; off < size; off += STAGE2_GRANULE) {
     khiter_t k = kh_get(s2, s2_map, ipa + off);
-    if (k != kh_end(s2_map))
-      kh_del(s2, s2_map, k);
+    if (k == kh_end(s2_map))
+      continue;
+    if (hblk_index != NULL) {
+      khiter_t h = kh_get(hblk, hblk_index,
+                          (uint64_t)(uintptr_t) kh_value(s2_map, k).haddr);
+      if (h != kh_end(hblk_index))
+        kh_del(hblk, hblk_index, h);
+    }
+    kh_del(s2, s2_map, k);
   }
+}
+
+/*
+ * The stage-2 block backing a host page, made if there is not one yet.
+ *
+ * This is where the "one IPA per host page" rule is kept. A caller asks for
+ * the block behind a host address and gets an IPA it can point stage-1
+ * descriptors at; the second caller to ask about the same host page gets the
+ * same block rather than a new mapping of it, which is the thing HVF refuses.
+ *
+ * The block's own permissions are widened to the union of what its callers
+ * asked for, and never narrowed. That is not a weakening: on this
+ * architecture the effective permission is the intersection of the two
+ * stages, and stage 1 carries each guest page's exact prot - which is already
+ * how alloc_guest_page has always worked, mapping its page-table chunks RWX
+ * and letting stage 1 decide. Narrowing a shared block would instead take
+ * permissions away from a neighbour that never asked for that.
+ */
+gaddr_t
+vmm_arm64_s2_block_for(void *hostpage, int prot, bool *created)
+{
+  assert(((uintptr_t) hostpage & (STAGE2_GRANULE - 1)) == 0);
+
+  if (hblk_index != NULL) {
+    khiter_t h = kh_get(hblk, hblk_index, (uint64_t)(uintptr_t) hostpage);
+    if (h != kh_end(hblk_index)) {
+      gaddr_t ipa = kh_value(hblk_index, h);
+      khiter_t k = kh_get(s2, s2_map, ipa);
+      if (k != kh_end(s2_map)) {
+        if (created) *created = false;
+        int have = kh_value(s2_map, k).prot;
+        if ((have | prot) != have)
+          vmm_arm64_map_stage2(ipa, STAGE2_GRANULE, have | prot, hostpage);
+        return ipa;
+      }
+    }
+  }
+
+  gaddr_t ipa = pt_ipa_alloc_block();
+  vmm_arm64_map_stage2(ipa, STAGE2_GRANULE, prot ? prot : HV_MEMORY_READ,
+                       hostpage);
+  if (created) *created = true;
+  return ipa;
+}
+
+/*
+ * How many stage-1 descriptors point into a block, so it can be released when
+ * the last one goes.
+ *
+ * The count is what replaces "scan the four guest pages that share this
+ * block's virtual address": once a block can be shared by regions that are
+ * nowhere near each other in the guest's address space, there is no virtual
+ * address to scan from.
+ */
+void
+vmm_arm64_s2_ref(gaddr_t ipa)
+{
+  khiter_t k = kh_get(s2, s2_map, ipa & ~(STAGE2_GRANULE - 1));
+  if (k != kh_end(s2_map))
+    kh_value(s2_map, k).refs++;
+}
+
+/* True when that was the last reference and the block is now unused. */
+bool
+vmm_arm64_s2_unref(gaddr_t ipa)
+{
+  khiter_t k = kh_get(s2, s2_map, ipa & ~(STAGE2_GRANULE - 1));
+  if (k == kh_end(s2_map))
+    return false;              /* not a block this owns - a page-table chunk */
+  if (kh_value(s2_map, k).refs > 0)
+    kh_value(s2_map, k).refs--;
+  return kh_value(s2_map, k).refs == 0;
+}
+
+void
+vmm_arm64_s2_clear_refs(void)
+{
+  gaddr_t ipa;
+  (void) ipa;
+  for (khiter_t k = kh_begin(s2_map); k != kh_end(s2_map); ++k)
+    if (kh_exist(s2_map, k))
+      kh_value(s2_map, k).refs = 0;
 }
 
 void

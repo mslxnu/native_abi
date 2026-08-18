@@ -22,19 +22,41 @@
 /*
  * The unit guest mappings are rounded to.
  *
- * On arm64 it is the stage-2 granule rather than the guest's own page size: a
- * mapping smaller than a 16KiB block cannot be given back independently, since
- * vmm_munmap works a block at a time. It lives here rather than in mmap.c
- * because brk has to agree with it - rounding the break to 4KiB while the
- * mapping behind it was rounded to 16KiB left the recorded region reaching past
- * current_brk, so the next brk mapped from inside a region that already existed
- * and record_region panicked with "recording overlapping regions".
+ * The guest's own page size, on both architectures. It lives here rather than
+ * in mmap.c because brk has to agree with it - rounding the break to 4KiB while
+ * the mapping behind it was rounded to 16KiB left the recorded region reaching
+ * past current_brk, so the next brk mapped from inside a region that already
+ * existed and record_region panicked with "recording overlapping regions".
+ *
+ * On arm64 this was the 16KiB stage-2 granule for as long as a stage-2 block
+ * belonged to one region: a mapping smaller than a block could not be given
+ * back independently. It no longer does - a block belongs to a host page and
+ * is released when the last stage-1 descriptor into it goes - so a guest can
+ * map, protect and unmap at the 4KiB granularity its page tables have always
+ * used.
+ *
+ * Rounding to 16KiB was not a harmless over-allocation. A guest told its pages
+ * were 4KiB got mappings a whole 16KiB block wide, so the page after a
+ * single-page mapping was writable where Linux would have faulted: guard pages
+ * were not guards, and consecutive mappings from a linker or an allocator ran
+ * into each other. That is what stopped Android, whose allocator refuses to run
+ * with 16KiB pages at all and so has to be told 4KiB.
  */
 #if defined(__arm64__)
 #include "arm64/vm.h"
-#define GUEST_MMAP_GRANULE STAGE2_GRANULE
+#define GUEST_MMAP_GRANULE PAGE_SIZEOF(PAGE_4KB)
+/*
+ * The unit *host* memory is obtained and given back in, which on arm64 is no
+ * longer the same thing as the unit the guest maps in. hv_vm_map takes nothing
+ * smaller than a 16KiB block and the arena allocates in blocks, so releasing a
+ * 4KiB slice of one would cut a hole in host memory a neighbouring guest page
+ * is still using - and the next time that block is re-established, hv_vm_map
+ * refuses the range with a bare HV_ERROR.
+ */
+#define HOST_BLOCK_GRANULE STAGE2_GRANULE
 #else
 #define GUEST_MMAP_GRANULE PAGE_SIZEOF(PAGE_4KB)
+#define HOST_BLOCK_GRANULE PAGE_SIZEOF(PAGE_4KB)
 #endif
 #include "util/list.h"
 #include "util/tree.h"

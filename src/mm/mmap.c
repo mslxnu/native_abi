@@ -122,8 +122,12 @@ do_munmap(gaddr_t gaddr, size_t size)
     vmm_munmap(overlapping->gaddr, overlapping->size);
     if (overlapping->arena_off < 0) {
       /* A real mapping (a shared file, or all of x86): the bytes belong to
-       * whatever it was mapped from, and the region owned all of them. */
-      munmap(overlapping->haddr, overlapping->size);
+       * whatever it was mapped from. Released only when this region owns whole
+       * host blocks, for the same reason the arena case below is - a host page
+       * is 16KiB here and a 4KiB region may be sharing one with a sibling. */
+      if ((uintptr_t) overlapping->haddr % HOST_BLOCK_GRANULE == 0 &&
+          overlapping->size % HOST_BLOCK_GRANULE == 0)
+        munmap(overlapping->haddr, overlapping->size);
     } else {
       /*
        * Arena memory is released only as a whole chunk. A region that mprotect
@@ -137,8 +141,8 @@ do_munmap(gaddr_t gaddr, size_t size)
        * as zeros - so neither can go. A region that owns whole blocks has no
        * sibling in them and releases normally.
        */
-      if (overlapping->arena_off % GUEST_MMAP_GRANULE == 0 &&
-          overlapping->size % GUEST_MMAP_GRANULE == 0) {
+      if (overlapping->arena_off % HOST_BLOCK_GRANULE == 0 &&
+          overlapping->size % HOST_BLOCK_GRANULE == 0) {
         munmap(overlapping->haddr, overlapping->size);
         arena_free(overlapping->arena_off, overlapping->size);
       }
