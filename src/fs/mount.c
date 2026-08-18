@@ -1321,6 +1321,17 @@ DEFINE_SYSCALL(open_tree, int, dfd, gstr_t, path_ptr, unsigned int, flags)
   char path[MOUNT_PATH_MAX];
   if (strncpy_from_user(path, path_ptr, sizeof path) < 0)
     return -LINUX_EFAULT;
+  /*
+   * An empty path with AT_EMPTY_PATH names the descriptor itself, and that is
+   * the form LXC binds a rootfs with: open the directory, then clone the mount
+   * at it. Requiring an absolute path refused it, and the container could not
+   * mount its own root.
+   */
+  if (path[0] == '\0' && (flags & LINUX_AT_EMPTY_PATH)) {
+    if (dfd == LINUX_AT_FDCWD || !guest_path_of_fd(dfd, path, sizeof path))
+      return -LINUX_EBADF;
+  }
+
   if (path[0] != '/')
     return -LINUX_EINVAL;       /* as elsewhere here: the table is keyed by
                                  * absolute guest paths */
@@ -1394,6 +1405,17 @@ DEFINE_SYSCALL(move_mount, int, from_dfd, gstr_t, from_ptr, int, to_dfd,
   char to[MOUNT_PATH_MAX];
   if (strncpy_from_user(to, to_ptr, sizeof to) < 0)
     return -LINUX_EFAULT;
+  /*
+   * An empty *target* names the descriptor it is relative to, the same way an
+   * empty source names its own - and LXC attaches a rootfs with both ends empty:
+   * a detached mount moved onto an open directory. Only the source end was
+   * handled, so the call was refused for want of a path that was deliberately
+   * not given.
+   */
+  if (to[0] == '\0' && (flags & LINUX_MOVE_MOUNT_T_EMPTY_PATH)) {
+    if (to_dfd == LINUX_AT_FDCWD || !guest_path_of_fd(to_dfd, to, sizeof to))
+      return -LINUX_EBADF;
+  }
   if (to[0] != '/')
     return -LINUX_EINVAL;
   (void) to_dfd;

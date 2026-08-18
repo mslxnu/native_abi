@@ -24,18 +24,51 @@ typedef void meta_strace_hook(int syscall_num, int argc, char *argnames[6], char
 meta_strace_hook *strace_pre_hooks[NR_SYSCALLS];
 meta_strace_hook *strace_post_hooks[NR_SYSCALLS];
 
+/*
+ * A guest string, for the log.
+ *
+ * Copied in rather than dereferenced. This walked guest memory directly -
+ * *(char *)guest_to_host(str + i) - which is fine for a pointer that is a
+ * string and fatal for one that is not: an unmapped address, or an argument
+ * that only *looks* like a string in the table, faults inside the formatter and
+ * kills the process being traced.
+ *
+ * That is the worst way for a tracer to fail, because it removes the evidence
+ * of itself: the log ends at the call before the one that crashed, and the
+ * guest looks like it stopped there on its own. waydroid's container was
+ * diagnosed four different ways off this - hang, kill, spin, unexplained exit -
+ * before the fault turned out to be here, in the instrument, on fsconfig's
+ * arguments. Nothing that only observes may ever be able to do that.
+ */
 void
 print_gstr(gstr_t str, int maxlen)
 {
+  if (str == 0) {
+    fprintf(strace_sink, "NULL");
+    return;
+  }
+  if (maxlen < 0)
+    maxlen = 0;
+  if (maxlen > 4096)
+    maxlen = 4096;
+
+  char buf[4097];
+  if (strncpy_from_user(buf, str, (size_t) maxlen + 1) < 0) {
+    /* Not readable: say where it pointed rather than dying of it. */
+    fprintf(strace_sink, "<unreadable %#llx>", (unsigned long long) str);
+    return;
+  }
+  buf[maxlen] = '\0';
+
   fprintf(strace_sink, "\"");
   for (int i = 0; i < maxlen; i++) {
-    char c = *((char*)guest_to_host(str + i));
+    char c = buf[i];
     if (c == '\0') {
       break;
     } else if (c == '\n') {
       fprintf(strace_sink, "\\n");
-    } else if (!isprint(c)) {
-      fprintf(strace_sink, "\\x%02x", c);
+    } else if (!isprint((unsigned char) c)) {
+      fprintf(strace_sink, "\\x%02x", (unsigned char) c);
     } else {
       fprintf(strace_sink, "%c", c);
     }
