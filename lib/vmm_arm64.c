@@ -458,7 +458,18 @@ vmm_arm64_write_sysreg(hv_sys_reg_t reg, uint64_t val)
 int
 vmm_enter(void)
 {
-  return hv_vcpu_run(vcpu->vcpuid) == HV_SUCCESS ? 0 : -1;
+  hv_return_t r = hv_vcpu_run(vcpu->vcpuid);
+  if (r == HV_SUCCESS)
+    return 0;
+  /*
+   * The framework refusing to run the vcpu, which the -1 below says nothing
+   * about. It is the bottom of the stack of ways a guest can stop without
+   * saying why: everything above this reports itself now, and this did not, so
+   * a guest that ended here ended in silence and looked from the outside like
+   * one that had simply stopped making syscalls.
+   */
+  warnk("hv_vcpu_run failed: 0x%x\n", (unsigned) r);
+  return -1;
 }
 
 /* Read/write a single 128-bit SIMD&FP register (V0..V31). Kept here, like the
