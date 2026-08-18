@@ -14,8 +14,12 @@
  *     to start a foreground container from a threaded process - which is what
  *     `lxc-start -F` is, and what waydroid runs.
  *   - openat2 honours the resolve restrictions it can answer and refuses the
- *     rest. LXC opens /sys/fs/cgroup with NO_MAGICLINKS|NO_SYMLINKS and treats
- *     a refusal as fatal, so refusing all of them stopped every container.
+ *     rest. LXC opens /sys/fs/cgroup with NO_MAGICLINKS|NO_SYMLINKS and pins
+ *     the container rootfs with those plus NO_XDEV|BENEATH, and treats either
+ *     refusal as fatal, so refusing all of them stopped every container.
+ *   - /proc/<pid>/cgroup answers for a pid that is not the caller. LXC reads
+ *     /proc/1/cgroup to learn the cgroup layout before it will start anything,
+ *     and got ENOENT because pid 1 is somebody else.
  */
 static long sys6(long n, long a, long b, long c, long d, long e, long f){
   register long x8 asm("x8")=n; register long x0 asm("x0")=a; register long x1 asm("x1")=b;
@@ -58,6 +62,9 @@ static long sys6(long n, long a, long b, long c, long d, long e, long f){
 #define RESOLVE_NO_MAGICLINKS 0x02
 #define RESOLVE_NO_SYMLINKS   0x04
 #define RESOLVE_BENEATH       0x08
+#define RESOLVE_NO_XDEV       0x01
+#define RESOLVE_IN_ROOT       0x10
+#define EXDEV    18
 
 struct open_how { unsigned long long flags, mode, resolve; };
 
@@ -267,12 +274,73 @@ int main(void) {
       sys6(SYS_unlinkat, AT_FDCWD, (long) "/cglink", 0, 0, 0, 0);
     }
 
-    /* One that cannot be honoured is still refused. */
-    how.resolve = RESOLVE_BENEATH;
+    /*
+     * BENEATH and NO_XDEV, which LXC asks for together with the other two when
+     * it pins a rootfs. BENEATH is enforceable once symlinks are excluded: it
+     * becomes the absence of ".." and of a leading slash.
+     */
+    long dir = sys6(SYS_openat, AT_FDCWD, (long) "/cg", O_RDONLY | O_DIRECTORY, 0, 0, 0);
+    if (dir < 0) {
+      fail("open /cg as a directory", dir);
+    } else {
+      /* A file, so the directory flag from the check above has to go. */
+      how.flags = O_RDONLY;
+      how.resolve = RESOLVE_NO_MAGICLINKS | RESOLVE_NO_SYMLINKS |
+                    RESOLVE_NO_XDEV | RESOLVE_BENEATH;
+      f = sys6(SYS_openat2, dir, (long) "cgroup.procs", (long) &how, sizeof how, 0, 0);
+      if (f < 0)
+        fail("openat2 beneath a directory with all four restrictions", f);
+      else
+        sys6(SYS_close, f, 0, 0, 0, 0, 0);
+
+      /* Leaving is what BENEATH forbids, and EXDEV is what Linux says. */
+      f = sys6(SYS_openat2, dir, (long) "../cg", (long) &how, sizeof how, 0, 0);
+      if (f != -EXDEV) {
+        fail("openat2 escaping with BENEATH", f);
+        if (f >= 0) sys6(SYS_close, f, 0, 0, 0, 0, 0);
+      }
+      f = sys6(SYS_openat2, dir, (long) "/cg", (long) &how, sizeof how, 0, 0);
+      if (f != -EXDEV) {
+        fail("openat2 given an absolute path with BENEATH", f);
+        if (f >= 0) sys6(SYS_close, f, 0, 0, 0, 0, 0);
+      }
+
+      /* BENEATH without NO_SYMLINKS cannot be kept, and says so. */
+      how.resolve = RESOLVE_BENEATH;
+      f = sys6(SYS_openat2, dir, (long) "cgroup.procs", (long) &how, sizeof how, 0, 0);
+      if (f != -EINVAL) {
+        fail("openat2 with BENEATH but no NO_SYMLINKS", f);
+        if (f >= 0) sys6(SYS_close, f, 0, 0, 0, 0, 0);
+      }
+      sys6(SYS_close, dir, 0, 0, 0, 0, 0);
+    }
+
+    /* One that still cannot be honoured is still refused. */
+    how.resolve = RESOLVE_IN_ROOT;
     f = sys6(SYS_openat2, AT_FDCWD, (long) "/cg", (long) &how, sizeof how, 0, 0);
     if (f != -EINVAL) {
       fail("openat2 with a restriction nabi cannot keep", f);
       if (f >= 0) sys6(SYS_close, f, 0, 0, 0, 0, 0);
+    }
+  }
+
+  /*
+   * /proc/1/cgroup: somebody else's, which is the one LXC reads. The content
+   * is checked, not merely the open - a file that exists and is empty would
+   * satisfy a check that only opened it, and tells the reader nothing.
+   */
+  {
+    long f = sys6(SYS_openat, AT_FDCWD, (long) "/proc/1/cgroup", O_RDONLY, 0, 0, 0);
+    if (f < 0) {
+      fail("open /proc/1/cgroup", f);
+    } else {
+      static char cbuf[128];
+      long n = sys6(SYS_read, f, (long) cbuf, sizeof cbuf - 1, 0, 0, 0);
+      sys6(SYS_close, f, 0, 0, 0, 0, 0);
+      if (n < 4)
+        fail("what /proc/1/cgroup says", n);
+      else if (!(cbuf[0] == '0' && cbuf[1] == ':' && cbuf[2] == ':' && cbuf[3] == '/'))
+        fail("the cgroup v2 line for pid 1", cbuf[0]);
     }
   }
 

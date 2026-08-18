@@ -25,6 +25,8 @@ void        cgroup_set_current(const char *path);
 
 /* /proc/<pid>/cgroup, as seen from this process's cgroup namespace. */
 int cgroup_proc_text(char *out, size_t n);
+/* The same, for a pid that may not be this process. See src/proc/cgroup.c. */
+int cgroup_proc_text_for(int32_t nspid, char *out, size_t n);
 
 /* The namespace's root, "/" unless this process unshared. */
 const char *cgroup_ns_root(void);

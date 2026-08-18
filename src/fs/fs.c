@@ -4734,13 +4734,62 @@ close_cloexec()
 static int
 resolve_check(int dirfd, const char *path, uint64_t resolve)
 {
-  if ((resolve & (LINUX_RESOLVE_NO_SYMLINKS | LINUX_RESOLVE_NO_MAGICLINKS)) == 0)
+  if (resolve == 0)
     return 0;
 
   char prefix[LINUX_PATH_MAX];
   size_t n = strlen(path);
   if (n >= sizeof prefix)
     return -LINUX_ENAMETOOLONG;
+
+  /*
+   * BENEATH: resolution may not escape the directory it starts from. An
+   * absolute path starts somewhere else by definition, and ".." is the only
+   * other way out once symlinks are excluded - which they are, because Linux
+   * requires NO_SYMLINKS alongside anything that wants this guarantee, and a
+   * caller that omits it is refused below.
+   *
+   * This is stricter than Linux, which permits a symlink that happens to stay
+   * beneath. Being stricter about a *restriction* is safe: it refuses things
+   * that would have been allowed, and never allows one that should not be.
+   * EXDEV is the error Linux gives for escaping.
+   */
+  if (resolve & LINUX_RESOLVE_BENEATH) {
+    if (!(resolve & LINUX_RESOLVE_NO_SYMLINKS))
+      return -LINUX_EINVAL;     /* cannot be kept without it; say so */
+    if (path[0] == '/')
+      return -LINUX_EXDEV;
+    for (size_t i = 0; i < n; i++)
+      if (path[i] == '.' && path[i + 1] == '.' &&
+          (i == 0 || path[i - 1] == '/') &&
+          (path[i + 2] == '\0' || path[i + 2] == '/'))
+        return -LINUX_EXDEV;
+  }
+
+  /*
+   * NO_XDEV: resolution may not cross a mount. The device a component sits on
+   * is what "a mount" means to anything that can see it, and st_dev says so
+   * directly - no mount table needed, and it notices a crossing wherever the
+   * host really has one.
+   */
+  dev_t start_dev = 0;
+  bool have_start = false;
+  if (resolve & LINUX_RESOLVE_NO_XDEV) {
+    struct stat st;
+    if (path[0] == '/') {
+      struct path rp;
+      if (vfs_grab_dir(dirfd, "/", 0, &rp) >= 0) {
+        if (fstatat(rp.dir->fd, rp.subpath, &st, 0) == 0) {
+          start_dev = st.st_dev;
+          have_start = true;
+        }
+        vfs_ungrab_dir(&rp);
+      }
+    } else if (dirfd != LINUX_AT_FDCWD && fstat(dirfd, &st) == 0) {
+      start_dev = st.st_dev;
+      have_start = true;
+    }
+  }
 
   for (size_t i = 1; i <= n; i++) {
     if (i != n && path[i] != '/')
@@ -4757,16 +4806,20 @@ resolve_check(int dirfd, const char *path, uint64_t resolve)
         return -LINUX_ELOOP;
     }
 
-    if (resolve & LINUX_RESOLVE_NO_SYMLINKS) {
+    if (resolve & (LINUX_RESOLVE_NO_SYMLINKS | LINUX_RESOLVE_NO_XDEV)) {
       struct path pp;
       if (vfs_grab_dir(dirfd, prefix, LOOKUP_NOFOLLOW, &pp) < 0)
         continue;               /* not there; the open itself will say so */
       struct stat st;
-      bool link = fstatat(pp.dir->fd, pp.subpath, &st,
-                          AT_SYMLINK_NOFOLLOW) == 0 && S_ISLNK(st.st_mode);
+      bool got = fstatat(pp.dir->fd, pp.subpath, &st, AT_SYMLINK_NOFOLLOW) == 0;
       vfs_ungrab_dir(&pp);
-      if (link)
+      if (!got)
+        continue;
+      if ((resolve & LINUX_RESOLVE_NO_SYMLINKS) && S_ISLNK(st.st_mode))
         return -LINUX_ELOOP;
+      if ((resolve & LINUX_RESOLVE_NO_XDEV) && have_start &&
+          st.st_dev != start_dev)
+        return -LINUX_EXDEV;
     }
   }
   return 0;
@@ -4797,19 +4850,24 @@ DEFINE_SYSCALL(openat2, int, dirfd, gstr_t, path_ptr, gaddr_t, how_ptr,
   }
 
   /*
-   * The resolve flags are restrictions, and the two that can be enforced are
-   * enforced rather than refused - see resolve_check. The rest still cannot be:
-   * BENEATH and IN_ROOT need resolution performed against a root nabi does not
-   * control, NO_XDEV needs the mount a walk crosses to be known during it, and
-   * CACHED is a promise about not going to disk. Refusing those is what a
-   * caller can recover from; openat2 exists so a program can ask and be told no.
+   * The resolve flags are restrictions, and the ones that can be enforced are
+   * enforced rather than refused - see resolve_check. Four can: the two that
+   * are questions about a path, plus BENEATH, which once symlinks are excluded
+   * is the absence of ".." and of a leading slash, and NO_XDEV, which is a
+   * comparison of st_dev along the walk.
    *
-   * Refusing *all* of them was too broad. LXC opens /sys/fs/cgroup with
-   * NO_MAGICLINKS|NO_SYMLINKS and treats the refusal as fatal, so no container
-   * could start at all.
+   * IN_ROOT still cannot be: it does not merely forbid escaping, it *rewrites*
+   * ".." and absolute paths to land at a root nabi does not control. CACHED is
+   * a promise about not going to disk. Refusing those is something a caller can
+   * recover from; openat2 exists so a program can ask and be told no.
+   *
+   * Refusing all of them was too broad. LXC opens /sys/fs/cgroup with two set
+   * and pins the container rootfs with four, and treats either refusal as
+   * fatal, so no container could start at all.
    */
   static const uint64_t resolve_known =
-      LINUX_RESOLVE_NO_SYMLINKS | LINUX_RESOLVE_NO_MAGICLINKS;
+      LINUX_RESOLVE_NO_SYMLINKS | LINUX_RESOLVE_NO_MAGICLINKS |
+      LINUX_RESOLVE_NO_XDEV | LINUX_RESOLVE_BENEATH;
   if (how.resolve & ~resolve_known)
     return -LINUX_EINVAL;
 

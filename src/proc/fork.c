@@ -400,6 +400,18 @@ do_clone(unsigned long clone_flags, unsigned long newsp, gaddr_t parent_tid, gad
    * the child exists - do_clone itself needs nothing for it, but it has to be
    * accepted here or the clone is refused before it gets there. */
   unsigned long implemented = LINUX_CLONE_THREAD | LINUX_CLONE_DETACHED | LINUX_CLONE_SETTLS | LINUX_CLONE_CHILD_SETTID | LINUX_CLONE_CHILD_CLEARTID | LINUX_CLONE_PARENT_SETTID | LINUX_CLONE_PIDFD;
+  /*
+   * The namespace flags are the caller's to act on and both callers do, before
+   * anything forks - see the note in the clone syscall. By the time do_clone
+   * runs, the namespaces exist and the child will inherit them, so what is left
+   * here is to not refuse the flags that asked for them.
+   *
+   * They were refused, which is why clone with a namespace flag had never
+   * worked: LXC asks for five at once and got EINVAL for the set.
+   */
+  implemented |= LINUX_CLONE_NEWNS | LINUX_CLONE_NEWUTS | LINUX_CLONE_NEWIPC |
+                 LINUX_CLONE_NEWPID | LINUX_CLONE_NEWNET | LINUX_CLONE_NEWUSER |
+                 LINUX_CLONE_NEWCGROUP | LINUX_CLONE_NEWTIME;
   unsigned long needed = 0;
   if (clone_flags & LINUX_CLONE_THREAD) {
     int needed = LINUX_CLONE_VM | LINUX_CLONE_FS | LINUX_CLONE_FILES | LINUX_CLONE_SIGHAND | LINUX_CLONE_SYSVSEM;
@@ -560,13 +572,19 @@ DEFINE_SYSCALL(clone3, gaddr_t, args_ptr, size_t, size)
   unsigned long clone_flags = (unsigned long) a.flags |
                               (unsigned long) (a.exit_signal & 0xff);
 
+  uint64_t ns_saved[NS_COUNT];
+  struct uts_namespace uts_saved;
+  bool ns_moved = false;
   if (clone_flags & (LINUX_CLONE_NEWNS | LINUX_CLONE_NEWUTS |
                      LINUX_CLONE_NEWIPC | LINUX_CLONE_NEWPID |
                      LINUX_CLONE_NEWNET | LINUX_CLONE_NEWUSER |
                      LINUX_CLONE_NEWCGROUP | LINUX_CLONE_NEWTIME)) {
+    /* The parent is put back afterwards; see the note in clone. */
+    nsproxy_snapshot(ns_saved, &uts_saved);
     int nsr = nsproxy_clone(clone_flags);
     if (nsr < 0)
       return nsr;
+    ns_moved = true;
   }
 
   /* clone takes the stack *pointer*; clone3 takes the base and the size, and a
@@ -578,6 +596,10 @@ DEFINE_SYSCALL(clone3, gaddr_t, args_ptr, size_t, size)
 
   int ret = do_clone(clone_flags, sp, (gaddr_t) a.parent_tid,
                      (gaddr_t) a.child_tid, (gaddr_t) a.tls);
+
+  if (ns_moved && ret != 0)
+    nsproxy_restore(ns_saved, &uts_saved);
+
   if (ret > 0) {
     /* clone3 has a field for it; the child itself gets 0 back and writes
      * nothing. */
@@ -607,13 +629,25 @@ DEFINE_SYSCALL(clone, unsigned long, clone_flags, unsigned long, newsp, gaddr_t,
   if (clone_flags & LINUX_CLONE_NEWTIME)
     return -LINUX_EINVAL;
 
+  /*
+   * The namespaces are made here, in the parent, because on arm64 the child is
+   * rebuilt from a checkpoint and the checkpoint has to carry them. That leaves
+   * the parent standing in namespaces it never asked to join, so it is put back
+   * once the child exists - which is the difference between clone and unshare,
+   * and the whole of what the caller expects.
+   */
+  uint64_t ns_saved[NS_COUNT];
+  struct uts_namespace uts_saved;
+  bool ns_moved = false;
   if (clone_flags & (LINUX_CLONE_NEWNS | LINUX_CLONE_NEWUTS |
                      LINUX_CLONE_NEWIPC | LINUX_CLONE_NEWPID |
                      LINUX_CLONE_NEWNET | LINUX_CLONE_NEWUSER |
                      LINUX_CLONE_NEWCGROUP)) {
+    nsproxy_snapshot(ns_saved, &uts_saved);
     int nsr = nsproxy_clone(clone_flags);
     if (nsr < 0)
       return nsr;
+    ns_moved = true;
   }
   /*
    * The last two clone arguments are architecture-ordered. x86-64 is
@@ -633,6 +667,11 @@ DEFINE_SYSCALL(clone, unsigned long, clone_flags, unsigned long, newsp, gaddr_t,
     return -LINUX_EINVAL;
 
   int ret = do_clone(clone_flags, newsp, parent_tid, child_tid, tls);
+
+  /* Only in the parent: the child is meant to be where it was put. */
+  if (ns_moved && ret != 0)
+    nsproxy_restore(ns_saved, &uts_saved);
+
   if (ret > 0) {
     /* The old call has no field of its own, so the descriptor goes where the
      * parent tid would have - which is why CLONE_PARENT_SETTID is refused

@@ -961,6 +961,21 @@ else
     fail=1
 fi
 
+# clonenstest: clone with a namespace flag, which had never worked - the
+# namespaces were created and then do_clone refused the flags that asked for
+# them. Checks the clone succeeds, the child is in its own uts namespace, and
+# the *parent* is put back: the namespace is made in the parent because a child
+# here is rebuilt from a checkpoint, so a clone that forgot to restore would
+# leave the parent somewhere it never asked to be.
+cp "$here/clonenstest" "$root/"; chmod +x "$root/clonenstest"
+out=$("$NABI" -m "$root" /clonenstest); rc=$?
+if [ "$rc" -eq 0 ] && [ "$out" = "clonens ok" ]; then
+    echo "  ok  clonenstest -> \"$out\", exit 0"
+else
+    echo "  FAIL clonenstest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 # abstracttest: the abstract unix socket namespace, which Darwin does not have
 # and which was not translated at all - the leading NUL was kept and the host
 # was asked to create a file with an empty name. Checks bind, connect and data,

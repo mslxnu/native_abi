@@ -419,6 +419,7 @@ guest-code cache sync.
   through the clone. `statmount` is read at the offsets it reports rather
   than at assumed ones.
 
+- `clonenstest` — clone with a namespace flag, and the parent restored afterwards
 - `abstracttest` — the abstract unix socket namespace: bind, connect, uniqueness,
   release on close, and an unbound name refusing with ECONNREFUSED
 - `lxctest` — the LXC `/dev` setup in one pass, the pieces lxc-start needs

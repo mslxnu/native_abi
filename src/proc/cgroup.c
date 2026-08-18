@@ -172,6 +172,91 @@ cgroup_proc_text(char *out, size_t n)
 }
 
 /*
+ * The cgroup a *given* pid is in, for /proc/<pid>/cgroup.
+ *
+ * Membership lives in the procs files rather than in this process, which is
+ * what makes another process's cgroup answerable at all: current_cgroup is only
+ * the shortcut this one keeps for itself, and nabi's processes do not share
+ * memory. So the hierarchy is walked and the files are read - they are the
+ * record, and procs_file_update above is what writes them.
+ *
+ * A pid found nowhere is at the root, which is where a process that has never
+ * been moved is. That is also the answer for pid 1: there is no init here to
+ * have been moved, and LXC reads /proc/1/cgroup to learn the layout rather than
+ * to learn about init.
+ */
+static bool
+find_in_tree(const char *dir, const char *rel, int32_t nspid,
+             char *out, size_t n)
+{
+  char procs[PATH_MAX];
+  snprintf(procs, sizeof procs, "%s/cgroup.procs", dir);
+  int fd = open(procs, O_RDONLY);
+  if (fd >= 0) {
+    char body[4096];
+    ssize_t got = read(fd, body, sizeof body - 1);
+    close(fd);
+    if (got > 0) {
+      body[got] = '\0';
+      for (char *line = body; *line; ) {
+        char *nl = strchr(line, '\n');
+        if (nl) *nl = '\0';
+        if (*line && atoi(line) == nspid) {
+          snprintf(out, n, "%s", rel[0] ? rel : "/");
+          return true;
+        }
+        if (!nl) break;
+        line = nl + 1;
+      }
+    }
+  }
+
+  DIR *d = opendir(dir);
+  if (d == NULL)
+    return false;
+  struct dirent *e;
+  bool found = false;
+  while (!found && (e = readdir(d)) != NULL) {
+    if (e->d_name[0] == '.')
+      continue;
+    char sub[PATH_MAX], subrel[CGROUP_PATH_MAX];
+    snprintf(sub, sizeof sub, "%s/%s", dir, e->d_name);
+    struct stat st;
+    if (stat(sub, &st) < 0 || !S_ISDIR(st.st_mode))
+      continue;
+    snprintf(subrel, sizeof subrel, "%s/%s", rel, e->d_name);
+    found = find_in_tree(sub, subrel, nspid, out, n);
+  }
+  closedir(d);
+  return found;
+}
+
+int
+cgroup_proc_text_for(int32_t nspid, char *out, size_t n)
+{
+  if (nspid == pidns_to_ns((int32_t) getpid()))
+    return cgroup_proc_text(out, n);
+
+  char root[PATH_MAX];
+  cgroup_root_dir(root, sizeof root);
+
+  char path[CGROUP_PATH_MAX] = "/";
+  (void) find_in_tree(root, "", nspid, path, sizeof path);
+
+  /* Reported the same way as our own: relative to the namespace's root. */
+  const char *nsroot = cgroup_ns_root();
+  const char *shown = path;
+  size_t rlen = strlen(nsroot);
+  if (rlen > 1 && strncmp(path, nsroot, rlen) == 0 &&
+      (path[rlen] == '\0' || path[rlen] == '/'))
+    shown = path[rlen] == '\0' ? "/" : path + rlen;
+  else if (rlen > 1)
+    shown = "/";
+
+  return snprintf(out, n, "0::%s\n", shown);
+}
+
+/*
  * Moving a process, which is what writing to cgroup.procs does.
  *
  * Only this process can be moved, because membership is kept in the process

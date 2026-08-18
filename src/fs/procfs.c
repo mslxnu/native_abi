@@ -275,6 +275,32 @@ own_procfs_file_n(const char *path, int *fd_out)
     }
   }
 
+  /*
+   * cgroup is answered for any pid, not only our own. Membership is recorded in
+   * the procs files rather than in this process, so another process's cgroup is
+   * a thing that can be looked up - and the caller that matters asks about
+   * somebody else: LXC reads /proc/1/cgroup to learn the layout before it will
+   * start a container, and got ENOENT because pid 1 is not us.
+   */
+  if (strcmp(slash, "/cgroup") == 0) {
+    if (fd_out) {
+      int32_t ns;
+      if (mine) {
+        ns = pidns_to_ns((int32_t) getpid());
+      } else {
+        char numbuf[16];
+        ns = 1;
+        if (n > 0 && n < sizeof numbuf) {
+          memcpy(numbuf, rest, n);
+          numbuf[n] = '\0';
+          ns = (int32_t) atoi(numbuf);
+        }
+      }
+      *fd_out = (int) ns;
+    }
+    return PROCFS_CGROUP;
+  }
+
   if (!mine)
     return PROCFS_NONE;
 
@@ -304,8 +330,6 @@ own_procfs_file_n(const char *path, int *fd_out)
 
   /* Which control group this process is in, as its cgroup namespace sees it.
    * Absent before there was a hierarchy, so anything asking got ENOENT. */
-  if (strcmp(slash, "/cgroup") == 0) return PROCFS_CGROUP;
-
   if (strcmp(slash, "/mounts") == 0)  return PROCFS_MOUNTS;
   /* mountinfo is what systemd and every container runtime actually read; it
    * carries the mount id and the propagation that /proc/mounts has no room
@@ -684,10 +708,10 @@ build_net_dev(size_t *len_out)
 }
 
 static char *
-build_cgroup(size_t *len_out)
+build_cgroup(int32_t nspid, size_t *len_out)
 {
   char buf[CGROUP_PATH_MAX + 16];
-  int n = cgroup_proc_text(buf, sizeof buf);
+  int n = cgroup_proc_text_for(nspid, buf, sizeof buf);
   if (n < 0)
     return NULL;
   char *out = malloc((size_t) n + 1);
@@ -1435,7 +1459,7 @@ procfs_open(const char *path, int *out_fd)
     content = build_mountinfo(&len);
     break;
   case PROCFS_CGROUP:
-    content = build_cgroup(&len);
+    content = build_cgroup(fdno, &len);
     break;
   case PROCFS_NET_DEV:
     content = build_net_dev(&len);
