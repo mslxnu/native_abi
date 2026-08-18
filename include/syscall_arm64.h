@@ -148,7 +148,7 @@
   SYSCALL(139, rt_sigreturn) \
   SYSCALL(140, setpriority) \
   SYSCALL(141, getpriority) \
-  SYSCALL(142, unimplemented) \
+  SYSCALL(142, reboot) \
   SYSCALL(143, setregid) \
   SYSCALL(144, setgid) \
   SYSCALL(145, setreuid) \

@@ -174,7 +174,7 @@
   SYSCALL(166, umount2) \
   SYSCALL(167, unimplemented) \
   SYSCALL(168, unimplemented) \
-  SYSCALL(169, unimplemented) \
+  SYSCALL(169, reboot) \
   SYSCALL(170, sethostname) \
   SYSCALL(171, setdomainname) \
   SYSCALL(172, iopl) \

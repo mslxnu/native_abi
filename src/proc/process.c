@@ -823,6 +823,76 @@ DEFINE_SYSCALL(exit_group, int, reason)
 }
 
 /*
+ * reboot: stopping the machine, where the machine is this process.
+ *
+ * There is no firmware here to hand control back to, so a restart cannot be a
+ * restart. What there is, and what the guest is actually asking for, is for
+ * everything running under this kernel to stop - and nabi's guest is exactly
+ * that set. So the halting commands end the guest, which is the same thing
+ * reboot means to an init in a namespace of its own: the namespace goes, and
+ * whoever started it decides whether anything comes back.
+ *
+ * kexec is the one command refused rather than emulated, for the reason
+ * kexec_load is refused: it names a kernel image to be entered, and there is
+ * nothing here that could enter one.
+ *
+ * The magic numbers are checked because they are the whole of what stops a
+ * stray call from stopping the machine - that is what they are in Linux for,
+ * and a guest that gets them wrong wants EINVAL rather than a shutdown.
+ * Android's init calls this at the end of its shutdown path and reports what
+ * came back, so ENOSYS there was a visible loose end even though the guest was
+ * on its way out anyway.
+ */
+DEFINE_SYSCALL(reboot, int, magic1, int, magic2, unsigned int, cmd, gaddr_t, arg)
+{
+  if ((unsigned int) magic1 != LINUX_REBOOT_MAGIC1)
+    return -LINUX_EINVAL;
+  switch ((unsigned int) magic2) {
+  case LINUX_REBOOT_MAGIC2:
+  case LINUX_REBOOT_MAGIC2A:
+  case LINUX_REBOOT_MAGIC2B:
+  case LINUX_REBOOT_MAGIC2C:
+    break;
+  default:
+    return -LINUX_EINVAL;
+  }
+
+  pthread_rwlock_rdlock(&proc.cred.lock);
+  bool root = proc.cred.euid == 0;
+  pthread_rwlock_unlock(&proc.cred.lock);
+  if (!root)
+    return -LINUX_EPERM;
+
+  switch (cmd) {
+  case LINUX_REBOOT_CMD_CAD_ON:
+  case LINUX_REBOOT_CMD_CAD_OFF:
+    /* Whether ctrl-alt-del reboots or signals init. There is no keyboard on
+     * this machine to press it on, so the setting is recorded nowhere and the
+     * call succeeds, which is what a caller toggling it needs. */
+    return 0;
+
+  case LINUX_REBOOT_CMD_RESTART:
+  case LINUX_REBOOT_CMD_RESTART2:
+  case LINUX_REBOOT_CMD_HALT:
+  case LINUX_REBOOT_CMD_POWER_OFF:
+    (void) arg;                 /* RESTART2's message has nowhere to go */
+    nsproxy_release();
+    _exit(0);                   /* asked for, so not a failure */
+
+  case LINUX_REBOOT_CMD_SW_SUSPEND:
+    /* Suspend-to-disk needs a kernel to write the image and firmware to resume
+     * it. Neither exists here, and there is no partial version worth doing. */
+    return -LINUX_ENOSYS;
+
+  case LINUX_REBOOT_CMD_KEXEC:
+    return -LINUX_ENOSYS;
+
+  default:
+    return -LINUX_EINVAL;
+  }
+}
+
+/*
  * tgkill and tkill: a signal aimed at one thread.
  *
  * Unimplemented, these returned ENOSYS - and that is much worse than it sounds,

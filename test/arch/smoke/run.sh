@@ -1075,6 +1075,32 @@ else
     fail=1
 fi
 
+# reboottest: reboot(2), which has no firmware to hand control back to, so the
+# halting commands end the guest instead. Checks the magic numbers that are the
+# whole of what stops a stray call from stopping the machine, that CAD_ON/OFF
+# succeed, and that kexec and software suspend are ENOSYS rather than EPERM.
+cp "$here/reboottest" "$root/"; chmod +x "$root/reboottest"
+out=$("$NABI" -m "$root" /reboottest 2>&1 | tail -1); rc=$?
+if [ "$out" = "reboot ok" ]; then
+    echo "  ok  reboottest -> \"$out\""
+else
+    echo "  FAIL reboottest -> \"$out\", exit $rc"
+    fail=1
+fi
+
+# rebootoff: the half reboottest cannot check, since a test that verified it
+# would have nothing left to report with. It calls reboot(POWER_OFF) and prints
+# "not reached" afterwards, so an empty output and exit 0 is the guest having
+# stopped where it was told to.
+cp "$here/rebootoff" "$root/"; chmod +x "$root/rebootoff"
+out=$("$NABI" -m "$root" /rebootoff 2>&1); rc=$?
+if [ "$rc" -eq 0 ] && [ -z "$out" ]; then
+    echo "  ok  rebootoff -> ended the guest, exit 0"
+else
+    echo "  FAIL rebootoff -> \"$out\", exit $rc"
+    fail=1
+fi
+
 # procchmodtest: chmod on a passed-through /proc, which the host module serving
 # it refuses - and Android's first-stage init treats a failed chmod of
 # /proc/cmdline as fatal. Checks that it succeeds by path and by dirfd, that a
