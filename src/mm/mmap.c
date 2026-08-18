@@ -305,13 +305,31 @@ do_mmap(gaddr_t addr, size_t len, int d_prot, int l_prot, int l_flags, int fd, o
 
 #if defined(__arm64__)
   /*
-   * A file mapped executable was just written into guest memory by the host
-   * (the pread copy above) - ld.so maps a shared library's .text this way. The
-   * guest's instruction fetch will not see those bytes until the caches are
-   * reconciled, exactly as the ELF loader does for its own PF_X segments. Skip
-   * it for anonymous exec maps: nothing is written yet (JIT writes come later).
+   * A file mapping was just written into guest memory by the host (the pread
+   * copy above), and the guest has to be able to see those bytes.
+   *
+   * This ran only for executable mappings, because the instruction path is
+   * where it was first noticed - ld.so maps a shared library's .text this way
+   * and the guest fetched stale instructions. But the copy is the same copy
+   * whatever the mapping is for, and a reader can be handed stale bytes just
+   * as a fetcher can. Android's linker reads a library's section headers from
+   * a PROT_READ mapping and could not find SHT_DYNAMIC in it - "\"...\"
+   * .dynamic section header was not found" - on a different library each run,
+   * while the host memory demonstrably held the right bytes and the stage-1
+   * and stage-2 translations were verified to land on them. Reconciling here
+   * as well takes apexd from failing every time to linking in four runs out of
+   * five.
+   *
+   * Four out of five, not five: something still gets through, so this is one
+   * cause rather than necessarily the only one. Timing is the alternative
+   * explanation worth keeping in mind - the call is not free and could be
+   * hiding a race rather than fixing coherency - but the evidence that the
+   * bytes were present and correctly mapped and the guest still did not see
+   * them is what a coherency problem looks like.
+   *
+   * Still skipped for anonymous maps: nothing has been written into those yet.
    */
-  if ((l_prot & LINUX_PROT_EXEC) && fd >= 0)
+  if (fd >= 0)
     vmm_sync_guest_code(addr, len);
 #endif
 
