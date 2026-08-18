@@ -171,6 +171,7 @@ enum procfs_file { PROCFS_NONE, PROCFS_MAPS, PROCFS_CMDLINE, PROCFS_COMM,
                    PROCFS_NS_FORCHILDREN, PROCFS_TIMENS_OFFSETS,
                    PROCFS_UID_MAP, PROCFS_GID_MAP, PROCFS_SETGROUPS,
                    PROCFS_MOUNTINFO, PROCFS_STAT, PROCFS_STATUS, PROCFS_CGROUP,
+                   PROCFS_ATTR,
                    PROCFS_NET_DEV };
 
 /* For PROCFS_FD, the number after /fd/. Meaningless for the others. */
@@ -338,6 +339,28 @@ own_procfs_file_n(const char *path, int *fd_out)
   if (strcmp(slash, "/maps") == 0)    return PROCFS_MAPS;
   if (strcmp(slash, "/cmdline") == 0) return PROCFS_CMDLINE;
   if (strcmp(slash, "/comm") == 0)    return PROCFS_COMM;
+  /*
+   * /proc/<pid>/attr/<name>: the security contexts an LSM would keep for the
+   * process. There is no LSM here and no context to keep, but the files have
+   * to exist, because a caller that cannot open one cannot proceed.
+   *
+   * libselinux sets the context new files are created with by writing
+   * /proc/thread-self/attr/fscreate, falling back to
+   * /proc/self/task/<tid>/attr/fscreate. Android's init does that before
+   * creating each cgroup directory, and both opens returning ENOENT is why
+   * "Command 'SetupCgroups' ... failed: Failed to setup cgroups: No such file
+   * or directory" - after which no controller is mounted, every process group
+   * lands at /uid_0/... off the root, and init says "cpuset cgroup controller
+   * is not mounted!" for the rest of its life.
+   *
+   * Empty, which is what Linux reads back for a process with no context, and
+   * writable, which is what the caller needs. The write goes nowhere: nabi has
+   * no security model to apply it to, and saying so by refusing the write
+   * would fail exactly the callers this exists for.
+   */
+  if (strncmp(slash, "/attr/", 6) == 0 && slash[6] != '\0' &&
+      strchr(slash + 6, '/') == NULL)
+    return PROCFS_ATTR;
   if (strcmp(slash, "/exe") == 0)     return PROCFS_EXE;
 
   /* /proc/self/fd/<n>. The host's procfs cannot answer this even when it is
@@ -1451,6 +1474,12 @@ procfs_open(const char *path, int *out_fd)
     break;
   case PROCFS_COMM:
     content = build_comm(&len);
+    break;
+  case PROCFS_ATTR:
+    /* No context to report. The descriptor is a writable temporary file like
+     * every other entry here, so a write lands somewhere harmless. */
+    content = strdup("");
+    len = 0;
     break;
   case PROCFS_MOUNTS:
     content = build_mounts(&len);
