@@ -3670,6 +3670,32 @@ darwinfs_renameat(struct fs *fs, struct dir *dir1, const char *from, struct dir 
   return syswrap(renameat(dir1->fd, from, dir2->fd, to));
 }
 
+/*
+ * The same rename, with the two flags Linux added.
+ *
+ * Darwin has them under other names: RENAME_EXCL is NOREPLACE, refusing to
+ * clobber, and RENAME_SWAP is EXCHANGE, the atomic swap. renameatx_np is where
+ * they live. RENAME_WHITEOUT has no counterpart and is not a general rename at
+ * all - it belongs to overlayfs, which is not what backs anything here - so it
+ * is refused rather than pretended.
+ */
+static int
+darwinfs_renameat2(struct dir *dir1, const char *from, struct dir *dir2,
+                   const char *to, unsigned int l_flags)
+{
+  unsigned int dflags = 0;
+  if (l_flags & LINUX_RENAME_NOREPLACE)
+    dflags |= RENAME_EXCL;
+  if (l_flags & LINUX_RENAME_EXCHANGE)
+    dflags |= RENAME_SWAP;
+
+  int r;
+  if ((r = permit_parent(dir1->fd, from, true)) < 0 ||
+      (r = permit_parent(dir2->fd, to, true)) < 0)
+    return r;
+  return syswrap(renameatx_np(dir1->fd, from, dir2->fd, to, dflags));
+}
+
 int
 darwinfs_linkat(struct fs *fs, struct dir *dir1, const char *from, struct dir *dir2, const char *to, int l_flags)
 {
@@ -5436,6 +5462,61 @@ DEFINE_SYSCALL(faccessat2, int, dirfd, gstr_t, path_ptr, int, mode, int, flags)
 DEFINE_SYSCALL(access, gstr_t, path_ptr, int, mode)
 {
   return sys_faccessat(LINUX_AT_FDCWD, path_ptr, mode);
+}
+
+/*
+ * renameat2, which is renameat with a flags word.
+ *
+ * The container reaches this and nothing else on the unimplemented list: LXC
+ * renames with RENAME_NOREPLACE, and unimplemented meant ENOSYS where the
+ * caller expected a rename.
+ */
+DEFINE_SYSCALL(renameat2, int, oldfd, gstr_t, oldpath_ptr, int, newfd,
+               gstr_t, newpath_ptr, unsigned int, flags)
+{
+  if (flags & ~(unsigned) (LINUX_RENAME_NOREPLACE | LINUX_RENAME_EXCHANGE |
+                           LINUX_RENAME_WHITEOUT))
+    return -LINUX_EINVAL;
+  /* Linux refuses the pair: one says the target must not exist, the other that
+   * it must. */
+  if ((flags & LINUX_RENAME_NOREPLACE) && (flags & LINUX_RENAME_EXCHANGE))
+    return -LINUX_EINVAL;
+  if (flags & LINUX_RENAME_WHITEOUT)
+    return -LINUX_EINVAL;       /* overlayfs only; see darwinfs_renameat2 */
+
+  char oldname[LINUX_PATH_MAX], newname[LINUX_PATH_MAX];
+  if (strncpy_from_user(oldname, oldpath_ptr, sizeof oldname) < 0 ||
+      strncpy_from_user(newname, newpath_ptr, sizeof newname) < 0)
+    return -LINUX_EFAULT;
+
+  struct path oldpath, newpath;
+  int r;
+  if ((r = vfs_grab_dir_w(oldfd, oldname, LOOKUP_NOFOLLOW, &oldpath)) < 0)
+    return r;
+  if ((r = vfs_grab_dir_w(newfd, newname, LOOKUP_NOFOLLOW, &newpath)) < 0)
+    goto out;
+  if (oldpath.fs != newpath.fs) {
+    r = -LINUX_EXDEV;
+    goto out2;
+  }
+
+  if (flags == 0) {
+    /* No flags is a plain rename, and every filesystem can do that one. */
+    r = newpath.fs->ops->renameat(newpath.fs, oldpath.dir, oldpath.subpath,
+                                  newpath.dir, newpath.subpath);
+  } else if (newpath.fs->ops->renameat == darwinfs_renameat) {
+    r = darwinfs_renameat2(oldpath.dir, oldpath.subpath, newpath.dir,
+                           newpath.subpath, flags);
+  } else {
+    /* A filesystem nabi serves itself has no flagged rename behind it. */
+    r = -LINUX_EINVAL;
+  }
+
+ out2:
+  vfs_ungrab_dir(&newpath);
+ out:
+  vfs_ungrab_dir(&oldpath);
+  return r;
 }
 
 DEFINE_SYSCALL(renameat, int, oldfd, gstr_t, oldpath_ptr, int, newfd, gstr_t, newpath_ptr)

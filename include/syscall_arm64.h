@@ -282,7 +282,7 @@
   SYSCALL(273, finit_module) \
   SYSCALL(274, unimplemented) \
   SYSCALL(275, unimplemented) \
-  SYSCALL(276, unimplemented) \
+  SYSCALL(276, renameat2) \
   SYSCALL(277, seccomp) \
   SYSCALL(278, getrandom) \
   SYSCALL(279, memfd_create) \

@@ -129,6 +129,11 @@ DECLARE_CENUM(at, LINUX_AT);
  * openat2's third argument. Fixed ABI: a caller passes its size, and the kernel
  * uses that to tell an old caller from a new one.
  */
+/* renameat2's flags. */
+#define LINUX_RENAME_NOREPLACE 1
+#define LINUX_RENAME_EXCHANGE  2
+#define LINUX_RENAME_WHITEOUT  4
+
 struct l_open_how {
   uint64_t flags;
   uint64_t mode;

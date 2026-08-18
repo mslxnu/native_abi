@@ -961,6 +961,19 @@ else
     fail=1
 fi
 
+# renametest: renameat2's flags. NOREPLACE must refuse and leave both names
+# alone; EXCHANGE must swap both ways at once - checked on the file contents,
+# because a NOREPLACE that quietly replaced and an EXCHANGE that renamed one way
+# both return 0 and are what the flags exist to prevent.
+cp "$here/renametest" "$root/"; chmod +x "$root/renametest"
+out=$("$NABI" -m "$root" /renametest); rc=$?
+if [ "$rc" -eq 0 ] && [ "$out" = "rename ok" ]; then
+    echo "  ok  renametest -> \"$out\", exit 0"
+else
+    echo "  FAIL renametest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 # pdeathtest: PR_SET_PDEATHSIG, and the signal actually arriving. Darwin has no
 # parent-death signal, so nabi watches for one with kqueue. Checked on a
 # grandchild that asks to be killed when its parent goes and is orphaned: a
