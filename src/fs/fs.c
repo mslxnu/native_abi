@@ -4551,6 +4551,68 @@ vkern_open_exec(const char *path)
   return fd;
 }
 
+/*
+ * The guest path a directory descriptor names, so a relative path can be asked
+ * about by name.
+ *
+ * Several things here are recognised by their *name* rather than by anything on
+ * the host: /proc entries nabi serves itself, the loop devices, the pty
+ * rewrite. A relative path carries no name, so opening "proc/self/mountinfo"
+ * against a descriptor on "/" reached the rootfs's own empty /proc and answered
+ * ENOENT, while "/proc/self/mountinfo" opened. LXC opens it exactly that way -
+ * it holds "/" open and works relative to it - and could not make the
+ * container's mounts dependent.
+ *
+ * Only two host paths can be turned back into guest ones, and both are exact:
+ * anything inside the rootfs, which is the rootfs prefix removed, and a
+ * passthrough prefix, which is already the same path on both sides. Anything
+ * else is not a guest path at all and is left alone.
+ */
+static bool
+host_to_guest_path(const char *host, char *out, size_t outsz)
+{
+  char root[PATH_MAX];
+  if (fcntl(proc.fileinfo.rootfd, F_GETPATH, root) != 0)
+    return false;
+
+  size_t rl = strlen(root);
+  while (rl > 1 && root[rl - 1] == '/')
+    rl--;
+  if (strncmp(host, root, rl) == 0 && (host[rl] == '\0' || host[rl] == '/')) {
+    snprintf(out, outsz, "%s", host[rl] == '\0' ? "/" : host + rl);
+    return true;
+  }
+  if (is_host_passthrough(host)) {
+    snprintf(out, outsz, "%s", host);
+    return true;
+  }
+  return false;               /* not a guest path at all */
+}
+
+bool
+guest_path_of_fd(int fd, char *out, size_t outsz)
+{
+  char host[PATH_MAX];
+  if (fcntl(fd, F_GETPATH, host) != 0)
+    return false;
+  return host_to_guest_path(host, out, outsz);
+}
+
+static bool
+guest_path_of_dirfd(int dirfd, const char *rel, char *out, size_t outsz)
+{
+  if (dirfd == LINUX_AT_FDCWD || rel[0] == '/')
+    return false;
+
+  char base[PATH_MAX];
+  if (!guest_path_of_fd(dirfd, base, sizeof base))
+    return false;
+
+  int n = snprintf(out, outsz, "%s%s%s", base,
+                   base[strlen(base) - 1] == '/' ? "" : "/", rel);
+  return n > 0 && (size_t) n < outsz;
+}
+
 int
 user_openat(int atdirfd, const char *name, int flags, int mode)
 {
@@ -4576,11 +4638,22 @@ user_openat(int atdirfd, const char *name, int flags, int mode)
   pthread_rwlock_wrlock(&proc.fileinfo.fdtable_lock);
   /* A few /proc files describe the guest rather than the nabi running it, and
    * only NABI can answer those. Anything else falls through to the host's. */
+  /*
+   * What these are asked about is the name, and a relative path does not carry
+   * one - so it is reconstructed from the descriptor it is relative to. The
+   * open itself still goes through the descriptor as given; only the question
+   * "is this one of ours" needs the whole name.
+   */
+  char byname[LINUX_PATH_MAX];
+  const char *lookup = name;
+  if (guest_path_of_dirfd(atdirfd, name, byname, sizeof byname))
+    lookup = byname;
+
   /* A loop device, which is a name nabi answers rather than a node the host
    * has - /dev is a passthrough and these cannot be created in it. */
-  if (loop_open(name, &fd) == 0) {
+  if (loop_open(lookup, &fd) == 0) {
     ;
-  } else if (procfs_open(name, &fd) < 0) {
+  } else if (procfs_open(lookup, &fd) < 0) {
     fd = do_openat(atdirfd, name, flags, mode);
     if (fd < 0) {
       char target[LINUX_PATH_MAX];
@@ -4920,11 +4993,18 @@ DEFINE_SYSCALL(openat2, int, dirfd, gstr_t, path_ptr, gaddr_t, how_ptr,
      * else that left the subtree shows up as a path that is not underneath the
      * one it started from - which is the guarantee BENEATH is, stated exactly.
      */
+    /*
+     * In the guest's terms, not the host's. A file nabi serves itself - a /proc
+     * entry, a loop device - is backed by a temp file that lives nowhere near
+     * the rootfs, so comparing host paths called every one of them an escape.
+     * What the guest asked about is a guest path and that is what has to be
+     * inside. A descriptor with no guest path is not something BENEATH can
+     * speak about, and is left alone.
+     */
     char base[PATH_MAX], got[PATH_MAX];
-    if (fcntl(dirfd, F_GETPATH, base) == 0 &&
-        fcntl(fd, F_GETPATH, got) == 0) {
+    if (guest_path_of_fd(dirfd, base, sizeof base) &&
+        guest_path_of_fd(fd, got, sizeof got)) {
       size_t bl = strlen(base);
-      /* "/" is its own prefix without a separator; everything else needs one. */
       if (bl > 0 && base[bl - 1] == '/')
         bl--;
       bool inside = strncmp(got, base, bl) == 0 &&

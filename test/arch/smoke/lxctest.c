@@ -361,6 +361,42 @@ int main(void) {
   }
 
   /*
+   * A /proc entry reached *relative to a descriptor*, which is how LXC reads
+   * it: it holds "/" open and opens "proc/self/mountinfo" against it. The
+   * entries nabi serves are recognised by name, and a relative path carries no
+   * name - so this used to reach the rootfs's own empty /proc and answer
+   * ENOENT while the absolute spelling opened.
+   */
+  {
+    long root = sys6(SYS_openat, AT_FDCWD, (long) "/", O_RDONLY | O_DIRECTORY, 0, 0, 0);
+    if (root < 0) {
+      fail("open /", root);
+    } else {
+      long f = sys6(SYS_openat, root, (long) "proc/self/mountinfo", O_RDONLY, 0, 0, 0);
+      if (f < 0) {
+        fail("opening proc/self/mountinfo relative to /", f);
+      } else {
+        static char mbuf[64];
+        long n = sys6(SYS_read, f, (long) mbuf, sizeof mbuf - 1, 0, 0, 0);
+        sys6(SYS_close, f, 0, 0, 0, 0, 0);
+        /* And it is the real thing, not an empty file that happened to open. */
+        if (n <= 0)
+          fail("what the relative open read", n);
+      }
+      /* The same path with BENEATH, which is the form LXC actually uses. */
+      { struct open_how h2;
+        h2.flags = O_RDONLY; h2.mode = 0; h2.resolve = RESOLVE_BENEATH;
+        long g = sys6(SYS_openat2, root, (long) "proc/self/mountinfo",
+                      (long) &h2, sizeof h2, 0, 0);
+        if (g < 0)
+          fail("openat2 of proc/self/mountinfo with BENEATH", g);
+        else
+          sys6(SYS_close, g, 0, 0, 0, 0, 0); }
+      sys6(SYS_close, root, 0, 0, 0, 0, 0);
+    }
+  }
+
+  /*
    * /proc/1/cgroup: somebody else's, which is the one LXC reads. The content
    * is checked, not merely the open - a file that exists and is empty would
    * satisfy a check that only opened it, and tells the reader nothing.
