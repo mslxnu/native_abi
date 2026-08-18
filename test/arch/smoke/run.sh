@@ -1031,6 +1031,19 @@ else
     fail=1
 fi
 
+# procchmodtest: chmod on a passed-through /proc, which the host module serving
+# it refuses - and Android's first-stage init treats a failed chmod of
+# /proc/cmdline as fatal. Checks that it succeeds by path and by dirfd, that a
+# missing file is still ENOENT, and that chmod of an ordinary file still takes.
+cp "$here/procchmodtest" "$root/"; chmod +x "$root/procchmodtest"
+out=$("$NABI" -m "$root" /procchmodtest 2>&1 | tail -1); rc=$?
+if [ "$out" = "procchmod ok" ]; then
+    echo "  ok  procchmodtest -> \"$out\""
+else
+    echo "  FAIL procchmodtest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 # netlinktest: AF_NETLINK, which nabi had no address family for at all - so
 # `ip` and glibc's getifaddrs both stopped at socket(). Checks the socket, its
 # own sockaddr_nl name, the MSG_PEEK|MSG_TRUNC sizing every netlink reader

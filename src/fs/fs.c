@@ -2522,6 +2522,26 @@ guest_mode_overlay_fd(int fd, struct l_newstat *l_st)
 }
 
 /*
+ * Filesystems whose permission bits are not ours to set.
+ *
+ * Linux's procfs implements setattr, so chmod on /proc/cmdline succeeds there
+ * and Android's first-stage init does exactly that before it will go on. When
+ * /proc and /sys are passed through, those files belong to the host module
+ * serving them, which has no mode to change and says EPERM. Nothing in NABI
+ * consults a mode on those paths -- the guest reads them as root -- so the
+ * honest answer is that the request is satisfied and the bits go nowhere,
+ * rather than failing a call that would have worked on Linux.
+ */
+static bool
+mode_is_unrecordable(const char *abs, int err)
+{
+  if (err != -LINUX_EPERM && err != -LINUX_EOPNOTSUPP && err != -LINUX_EROFS)
+    return false;
+  return strncmp(abs, "/proc/", 6) == 0 || strcmp(abs, "/proc") == 0 ||
+         strncmp(abs, "/sys/", 5) == 0 || strcmp(abs, "/sys") == 0;
+}
+
+/*
  * Record a mode and put a workable one on the host.
  *
  * A mode the host can carry as it stands is left alone and any old attribute
@@ -2547,7 +2567,7 @@ guest_mode_record(int dirfd, const char *path, bool nofollow, uint32_t mode)
   mode_t host = host_mode_for(mode, is_dir);
   int r = syswrap(fchmodat(dirfd, path, host, nofollow ? AT_SYMLINK_NOFOLLOW : 0));
   if (r < 0)
-    return r;
+    return mode_is_unrecordable(abs, r) ? 0 : r;
 
   if ((mode & GUEST_MODE_BITS) == (uint32_t) host) {
     removexattr(abs, GUEST_MODE_XATTR, nofollow ? XATTR_NOFOLLOW : 0);
