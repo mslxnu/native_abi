@@ -72,6 +72,91 @@ guest_sa_family(const char *addr, size_t addrlen)
   return (int) ((const struct l_sockaddr *) addr)->sa_family;
 }
 
+/*
+ * AF_UNIX SOCK_SEQPACKET, which Darwin does not have.
+ *
+ * Linux gives local sockets a sequenced-packet mode: connection-oriented like a
+ * stream, but with the message boundaries of a datagram. Darwin answers
+ * EPROTONOSUPPORT for it, and that is what stopped Android's init - it makes
+ * its channel to property_service with socketpair(AF_UNIX, SOCK_SEQPACKET) and
+ * calls the failure fatal, so second-stage init died there having already got
+ * as far as reading properties.
+ *
+ * A connected AF_UNIX datagram pair is the same channel in every respect that
+ * the guest can observe but one. It keeps boundaries, it is reliable and
+ * ordered, and an oversized message is truncated with MSG_TRUNC set, all of
+ * which was measured on this host rather than assumed. The exception is the
+ * peer going away: Linux reports end-of-file, Darwin reports ECONNRESET. So the
+ * substituted descriptors are remembered and that one answer is translated
+ * back, which is why this is a note-and-fix pair rather than a type swap.
+ */
+KHASH_MAP_INIT_INT(seqfd, bool)         /* fd -> the peer has gone */
+static khash_t(seqfd) *seqpacket_fds;
+
+static int
+seqpacket_darwin_type(int family, int dtype)
+{
+  if (family == LINUX_AF_UNIX && dtype == LINUX_SOCK_SEQPACKET)
+    return SOCK_DGRAM;
+  return dtype;
+}
+
+static void
+seqpacket_note(int fd, int family, int dtype)
+{
+  if (family != LINUX_AF_UNIX || dtype != LINUX_SOCK_SEQPACKET)
+    return;
+  if (seqpacket_fds == NULL)
+    seqpacket_fds = kh_init(seqfd);
+  int ret;
+  khiter_t k = kh_put(seqfd, seqpacket_fds, fd, &ret);
+  kh_value(seqpacket_fds, k) = false;
+}
+
+void
+seqpacket_close(int fd)
+{
+  if (seqpacket_fds == NULL)
+    return;
+  khiter_t k = kh_get(seqfd, seqpacket_fds, fd);
+  if (k != kh_end(seqpacket_fds))
+    kh_del(seqfd, seqpacket_fds, k);
+}
+
+/*
+ * A peer that has gone is end-of-file on Linux, not a reset connection - and
+ * it stays end-of-file. Darwin hands the reset over once, having drained what
+ * was queued behind it, and a read after that simply blocks: nothing more is
+ * coming and nothing says so. So the answer is remembered, and every later
+ * read gets it without going near the descriptor. Getting only the first one
+ * right is worse than getting none of them right, because a reader that loops
+ * until EOF then hangs on the read after the one that told it to stop.
+ */
+bool
+seqpacket_gone(int fd, int *ret)
+{
+  if (seqpacket_fds == NULL)
+    return false;
+  khiter_t k = kh_get(seqfd, seqpacket_fds, fd);
+  if (k == kh_end(seqpacket_fds) || !kh_value(seqpacket_fds, k))
+    return false;
+  *ret = 0;
+  return true;
+}
+
+int
+seqpacket_eof(int fd, int ret)
+{
+  if (ret != -LINUX_ECONNRESET || seqpacket_fds == NULL)
+    return ret;
+  khiter_t k = kh_get(seqfd, seqpacket_fds, fd);
+  if (k == kh_end(seqpacket_fds))
+    return ret;
+  kh_value(seqpacket_fds, k) = true;
+  return 0;
+}
+
+
 DEFINE_SYSCALL(socket, int, family, int, type, int, protocol)
 {
   /* Netlink has no host socket behind it; it is answered here. Taken before the
@@ -82,7 +167,10 @@ DEFINE_SYSCALL(socket, int, family, int, type, int, protocol)
 
   int ret;
   pthread_rwlock_wrlock(&proc.fileinfo.fdtable_lock);
-  int fd = syswrap(socket(linux_to_darwin_sa_family(family), type & ~(LINUX_SOCK_NONBLOCK | LINUX_SOCK_CLOEXEC), protocol));
+  int dtype = type & ~(LINUX_SOCK_NONBLOCK | LINUX_SOCK_CLOEXEC);
+  int fd = syswrap(socket(linux_to_darwin_sa_family(family),
+                          seqpacket_darwin_type(family, dtype), protocol));
+  seqpacket_note(fd, family, dtype);
   ret = fd;
   if (fd < 0) {
     goto err;
@@ -838,7 +926,10 @@ DEFINE_SYSCALL(recvfrom, int, socket, gaddr_t, buf_ptr, int, length, int, flags,
   }
 
   char *buf = alloca(length);
-  int ret = syswrap(recvfrom(socket, buf, length, dflags, sock_ptr, socklen_ptr));
+  int ret;
+  if (!seqpacket_gone(socket, &ret))
+    ret = seqpacket_eof(socket,
+          syswrap(recvfrom(socket, buf, length, dflags, sock_ptr, socklen_ptr)));
   if (ret < 0)
     return ret;
   if (copy_to_user(buf_ptr, buf, ret))
@@ -1215,7 +1306,8 @@ DEFINE_SYSCALL(recvmsg, int, sockfd, gaddr_t, msg_ptr, int, flags)
     }
   }
 
-  r = syswrap(recvmsg(sockfd, &dmsg, dflags));
+  if (!seqpacket_gone(sockfd, &r))
+    r = seqpacket_eof(sockfd, syswrap(recvmsg(sockfd, &dmsg, dflags)));
   if (r < 0) {
     goto out;
   }
@@ -1568,9 +1660,12 @@ DEFINE_SYSCALL(socketpair, int, family, int, type, int, protocol, gaddr_t, usock
    * like a socketpair-specific refusal rather than a flag being passed on.
    */
   int dtype = type & ~(LINUX_SOCK_NONBLOCK | LINUX_SOCK_CLOEXEC);
-  int ret = syswrap(socketpair(linux_to_darwin_sa_family(family), dtype, protocol, fds));
+  int ret = syswrap(socketpair(linux_to_darwin_sa_family(family),
+                               seqpacket_darwin_type(family, dtype), protocol, fds));
   if (ret < 0)
     goto err;
+  seqpacket_note(fds[0], family, dtype);
+  seqpacket_note(fds[1], family, dtype);
   /*
    * And the flags are then applied, which they never were: a caller asking for
    * a non-blocking pair got a blocking one, and one asking for close-on-exec

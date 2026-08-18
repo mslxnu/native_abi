@@ -833,6 +833,7 @@ darwinfs_close(struct file *file)
   netlink_close(file->fd);
   loop_close(file->fd);
   abstract_close(file->fd);
+  seqpacket_close(file->fd);
   procfs_close_fd(file->fd);
   if (file->dirp != NULL) {
     closedir(file->dirp);       /* takes the dup with it */
@@ -3319,7 +3320,8 @@ DEFINE_SYSCALL(read, int, fd, gaddr_t, buf_ptr, size_t, size)
     }
   }
   struct iovec iov = { buf, size };
-  r = file->ops->readv(file, &iov, 1);
+  if (!seqpacket_gone(file->fd, &r))
+    r = seqpacket_eof(file->fd, file->ops->readv(file, &iov, 1));
   if (r < 0) {
     goto out;
   }
@@ -3403,7 +3405,9 @@ DEFINE_SYSCALL(readv, int, fd, gaddr_t, iov_ptr, int, iovcnt)
   if (file->ops->readv == NULL) {
     return -LINUX_EBADF;
   }
-  int r = file->ops->readv(file, iov, iovcnt);
+  int r;
+  if (!seqpacket_gone(file->fd, &r))
+    r = seqpacket_eof(file->fd, file->ops->readv(file, iov, iovcnt));
   if (r < 0) {
     return r;
   }

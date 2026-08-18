@@ -1031,6 +1031,21 @@ else
     fail=1
 fi
 
+# seqpackettest: AF_UNIX SOCK_SEQPACKET, which Darwin has no such thing as and
+# answers EPROTONOSUPPORT for - so Android's second-stage init died making its
+# channel to property_service. Built out of a connected datagram pair instead.
+# Checks the pair is created, that message boundaries survive, that an oversize
+# message truncates rather than leaving a remainder, and that a peer that goes
+# away reads as end-of-file and keeps reading that way.
+cp "$here/seqpackettest" "$root/"; chmod +x "$root/seqpackettest"
+out=$("$NABI" -m "$root" /seqpackettest 2>&1 | tail -1); rc=$?
+if [ "$out" = "seqpackettest: ok" ]; then
+    echo "  ok  seqpackettest -> \"$out\""
+else
+    echo "  FAIL seqpackettest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 # procchmodtest: chmod on a passed-through /proc, which the host module serving
 # it refuses - and Android's first-stage init treats a failed chmod of
 # /proc/cmdline as fatal. Checks that it succeeds by path and by dirfd, that a

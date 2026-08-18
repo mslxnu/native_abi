@@ -298,6 +298,9 @@ void rtsig_init(void);
 
 /* Abstract unix sockets, which are files here. See src/net/net.c. */
 void abstract_close(int fd);
+void seqpacket_close(int fd);
+int seqpacket_eof(int fd, int ret);
+bool seqpacket_gone(int fd, int *ret);
 
 /* PR_SET_PDEATHSIG, forgotten in a child as Linux forgets it. */
 void pdeathsig_clear(void);
