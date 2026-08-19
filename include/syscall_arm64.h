@@ -159,7 +159,7 @@
   SYSCALL(150, getresgid) \
   SYSCALL(151, setfsuid) \
   SYSCALL(152, setfsgid) \
-  SYSCALL(153, unimplemented) \
+  SYSCALL(153, times) \
   SYSCALL(154, setpgid) \
   SYSCALL(155, getpgid) \
   SYSCALL(156, getsid) \

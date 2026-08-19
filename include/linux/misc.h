@@ -123,6 +123,17 @@ struct l_ustat {
   char        f_fpack[6];
 };
 
+/*
+ * struct tms: filled by times(2), the process CPU time counters.
+ * Fields are in clock ticks (100 Hz, matching AT_CLKTCK in auxval).
+ */
+struct l_tms {
+  l_clock_t   tms_utime;   /* User CPU time */
+  l_clock_t   tms_stime;   /* System CPU time */
+  l_clock_t   tms_cutime;  /* User CPU time of children */
+  l_clock_t   tms_cstime;  /* System CPU time of children */
+};
+
 /* Resource limits */
 #define	LINUX_RLIMIT_CPU	0
 #define	LINUX_RLIMIT_FSIZE	1

@@ -1361,6 +1361,16 @@ else
     fail=1
 fi
 
+# timestest: times(2) — process CPU time counters and wall clock since boot
+cp "$here/timestest" "$root/"; chmod +x "$root/timestest"
+out=$("$NABI" -m "$root" /timestest); rc=$?
+if [ "$rc" -eq 0 ] && [ "$out" = "times ok" ]; then
+    echo "  ok  timestest -> \"$out\", exit 0"
+else
+    echo "  FAIL timestest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 if [ "$fail" -eq 0 ]; then
     echo "smoke: PASS"
 else

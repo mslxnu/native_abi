@@ -5732,8 +5732,22 @@ DEFINE_SYSCALL(statfs, gstr_t, path_ptr, gaddr_t, buf_ptr)
  * ustat is the ancient predecessor of statfs.  The device number is ignored
  * (NABI has one root filesystem), and the struct is small: free blocks, free
  * inodes, and two six-byte name fields that have never meant anything.
+ *
+ * ustat has no arm64 Linux number, so LSYS_ustat does not exist on that
+ * architecture.  The function is defined unconditionally; the wrapper that
+ * feeds strace is only needed on x86, where the dispatch table references it.
  */
-DEFINE_SYSCALL(ustat, l_ulong, dev, gaddr_t, ubuf_ptr)
+uint64_t sys_ustat(uint64_t dev, uint64_t ubuf_ptr);
+#ifdef __x86_64__
+uint64_t _sys_ustat(uint64_t temp__dev, uint64_t temp__ubuf_ptr) {
+  meta_strace_pre(-1, "ustat", "dev", temp__dev, "ubuf", temp__ubuf_ptr, 0, 0);
+  uint64_t ret = sys_ustat((l_ulong)temp__dev, (gaddr_t)temp__ubuf_ptr);
+  meta_strace_post(-1, "ustat", ret, "dev", temp__dev, "ubuf", temp__ubuf_ptr, 0, 0);
+  return ret;
+}
+#endif
+uint64_t
+sys_ustat(uint64_t dev, uint64_t ubuf_ptr)
 {
   (void)dev;
   if (ubuf_ptr == 0)

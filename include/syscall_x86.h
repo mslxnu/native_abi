@@ -105,7 +105,7 @@
   SYSCALL(97, getrlimit) \
   SYSCALL(98, getrusage) \
   SYSCALL(99, sysinfo) \
-  SYSCALL(100, unimplemented) \
+  SYSCALL(100, times) \
   SYSCALL(101, ptrace) \
   SYSCALL(102, getuid) \
   SYSCALL(103, syslog) \

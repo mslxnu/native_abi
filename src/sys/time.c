@@ -19,6 +19,7 @@
 #include <sys/time.h>
 #include <sys/attr.h>
 #include <sys/stat.h>
+#include <sys/resource.h>
 #include <mach/clock.h>
 #include <mach/mach.h>
 
@@ -499,5 +500,37 @@ DEFINE_SYSCALL(setitimer, int, which, gaddr_t, new_ptr, gaddr_t, old_ptr) {
     }
   }
   return r;
+}
+
+/*
+ * times(2): process CPU time counters and wall clock since boot.
+ *
+ * tms_utime and tms_stime come from getrusage(RUSAGE_SELF).  The children
+ * fields are zeroed: NABI does not track unwaited children separately, and
+ * the existing wait4 path does not accumulate their times.
+ *
+ * The return value is wall clock time since boot in clock ticks (100 Hz,
+ * matching AT_CLKTCK in the auxiliary vector).
+ */
+DEFINE_SYSCALL(times, gaddr_t, buf_ptr)
+{
+  struct rusage ru;
+  int r = syswrap(getrusage(RUSAGE_SELF, &ru));
+  if (r < 0)
+    return r;
+  if (buf_ptr != 0) {
+    struct l_tms tms;
+    tms.tms_utime  = (l_clock_t)ru.ru_utime.tv_sec  * 100 + ru.ru_utime.tv_usec / 10000;
+    tms.tms_stime  = (l_clock_t)ru.ru_stime.tv_sec  * 100 + ru.ru_stime.tv_usec / 10000;
+    tms.tms_cutime = 0;
+    tms.tms_cstime = 0;
+    if (copy_to_user(buf_ptr, &tms, sizeof tms))
+      return -LINUX_EFAULT;
+  }
+  struct timespec ts;
+  r = syswrap(clock_gettime(CLOCK_MONOTONIC, &ts));
+  if (r < 0)
+    return r;
+  return (l_clock_t)ts.tv_sec * 100 + ts.tv_nsec / 10000000;
 }
 
