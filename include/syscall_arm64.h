@@ -66,7 +66,7 @@
   SYSCALL(57, close) \
   SYSCALL(58, unimplemented) \
   SYSCALL(59, pipe2) \
-  SYSCALL(60, unimplemented) \
+  SYSCALL(60, quotactl) \
   SYSCALL(61, getdents64) \
   SYSCALL(62, lseek) \
   SYSCALL(63, read) \
@@ -449,7 +449,7 @@
   SYSCALL(440, process_madvise) \
   SYSCALL(441, epoll_pwait2) \
   SYSCALL(442, mount_setattr) \
-  SYSCALL(443, unimplemented) \
+  SYSCALL(443, quotactl_fd) \
   SYSCALL(444, landlock_create_ruleset) \
   SYSCALL(445, landlock_add_rule) \
   SYSCALL(446, landlock_restrict_self) \

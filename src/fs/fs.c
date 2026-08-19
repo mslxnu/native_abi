@@ -5770,6 +5770,31 @@ sys_ustat(uint64_t dev, uint64_t ubuf_ptr)
   return 0;
 }
 
+/*
+ * quotactl and quotactl_fd: disk quota control.
+ *
+ * NABI does not manage disk quotas.  The underlying host filesystems (APFS,
+ * HFS+) do not expose Linux-style quota semantics, and NABI's emulation
+ * layer has no quota accounting.  Every subcommand therefore returns
+ * ENOSYS — the same answer the guest would get from a kernel compiled
+ * without quota support, and the answer that all quota tools handle
+ * gracefully (they print "quotas not supported" and exit).
+ *
+ * quotactl_fd was added in Linux 5.14 as a file-descriptor-relative
+ * variant of quotactl.  It shares the same fate here.
+ */
+DEFINE_SYSCALL(quotactl, int, cmd, gstr_t, special_ptr, int, id, gaddr_t, addr)
+{
+  (void)cmd; (void)special_ptr; (void)id; (void)addr;
+  return -LINUX_ENOSYS;
+}
+
+DEFINE_SYSCALL(quotactl_fd, int, fd, int, cmd, int, id, gaddr_t, addr)
+{
+  (void)fd; (void)cmd; (void)id; (void)addr;
+  return -LINUX_ENOSYS;
+}
+
 int
 do_faccessat(int dirfd, const char *name, int mode, int flags)
 {

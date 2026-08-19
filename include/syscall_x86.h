@@ -184,7 +184,7 @@
   SYSCALL(176, delete_module) \
   SYSCALL(177, get_kernel_syms) \
   SYSCALL(178, unimplemented) \
-  SYSCALL(179, unimplemented) \
+  SYSCALL(179, quotactl) \
   SYSCALL(180, nfsservctl) \
   SYSCALL(181, getpmsg) \
   SYSCALL(182, putpmsg) \
@@ -448,7 +448,7 @@
   SYSCALL(440, process_madvise) \
   SYSCALL(441, epoll_pwait2) \
   SYSCALL(442, mount_setattr) \
-  SYSCALL(443, unimplemented) \
+  SYSCALL(443, quotactl_fd) \
   SYSCALL(444, landlock_create_ruleset) \
   SYSCALL(445, landlock_add_rule) \
   SYSCALL(446, landlock_restrict_self) \

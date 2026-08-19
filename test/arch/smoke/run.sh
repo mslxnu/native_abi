@@ -1371,6 +1371,16 @@ else
     fail=1
 fi
 
+# quotatest: quotactl(2) and quotactl_fd(2) — disk quota control returns ENOSYS
+cp "$here/quotatest" "$root/"; chmod +x "$root/quotatest"
+out=$("$NABI" -m "$root" /quotatest); rc=$?
+if [ "$rc" -eq 0 ] && [ "$out" = "quota ok" ]; then
+    echo "  ok  quotatest -> \"$out\", exit 0"
+else
+    echo "  FAIL quotatest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 if [ "$fail" -eq 0 ]; then
     echo "smoke: PASS"
 else
