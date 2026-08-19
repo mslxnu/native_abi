@@ -5728,6 +5728,34 @@ DEFINE_SYSCALL(statfs, gstr_t, path_ptr, gaddr_t, buf_ptr)
   return r;
 }
 
+/*
+ * ustat is the ancient predecessor of statfs.  The device number is ignored
+ * (NABI has one root filesystem), and the struct is small: free blocks, free
+ * inodes, and two six-byte name fields that have never meant anything.
+ */
+DEFINE_SYSCALL(ustat, l_ulong, dev, gaddr_t, ubuf_ptr)
+{
+  (void)dev;
+  if (ubuf_ptr == 0)
+    return 0;
+  struct path path;
+  int r = vfs_grab_dir(LINUX_AT_FDCWD, "/", 0, &path);
+  if (r < 0)
+    return r;
+  struct l_statfs st;
+  r = path.fs->ops->statfs(path.fs, path.dir, path.subpath, &st);
+  vfs_ungrab_dir(&path);
+  if (r < 0)
+    return r;
+  struct l_ustat ustat;
+  memset(&ustat, 0, sizeof ustat);
+  ustat.f_tfree = (l_int)st.f_bfree;
+  ustat.f_tinode = (l_ulong)st.f_ffree;
+  if (copy_to_user(ubuf_ptr, &ustat, sizeof ustat))
+    return -LINUX_EFAULT;
+  return 0;
+}
+
 int
 do_faccessat(int dirfd, const char *name, int mode, int flags)
 {

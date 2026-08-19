@@ -141,7 +141,7 @@
   SYSCALL(133, mknod) \
   SYSCALL(134, uselib) \
   SYSCALL(135, personality) \
-  SYSCALL(136, unimplemented) \
+  SYSCALL(136, ustat) \
   SYSCALL(137, statfs) \
   SYSCALL(138, fstatfs) \
   SYSCALL(139, sysfs) \

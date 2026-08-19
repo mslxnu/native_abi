@@ -108,6 +108,21 @@ struct l_sched_attr {
 /* sched_attr flags */
 #define LINUX_SCHED_FLAG_RESET_ON_FORK  0x01
 
+/*
+ * ustat: the struct filled by the ustat(2) syscall.  Obsolete on Linux,
+ * present only on x86-64 (no arm64 number).  The layout matches the
+ * x86-64 ABI: __daddr_t (int32) + padding + __ino_t (uint64) + name.
+ * NABI fills f_tfree from the host free-block count and f_tinode from
+ * the host free-inode count; f_fname and f_fpack are zeroed.
+ */
+struct l_ustat {
+  l_int       f_tfree;    /* Number of free blocks. */
+  l_uint      _pad;       /* alignment */
+  l_ulong     f_tinode;   /* Number of free inodes. */
+  char        f_fname[6];
+  char        f_fpack[6];
+};
+
 /* Resource limits */
 #define	LINUX_RLIMIT_CPU	0
 #define	LINUX_RLIMIT_FSIZE	1
