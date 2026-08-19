@@ -1381,6 +1381,16 @@ else
     fail=1
 fi
 
+# rahtest: readahead(2) — prefetch hint on valid/bogus fd
+cp "$here/rahtest" "$root/"; chmod +x "$root/rahtest"
+out=$("$NABI" -m "$root" /rahtest); rc=$?
+if [ "$rc" -eq 0 ] && [ "$out" = "rahtest ok" ]; then
+    echo "  ok  rahtest -> \"$out\", exit 0"
+else
+    echo "  FAIL rahtest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 if [ "$fail" -eq 0 ]; then
     echo "smoke: PASS"
 else

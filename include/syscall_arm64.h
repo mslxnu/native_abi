@@ -219,7 +219,7 @@
   SYSCALL(210, shutdown) \
   SYSCALL(211, sendmsg) \
   SYSCALL(212, recvmsg) \
-  SYSCALL(213, unimplemented) \
+  SYSCALL(213, readahead) \
   SYSCALL(214, brk) \
   SYSCALL(215, munmap) \
   SYSCALL(216, mremap) \

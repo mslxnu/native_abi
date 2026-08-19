@@ -5795,6 +5795,23 @@ DEFINE_SYSCALL(quotactl_fd, int, fd, int, cmd, int, id, gaddr_t, addr)
   return -LINUX_ENOSYS;
 }
 
+/*
+ * readahead is a pure performance hint: prefetch @count bytes starting at
+ * @offset on @fd into the page cache.  Darwin maintains its own read-ahead
+ * heuristics and has no fcntl equivalent that accepts an arbitrary
+ * (offset, length) pair, so NABI validates the fd and returns 0.  The
+ * caller never checks the return value — even Linux may ignore the hint
+ * — but a bogus fd must still yield EBADF.
+ */
+DEFINE_SYSCALL(readahead, int, fd, l_long, offset, l_ulong, count)
+{
+  (void)offset; (void)count;
+  struct file *file = get_file(fd);
+  if (file == NULL)
+    return -LINUX_EBADF;
+  return 0;
+}
+
 int
 do_faccessat(int dirfd, const char *name, int mode, int flags)
 {

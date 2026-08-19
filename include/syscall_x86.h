@@ -192,7 +192,7 @@
   SYSCALL(184, tuxcall) \
   SYSCALL(185, security) \
   SYSCALL(186, gettid) \
-  SYSCALL(187, unimplemented) \
+  SYSCALL(187, readahead) \
   SYSCALL(188, setxattr) \
   SYSCALL(189, lsetxattr) \
   SYSCALL(190, fsetxattr) \
