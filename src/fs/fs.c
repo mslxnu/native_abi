@@ -647,6 +647,31 @@ signalfd_read(int fd, char *out, size_t size, int *ret)
     }
     pthread_rwlock_unlock(&proc.sig_lock);
 
+    /*
+     * Nothing pending, so nothing may be left making the descriptor readable.
+     *
+     * The byte in the socketpair only exists to wake a waiter; the pending set
+     * is what actually says whether there is a signal to report. They come
+     * apart whenever an arrival is consumed by something other than this read
+     * - nabi's own delivery to a handler, or a sigwait - and the byte outlives
+     * the bit. Then poll calls the descriptor readable, the read finds nothing,
+     * and the caller goes round again forever: Android's init sat at full CPU
+     * repeating "epoll() woke us up, but we waited with no SIGCHLD!".
+     *
+     * Drained before the answer, and the pending set looked at once more
+     * afterwards, because a signal arriving during the drain would otherwise
+     * have its byte thrown away along with the stale ones - the re-check is
+     * what makes that safe rather than a lost wakeup.
+     */
+    char drain[64];
+    while (recv(fd, drain, sizeof drain, MSG_DONTWAIT) > 0)
+      ;
+    pthread_rwlock_rdlock(&proc.sig_lock);
+    bool arrived = (task.sigpending & sf->mask.__mask) != 0;
+    pthread_rwlock_unlock(&proc.sig_lock);
+    if (arrived)
+      continue;
+
     int fl = fcntl(fd, F_GETFL);
     if (fl >= 0 && (fl & O_NONBLOCK)) {
       *ret = -LINUX_EAGAIN;
