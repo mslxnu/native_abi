@@ -278,6 +278,29 @@ typedef struct l_siginfo {
 #define	lsi_fd		_sifields._sigpoll._fd
 
 /*
+ * siginfo si_code values used by rt_sigqueueinfo validation.
+ *
+ * These are the codes the kernel rejects: plain kill(2) uses SI_USER (0),
+ * the kernel itself uses SI_KERNEL (0x80), and tkill/tgkill/tgkill use
+ * SI_TKILL (-6) and SI_DETHREAD (-7).  A positive si_code is also invalid:
+ * it is reserved for signal-specific positive values the kernel generates
+ * (CLD_*, TRAP_*, POLL_*, etc.) that user space must not inject.
+ *
+ * Everything else - SI_QUEUE (-1), SI_TIMER (-2), SI_MESGQ (-3),
+ * SI_ASYNCIO (-4), SI_SIGIO (-5) - is legal for a caller to supply.
+ */
+#define LINUX_SI_USER		0
+#define LINUX_SI_KERNEL		0x80
+#define LINUX_SI_QUEUE		(-1)
+#define LINUX_SI_TIMER		(-2)
+#define LINUX_SI_MESGQ		(-3)
+#define LINUX_SI_ASYNCIO	(-4)
+#define LINUX_SI_SIGIO		(-5)
+#define LINUX_SI_TKILL		(-6)
+#define LINUX_SI_DETHREAD	(-7)
+#define LINUX_SI_ASYNCNL	(-60)
+
+/*
  * The record a signalfd answers a read with. Fixed size - 128 bytes, as on
  * Linux - because it comes out of read(2), so the layout cannot be allowed to
  * drift with a future kernel.

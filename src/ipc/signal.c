@@ -1,5 +1,6 @@
 #include "common.h"
 #include "linux/signal.h"
+#include "linux/time.h"
 
 #include "noah.h"
 #include "namespace.h"
@@ -679,6 +680,168 @@ DEFINE_SYSCALL(rt_sigsuspend, gaddr_t, nset, size_t, size)
 }
 
 /*
+ * rt_sigtimedwait: suspend until one of a chosen set of signals is pending.
+ *
+ * This is the timed variant of sigsuspend: the caller picks which signals to
+ * wait for rather than temporarily replacing the whole mask. The mask is
+ * temporarily set to block everything *except* the wait-set signals, the
+ * pending set is scanned, and if nothing is there the call sleeps until one
+ * arrives or the timeout expires.
+ *
+ * The return value is the signal number that was delivered. The signal is
+ * removed from the pending set by pop_signal. If uinfo is not NULL the
+ * siginfo is filled in as best nabi can: the signal number and SI_USER as the
+ * code, because nabi's delivery path does not carry the original payload.
+ *
+ * On timeout the return is -EAGAIN. If a signal that is *not* in the wait set
+ * arrives, the call returns -EINTR (matching Linux behaviour for signals that
+ * were blocked before we unblocked the wait set and are still blocked in the
+ * guest's real mask).
+ */
+DEFINE_SYSCALL(rt_sigtimedwait, gaddr_t, uthese, gaddr_t, uinfo, gaddr_t, uts, size_t, sigsetsize)
+{
+  if (sigsetsize != sizeof(l_sigset_t))
+    return -LINUX_EINVAL;
+
+  l_sigset_t lwait;
+  if (copy_from_user(&lwait, uthese, sizeof(l_sigset_t)))
+    return -LINUX_EFAULT;
+
+  /* Read an optional timeout. */
+  struct timespec ts;
+  bool has_timeout = false;
+  if (uts != 0) {
+    struct l_timespec lts;
+    if (copy_from_user(&lts, uts, sizeof lts))
+      return -LINUX_EFAULT;
+    ts.tv_sec  = lts.tv_sec;
+    ts.tv_nsec = lts.tv_nsec;
+    if (ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1000000000L)
+      return -LINUX_EINVAL;
+    has_timeout = true;
+  }
+
+  /*
+   * Temporarily unmask only the signals the caller is waiting for. The rest
+   * of the guest's mask stays in place, so a signal outside the wait set
+   * cannot sneak in through the host.
+   */
+  l_sigset_t loset = task.sigmask;
+  sigset_t dmask, doldmask;
+
+  /*
+   * Build a Darwin mask that blocks everything the guest blocks, then
+   * *unblocks* the wait-set signals. The result is "block everything
+   * except the wait set" on the host side, which is what lets the host's
+   * own signal delivery wake us from sleep.
+   */
+  linux_to_darwin_sigset(&task.sigmask, &dmask);
+  sigset_t dwait;
+  linux_to_darwin_sigset(&lwait, &dwait);
+  /* Unblock the wait-set signals in the host mask. */
+  for (int sig = 1; sig <= LINUX_SIGRTMAX; sig++) {
+    if (LINUX_SIGISMEMBER(&lwait, sig))
+      sigdelset(&dmask, linux_to_darwin_signal(sig));
+  }
+  pthread_sigmask(SIG_SETMASK, &dmask, &doldmask);
+
+  /*
+   * Also update the guest mask so that has_sigpending and pop_signal see
+   * the wait set as unblocked.
+   */
+  LINUX_SIGSET_SET(&task.sigmask, &lwait);
+  for (int sig = 1; sig <= LINUX_SIGRTMAX; sig++)
+    if (LINUX_SIGISMEMBER(&lwait, sig))
+      LINUX_SIGDELSET(&task.sigmask, sig);
+
+  /* Check the pending set first - a signal may already be waiting. */
+  int sig = 0;
+  uint64_t waitbits = lwait.__mask;
+  uint64_t pending = task.sigpending & waitbits & ~LINUX_SIGSET_TO_UI64(&task.sigmask);
+  if (pending) {
+    sig = __builtin_ffsll((long long) pending);
+    assert(0 < sig && sig <= LINUX_NSIG);
+    CLEAR_SIGBIT(&task.sigpending, sig);
+    goto out;
+  }
+
+  /*
+   * Sleep until one of the waited signals arrives or the timeout expires.
+   * sleep() is built on nanosleep on macOS, so it is interruptible and
+   * cannot swallow an alarm the way a blocking syscall could.
+   */
+  if (!has_timeout) {
+    /* No timeout: sleep indefinitely. */
+    while (1) {
+      sleep(114514);
+      pending = task.sigpending & waitbits;
+      if (pending) {
+        sig = __builtin_ffsll((long long) pending);
+        assert(0 < sig && sig <= LINUX_NSIG);
+        CLEAR_SIGBIT(&task.sigpending, sig);
+        goto out;
+      }
+    }
+  }
+
+  /*
+   * With a timeout: track elapsed time against the deadline.  The guest
+   * timeout is relative to CLOCK_MONOTONIC, which maps to Darwin's
+   * CLOCK_MONOTONIC_RAW (CLOCK_MONOTONIC in the host is fine for a
+   * relative sleep).
+   */
+  {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    /* Absolute deadline = now + ts. */
+    struct timespec deadline;
+    deadline.tv_sec  = now.tv_sec  + ts.tv_sec;
+    deadline.tv_nsec = now.tv_nsec + ts.tv_nsec;
+    if (deadline.tv_nsec >= 1000000000L) {
+      deadline.tv_sec  += 1;
+      deadline.tv_nsec -= 1000000000L;
+    }
+
+    while (1) {
+      clock_gettime(CLOCK_MONOTONIC, &now);
+      long rem_sec  = deadline.tv_sec  - now.tv_sec;
+      long rem_nsec = deadline.tv_nsec - now.tv_nsec;
+      if (rem_nsec < 0) { rem_sec -= 1; rem_nsec += 1000000000L; }
+      if (rem_sec < 0) {
+        /* Timeout expired. */
+        sig = -LINUX_EAGAIN;
+        goto out;
+      }
+      struct timespec nap = { .tv_sec = rem_sec, .tv_nsec = rem_nsec };
+      nanosleep(&nap, NULL);
+
+      pending = task.sigpending & waitbits;
+      if (pending) {
+        sig = __builtin_ffsll((long long) pending);
+        assert(0 < sig && sig <= LINUX_NSIG);
+        CLEAR_SIGBIT(&task.sigpending, sig);
+        goto out;
+      }
+    }
+  }
+
+out:
+  /* Restore masks. */
+  task.sigmask = loset;
+  pthread_sigmask(SIG_SETMASK, &doldmask, NULL);
+
+  if (sig > 0 && uinfo != 0) {
+    l_siginfo_t si;
+    memset(&si, 0, sizeof si);
+    si.lsi_signo = sig;
+    si.lsi_code  = LINUX_SI_USER;
+    if (copy_to_user(uinfo, &si, sizeof si))
+      return -LINUX_EFAULT;
+  }
+  return sig;
+}
+
+/*
  * pause: wait until a signal arrives.
  *
  * It is sigsuspend with the mask left alone, and it is written beside it rather
@@ -774,6 +937,43 @@ DEFINE_SYSCALL(kill, l_pid_t, pid, int, sig)
     pid = h;
   }
   return send_signal(pid, sig);
+}
+
+/*
+ * rt_sigqueueinfo: send a signal with a siginfo payload to a process group.
+ *
+ * The si_code is validated: only codes that user space is allowed to supply
+ * (SI_QUEUE, SI_TIMER, SI_MESGQ, SI_ASYNCIO, SI_SIGIO) reach here.
+ * SI_USER, SI_KERNEL, SI_TKILL, SI_DETHREAD and any positive code are
+ * rejected - the same way the kernel does it.
+ *
+ * Like rt_tgsigqueueinfo, the payload is not carried through delivery.
+ * nabi's signal infrastructure loses everything but the signal number:
+ * the pending set is a bitmap and pop_signal returns only the number.
+ */
+DEFINE_SYSCALL(rt_sigqueueinfo, l_pid_t, tgid, int, sig, gaddr_t, uinfo)
+{
+  l_siginfo_t si;
+
+  if (sig <= 0 || sig > LINUX_SIGRTMAX)
+    return -LINUX_EINVAL;
+  if (copy_from_user(&si, uinfo, sizeof si))
+    return -LINUX_EFAULT;
+  /*
+   * Reject codes only the kernel may use.  A positive si_code is reserved
+   * for the signal-class-specific codes (CLD_*, TRAP_*, POLL_*, etc.) that
+   * the kernel generates; user space must not inject them.
+   */
+  if (si.lsi_code == LINUX_SI_USER ||
+      si.lsi_code == LINUX_SI_KERNEL ||
+      si.lsi_code == LINUX_SI_TKILL ||
+      si.lsi_code == LINUX_SI_DETHREAD ||
+      si.lsi_code > 0)
+    return -LINUX_EINVAL;
+  pid_t h = pidns_to_host(tgid);
+  if (h < 0)
+    return -LINUX_ESRCH;
+  return send_signal(h, sig);
 }
 
 /*

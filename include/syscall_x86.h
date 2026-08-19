@@ -133,8 +133,8 @@
   SYSCALL(125, capget) \
   SYSCALL(126, capset) \
   SYSCALL(127, rt_sigpending) \
-  SYSCALL(128, unimplemented) \
-  SYSCALL(129, unimplemented) \
+  SYSCALL(128, rt_sigtimedwait) \
+  SYSCALL(129, rt_sigqueueinfo) \
   SYSCALL(130, rt_sigsuspend) \
   SYSCALL(131, sigaltstack) \
   SYSCALL(132, utime) \

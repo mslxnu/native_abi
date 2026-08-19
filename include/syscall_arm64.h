@@ -143,8 +143,8 @@
   SYSCALL(134, rt_sigaction) \
   SYSCALL(135, rt_sigprocmask) \
   SYSCALL(136, rt_sigpending) \
-  SYSCALL(137, unimplemented) \
-  SYSCALL(138, unimplemented) \
+  SYSCALL(137, rt_sigtimedwait) \
+  SYSCALL(138, rt_sigqueueinfo) \
   SYSCALL(139, rt_sigreturn) \
   SYSCALL(140, setpriority) \
   SYSCALL(141, getpriority) \

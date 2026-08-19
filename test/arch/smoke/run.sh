@@ -1328,6 +1328,23 @@ else
     fail=1
 fi
 
+# sigqtest: rt_sigqueueinfo and rt_sigtimedwait. rt_sigqueueinfo sends a
+# real-time signal with a siginfo payload; the si_code must be validated (only
+# SI_QUEUE and friends are legal, not SI_USER, SI_KERNEL, SI_TKILL or
+# positive). rt_sigtimedwait suspends until one of a chosen set of signals is
+# pending or a timeout expires: it must return -EAGAIN on timeout, return the
+# signal number when one arrives, fill the uinfo with signo and SI_USER, and
+# refuse a wrong sigsetsize. The real-time signals have no Darwin counterpart,
+# so the whole path runs through nabi's own infrastructure.
+cp "$here/sigqtest" "$root/"; chmod +x "$root/sigqtest"
+out=$("$NABI" -m "$root" /sigqtest); rc=$?
+if [ "$rc" -eq 0 ] && [ "$out" = "sigq ok" ]; then
+    echo "  ok  sigqtest -> \"$out\", exit 0"
+else
+    echo "  FAIL sigqtest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 if [ "$fail" -eq 0 ]; then
     echo "smoke: PASS"
 else
