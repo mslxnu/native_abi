@@ -1345,6 +1345,22 @@ else
     fail=1
 fi
 
+# sattrtest: sched_setattr and sched_getattr — the modern scheduling interface
+# that replaces sched_setscheduler/sched_setparam and adds SCHED_DEADLINE.
+# Checks: the size field versions the struct (too small is EINVAL, too large is
+# accepted), normal policies succeed silently, real-time policies are refused
+# with EPERM, DEADLINE is refused with EINVAL, priority range is checked before
+# privilege, SCHED_FLAG_RESET_ON_FORK is accepted, and getattr always reports
+# SCHED_OTHER with priority 0 — consistent with every other scheduler call.
+cp "$here/sattrtest" "$root/"; chmod +x "$root/sattrtest"
+out=$("$NABI" -m "$root" /sattrtest); rc=$?
+if [ "$rc" -eq 0 ] && [ "$out" = "sattr ok" ]; then
+    echo "  ok  sattrtest -> \"$out\", exit 0"
+else
+    echo "  FAIL sattrtest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 if [ "$fail" -eq 0 ]; then
     echo "smoke: PASS"
 else

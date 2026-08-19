@@ -86,6 +86,28 @@ struct l_sched_param {
 	int	sched_priority;
 };
 
+/*
+ * sched_attr: the sched_setattr / sched_getattr layout.  The size field
+ * versions the structure; a caller that passes a smaller size is asking
+ * for an older layout, and the kernel fills only the fields that version
+ * covers.  NABI reports v1 (56 bytes) which adds sched_flags.
+ */
+#define LINUX_SCHED_ATTR_VERSION  1
+
+struct l_sched_attr {
+	l_uint		size;
+	l_uint		sched_policy;
+	l_ulong		sched_flags;
+	l_int		sched_nice;
+	l_uint		sched_priority;
+	l_ulong		sched_runtime;
+	l_ulong		sched_deadline;
+	l_ulong		sched_period;
+};
+
+/* sched_attr flags */
+#define LINUX_SCHED_FLAG_RESET_ON_FORK  0x01
+
 /* Resource limits */
 #define	LINUX_RLIMIT_CPU	0
 #define	LINUX_RLIMIT_FSIZE	1

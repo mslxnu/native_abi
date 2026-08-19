@@ -319,8 +319,8 @@
   SYSCALL(311, process_vm_writev) \
   SYSCALL(312, kcmp) \
   SYSCALL(313, finit_module) \
-  SYSCALL(314, unimplemented) \
-  SYSCALL(315, unimplemented) \
+  SYSCALL(314, sched_setattr) \
+  SYSCALL(315, sched_getattr) \
   SYSCALL(316, renameat2) \
   SYSCALL(317, seccomp) \
   SYSCALL(318, getrandom) \

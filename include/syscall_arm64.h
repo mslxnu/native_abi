@@ -280,8 +280,8 @@
   SYSCALL(271, process_vm_writev) \
   SYSCALL(272, kcmp) \
   SYSCALL(273, finit_module) \
-  SYSCALL(274, unimplemented) \
-  SYSCALL(275, unimplemented) \
+  SYSCALL(274, sched_setattr) \
+  SYSCALL(275, sched_getattr) \
   SYSCALL(276, renameat2) \
   SYSCALL(277, seccomp) \
   SYSCALL(278, getrandom) \

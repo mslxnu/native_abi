@@ -2130,6 +2130,113 @@ DEFINE_SYSCALL(sched_rr_get_interval, l_pid_t, pid, gaddr_t, interval_ptr)
 }
 
 /*
+ * sched_setattr: the modern interface for changing scheduling policy.
+ *
+ * Everything the older sched_setscheduler and sched_setparam do is expressible
+ * here, plus SCHED_DEADLINE whose three timing parameters have no older call.
+ * NABI handles it the same way: normal policies are accepted silently (the
+ * thread is already SCHED_OTHER and stays there), real-time policies are
+ * refused with EPERM, and DEADLINE is refused with EINVAL because it needs
+ * kernel support that does not exist in a guest.
+ *
+ * The size field versions the structure: a caller may pass fewer bytes than
+ * NABI knows about, and only the fields that version covers are examined.
+ * Version 0 (48 bytes) lacks sched_flags; version 1 (56 bytes) includes it.
+ * A size larger than what we know is not an error — the caller is newer —
+ * and a size smaller than the minimum (40 bytes, through sched_priority) is
+ * EINVAL.  Flags outside RESET_ON_FORK are silently accepted so that future
+ * flags do not break old callers.
+ */
+DEFINE_SYSCALL(sched_setattr, l_pid_t, pid, gaddr_t, attr_ptr, unsigned int, flags)
+{
+  int r;
+  if ((r = sched_check_pid(pid)) < 0)
+    return r;
+  if (attr_ptr == 0)
+    return -LINUX_EINVAL;
+
+  struct l_sched_attr a;
+  if (copy_from_user(&a, attr_ptr, sizeof a))
+    return -LINUX_EFAULT;
+
+  /* The minimum usable size covers through sched_priority (40 bytes).  The
+   * maximum NABI understands is the full v1 (56 bytes); a larger size means
+   * a newer caller, which is fine — just ignore the fields we do not know. */
+  if (a.size < 40)
+    return -LINUX_EINVAL;
+
+  int base = a.sched_policy;
+  if (flags & LINUX_SCHED_FLAG_RESET_ON_FORK)
+    base &= ~LINUX_SCHED_RESET_ON_FORK;
+  if (!sched_policy_known(base))
+    return -LINUX_EINVAL;
+
+  if (sched_policy_is_realtime(base)) {
+    /* Priority range first, then privilege — the order Linux checks in. */
+    if (a.sched_priority < LINUX_SCHED_RT_PRIO_MIN ||
+        a.sched_priority > LINUX_SCHED_RT_PRIO_MAX)
+      return -LINUX_EINVAL;
+    return -LINUX_EPERM;
+  }
+
+  if (base == LINUX_SCHED_DEADLINE)
+    return -LINUX_EINVAL;         /* no DEADLINE support */
+
+  if (a.sched_priority != 0)
+    return -LINUX_EINVAL;
+  return 0;                       /* already SCHED_OTHER, staying there */
+}
+
+/*
+ * sched_getattr: report a task's scheduling attributes.
+ *
+ * The answer is always the same: SCHED_OTHER with no flags, nice 0,
+ * priority 0, and zero timing parameters.  That is honest — the thread is
+ * SCHED_OTHER and nothing the guest did changed that — and consistent with
+ * what every other scheduler call in NABI reports.
+ *
+ * The size field controls how many bytes are written back: a caller using an
+ * older layout gets fewer fields, and a newer caller gets the full v1 struct.
+ * The flags field is only written when the caller's version includes it (size
+ * >= 56).
+ */
+DEFINE_SYSCALL(sched_getattr, l_pid_t, pid, gaddr_t, attr_ptr, unsigned int, flags)
+{
+  int r;
+  if ((r = sched_check_pid(pid)) < 0)
+    return r;
+  if (attr_ptr == 0)
+    return -LINUX_EINVAL;
+
+  /* Read the caller's size so we know how much to write back. */
+  l_uint caller_size;
+  if (copy_from_user(&caller_size, attr_ptr, sizeof caller_size))
+    return -LINUX_EFAULT;
+  if (caller_size < 40)
+    return -LINUX_EINVAL;
+
+  struct l_sched_attr a;
+  a.size           = sizeof(struct l_sched_attr);
+  a.sched_policy   = LINUX_SCHED_OTHER;
+  a.sched_flags    = 0;
+  a.sched_nice     = 0;
+  a.sched_priority = 0;
+  a.sched_runtime  = 0;
+  a.sched_deadline = 0;
+  a.sched_period   = 0;
+
+  /* Write back only as many bytes as the caller asked for.  The first field
+   * is always size (4 bytes), so everything from the second field onward is
+   * at offset 4.  The caller's size already includes the 4-byte preamble. */
+  size_t n = caller_size < sizeof a ? caller_size : sizeof a;
+  if (copy_to_user(attr_ptr, &a, n))
+    return -LINUX_EFAULT;
+  /* Linux always returns sizeof(struct sched_attr) regardless of how many
+   * bytes were actually written. */
+  return sizeof(struct l_sched_attr);
+}
+
+/*
  * Accepted and not enforced, which is worth being explicit about.
  *
  * Darwin has no CPU pinning to offer - thread_policy_set's affinity policy is a
