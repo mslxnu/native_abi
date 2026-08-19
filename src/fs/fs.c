@@ -4495,7 +4495,23 @@ resolve_path(const struct dir *parent, const char *name, int flags, struct path 
         *sp = 0;
       }
     }
-    if ((flags & LOOKUP_NOFOLLOW) == 0) {
+    /*
+     * O_NOFOLLOW is about the file being opened, not about the path used to
+     * reach it. Linux follows every symlink on the way and refuses only if the
+     * *last* component is one; that is what makes it a way to say "give me
+     * this file, not whatever it points at" rather than "fail on any symlink
+     * anywhere in this name".
+     *
+     * Refusing them all is a very quiet difference: it turns into ENOENT on a
+     * path that plainly exists, and only for callers that pass the flag.
+     * libprocessgroup opens /etc/cgroups.json with O_NOFOLLOW|O_CLOEXEC and
+     * Android ships /etc as a symlink to /system/etc, so cgroup setup failed
+     * with "Failed to load cgroup description file" while the same path opened
+     * perfectly well for anything that did not ask for O_NOFOLLOW - which is
+     * every shell and every test.
+     */
+    bool last = (*c == '\0');
+    if ((flags & LOOKUP_NOFOLLOW) == 0 || !last) {
       char buf[LINUX_PATH_MAX];
       int n;
       if ((n = fs->ops->readlinkat(fs, &dir, path->subpath, buf, sizeof buf)) > 0) {

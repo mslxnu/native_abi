@@ -1138,6 +1138,24 @@ else
     fail=1
 fi
 
+# nofollowtest: O_NOFOLLOW is about the file, not the path to it. nabi refused
+# every symlink in a name rather than only the last component, so a path that
+# plainly exists returned ENOENT - but only for callers passing the flag, which
+# is why nothing else noticed. Android ships /etc as a symlink and
+# libprocessgroup opens /etc/cgroups.json with O_NOFOLLOW|O_CLOEXEC.
+nfroot=$(mktemp -d)
+mkdir -p "$nfroot/dir"; echo hi > "$nfroot/dir/file"
+ln -s /dir "$nfroot/link_to_dir"; ln -s /dir/file "$nfroot/link_to_file"
+cp "$here/nofollowtest" "$nfroot/"; chmod +x "$nfroot/nofollowtest"
+out=$("$NABI" -m "$nfroot" /nofollowtest 2>&1 | tail -1); rc=$?
+rm -rf "$nfroot"
+if [ "$out" = "nofollow ok" ]; then
+    echo "  ok  nofollowtest -> \"$out\""
+else
+    echo "  FAIL nofollowtest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 # procchmodtest: chmod on a passed-through /proc, which the host module serving
 # it refuses - and Android's first-stage init treats a failed chmod of
 # /proc/cmdline as fatal. Checks that it succeeds by path and by dirfd, that a
