@@ -161,7 +161,7 @@
   SYSCALL(153, vhangup) \
   SYSCALL(154, modify_ldt) \
   SYSCALL(155, pivot_root) \
-  SYSCALL(156, unimplemented) \
+  SYSCALL(156, _sysctl) \
   SYSCALL(157, prctl) \
   SYSCALL(158, arch_prctl) \
   SYSCALL(159, adjtimex) \
@@ -169,7 +169,7 @@
   SYSCALL(161, chroot) \
   SYSCALL(162, sync) \
   SYSCALL(163, acct) \
-  SYSCALL(164, unimplemented) \
+  SYSCALL(164, settimeofday) \
   SYSCALL(165, mount) \
   SYSCALL(166, umount2) \
   SYSCALL(167, swapon) \

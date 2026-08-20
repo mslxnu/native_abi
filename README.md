@@ -278,7 +278,7 @@ A dash in a number column means that architecture has no such call.
 
 | Syscall | aarch64 | x86-64 | NABI |
 |---|---:|---:|:---:|
-| `_sysctl` | — | 156 | · |
+| `_sysctl` | — | 156 | ⊘ |
 | `accept` | 202 | 43 | ✅ |
 | `accept4` | 242 | 288 | ✅ |
 | `access` | — | 21 | ✅ |
@@ -589,7 +589,7 @@ A dash in a number column means that architecture has no such call.
 | `setrlimit` | 164 | 160 | ✅ |
 | `setsid` | 157 | 112 | ✅ |
 | `setsockopt` | 208 | 54 | ✅ |
-| `settimeofday` | 170 | 164 | · |
+| `settimeofday` | 170 | 164 | ⊘ |
 | `setuid` | 146 | 105 | ✅ |
 | `setxattr` | 5 | 188 | ✅ |
 | `shmat` | 196 | 30 | ✅ |

@@ -176,7 +176,7 @@
   SYSCALL(167, prctl) \
   SYSCALL(168, getcpu) \
   SYSCALL(169, gettimeofday) \
-  SYSCALL(170, unimplemented) \
+  SYSCALL(170, settimeofday) \
   SYSCALL(171, adjtimex) \
   SYSCALL(172, getpid) \
   SYSCALL(173, getppid) \
@@ -1089,5 +1089,6 @@
   SYSCALL(1077, vserver) \
   SYSCALL(1078, query_module) \
   SYSCALL(1079, uretprobe) \
+  SYSCALL(1080, _sysctl) \
 
-#define NR_SYSCALLS 1080
+#define NR_SYSCALLS 1081
