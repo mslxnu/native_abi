@@ -81,7 +81,7 @@
   SYSCALL(73, flock) \
   SYSCALL(74, fsync) \
   SYSCALL(75, fdatasync) \
-  SYSCALL(76, unimplemented) \
+  SYSCALL(76, truncate) \
   SYSCALL(77, ftruncate) \
   SYSCALL(78, getdents) \
   SYSCALL(79, getcwd) \

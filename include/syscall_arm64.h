@@ -51,7 +51,7 @@
   SYSCALL(42, nfsservctl) \
   SYSCALL(43, statfs) \
   SYSCALL(44, fstatfs) \
-  SYSCALL(45, unimplemented) \
+  SYSCALL(45, truncate) \
   SYSCALL(46, ftruncate) \
   SYSCALL(47, fallocate) \
   SYSCALL(48, faccessat) \

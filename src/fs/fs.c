@@ -7233,6 +7233,18 @@ DEFINE_SYSCALL(chroot, gstr_t, path_ptr)
   return 0;
 }
 
+DEFINE_SYSCALL(truncate, gstr_t, path_ptr, unsigned long, length)
+{
+  char pathname[LINUX_PATH_MAX];
+  strncpy_from_user(pathname, path_ptr, sizeof pathname);
+  int fd = syswrap(open(pathname, O_WRONLY));
+  if (fd < 0)
+    return fd;
+  int r = syswrap(ftruncate(fd, length));
+  close(fd);
+  return r;
+}
+
 DEFINE_SYSCALL(ftruncate, unsigned int, fd, unsigned long, length)
 {
   return syswrap(ftruncate(fd, length));

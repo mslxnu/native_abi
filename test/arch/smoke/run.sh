@@ -1422,6 +1422,16 @@ else
     fail=1
 fi
 
+# truntest: truncate(2) — shrink, expand, error on ENOENT, and no-op.
+cp "$here/truntest" "$root/"; chmod +x "$root/truntest"
+out=$("$NABI" -m "$root" /truntest); rc=$?
+if [ "$rc" -eq 0 ] && [ "$out" = "truntest ok" ]; then
+    echo "  ok  truntest -> \"$out\", exit 0"
+else
+    echo "  FAIL truntest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 if [ "$fail" -eq 0 ]; then
     echo "smoke: PASS"
 else
