@@ -64,7 +64,7 @@
   SYSCALL(55, fchown) \
   SYSCALL(56, openat) \
   SYSCALL(57, close) \
-  SYSCALL(58, unimplemented) \
+  SYSCALL(58, vhangup) \
   SYSCALL(59, pipe2) \
   SYSCALL(60, quotactl) \
   SYSCALL(61, getdents64) \

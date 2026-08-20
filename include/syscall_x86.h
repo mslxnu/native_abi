@@ -158,7 +158,7 @@
   SYSCALL(150, munlock) \
   SYSCALL(151, mlockall) \
   SYSCALL(152, munlockall) \
-  SYSCALL(153, unimplemented) \
+  SYSCALL(153, vhangup) \
   SYSCALL(154, modify_ldt) \
   SYSCALL(155, pivot_root) \
   SYSCALL(156, unimplemented) \

@@ -646,7 +646,7 @@ A dash in a number column means that architecture has no such call.
 | `utimensat` | 88 | 280 | ✅ |
 | `utimes` | — | 235 | ✅ |
 | `vfork` | — | 58 | ✅ |
-| `vhangup` | 58 | 153 | · |
+| `vhangup` | 58 | 153 | ⊘ |
 | `vmsplice` | 75 | 278 | ✅ |
 | `vserver` | — | 236 | ⊘ |
 | `wait4` | 260 | 61 | ✅ |
