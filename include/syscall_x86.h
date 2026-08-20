@@ -183,7 +183,7 @@
   SYSCALL(175, init_module) \
   SYSCALL(176, delete_module) \
   SYSCALL(177, get_kernel_syms) \
-  SYSCALL(178, unimplemented) \
+  SYSCALL(178, query_module) \
   SYSCALL(179, quotactl) \
   SYSCALL(180, nfsservctl) \
   SYSCALL(181, getpmsg) \

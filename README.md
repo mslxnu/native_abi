@@ -515,7 +515,7 @@ A dash in a number column means that architecture has no such call.
 | `pwrite64` | 68 | 18 | ✅ |
 | `pwritev` | 70 | 296 | ✅ |
 | `pwritev2` | 287 | 328 | ✅ |
-| `query_module` | — | 178 | · |
+| `query_module` | — | 178 | ⊘ |
 | `quotactl` | 60 | 179 | ✅ |
 | `quotactl_fd` | 443 | 443 | ✅ |
 | `read` | 63 | 0 | ✅ |
