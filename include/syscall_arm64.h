@@ -134,7 +134,7 @@
   SYSCALL(125, sched_get_priority_max) \
   SYSCALL(126, sched_get_priority_min) \
   SYSCALL(127, sched_rr_get_interval) \
-  SYSCALL(128, unimplemented) \
+  SYSCALL(128, restart_syscall) \
   SYSCALL(129, kill) \
   SYSCALL(130, tkill) \
   SYSCALL(131, tgkill) \

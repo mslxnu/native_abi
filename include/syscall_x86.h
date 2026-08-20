@@ -224,7 +224,7 @@
   SYSCALL(216, remap_file_pages) \
   SYSCALL(217, getdents64) \
   SYSCALL(218, set_tid_address) \
-  SYSCALL(219, unimplemented) \
+  SYSCALL(219, restart_syscall) \
   SYSCALL(220, semtimedop) \
   SYSCALL(221, fadvise64) \
   SYSCALL(222, timer_create) \

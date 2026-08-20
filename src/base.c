@@ -221,6 +221,7 @@ DEFINE_NOT_IMPLEMENTED_SYSCALL(request_key)
 
 DEFINE_NOT_IMPLEMENTED_SYSCALL(uretprobe)
 DEFINE_NOT_IMPLEMENTED_SYSCALL(vhangup)
+DEFINE_NOT_IMPLEMENTED_SYSCALL(restart_syscall)
 
 /*
  * ioperm and iopl: direct access to x86 I/O ports.

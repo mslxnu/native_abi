@@ -533,7 +533,7 @@ A dash in a number column means that architecture has no such call.
 | `renameat` | 38 | 264 | ✅ |
 | `renameat2` | 276 | 316 | ✅ |
 | `request_key` | 218 | 249 | ⊘ |
-| `restart_syscall` | 128 | 219 | · |
+| `restart_syscall` | 128 | 219 | ⊘ |
 | `rmdir` | — | 84 | ✅ |
 | `rseq` | 293 | 334 | ⊘ |
 | `rt_sigaction` | 134 | 13 | ✅ |
