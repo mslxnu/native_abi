@@ -340,7 +340,7 @@
   SYSCALL(332, statx) \
   SYSCALL(333, io_pgetevents) \
   SYSCALL(334, rseq) \
-  SYSCALL(335, unimplemented) \
+  SYSCALL(335, uretprobe) \
   SYSCALL(336, unimplemented) \
   SYSCALL(337, unimplemented) \
   SYSCALL(338, unimplemented) \

@@ -1088,5 +1088,6 @@
   SYSCALL(1076, vfork) \
   SYSCALL(1077, vserver) \
   SYSCALL(1078, query_module) \
+  SYSCALL(1079, uretprobe) \
 
-#define NR_SYSCALLS 1079
+#define NR_SYSCALLS 1080

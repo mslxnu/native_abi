@@ -638,7 +638,7 @@ A dash in a number column means that architecture has no such call.
 | `unlink` | — | 87 | ✅ |
 | `unlinkat` | 35 | 263 | ✅ |
 | `unshare` | 97 | 272 | ✅ |
-| `uretprobe` | — | 335 | · |
+| `uretprobe` | 1079 | 335 | ⊘ |
 | `uselib` | — | 134 | ⊘ |
 | `userfaultfd` | 282 | 323 | ✅ |
 | `ustat` | — | 136 | ✅ |
