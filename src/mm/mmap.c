@@ -1523,3 +1523,17 @@ DEFINE_SYSCALL(process_mrelease, int, pidfd, unsigned int, flags)
    */
   return -LINUX_EINVAL;
 }
+
+/*
+ * remap_file_pages(2) — create a non-linear shared file mapping.
+ *
+ * Deprecated since Linux 3.16; the kernel returns 0 (success) for all
+ * callers.  We do the same.  The glibc wrapper still exists for legacy
+ * binaries, and some Android ART builds touch it.
+ */
+DEFINE_SYSCALL(remap_file_pages, gaddr_t, start, size_t, size, int, prot,
+               l_ulong, page, unsigned long, flags)
+{
+  (void)start; (void)size; (void)prot; (void)page; (void)flags;
+  return 0;
+}

@@ -240,7 +240,7 @@
   SYSCALL(231, munlockall) \
   SYSCALL(232, mincore) \
   SYSCALL(233, madvise) \
-  SYSCALL(234, unimplemented) \
+  SYSCALL(234, remap_file_pages) \
   SYSCALL(235, mbind) \
   SYSCALL(236, get_mempolicy) \
   SYSCALL(237, set_mempolicy) \

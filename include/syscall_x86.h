@@ -221,7 +221,7 @@
   SYSCALL(213, epoll_create) \
   SYSCALL(214, epoll_ctl_old) \
   SYSCALL(215, epoll_wait_old) \
-  SYSCALL(216, unimplemented) \
+  SYSCALL(216, remap_file_pages) \
   SYSCALL(217, getdents64) \
   SYSCALL(218, set_tid_address) \
   SYSCALL(219, unimplemented) \

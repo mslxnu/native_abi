@@ -1401,6 +1401,16 @@ else
     fail=1
 fi
 
+# rfptest: remap_file_pages(2) — deprecated no-op, always returns 0
+cp "$here/rfptest" "$root/"; chmod +x "$root/rfptest"
+out=$("$NABI" -m "$root" /rfptest); rc=$?
+if [ "$rc" -eq 0 ] && [ "$out" = "rfptest ok (5 checks)" ]; then
+    echo "  ok  rfptest -> \"$out\", exit 0"
+else
+    echo "  FAIL rfptest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 if [ "$fail" -eq 0 ]; then
     echo "smoke: PASS"
 else
