@@ -16,7 +16,6 @@
 #include "noah.h"
 #include "vmm.h"
 #include "mm.h"
-#include "linux/userfaultfd.h"
 #include <sys/mman.h>
 
 #include "arm64/vm.h"
@@ -204,21 +203,11 @@ checkpoint_restore(int ckpt_fd, int arena_fd)
   proc.ident.exe         = exe;
   proc.ident.cmdline     = cmdline;
   proc.ident.cmdline_len = hdr.cmdline_len;
-  /* Host-derived, so it is probed here rather than carried in the checkpoint -
-   * but it must be probed, because this process never ran init_fileinfo. */
-  init_host_passthrough();
-  /* The signalfd table is a static array that starts all-fd-0, and a free slot
-   * is fd < 0: without this, init_fileinfo's invalidate never runs here, every
-   * slot still names fd 0, and the guest's real stdin is misread as a
-   * signalfd. */
-  signalfds_init();
-  /* And the userfaultfd table, for exactly the same reason. It is invalidated
-   * beside the signalfd one in init_fileinfo, which a resumed child never runs
-   * - so every slot named fd 0 and the guest's stdin was taken for a
-   * userfaultfd in every forked process. A login shell then could not read a
-   * key: "read: 0: read error: Bad file descriptor", and sed the same on its
-   * stdin. */
-  userfaultfd_init();
+  /* Everything this process must establish for itself. A resumed child never
+   * runs init_fileinfo, so anything that cannot be inherited or carried in the
+   * checkpoint has to be done here too - see reinit_process_tables, which is
+   * the one list of them. */
+  reinit_process_tables();
 
   vmm_restore_vcpu(&hdr.vcpu);
 

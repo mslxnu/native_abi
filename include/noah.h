@@ -228,6 +228,9 @@ void reset_signal_state(void);
 bool stop_other_tasks(void);
 bool task_should_stop(void);
 noreturn void task_stop_self(void);
+/* The per-process state neither startup path may skip; see fs.c. Anything new
+ * of that kind goes in there, not beside a call to it. */
+void reinit_process_tables(void);
 void init_fileinfo(int rootfd);
 void signalfds_init(void);
 void init_host_passthrough(void);

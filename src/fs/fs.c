@@ -173,12 +173,40 @@ report_rootfs_case(void)
           "    util/msl-mkvolume.sh ~/.msl/disk.sparseimage /Volumes/msl\n");
 }
 
+/*
+ * Everything a process has to establish for itself, wherever it came from.
+ *
+ * There are two ways into a running guest and they share almost nothing. A
+ * first boot goes through init_fileinfo; a forked child does not, because on
+ * arm64 a fork is a fork plus an exec and the child comes up in
+ * checkpoint_restore instead. Anything a process cannot inherit has to be done
+ * on both, and the ones that were listed separately were forgotten one at a
+ * time.
+ *
+ * The tables here are static arrays whose free slot is fd < 0, so an
+ * uninitialised one is not empty - it is full of slots naming fd 0, and every
+ * lookup for the guest's own stdin answers yes. That was the signalfd table
+ * once and the userfaultfd table again after it: a login shell could not read
+ * a key, "read: 0: read error", and sed failed the same way on its stdin. The
+ * passthrough probe is here for the same reason rather than a different one -
+ * it is host-derived, so it cannot travel in a checkpoint either.
+ *
+ * A new table of this shape belongs in this function and nowhere else. That is
+ * the whole point of it: there is one list, so there is nothing to keep in
+ * step.
+ */
 void
-init_fileinfo(int rootfd)
+reinit_process_tables(void)
 {
   init_host_passthrough();
   signalfds_init();
   userfaultfd_init();
+}
+
+void
+init_fileinfo(int rootfd)
+{
+  reinit_process_tables();
 
   /* pathconf answers this without touching the tree, which matters: probing by
    * creating two files would write to a rootfs that may be read-only, and
