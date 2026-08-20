@@ -16,6 +16,7 @@
 #include "noah.h"
 #include "vmm.h"
 #include "mm.h"
+#include "linux/userfaultfd.h"
 #include <sys/mman.h>
 
 #include "arm64/vm.h"
@@ -211,6 +212,13 @@ checkpoint_restore(int ckpt_fd, int arena_fd)
    * slot still names fd 0, and the guest's real stdin is misread as a
    * signalfd. */
   signalfds_init();
+  /* And the userfaultfd table, for exactly the same reason. It is invalidated
+   * beside the signalfd one in init_fileinfo, which a resumed child never runs
+   * - so every slot named fd 0 and the guest's stdin was taken for a
+   * userfaultfd in every forked process. A login shell then could not read a
+   * key: "read: 0: read error: Bad file descriptor", and sed the same on its
+   * stdin. */
+  userfaultfd_init();
 
   vmm_restore_vcpu(&hdr.vcpu);
 
