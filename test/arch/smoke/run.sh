@@ -1391,6 +1391,16 @@ else
     fail=1
 fi
 
+# uffdtest: userfaultfd(2) — on-demand page resolution lifecycle
+cp "$here/uffdtest" "$root/"; chmod +x "$root/uffdtest"
+out=$("$NABI" -m "$root" /uffdtest); rc=$?
+if [ "$rc" -eq 0 ] && [ "$out" = "uffdtest ok (15 checks)" ]; then
+    echo "  ok  uffdtest -> \"$out\", exit 0"
+else
+    echo "  FAIL uffdtest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 if [ "$fail" -eq 0 ]; then
     echo "smoke: PASS"
 else

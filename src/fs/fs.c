@@ -44,6 +44,7 @@
 #include "linux/ioctl.h"
 #include "linux/termios.h"
 #include "linux/socket.h"
+#include "linux/userfaultfd.h"
 
 #include <stddef.h>
 #include <stdio.h>
@@ -177,6 +178,7 @@ init_fileinfo(int rootfd)
 {
   init_host_passthrough();
   signalfds_init();
+  userfaultfd_init();
 
   /* pathconf answers this without touching the tree, which matters: probing by
    * creating two files would write to a rootfs that may be read-only, and
@@ -3492,6 +3494,13 @@ DEFINE_SYSCALL(read, int, fd, gaddr_t, buf_ptr, size_t, size)
     return r;
   }
 
+  if (buf != NULL && userfaultfd_read(fd, buf, size, &r)) {
+    if (r > 0 && copy_to_user(buf_ptr, buf, (size_t) r))
+      r = -LINUX_EFAULT;
+    free(buf);
+    return r;
+  }
+
   if (buf != NULL && fanotify_read(fd, buf, size, &r)) {
     if (r > 0 && copy_to_user(buf_ptr, buf, (size_t) r))
       r = -LINUX_EFAULT;
@@ -3682,6 +3691,11 @@ DEFINE_SYSCALL(fchmod, int, fd, l_mode_t, mode)
 
 DEFINE_SYSCALL(ioctl, int, fd, int, cmd, uint64_t, val0)
 {
+  /* userfaultfd ioctls are not file-ops — intercept first. */
+  int uffd_ret;
+  if (userfaultfd_ioctl(fd, cmd, val0, &uffd_ret))
+    return uffd_ret;
+
   struct file *file = get_file(fd);
   if (file == NULL)
     return -LINUX_EBADF;
@@ -5080,6 +5094,7 @@ user_close(int fd)
   fanotify_close(fd);
   timerfd_close(fd);
   signalfd_close(fd);
+  userfaultfd_close(fd);
   uring_close(fd);
   pidfd_close(fd);
   epoll_close(fd);

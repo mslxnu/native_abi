@@ -328,7 +328,7 @@
   SYSCALL(320, kexec_file_load) \
   SYSCALL(321, bpf) \
   SYSCALL(322, execveat) \
-  SYSCALL(323, unimplemented) \
+  SYSCALL(323, userfaultfd) \
   SYSCALL(324, membarrier) \
   SYSCALL(325, mlock2) \
   SYSCALL(326, copy_file_range) \

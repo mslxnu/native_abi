@@ -144,6 +144,7 @@ COMMON_SRCS := src/main.c \
                src/fs/memfd.c \
                src/fs/splice.c \
                src/fs/tee.c \
+               src/fs/userfaultfd.c \
                src/sys/timer.c \
                src/fs/fs.c \
                src/fs/binder_broker.c \

@@ -21,6 +21,7 @@
 #include "checkpoint.h"
 #endif
 #include "linux/errno.h"
+#include "linux/userfaultfd.h"
 #include <sys/sysctl.h>
 #include <sys/resource.h>
 
@@ -159,6 +160,13 @@ main_loop(int return_on_sigret)
         case VM_ACCESS_UNKNOWN: break;
         }
         if (!addr_ok(exit.fault_addr, verify)) {
+          /*
+           * If the address is in a userfaultfd-registered range, block the
+           * faulting thread until the resolver calls UFFDIO_COPY.
+           */
+          if (userfaultfd_handle_fault(exit.fault_addr, exit.fault_access))
+            break;
+
           static const char *acc[] = { "?", "read", "write", "exec" };
           uint64_t pc = 0;
           vmm_get_reg(VREG_PC, &pc);

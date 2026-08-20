@@ -340,6 +340,12 @@ void fanotify_close(int fd);
 bool timerfd_read(int fd, char *out, size_t size, int *ret);
 void timerfd_close(int fd);
 
+/* userfaultfd (src/fs/userfaultfd.c).  On-demand page resolution for
+ * PROT_NONE regions — a faulting thread blocks until a resolver feeds the
+ * page through UFFDIO_COPY. */
+bool userfaultfd_is(int fd);
+void userfaultfd_close(int fd);
+
 /* tee (src/fs/tee.c). What tee removed from a pipe is held in front of it, so
  * reads and readiness have to consult it before the pipe itself. */
 /*

@@ -288,7 +288,7 @@
   SYSCALL(279, memfd_create) \
   SYSCALL(280, bpf) \
   SYSCALL(281, execveat) \
-  SYSCALL(282, unimplemented) \
+  SYSCALL(282, userfaultfd) \
   SYSCALL(283, membarrier) \
   SYSCALL(284, mlock2) \
   SYSCALL(285, copy_file_range) \
