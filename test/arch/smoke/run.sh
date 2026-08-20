@@ -1411,6 +1411,17 @@ else
     fail=1
 fi
 
+# rmmtest: recvmmsg(2) — receive multiple datagrams on a socketpair, vlen=0,
+# timeout expiry, and MSG_DONTWAIT on an empty socket.
+cp "$here/rmmtest" "$root/"; chmod +x "$root/rmmtest"
+out=$("$NABI" -m "$root" /rmmtest); rc=$?
+if [ "$rc" -eq 0 ] && [ "$out" = "recvmmsg ok" ]; then
+    echo "  ok  rmmtest -> \"$out\", exit 0"
+else
+    echo "  FAIL rmmtest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 if [ "$fail" -eq 0 ]; then
     echo "smoke: PASS"
 else

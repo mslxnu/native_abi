@@ -249,7 +249,7 @@
   SYSCALL(240, rt_tgsigqueueinfo) \
   SYSCALL(241, perf_event_open) \
   SYSCALL(242, accept4) \
-  SYSCALL(243, unimplemented) \
+  SYSCALL(243, recvmmsg) \
   SYSCALL(244, unimplemented) \
   SYSCALL(245, unimplemented) \
   SYSCALL(246, unimplemented) \
@@ -423,7 +423,7 @@
   SYSCALL(414, unimplemented) \
   SYSCALL(415, unimplemented) \
   SYSCALL(416, unimplemented) \
-  SYSCALL(417, unimplemented) \
+  SYSCALL(417, recvmmsg_time64) \
   SYSCALL(418, unimplemented) \
   SYSCALL(419, unimplemented) \
   SYSCALL(420, unimplemented) \

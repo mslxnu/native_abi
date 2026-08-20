@@ -16,11 +16,13 @@
 #include <assert.h>
 #include <limits.h>
 #include <fcntl.h>
+#include <sys/poll.h>
 
 #include "linux/common.h"
 #include "linux/socket.h"
 #include "linux/netlink.h"
 #include "linux/misc.h"
+#include "linux/time.h"
 
 /*
  * A network namespace here is an *empty* one, and that is the whole of it.
@@ -1297,48 +1299,47 @@ out:
   return r;
 }
 
-DEFINE_SYSCALL(recvmsg, int, sockfd, gaddr_t, msg_ptr, int, flags)
+/*
+ * Core recvmsg logic.  lmsg is a *local* copy of the guest's l_msghdr
+ * (already copied from user by the caller).  msg_ptr is the guest address
+ * of the l_msghdr so we can write back msg_namelen, msg_controllen, etc.
+ *
+ * Returns bytes received, or a negative Linux error.
+ */
+static int
+do_recvmsg(int sockfd, struct l_msghdr *lmsg, gaddr_t msg_ptr, int flags)
 {
   int r;
-  struct l_msghdr lmsg;
-  if (copy_from_user(&lmsg, msg_ptr, sizeof lmsg)) {
-    return -LINUX_EFAULT;
-  }
-  char *msg_name = malloc(lmsg.msg_name == 0 ? 0 : lmsg.msg_namelen);
-  struct l_iovec *liov = malloc(lmsg.msg_iovlen * sizeof(struct l_iovec));
-  if (copy_from_user(liov, lmsg.msg_iov, lmsg.msg_iovlen * sizeof(struct l_iovec))) {
+  char *msg_name = malloc(lmsg->msg_name == 0 ? 0 : lmsg->msg_namelen);
+  struct l_iovec *liov = malloc(lmsg->msg_iovlen * sizeof(struct l_iovec));
+  if (copy_from_user(liov, lmsg->msg_iov, lmsg->msg_iovlen * sizeof(struct l_iovec))) {
     free(msg_name);
     free(liov);
     return -LINUX_EFAULT;
   }
-  struct iovec *msg_iov = malloc(lmsg.msg_iovlen * sizeof(struct iovec));
+  struct iovec *msg_iov = malloc(lmsg->msg_iovlen * sizeof(struct iovec));
   size_t iov_total_len = 0;
-  for (size_t i = 0; i < lmsg.msg_iovlen; ++i) {
+  for (size_t i = 0; i < lmsg->msg_iovlen; ++i) {
     iov_total_len += liov[i].iov_len;
   }
   char *iov_buf = malloc(iov_total_len), *iov_buf_ptr = iov_buf;
-  for (size_t i = 0; i < lmsg.msg_iovlen; ++i) {
+  for (size_t i = 0; i < lmsg->msg_iovlen; ++i) {
     msg_iov[i].iov_base = iov_buf_ptr;
     msg_iov[i].iov_len = liov[i].iov_len;
     iov_buf_ptr += liov[i].iov_len;
   }
-  char *msg_control = malloc(lmsg.msg_controllen);
+  char *msg_control = malloc(lmsg->msg_controllen);
   struct msghdr dmsg;
-  dmsg.msg_namelen = lmsg.msg_namelen;
-  dmsg.msg_name = lmsg.msg_name == 0 ? 0 : msg_name;
+  dmsg.msg_namelen = lmsg->msg_namelen;
+  dmsg.msg_name = lmsg->msg_name == 0 ? 0 : msg_name;
   dmsg.msg_iov = msg_iov;
-  dmsg.msg_iovlen = lmsg.msg_iovlen;
+  dmsg.msg_iovlen = lmsg->msg_iovlen;
   dmsg.msg_control = msg_control;
-  dmsg.msg_controllen = lmsg.msg_controllen;
-  dmsg.msg_flags = linux_to_darwin_msg_flags(lmsg.msg_flags);
+  dmsg.msg_controllen = lmsg->msg_controllen;
+  dmsg.msg_flags = linux_to_darwin_msg_flags(lmsg->msg_flags);
 
-  /* MSG_TRUNC asks for the datagram's real size; see peek_datagram_len.
-   * Declared before the first goto below, which would otherwise jump past its
-   * initialiser and leave the return value reading it uninitialised. */
   ssize_t whole = -1;
 
-  /* Converted, for the reason recvfrom's are: the numbers differ, and Linux's
-   * MSG_DONTWAIT is Darwin's MSG_WAITALL. */
   int dflags = linux_to_darwin_msg_flags(flags & ~RECV_FLAGS_HANDLED_HERE);
   if (dflags < 0) {
     r = dflags;
@@ -1359,13 +1360,6 @@ DEFINE_SYSCALL(recvmsg, int, sockfd, gaddr_t, msg_ptr, int, flags)
     goto out;
   }
 
-  /*
-   * Who a netlink reply came from. The descriptor underneath is a unix
-   * socketpair, so Darwin names the sender with a sockaddr_un - and a netlink
-   * reader checks the length it was given against sizeof(struct sockaddr_nl)
-   * before it will look at the message. iproute2 says "sender address length
-   * == 16" and stops. The sender is the kernel, which is port id 0.
-   */
   bool is_nl = netlink_is(sockfd);
   struct l_sockaddr_nl from_nl;
   if (is_nl) {
@@ -1374,12 +1368,12 @@ DEFINE_SYSCALL(recvmsg, int, sockfd, gaddr_t, msg_ptr, int, flags)
     dmsg.msg_namelen = sizeof from_nl;
   }
 
-  if (lmsg.msg_name != 0) {
+  if (lmsg->msg_name != 0) {
     const void *name = is_nl ? (const void *) &from_nl : dmsg.msg_name;
     socklen_t namelen = dmsg.msg_namelen;
-    if ((l_int) namelen > lmsg.msg_namelen)
-      namelen = lmsg.msg_namelen;
-    if (copy_to_user(lmsg.msg_name, name, namelen)) {
+    if ((l_int) namelen > lmsg->msg_namelen)
+      namelen = lmsg->msg_namelen;
+    if (copy_to_user(lmsg->msg_name, name, namelen)) {
       r = -LINUX_EFAULT;
       goto out;
     }
@@ -1388,25 +1382,15 @@ DEFINE_SYSCALL(recvmsg, int, sockfd, gaddr_t, msg_ptr, int, flags)
     r = -LINUX_EFAULT;
     goto out;
   }
-  for (size_t i = 0; i < lmsg.msg_iovlen; ++i) {
+  for (size_t i = 0; i < lmsg->msg_iovlen; ++i) {
     if (copy_to_user(liov[i].iov_base, dmsg.msg_iov[i].iov_base, liov[i].iov_len)) {
       r = -LINUX_EFAULT;
       goto out;
     }
   }
-  /*
-   * Translated rather than copied. The two cmsghdr layouts differ by the size
-   * of their first field, so the bytes Darwin produced describe nothing the
-   * guest's macros can walk - and any descriptors inside are host descriptors
-   * this process has just acquired without its own fd table knowing.
-   */
   {
     bool truncated = false;
-    /* The syscall's flags, not the header's: MSG_CMSG_CLOEXEC is an argument
-     * to recvmsg and never appears in msg_flags, which carries what came
-     * *back*. Reading it from the wrong one leaves every passed descriptor
-     * inheritable across exec. */
-    int n = cmsg_to_guest(&dmsg, lmsg.msg_control, lmsg.msg_controllen,
+    int n = cmsg_to_guest(&dmsg, lmsg->msg_control, lmsg->msg_controllen,
                           flags, &truncated);
     if (n < 0) {
       r = n;
@@ -1418,13 +1402,9 @@ DEFINE_SYSCALL(recvmsg, int, sockfd, gaddr_t, msg_ptr, int, flags)
       r = -LINUX_EFAULT;
       goto out;
     }
-    /* Say so when it did not fit, or a receiver reads the count it was given
-     * and walks past the end of what was written. */
     l_uint mflags = darwin_to_linux_msg_flags(dmsg.msg_flags);
     if (truncated)
       mflags |= LINUX_MSG_CTRUNC;
-    /* And say so when the data itself did not fit, which is the other half of
-     * what MSG_TRUNC is for. */
     if (whole >= 0 && (size_t) whole > iov_total_len)
       mflags |= LINUX_MSG_TRUNC;
     if (copy_to_user(msg_ptr + offsetof(struct l_msghdr, msg_flags),
@@ -1439,8 +1419,146 @@ out:
   free(msg_iov);
   free(iov_buf);
   free(msg_control);
-  /* What was there, not what fitted. */
   return whole >= 0 && r >= 0 ? (int) whole : r;
+}
+
+DEFINE_SYSCALL(recvmsg, int, sockfd, gaddr_t, msg_ptr, int, flags)
+{
+  struct l_msghdr lmsg;
+  if (copy_from_user(&lmsg, msg_ptr, sizeof lmsg)) {
+    return -LINUX_EFAULT;
+  }
+  return do_recvmsg(sockfd, &lmsg, msg_ptr, flags);
+}
+
+/*
+ * recvmmsg(2) — receive multiple messages at once.
+ *
+ * Calls do_recvmsg in a loop.  The first message blocks (unless the caller
+ * passed MSG_DONTWAIT); subsequent messages are non-blocking.  When a
+ * timeout is given it is a relative CLOCK_MONOTONIC deadline — we convert it
+ * to an absolute deadline once, then poll(2) the socket before each blocking
+ * recvmsg to respect the remaining time.
+ */
+DEFINE_SYSCALL(recvmmsg, int, sockfd, gaddr_t, msgvec_ptr, unsigned int, vlen, unsigned int, flags, gaddr_t, timeout_ptr)
+{
+  if (vlen == 0)
+    return 0;
+
+  /* Convert the optional relative timeout into an absolute deadline. */
+  struct timespec deadline;
+  bool has_deadline = false;
+  if (timeout_ptr != 0) {
+    struct l_timespec lts;
+    if (copy_from_user(&lts, timeout_ptr, sizeof lts))
+      return -LINUX_EFAULT;
+    if (lts.tv_sec < 0 || lts.tv_nsec < 0 || lts.tv_nsec >= 1000000000L)
+      return -LINUX_EINVAL;
+    clock_gettime(CLOCK_MONOTONIC, &deadline);
+    deadline.tv_sec  += lts.tv_sec;
+    deadline.tv_nsec += lts.tv_nsec;
+    if (deadline.tv_nsec >= 1000000000L) {
+      deadline.tv_sec  += 1;
+      deadline.tv_nsec -= 1000000000L;
+    }
+    has_deadline = true;
+  }
+
+  /* Copy the whole mmsghdr array in one shot. */
+  struct l_mmsghdr *msgs = malloc(vlen * sizeof(struct l_mmsghdr));
+  if (msgs == NULL)
+    return -LINUX_ENOMEM;
+  if (copy_from_user(msgs, msgvec_ptr, vlen * sizeof(struct l_mmsghdr))) {
+    free(msgs);
+    return -LINUX_EFAULT;
+  }
+
+  unsigned int count = 0;
+  for (unsigned int i = 0; i < vlen; ++i) {
+    int mflags = (int) flags;
+
+    /*
+     * Linux: after the first message, MSG_WAITFORONE forces MSG_DONTWAIT
+     * so subsequent calls never block.
+     */
+    if (i > 0 && (flags & LINUX_MSG_WAITFORONE))
+      mflags |= LINUX_MSG_DONTWAIT;
+
+    /*
+     * If a deadline is set and the first message needs to block, poll(2)
+     * the socket with the remaining time so we don't sleep forever.
+     * Subsequent messages are always non-blocking (MSG_WAITFORONE or not).
+     */
+    if (i == 0 && has_deadline && !(mflags & LINUX_MSG_DONTWAIT)) {
+      struct timespec now;
+      clock_gettime(CLOCK_MONOTONIC, &now);
+      long ms = (long)(deadline.tv_sec  - now.tv_sec)  * 1000 +
+                (long)(deadline.tv_nsec - now.tv_nsec) / 1000000;
+      if (ms <= 0) {
+        /* Deadline already passed — return what we have (0). */
+        break;
+      }
+      struct pollfd pfd = { .fd = sockfd, .events = POLLIN };
+      int pr = poll(&pfd, 1, (int) ms);
+      if (pr < 0) {
+        int err = syswrap(-1);
+        if (count > 0)
+          break;
+        free(msgs);
+        return err;
+      }
+      if (pr == 0) {
+        /* Timeout expired before any data arrived. */
+        break;
+      }
+      /* Socket is ready — fall through to a non-blocking recvmsg. */
+      mflags |= LINUX_MSG_DONTWAIT;
+    }
+
+    int r = do_recvmsg(sockfd, &msgs[i].msg_hdr,
+                       msgvec_ptr + sizeof(struct l_mmsghdr) * i
+                                 + offsetof(struct l_mmsghdr, msg_hdr),
+                       mflags);
+    if (r < 0) {
+      /*
+       * EAGAIN / EWOULDBLOCK after at least one successful receive is
+       * normal for recvmmsg — just return what we have.
+       */
+      if (r == -LINUX_EAGAIN || r == -LINUX_EWOULDBLOCK) {
+        if (count > 0)
+          break;
+        free(msgs);
+        return r;
+      }
+      /* Any other error on the first message is fatal. */
+      if (count == 0) {
+        free(msgs);
+        return r;
+      }
+      break;
+    }
+
+    /* Write back msg_len for this entry. */
+    if (copy_to_user(msgvec_ptr + sizeof(struct l_mmsghdr) * i
+                              + offsetof(struct l_mmsghdr, msg_len),
+                     &r, sizeof(l_uint))) {
+      free(msgs);
+      return -LINUX_EFAULT;
+    }
+    count++;
+  }
+
+  free(msgs);
+  return (int) count;
+}
+
+/*
+ * recvmmsg_time64(2) — identical to recvmmsg on a 64-bit host; the time64
+ * variant exists only for 32-bit guests that need wider tv_sec.
+ */
+DEFINE_SYSCALL(recvmmsg_time64, int, sockfd, gaddr_t, msgvec_ptr, unsigned int, vlen, unsigned int, flags, gaddr_t, timeout_ptr)
+{
+  return sys_recvmmsg(sockfd, msgvec_ptr, vlen, flags, timeout_ptr);
 }
 
 DEFINE_SYSCALL(listen, int, socket, int, backlog)

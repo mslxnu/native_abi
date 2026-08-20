@@ -304,7 +304,7 @@
   SYSCALL(296, pwritev) \
   SYSCALL(297, rt_tgsigqueueinfo) \
   SYSCALL(298, perf_event_open) \
-  SYSCALL(299, unimplemented) \
+  SYSCALL(299, recvmmsg) \
   SYSCALL(300, fanotify_init) \
   SYSCALL(301, fanotify_mark) \
   SYSCALL(302, prlimit64) \
@@ -422,7 +422,7 @@
   SYSCALL(414, unimplemented) \
   SYSCALL(415, unimplemented) \
   SYSCALL(416, unimplemented) \
-  SYSCALL(417, unimplemented) \
+  SYSCALL(417, recvmmsg_time64) \
   SYSCALL(418, unimplemented) \
   SYSCALL(419, unimplemented) \
   SYSCALL(420, unimplemented) \
