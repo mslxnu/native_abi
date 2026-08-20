@@ -569,8 +569,10 @@ static pthread_mutex_t signalfds_lock = PTHREAD_MUTEX_INITIALIZER;
 void
 signalfds_init(void)
 {
-  for (int i = 0; i < SIGNALFD_MAX; i++)
+  for (int i = 0; i < SIGNALFD_MAX; i++) {
     signalfds[i].fd = -1;
+    signalfds[i].wr = -1;
+  }
 }
 
 /* Whether any signalfd is waiting on `lsig`, which decides whether nabi has to
@@ -592,6 +594,8 @@ signalfd_wants(int lsig)
 static struct signalfd_state *
 signalfd_lookup(int fd)
 {
+  if (fd < 0)
+    return NULL;
   pthread_mutex_lock(&signalfds_lock);
   for (int i = 0; i < SIGNALFD_MAX; i++) {
     if (signalfds[i].fd == fd) {
@@ -853,6 +857,11 @@ DEFINE_SYSCALL(signalfd, int, fd, gaddr_t, mask_ptr, size_t, sizemask)
 static void
 signalfd_close(int fd)
 {
+  /* A free slot is fd == -1, so an unguarded walk with fd < 0 would match the
+   * first free slot and close its wr: a stale zero there is host stdin. A
+   * negative descriptor is not a signalfd, and never reaches the walk. */
+  if (fd < 0)
+    return;
   pthread_mutex_lock(&signalfds_lock);
   for (int i = 0; i < SIGNALFD_MAX; i++) {
     if (signalfds[i].fd == fd) {
@@ -5100,6 +5109,11 @@ do_close(struct fdtable *table, int fd)
 int
 user_close(int fd)
 {
+  /* close(-1) and friends are EBADF with no side effects on Linux. Returning
+   * here also keeps a negative fd out of the registry walks below: a sentinel
+   * keyed on -1 must never be handed one. */
+  if (fd < 0)
+    return -LINUX_EBADF;
   /*
    * IN_CLOSE_WRITE and IN_CLOSE_NOWRITE, which kqueue has no way to report -
    * the host cannot see a descriptor being closed. They are taken here, where
