@@ -172,8 +172,8 @@
   SYSCALL(164, unimplemented) \
   SYSCALL(165, mount) \
   SYSCALL(166, umount2) \
-  SYSCALL(167, unimplemented) \
-  SYSCALL(168, unimplemented) \
+  SYSCALL(167, swapon) \
+  SYSCALL(168, swapoff) \
   SYSCALL(169, reboot) \
   SYSCALL(170, sethostname) \
   SYSCALL(171, setdomainname) \

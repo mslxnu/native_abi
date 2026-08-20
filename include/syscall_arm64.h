@@ -230,8 +230,8 @@
   SYSCALL(221, execve) \
   SYSCALL(222, mmap) \
   SYSCALL(223, fadvise64) \
-  SYSCALL(224, unimplemented) \
-  SYSCALL(225, unimplemented) \
+  SYSCALL(224, swapon) \
+  SYSCALL(225, swapoff) \
   SYSCALL(226, mprotect) \
   SYSCALL(227, msync) \
   SYSCALL(228, mlock) \

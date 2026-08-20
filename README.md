@@ -607,8 +607,8 @@ A dash in a number column means that architecture has no such call.
 | `statfs` | 43 | 137 | ✅ |
 | `statmount` | 457 | 457 | ✅ |
 | `statx` | 291 | 332 | ✅ |
-| `swapoff` | 225 | 168 | · |
-| `swapon` | 224 | 167 | · |
+| `swapoff` | 225 | 168 | ⊘ |
+| `swapon` | 224 | 167 | ⊘ |
 | `symlink` | — | 88 | ✅ |
 | `symlinkat` | 36 | 266 | ✅ |
 | `sync` | 81 | 162 | ✅ |
