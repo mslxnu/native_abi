@@ -224,7 +224,7 @@
   SYSCALL(215, munmap) \
   SYSCALL(216, mremap) \
   SYSCALL(217, add_key) \
-  SYSCALL(218, unimplemented) \
+  SYSCALL(218, request_key) \
   SYSCALL(219, keyctl) \
   SYSCALL(220, clone) \
   SYSCALL(221, execve) \
@@ -1087,5 +1087,6 @@
   SYSCALL(1075, utimes) \
   SYSCALL(1076, vfork) \
   SYSCALL(1077, vserver) \
+  SYSCALL(1078, query_module) \
 
-#define NR_SYSCALLS 1078
+#define NR_SYSCALLS 1079

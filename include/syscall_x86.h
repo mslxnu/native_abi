@@ -254,7 +254,7 @@
   SYSCALL(246, kexec_load) \
   SYSCALL(247, waitid) \
   SYSCALL(248, add_key) \
-  SYSCALL(249, unimplemented) \
+  SYSCALL(249, request_key) \
   SYSCALL(250, keyctl) \
   SYSCALL(251, ioprio_set) \
   SYSCALL(252, ioprio_get) \

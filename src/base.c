@@ -217,6 +217,7 @@ DEFINE_NOT_IMPLEMENTED_SYSCALL(add_key)
  * request_key completes the family and is absent alongside them.
  */
 DEFINE_NOT_IMPLEMENTED_SYSCALL(keyctl)
+DEFINE_NOT_IMPLEMENTED_SYSCALL(request_key)
 
 /*
  * ioperm and iopl: direct access to x86 I/O ports.

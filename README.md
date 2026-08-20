@@ -515,7 +515,7 @@ A dash in a number column means that architecture has no such call.
 | `pwrite64` | 68 | 18 | ✅ |
 | `pwritev` | 70 | 296 | ✅ |
 | `pwritev2` | 287 | 328 | ✅ |
-| `query_module` | — | 178 | ⊘ |
+| `query_module` | 1078 | 178 | ⊘ |
 | `quotactl` | 60 | 179 | ✅ |
 | `quotactl_fd` | 443 | 443 | ✅ |
 | `read` | 63 | 0 | ✅ |
@@ -532,7 +532,7 @@ A dash in a number column means that architecture has no such call.
 | `rename` | — | 82 | ✅ |
 | `renameat` | 38 | 264 | ✅ |
 | `renameat2` | 276 | 316 | ✅ |
-| `request_key` | 218 | 249 | · |
+| `request_key` | 218 | 249 | ⊘ |
 | `restart_syscall` | 128 | 219 | · |
 | `rmdir` | — | 84 | ✅ |
 | `rseq` | 293 | 334 | ⊘ |
