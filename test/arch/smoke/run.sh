@@ -1156,6 +1156,21 @@ else
     fail=1
 fi
 
+# shmapdtest: a read-only descriptor on a writable file still maps MAP_SHARED.
+# A descriptor that cannot write is not a file that cannot be written, and
+# Android's property area is a 0644 file that init writes while every other
+# process opens it O_RDONLY and maps it shared - so a private copy froze every
+# property at the moment it was mapped. Checks visibility through another
+# descriptor and across a fork, and that a genuinely read-only file still maps.
+cp "$here/shmapdtest" "$root/"; chmod +x "$root/shmapdtest"
+out=$("$NABI" -m "$root" /shmapdtest 2>&1 | tail -1); rc=$?
+if [ "$out" = "shmapd ok" ]; then
+    echo "  ok  shmapdtest -> \"$out\""
+else
+    echo "  FAIL shmapdtest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 # procchmodtest: chmod on a passed-through /proc, which the host module serving
 # it refuses - and Android's first-stage init treats a failed chmod of
 # /proc/cmdline as fatal. Checks that it succeeds by path and by dirfd, that a

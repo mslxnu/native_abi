@@ -19,6 +19,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <mach/vm_statistics.h>
 #include <pthread.h>
 
@@ -267,16 +268,64 @@ do_mmap(gaddr_t addr, size_t len, int d_prot, int l_prot, int l_flags, int fd, o
   int amode = fd >= 0 ? fcntl(fd, F_GETFL) : -1;
   bool fd_writable = amode >= 0 && ((amode & O_ACCMODE) == O_RDWR ||
                                     (amode & O_ACCMODE) == O_WRONLY);
-  bool shared_file = fd >= 0 && (l_flags & LINUX_MAP_SHARED) &&
-                     (offset & (GUEST_MMAP_GRANULE - 1)) == 0 &&
-                     !(l_prot & LINUX_PROT_EXEC) && fd_writable;
+  bool wants_shared = fd >= 0 && (l_flags & LINUX_MAP_SHARED) &&
+                      (offset & (GUEST_MMAP_GRANULE - 1)) == 0 &&
+                      !(l_prot & LINUX_PROT_EXEC);
+
+  /*
+   * A descriptor that cannot write is not the same thing as a file that cannot
+   * be written.
+   *
+   * The reasoning above holds for a file nothing may modify: nobody can change
+   * it, so a private copy of it is the same bytes forever. It does not hold for
+   * a *writable file* that this caller merely opened read-only, and that is the
+   * ordinary shape of a reader: Android's property area is a 0644 file that
+   * init writes through its own descriptor while every other process opens it
+   * O_RDONLY and maps it MAP_SHARED. Handing those readers a private copy froze
+   * every property at the moment they mapped it, silently - and properties are
+   * what sequence the rest of Android's boot.
+   *
+   * So the question is asked of the file rather than of the descriptor: reopen
+   * it for writing, and if that succeeds the mapping has to be shared, because
+   * somebody can change what is behind it. If it fails the file really is
+   * read-only and the private copy is right, which is what keeps ldconfig's
+   * PROT_READ maps of libraries working on a read-only rootfs.
+   *
+   * The reopened descriptor is checked to be the same file. F_GETPATH answers
+   * with a name, and a name can come to mean something else - the file may have
+   * been replaced since it was opened - so the identity is confirmed rather
+   * than assumed.
+   */
+  int reopened = -1;
+  if (wants_shared && !fd_writable) {
+    char path[PATH_MAX];
+    struct stat a_st, b_st;
+    if (fcntl(fd, F_GETPATH, path) == 0 && fstat(fd, &a_st) == 0) {
+      int cand = open(path, O_RDWR);
+      if (cand >= 0) {
+        if (fstat(cand, &b_st) == 0 && b_st.st_dev == a_st.st_dev &&
+            b_st.st_ino == a_st.st_ino)
+          reopened = cand;
+        else
+          close(cand);
+      }
+    }
+  }
+  bool shared_file = wants_shared && (fd_writable || reopened >= 0);
+  /* Whichever descriptor can actually back a shared mapping. The guest's own
+   * protection is unchanged; this only decides what the host maps from. */
+  int mapfd = reopened >= 0 ? reopened : fd;
 
   if (reserve_only) {
     ptr = NULL;
   } else if (shared_file) {
-    ptr = mmap(0, len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, offset);
-    if (ptr == MAP_FAILED)
-      return -darwin_to_linux_errno(errno);
+    ptr = mmap(0, len, PROT_READ | PROT_WRITE, MAP_SHARED, mapfd, offset);
+    if (ptr == MAP_FAILED) {
+      int e = errno;
+      if (reopened >= 0)
+        close(reopened);
+      return -darwin_to_linux_errno(e);
+    }
     /*
      * And a descriptor of our own for it. The guest is free to close its own
      * the moment the mapping exists - that is the ordinary way to map a file,
@@ -287,10 +336,14 @@ do_mmap(gaddr_t addr, size_t len, int d_prot, int l_prot, int l_flags, int fd, o
      * in Android's init died on that, one panic deep in the child, with no
      * trace of its own because the sinks are opened after the restore.
      */
-    owned_fd = dup(fd);
+    /* A descriptor reopened for this mapping is already ours to keep; only a
+     * borrowed one needs duplicating. */
+    owned_fd = reopened >= 0 ? reopened : dup(fd);
     if (owned_fd >= 0)
       fcntl(owned_fd, F_SETFD, 0);        /* must survive the child's exec */
   } else {
+    if (reopened >= 0)
+      close(reopened);                    /* not shared after all */
     ptr = arena_alloc(len, &arena_off);
     if (fd >= 0 && pread(fd, ptr, len, offset) < 0) {
       int e = errno;
