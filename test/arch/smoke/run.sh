@@ -1214,6 +1214,20 @@ else
     fail=1
 fi
 
+# sigchldfd2test: a signalfd for a signal the guest also has a handler for,
+# which is Android init's shape and not the one sigchldfdtest covers. Two of
+# nabi's decisions lean on each other here - signalfd_arm bows out when the
+# guest has its own handler, and rt_sigprocmask leaves a handled signal
+# unblocked on the host - and each is only right while the other holds.
+cp "$here/sigchldfd2test" "$root/"; chmod +x "$root/sigchldfd2test"
+out=$("$NABI" -m "$root" /sigchldfd2test 2>&1 | tail -1); rc=$?
+if [ "$out" = "sigchldfd2 ok" ]; then
+    echo "  ok  sigchldfd2test -> \"$out\""
+else
+    echo "  FAIL sigchldfd2test -> \"$out\", exit $rc"
+    fail=1
+fi
+
 # pid1test: --pid1, which starts the guest as pid 1 of a pid namespace of its
 # own. Run both ways, because the option has to do something and has to be the
 # only thing that does it: without it the guest keeps an ordinary pid, and a
