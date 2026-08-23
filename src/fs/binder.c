@@ -26,6 +26,7 @@
  */
 #include "common.h"
 #include "noah.h"
+#include "namespace.h"
 #include "mm.h"
 
 #include <errno.h>
@@ -34,6 +35,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/mman.h>
+#include <sys/file.h>
+#include <sys/stat.h>
+#include <limits.h>
 #include <unistd.h>
 
 #include "linux/errno.h"
@@ -66,9 +71,71 @@
 
 #define TF_ONE_WAY 0x01u
 
-#define BINDER_MAX_EP     64
+/*
+ * A flat_binder_object on the wire: type and flags, then the binder pointer or
+ * handle, then the cookie. Twenty-four bytes, with the cookie at sixteen.
+ */
+#define FLAT_OBJ_SIZE   24
+#define FLAT_OBJ_COOKIE 16
+/* B_PACK_CHARS('f','d','*',B_TYPE_LARGE), as mSL-DevFS's binder.h spells it. */
+#define LINUX_BINDER_TYPE_FD_EMUL 0x66642a85u
+
+#define BINDER_MAX_EP     32
 #define BINDER_MAX_ALLOCS 128
 #define BINDER_PENDING    (64 * 1024)
+
+/*
+ * The part of binder that cannot live in one process.
+ *
+ * Endpoints are in different nabi processes - that is what binder is for - so
+ * the registry of who exists, which of them is the context manager, and what
+ * is waiting for each has to be somewhere they can all reach. It is a file
+ * mapped shared by every process of the instance, locked while it is touched.
+ *
+ * A message carries its payload rather than a pointer to it. The obvious
+ * design - have the sender write straight into the receiver's arena - cannot
+ * work here and does not need to: the arena is the guest's own anonymous
+ * memory, private to its process, and no other nabi can reach it. What has to
+ * cross is the *payload*, and once it has, the receiver allocates in its own
+ * arena and copies it in locally, which is the same code the one-process
+ * engine already used. The guest cannot tell the difference; it is handed a
+ * pointer into its own arena either way.
+ *
+ * The payload cap is the price of staging it. Binder's own limit is the
+ * receiver's arena; here a transaction larger than a record is refused rather
+ * than truncated. Android's ordinary traffic is far below this - bulk data
+ * goes by descriptor or shared memory, not in the parcel.
+ */
+#define BSHM_MSG_MAX  8
+#define BSHM_PAYLOAD  8192
+#define BSHM_MAGIC    0x42494e44u
+
+struct bmsg {
+  uint32_t used;
+  uint32_t is_reply;
+  uint64_t cookie;
+  uint32_t code, flags;
+  uint32_t sender_pid, sender_euid;
+  uint64_t data_size, offsets_size;
+  unsigned char data[BSHM_PAYLOAD];
+};
+
+struct bep_shared {
+  uint32_t used;
+  int32_t  pid;
+  uint32_t id;
+  uint32_t is_mgr;
+  struct bmsg q[BSHM_MSG_MAX];
+};
+
+struct bshm {
+  uint32_t magic;
+  uint32_t next_id;
+  struct bep_shared ep[BINDER_MAX_EP];
+};
+
+static struct bshm *shm;
+static int shm_fd = -1;
 
 struct binder_alloc {
   uint64_t addr, size;
@@ -79,7 +146,8 @@ struct binder_alloc {
  * that opens it twice has two of everything, which is what the ABI says. */
 struct binder_ep {
   int      fd;                   /* the descriptor the guest holds; -1 free */
-  int      wr;                   /* the end nabi pokes to make fd readable */
+  int      wr;                   /* our own end, for waking a local reader */
+  uint32_t id;                   /* this endpoint's place in the shared table */
   bool     is_mgr;
   uint32_t max_threads;
 
@@ -94,6 +162,72 @@ struct binder_ep {
 static struct binder_ep eps[BINDER_MAX_EP];
 static pthread_mutex_t eps_lock = PTHREAD_MUTEX_INITIALIZER;
 
+/*
+ * The shared registry, made by whichever process needs it first and found by
+ * the rest through the environment - the same way the binder broker publishes
+ * its rendezvous and the kernel log its file. A forked child inherits the name
+ * and maps the same memory.
+ */
+#define BINDER_SHM_ENV "NABI_BINDER_SHM"
+
+static void
+shm_path(char *out, size_t n)
+{
+  const char *set = getenv(BINDER_SHM_ENV);
+  if (set != NULL && *set != '\0') {
+    snprintf(out, n, "%s", set);
+    return;
+  }
+  const char *tmp = getenv("TMPDIR");
+  snprintf(out, n, "%s/nabi-binder-%s-%d", tmp && *tmp ? tmp : "/tmp",
+           nabi_boot_tag(), (int) getpid());
+  setenv(BINDER_SHM_ENV, out, 1);
+}
+
+/* The wake channel for one endpoint: a fifo, because any process may open it
+ * by name and a byte written to it wakes a poll on the read end. A socketpair
+ * cannot do that - only the process holding the other end can poke it. */
+static void
+wake_path(uint32_t id, char *out, size_t n)
+{
+  char base[PATH_MAX];
+  shm_path(base, sizeof base);
+  snprintf(out, n, "%s-wake-%u", base, id);
+}
+
+static bool
+shm_attach(void)
+{
+  if (shm != NULL)
+    return true;
+  char path[PATH_MAX];
+  shm_path(path, sizeof path);
+  int fd = open(path, O_RDWR | O_CREAT, 0600);
+  if (fd < 0)
+    return false;
+  if (ftruncate(fd, sizeof(struct bshm)) < 0) {
+    close(fd);
+    return false;
+  }
+  void *p = mmap(NULL, sizeof(struct bshm), PROT_READ | PROT_WRITE,
+                 MAP_SHARED, fd, 0);
+  if (p == MAP_FAILED) {
+    close(fd);
+    return false;
+  }
+  shm = p;
+  shm_fd = fd;
+  if (shm->magic != BSHM_MAGIC) {
+    memset(shm, 0, sizeof *shm);
+    shm->magic = BSHM_MAGIC;
+    shm->next_id = 1;
+  }
+  return true;
+}
+
+static void shm_lock(void)   { if (shm_fd >= 0) flock(shm_fd, LOCK_EX); }
+static void shm_unlock(void) { if (shm_fd >= 0) flock(shm_fd, LOCK_UN); }
+
 void
 binder_emul_init(void)
 {
@@ -101,6 +235,9 @@ binder_emul_init(void)
     eps[i].fd = -1;
     eps[i].wr = -1;
   }
+  /* The mapping does not survive an exec, and a forked child is an exec. */
+  shm = NULL;
+  shm_fd = -1;
 }
 
 /* A descriptor the guest holds. Negative is refused rather than searched for:
@@ -139,24 +276,45 @@ binder_emul_is(int fd)
  * context manager - the one object every binder client can find without having
  * been given a reference to it first.
  */
-static struct binder_ep *
-ep_for_handle(uint32_t handle)
+/*
+ * Which endpoint a handle names, across the whole instance. Only handle 0
+ * exists so far and it is the context manager - the one object every client
+ * can find without having been given a reference to it first. Answered from
+ * the shared registry, because the manager is usually in another process.
+ */
+static int
+shm_ep_for_handle(uint32_t handle)
 {
-  if (handle != 0)
-    return NULL;
+  if (handle != 0 || !shm_attach())
+    return -1;
   for (int i = 0; i < BINDER_MAX_EP; i++)
-    if (eps[i].fd >= 0 && eps[i].is_mgr)
-      return &eps[i];
-  return NULL;
+    if (shm->ep[i].used && shm->ep[i].is_mgr)
+      return i;
+  return -1;
+}
+
+/* Wake whoever is waiting on an endpoint, wherever it is. */
+static void
+shm_wake(uint32_t id)
+{
+  char path[PATH_MAX];
+  wake_path(id, path, sizeof path);
+  int fd = open(path, O_WRONLY | O_NONBLOCK);
+  if (fd < 0)
+    return;                      /* nobody listening; the queue still has it */
+  char one = 1;
+  (void) write(fd, &one, 1);
+  close(fd);
 }
 
 /* Readable when something is waiting, the way signalfd and eventfd do it. */
+/* Make this endpoint readable for a poll in *this* process. A sender in
+ * another one uses shm_wake, which opens the same fifo by name. */
 static void
 ep_poke(struct binder_ep *e)
 {
-  char one = 1;
-  if (e->wr >= 0)
-    (void) send(e->wr, &one, 1, MSG_DONTWAIT | MSG_NOSIGNAL);
+  if (e->id != 0)
+    shm_wake(e->id);
 }
 
 static void
@@ -221,30 +379,66 @@ arena_release(struct binder_ep *e, uint64_t addr)
 int
 binder_emul_open(int flags, int *out_fd)
 {
-  int sv[2];
-  if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) < 0)
+  if (!shm_attach()) {
+    errno = ENOMEM;
     return -1;
+  }
+
+  /* A place in the shared registry, so senders in other processes can find
+   * this endpoint and leave work for it. */
+  shm_lock();
+  int slot = -1;
+  for (int i = 0; i < BINDER_MAX_EP; i++)
+    if (!shm->ep[i].used) { slot = i; break; }
+  if (slot < 0) {
+    shm_unlock();
+    errno = EMFILE;
+    return -1;
+  }
+  memset(&shm->ep[slot], 0, sizeof shm->ep[slot]);
+  shm->ep[slot].id = shm->next_id++;
+  shm->ep[slot].pid = (int32_t) getpid();
+  shm->ep[slot].used = 1;
+  uint32_t id = shm->ep[slot].id;
+  shm_unlock();
+
+  /* The descriptor the guest holds is the reading end of a fifo, which is what
+   * lets a sender in another process wake it: a fifo has a name, and a
+   * socketpair has only the two ends its maker holds. Opened read-write so it
+   * never reports end-of-file when no writer happens to have it open. */
+  char path[PATH_MAX];
+  wake_path(id, path, sizeof path);
+  unlink(path);
+  if (mkfifo(path, 0600) < 0 && errno != EEXIST) {
+    shm_lock(); shm->ep[slot].used = 0; shm_unlock();
+    return -1;
+  }
+  int fd = open(path, O_RDWR | O_NONBLOCK);
+  if (fd < 0) {
+    shm_lock(); shm->ep[slot].used = 0; shm_unlock();
+    return -1;
+  }
   if (flags & LINUX_O_CLOEXEC)
-    fcntl(sv[0], F_SETFD, FD_CLOEXEC);
-  if (flags & LINUX_O_NONBLOCK)
-    fcntl(sv[0], F_SETFL, O_NONBLOCK);
-  fcntl(sv[1], F_SETFL, O_NONBLOCK);
+    fcntl(fd, F_SETFD, FD_CLOEXEC);
+  if (!(flags & LINUX_O_NONBLOCK))
+    fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) & ~O_NONBLOCK);
 
   pthread_mutex_lock(&eps_lock);
   struct binder_ep *e = ep_free();
   if (e == NULL) {
     pthread_mutex_unlock(&eps_lock);
-    close(sv[0]);
-    close(sv[1]);
+    close(fd);
+    shm_lock(); shm->ep[slot].used = 0; shm_unlock();
     errno = EMFILE;
     return -1;
   }
   memset(e, 0, sizeof *e);
-  e->wr = sv[1];
-  e->fd = sv[0];                 /* published last, as the poke walks the table */
+  e->wr = -1;
+  e->id = id;
+  e->fd = fd;                    /* published last, as the poke walks the table */
   pthread_mutex_unlock(&eps_lock);
 
-  *out_fd = sv[0];
+  *out_fd = fd;
   return 0;
 }
 
@@ -253,13 +447,27 @@ binder_emul_close(int fd)
 {
   pthread_mutex_lock(&eps_lock);
   struct binder_ep *e = ep_of(fd);
+  uint32_t id = e ? e->id : 0;
   if (e != NULL) {
-    if (e->wr >= 0)
-      close(e->wr);
     e->wr = -1;
     e->fd = -1;
   }
   pthread_mutex_unlock(&eps_lock);
+  if (id == 0)
+    return;
+
+  if (shm_attach()) {
+    shm_lock();
+    for (int i = 0; i < BINDER_MAX_EP; i++)
+      if (shm->ep[i].used && shm->ep[i].id == id) {
+        shm->ep[i].used = 0;     /* the manager goes with it, if it was one */
+        break;
+      }
+    shm_unlock();
+  }
+  char path[PATH_MAX];
+  wake_path(id, path, sizeof path);
+  unlink(path);
 }
 
 /* The 64-byte transaction on the wire, at the offsets binder.h lays out. */
@@ -280,43 +488,152 @@ struct btr {
 static int
 do_transaction(struct binder_ep *from, const struct btr *tr, bool reply)
 {
-  struct binder_ep *to = reply ? from : ep_for_handle((uint32_t) tr->target);
-  if (to == NULL)
+  int slot = reply ? -1 : shm_ep_for_handle((uint32_t) tr->target);
+  if (reply) {
+    /* A reply goes back to whoever is waiting for it. Only the same endpoint
+     * so far, which is what the one-thread case needs; a reply across
+     * processes needs the transaction stack that is not built yet. */
+    slot = -1;
+    for (int i = 0; i < BINDER_MAX_EP && shm_attach(); i++)
+      if (shm->ep[i].used && shm->ep[i].id == from->id) { slot = i; break; }
+  }
+  if (slot < 0)
     return -LINUX_ENOENT;
 
   uint64_t total = tr->data_size + tr->offsets_size;
-  uint64_t at = arena_take(to, total ? total : 8);
-  if (at == 0)
-    return -LINUX_ENOMEM;
+  if (total > BSHM_PAYLOAD)
+    return -LINUX_ENOMEM;        /* staged, so a record is the limit */
 
+  /*
+   * Staged into shared memory rather than written into the receiver's arena.
+   * The arena is the receiver's own anonymous memory and no other process can
+   * reach it; what has to cross is the payload. The receiver copies it into
+   * its arena when it collects the message, in its own process, with the same
+   * code that always did it.
+   */
+  shm_lock();
+  struct bep_shared *dst = &shm->ep[slot];
+  struct bmsg *m = NULL;
+  for (int i = 0; i < BSHM_MSG_MAX; i++)
+    if (!dst->q[i].used) { m = &dst->q[i]; break; }
+  if (m == NULL) {
+    shm_unlock();
+    return -LINUX_EAGAIN;        /* the receiver is behind; binder blocks here */
+  }
+
+  m->is_reply = reply;
+  m->cookie = tr->cookie;
+  m->code = tr->code;
+  m->flags = tr->flags;
+  m->sender_pid = (uint32_t) getpid();
+  m->sender_euid = 0;
+  m->data_size = tr->data_size;
+  m->offsets_size = tr->offsets_size;
+  int err = 0;
   if (tr->data_size > 0) {
-    void *dst = guest_to_host(at);
     void *src = guest_to_host(tr->buffer);
-    if (dst == NULL || src == NULL)
-      return -LINUX_EFAULT;
-    memcpy(dst, src, tr->data_size);
+    if (src == NULL) err = -LINUX_EFAULT;
+    else memcpy(m->data, src, tr->data_size);
   }
-  if (tr->offsets_size > 0) {
-    void *dst = guest_to_host(at + tr->data_size);
+  if (err == 0 && tr->offsets_size > 0) {
     void *src = guest_to_host(tr->offsets);
-    if (dst == NULL || src == NULL)
-      return -LINUX_EFAULT;
-    memcpy(dst, src, tr->offsets_size);
+    if (src == NULL) err = -LINUX_EFAULT;
+    else memcpy(m->data + tr->data_size, src, tr->offsets_size);
+  }
+  if (err != 0) {
+    shm_unlock();
+    return err;
   }
 
-  struct btr out = *tr;
-  out.buffer = at;
-  out.offsets = tr->offsets_size ? at + tr->data_size : 0;
-  out.sender_pid = (uint32_t) getpid();
-  out.sender_euid = 0;
+  /*
+   * Descriptors named in the parcel.
+   *
+   * A BINDER_TYPE_FD object carries a descriptor number, and a number means
+   * nothing in another process. Linux's driver installs the file in the
+   * receiver and rewrites the number; nothing on macOS can do that from here,
+   * so the object keeps the sender's number and the driver stamps the sender's
+   * pid into the cookie. That pair is what the receiver hands the descriptor
+   * broker to get a real descriptor of its own - the same arrangement the kext
+   * uses, kept identical so both binders behave the same way.
+   */
+  if (m->offsets_size >= 8) {
+    unsigned char *data = m->data;
+    uint64_t *offs = (uint64_t *)(void *)(m->data + m->data_size);
+    size_t n = (size_t)(m->offsets_size / 8);
+    for (size_t i = 0; i < n; i++) {
+      uint64_t at = offs[i];
+      if (at + FLAT_OBJ_SIZE > m->data_size)
+        continue;                /* not an object we can read; leave it alone */
+      uint32_t type;
+      memcpy(&type, data + at, sizeof type);
+      if (type != LINUX_BINDER_TYPE_FD_EMUL)
+        continue;
+      uint64_t cookie = (uint64_t) getpid();
+      memcpy(data + at + FLAT_OBJ_COOKIE, &cookie, sizeof cookie);
+    }
+  }
 
-  ep_queue_cmd(to, reply ? BR_REPLY : BR_TRANSACTION);
-  ep_queue(to, &out, sizeof out);
+  m->used = 1;
+  uint32_t wake_id = dst->id;
+  shm_unlock();
+
+  shm_wake(wake_id);
 
   /* The sender is told its transaction was handed over. For a one-way call
    * that is the whole of the answer it gets. */
   ep_queue_cmd(from, BR_TRANSACTION_COMPLETE);
   return 0;
+}
+
+/*
+ * Collect whatever has been left for this endpoint and turn it into the
+ * commands the guest will read. This is where a message becomes a pointer into
+ * the reader's own arena, which is why it happens here and not where the
+ * message was posted.
+ */
+static void
+collect_messages(struct binder_ep *e)
+{
+  if (!shm_attach())
+    return;
+  shm_lock();
+  int slot = -1;
+  for (int i = 0; i < BINDER_MAX_EP; i++)
+    if (shm->ep[i].used && shm->ep[i].id == e->id) { slot = i; break; }
+  if (slot < 0) {
+    shm_unlock();
+    return;
+  }
+  for (int i = 0; i < BSHM_MSG_MAX; i++) {
+    struct bmsg *m = &shm->ep[slot].q[i];
+    if (!m->used)
+      continue;
+    uint64_t total = m->data_size + m->offsets_size;
+    uint64_t at = arena_take(e, total ? total : 8);
+    if (at == 0)
+      break;                     /* no room yet; it stays queued */
+    void *dst = guest_to_host(at);
+    if (dst == NULL)
+      break;
+    memcpy(dst, m->data, total);
+
+    struct btr out;
+    memset(&out, 0, sizeof out);
+    out.cookie = m->cookie;
+    out.code = m->code;
+    out.flags = m->flags;
+    out.sender_pid = m->sender_pid;
+    out.sender_euid = m->sender_euid;
+    out.data_size = m->data_size;
+    out.offsets_size = m->offsets_size;
+    out.buffer = at;
+    out.offsets = m->offsets_size ? at + m->data_size : 0;
+
+    ep_queue_cmd(e, m->is_reply ? BR_REPLY : BR_TRANSACTION);
+    ep_queue(e, &out, sizeof out);
+    m->used = 0;
+  }
+  shm_unlock();
 }
 
 /* Walk the commands the guest wrote. Returns 0, or the first error - binder
@@ -392,6 +709,7 @@ serve_reads(struct binder_ep *e, uint64_t buf, uint64_t size,
 {
   if (size == 0)
     return 0;
+  collect_messages(e);           /* anything another process left for us */
   size_t have = e->pending_len - e->pending_off;
   if (have == 0)
     return 0;
@@ -405,10 +723,13 @@ serve_reads(struct binder_ep *e, uint64_t buf, uint64_t size,
     e->pending_off = e->pending_len = 0;
   *consumed = n;
 
-  /* Drain the readability byte with the data it stood for. */
+  /* Drain the wake bytes along with the work they stood for. */
   char drain[64];
-  while (recv(e->fd, drain, sizeof drain, MSG_DONTWAIT) > 0)
+  int fl = fcntl(e->fd, F_GETFL);
+  fcntl(e->fd, F_SETFL, fl | O_NONBLOCK);
+  while (read(e->fd, drain, sizeof drain) > 0)
     ;
+  fcntl(e->fd, F_SETFL, fl);
   return 0;
 }
 
@@ -441,14 +762,23 @@ binder_emul_ioctl(int fd, int cmd, uint64_t arg)
 
   case LINUX_BINDER_SET_CONTEXT_MGR:
   case LINUX_BINDER_SET_CONTEXT_MGR_EXT:
-    /* Only one at a time, which is what makes handle 0 mean one thing. */
+    /* One at a time across the whole instance, not just this process - that is
+     * what makes handle 0 mean one thing to everybody. */
+    if (!shm_attach()) { r = -LINUX_ENOMEM; break; }
+    shm_lock();
     for (int i = 0; i < BINDER_MAX_EP; i++)
-      if (eps[i].fd >= 0 && eps[i].is_mgr && &eps[i] != e) {
+      if (shm->ep[i].used && shm->ep[i].is_mgr && shm->ep[i].id != e->id) {
         r = -LINUX_EBUSY;
         break;
       }
     if (r == 0)
-      e->is_mgr = true;
+      for (int i = 0; i < BINDER_MAX_EP; i++)
+        if (shm->ep[i].used && shm->ep[i].id == e->id) {
+          shm->ep[i].is_mgr = 1;
+          e->is_mgr = true;
+          break;
+        }
+    shm_unlock();
     break;
 
   case LINUX_BINDER_MSL_SET_ARENA: {

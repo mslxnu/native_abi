@@ -1176,14 +1176,15 @@ fi
 # emulation selectable: NABI_BINDER=emulated forces it even where /dev/binder
 # exists. Asserted by how far it gets, not by passing outright - delivery
 # between processes is not implemented yet, so twoproc is where it stops. The
-# stage banner prints before the stage runs, so reaching [twoproc] means
-# version, arena, manager, oneway and epoll all passed.
+# stage banner prints before the stage runs, so reaching [fda] means version,
+# arena, manager, oneway, epoll, twoproc and fd all passed. Scatter-gather
+# transactions are not implemented, so fda is where it stops.
 cp "$here/binderprobe" "$root/"; chmod +x "$root/binderprobe"
 out=$(NABI_BINDER=emulated "$NABI" -m "$root" /binderprobe 2>&1)
-if printf '%s\n' "$out" | grep -q '\[twoproc\]'; then
-    echo "  ok  binderprobe (emulated) -> through oneway and epoll"
+if printf '%s\n' "$out" | grep -q '\[fda\]'; then
+    echo "  ok  binderprobe (emulated) -> through twoproc and fd"
 else
-    echo "  FAIL binderprobe (emulated) -> did not reach twoproc"
+    echo "  FAIL binderprobe (emulated) -> did not reach fda"
     printf '%s\n' "$out" | tail -3 | sed 's/^/       /'
     fail=1
 fi
