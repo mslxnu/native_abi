@@ -1194,6 +1194,56 @@ serve_reads(struct binder_ep *e, uint64_t buf, uint64_t size,
   return 0;
 }
 
+/*
+ * Where this endpoint's transaction buffers live.
+ *
+ * Registered two ways, because there are two kinds of caller. mSL's own
+ * BINDER_MSL_SET_ARENA hands over memory the guest already has, which is what
+ * the conformance probe does; a real binder client calls mmap on the device
+ * and the driver gives it a mapping, which is what every process in Android
+ * does - libbinder's ProcessState maps just under a megabyte before it will
+ * talk to anything. Both end here.
+ */
+static int
+arena_set(struct binder_ep *e, uint64_t addr, uint64_t size)
+{
+  /* Refused rather than trusted: a null or tiny arena is a caller that has not
+   * really registered one, and the first transaction would write into whatever
+   * is there. */
+  if (addr == 0 || size < 4096)
+    return -LINUX_EINVAL;
+  if (guest_to_host(addr) == NULL)
+    return -LINUX_EFAULT;
+  /*
+   * Once only. Buffers already handed out point into the arena that was
+   * registered when they were allocated, so accepting a second one would leave
+   * the guest holding pointers this no longer believes in - and the receiver
+   * would go on reading a region nothing is delivering into.
+   */
+  if (e->arena_addr != 0)
+    return -LINUX_EBUSY;
+  e->arena_addr = addr;
+  e->arena_size = size;
+  e->arena_brk = 0;
+  memset(e->allocs, 0, sizeof e->allocs);
+  return 0;
+}
+
+/*
+ * mmap of the device, which is how a real client asks for its arena. The
+ * memory is the guest's own - nabi has nothing of its own to map here - so the
+ * caller has already made an anonymous mapping and this only records it.
+ */
+int
+binder_emul_mmap(int fd, uint64_t addr, uint64_t size)
+{
+  pthread_mutex_lock(&eps_lock);
+  struct binder_ep *e = ep_of(fd);
+  int r = e == NULL ? -LINUX_ENOTTY : arena_set(e, addr, size);
+  pthread_mutex_unlock(&eps_lock);
+  return r;
+}
+
 int
 binder_emul_ioctl(int fd, int cmd, uint64_t arg)
 {
@@ -1263,22 +1313,7 @@ binder_emul_ioctl(int fd, int cmd, uint64_t arg)
     void *p = guest_to_host(arg);
     if (p == NULL) { r = -LINUX_EFAULT; break; }
     memcpy(&a, p, sizeof a);
-    /* Refused rather than trusted: a null or tiny arena is a caller that has
-     * not really registered one, and the first transaction would write into
-     * whatever is there. */
-    if (a.addr == 0 || a.size < 4096) { r = -LINUX_EINVAL; break; }
-    if (guest_to_host(a.addr) == NULL) { r = -LINUX_EFAULT; break; }
-    /*
-     * Once only. Buffers already handed out point into the arena that was
-     * registered when they were allocated, so accepting a second one would
-     * leave the guest holding pointers this no longer believes in - and the
-     * receiver would go on reading a region nothing is delivering into.
-     */
-    if (e->arena_addr != 0) { r = -LINUX_EBUSY; break; }
-    e->arena_addr = a.addr;
-    e->arena_size = a.size;
-    e->arena_brk = 0;
-    memset(e->allocs, 0, sizeof e->allocs);
+    r = arena_set(e, a.addr, a.size);
     break;
   }
 

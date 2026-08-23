@@ -239,6 +239,7 @@ int  binder_emul_open(const char *ctx, int flags, int *out_fd);
 void binder_emul_close(int fd);
 bool binder_emul_is(int fd);
 int  binder_emul_ioctl(int fd, int cmd, uint64_t arg);
+int  binder_emul_mmap(int fd, uint64_t addr, uint64_t size);
 
 /* /dev/kmsg, served by nabi because there is no kernel here to keep a log. */
 void kmsg_init(void);

@@ -199,6 +199,29 @@ do_mmap(gaddr_t addr, size_t len, int d_prot, int l_prot, int l_flags, int fd, o
 
   len = roundup(len, GUEST_MMAP_GRANULE);
 
+  /*
+   * mmap of the binder device, which is how a real client asks for the buffer
+   * its transactions are delivered into. There is nothing on nabi's side to
+   * map - the emulated driver's arena is the guest's own memory - so the
+   * mapping is made anonymously and the endpoint is told where it went.
+   *
+   * The conformance probe never needed this: it registers memory it already
+   * has, through mSL's own BINDER_MSL_SET_ARENA. Every real process does it
+   * the other way. libbinder's ProcessState maps just under a megabyte of the
+   * device before it will talk to anything, and mapping the endpoint's own
+   * descriptor - a fifo - came back ESPIPE, so vold reported "Binder driver
+   * could not be opened. Terminating." and init rebooted for a failed vold.
+   */
+  bool binder_arena = fd >= 0 && binder_emul_is(fd);
+  int binder_fd = fd;
+  if (binder_arena) {
+    fd = -1;
+    offset = 0;
+    l_flags = (l_flags & ~LINUX_MAP_SHARED) | LINUX_MAP_PRIVATE |
+              LINUX_MAP_ANONYMOUS;
+    l_prot |= LINUX_PROT_READ | LINUX_PROT_WRITE;
+  }
+
   if ((l_flags & ~(LINUX_MAP_SHARED | LINUX_MAP_PRIVATE | LINUX_MAP_FIXED | LINUX_MAP_ANON | LINUX_MAP_HUGETLB)) != 0) {
     warnk("unsupported mmap l_flags: 0x%x\n", l_flags);
     exit(1);
@@ -400,6 +423,13 @@ do_mmap(gaddr_t addr, size_t len, int d_prot, int l_prot, int l_flags, int fd, o
   if (fd >= 0)
     vmm_sync_guest_code(addr, len);
 #endif
+
+  /* Now that it has an address, the endpoint can be told where its arena is. */
+  if (binder_arena) {
+    int br = binder_emul_mmap(binder_fd, addr, len);
+    if (br < 0)
+      return (gaddr_t) br;
+  }
 
   return addr;
 }

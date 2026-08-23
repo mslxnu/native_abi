@@ -1271,6 +1271,18 @@ elif [ "${ok_plain:-0}" = 1 ]; then
     fail=1
 fi
 
+# bindermmaptest: mmap of the binder device, which is how a real client asks for
+# its arena - and what every process in Android does. Emulated only: the kext's
+# driver answers mmap with ENODEV, so the shared probe cannot ask for it.
+cp "$here/bindermmaptest" "$root/"; chmod +x "$root/bindermmaptest"
+out=$(NABI_BINDER=emulated "$NABI" -m "$root" /bindermmaptest 2>&1 | tail -1); rc=$?
+if [ "$out" = "bindermmap ok" ]; then
+    echo "  ok  bindermmaptest -> \"$out\""
+else
+    echo "  FAIL bindermmaptest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 # binderfstest: the filesystem that makes binders, served by nabi rather than by
 # the kext. Forced to the emulation, because that is the side that has to work
 # without one - and because the two do not answer alike: the kext's binderfs is
