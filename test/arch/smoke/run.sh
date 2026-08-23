@@ -1171,6 +1171,27 @@ else
     fail=1
 fi
 
+# devnodetest: the devices nabi answers for once the guest owns /dev. A node
+# made with mknod is a placeholder, and Linux names devices two ways: by number
+# for the ones whose major/minor it fixes, and by name for the ones it assigns
+# dynamically. Binder is the second kind, so it answered ENXIO the moment a
+# guest mounted its own /dev - which Android always does - while /dev/null went
+# on working. Also checks that a name is a device only inside /dev.
+cp "$here/devnodetest" "$root/"; chmod +x "$root/devnodetest"
+out=$("$NABI" -m "$root" /devnodetest 2>&1)
+rc=$?
+binder=$(printf '%s\n' "$out" | sed -n 's/^binder-open=//p')
+last=$(printf '%s\n' "$out" | tail -1)
+# Whether this host provides binder at all depends on mSL/DevFS being loaded,
+# so the strict check is made only where the device exists to be reached.
+if [ -e /dev/binder ]; then want_binder=1; else want_binder=-6; fi
+if [ "$last" = "devnode ok" ] && [ "$binder" = "$want_binder" ]; then
+    echo "  ok  devnodetest -> \"$last\", binder=$binder"
+else
+    echo "  FAIL devnodetest -> \"$last\", binder=$binder (wanted $want_binder), exit $rc"
+    fail=1
+fi
+
 # procchmodtest: chmod on a passed-through /proc, which the host module serving
 # it refuses - and Android's first-stage init treats a failed chmod of
 # /proc/cmdline as fatal. Checks that it succeeds by path and by dirfd, that a

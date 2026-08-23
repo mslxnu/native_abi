@@ -184,6 +184,10 @@ struct mount_entry {
   uint32_t master;
 };
 
+/* The guest path a host path is reached by, if a mount puts it there. The
+ * reverse of mount_resolve; see src/fs/mount.c. */
+bool mount_guest_path_of(const char *host_path, char *out, size_t outsz);
+
 struct mount_table {
   struct mount_entry m[MOUNT_MAX];
   uint32_t n;

@@ -327,6 +327,87 @@ find_mount(const struct mount_table *t, const char *guest_path)
   return best;
 }
 
+
+/*
+ * The guest path a host path is reached by, if a mount puts it there.
+ *
+ * The reverse of mount_resolve, and needed for the same reason a forward
+ * lookup is: once the guest has mounted something, the host name of a file
+ * under it says nothing about where the guest sees it. A tmpfs on /dev is
+ * backed by a directory in TMPDIR, so F_GETPATH on anything inside it answers
+ * with that directory - which is a perfectly good host path and completely
+ * useless for deciding whether the guest is looking at /dev.
+ *
+ * The longest matching backing directory wins, so a mount inside another mount
+ * answers with the inner one, which is the mount the guest is actually seeing.
+ */
+/*
+ * Host paths that name the same file do not have to look the same.
+ *
+ * macOS reaches /tmp, /var and /etc through symlinks into /private, so
+ * F_GETPATH answers with /private/var/folders/... for a directory that was
+ * recorded as /var/folders/... when it was created - and a plain prefix
+ * comparison of the two says they are unrelated. A repeated separator does the
+ * same damage, and TMPDIR conventionally ends in one, so building a path from
+ * it gives ".../T//nabi-tmpfs-XXXXXX".
+ *
+ * Normalising is cheap here and the alternative is resolving both sides, which
+ * costs a syscall each on a path that is only ever compared.
+ */
+static void
+host_path_norm(const char *in, char *out, size_t outsz)
+{
+  static const char priv[] = "/private";
+  const size_t plen = sizeof priv - 1;
+  if (strncmp(in, priv, plen) == 0 && (in[plen] == '/' || in[plen] == '\0'))
+    in += plen;
+
+  size_t j = 0;
+  for (size_t i = 0; in[i] != '\0' && j + 1 < outsz; i++) {
+    if (in[i] == '/' && j > 0 && out[j - 1] == '/')
+      continue;                 /* collapse repeats */
+    out[j++] = in[i];
+  }
+  if (j > 1 && out[j - 1] == '/')
+    j--;                        /* no trailing separator */
+  out[j] = '\0';
+  if (j == 0 && outsz > 1) {
+    out[0] = '/';
+    out[1] = '\0';
+  }
+}
+
+bool
+mount_guest_path_of(const char *host_path, char *out, size_t outsz)
+{
+  struct mount_table t;
+  if (!current_table(&t) || t.n == 0)
+    return false;
+
+  char want[MOUNT_PATH_MAX];
+  host_path_norm(host_path, want, sizeof want);
+
+  int best = -1;
+  size_t best_len = 0;
+  for (uint32_t i = 0; i < t.n; i++) {
+    if (t.m[i].hostdir[0] == '\0')
+      continue;
+    char have[MOUNT_PATH_MAX];
+    host_path_norm(t.m[i].hostdir, have, sizeof have);
+    size_t n = under(want, have);
+    if (n > 0 && n >= best_len) {
+      best = (int) i;
+      best_len = n;
+    }
+  }
+  if (best < 0)
+    return false;
+
+  const char *rest = want + best_len;
+  int n = snprintf(out, outsz, "%s%s", t.m[best].target, rest);
+  return n > 0 && (size_t) n < outsz;
+}
+
 /*
  * pivot_root's effect on the mount table.
  *

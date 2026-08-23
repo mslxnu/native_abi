@@ -2702,36 +2702,122 @@ struct guest_dev {
   uint32_t dev;                  /* the Linux device number */
 };
 
+/* Defined below, beside the other guest-path helpers. */
+static bool host_to_guest_path(const char *host, char *out, size_t outsz);
+
 /*
- * The host device a guest's device number names, or NULL.
+ * The devices nabi answers for, and what each one means.
  *
- * Linux fixes these numbers, so a node the guest made with mknod can be
- * recognised by them alone rather than by the name it was given - which matters
- * because the name is the guest's to choose and /dev/__null__ is as valid as
- * /dev/null.
+ * A node the guest made with mknod is a placeholder: there is no driver behind
+ * it, so opening it has to be turned into something real or refused. Two ways
+ * of naming a device have to be understood, because Linux uses both.
  *
- * kmsg is the one that is not a straight mapping: it is the kernel's log, there
- * is no kernel here to have one, and what a writer wants is for the write to be
- * accepted and go nowhere. That is /dev/null exactly. Reading it back would be
- * a lie, but nothing reads kmsg expecting its own writes.
+ * By number, for the devices whose major and minor Linux fixes. That is the
+ * reliable key when it applies: the *name* is the guest's to choose, and
+ * /dev/__null__ with 1:3 is as much the null device as /dev/null is.
+ *
+ * By name, for the devices whose numbers Linux hands out dynamically. Binder is
+ * the reason this exists. Its numbers are whatever the kernel assigned when the
+ * device was created, so they identify nothing - but the name is fixed by
+ * convention and by every client that opens it. Matched only inside the guest's
+ * own /dev, because a name is only a device *there*; a file called "binder" in
+ * a home directory is a file.
+ *
+ * The distinction matters as soon as a guest mounts its own /dev, which Android
+ * always does. The passthrough is shadowed at that point, so every device the
+ * guest then creates is a placeholder - and /dev/binder answered ENXIO while
+ * /dev/null still worked, purely because one is found by number and the other
+ * is not.
+ */
+struct guest_device {
+  const char *name;              /* matched in the guest's /dev; NULL for none */
+  unsigned    maj, min;          /* Linux's numbers; 0/0 when it has none fixed */
+  const char *host;              /* the host device that means the same thing */
+};
+
+static const struct guest_device guest_devices[] = {
+  { "null",      1,  3, "/dev/null"    },
+  { "zero",      1,  5, "/dev/zero"    },
+  { "random",    1,  8, "/dev/random"  },
+  { "urandom",   1,  9, "/dev/urandom" },
+  /*
+   * kmsg is the kernel's log, and there is no kernel here to have one. What a
+   * writer wants is for the write to be accepted and to go nowhere, which is
+   * /dev/null exactly. Reading it back would be a lie - nothing that writes to
+   * kmsg expects to read its own lines - but nothing can read it either, which
+   * is why init's diagnostics are invisible unless a trace is running.
+   */
+  { "kmsg",      1, 11, "/dev/null"    },
+  { "tty",       5,  0, "/dev/tty"     },
+  /*
+   * The binder devices, whose numbers are assigned rather than fixed. These are
+   * the host's only while mSL/DevFS is loaded; without it the open fails and
+   * the guest is told ENXIO, which is the truthful answer for a node with no
+   * driver behind it.
+   */
+  { "binder",    0,  0, "/dev/binder"    },
+  { "hwbinder",  0,  0, "/dev/hwbinder"  },
+  { "vndbinder", 0,  0, "/dev/vndbinder" },
+};
+
+#define NR_GUEST_DEVICES (sizeof guest_devices / sizeof guest_devices[0])
+
+/*
+ * The leaf of a guest path that names something directly in /dev, or NULL.
+ *
+ * The host name is turned back into a guest name through the mount table
+ * rather than through F_GETPATH: once the guest has mounted a tmpfs on /dev -
+ * which is the case this exists for - the host name of a node inside it is a
+ * directory in TMPDIR, and says nothing about the guest seeing /dev.
  */
 static const char *
-host_device_for(uint32_t mode, uint32_t dev)
+dev_leaf_of(int dirfd, const char *path)
+{
+  char host[PATH_MAX], guest[LINUX_PATH_MAX];
+  if (!abs_path_at(dirfd, path, host, sizeof host))
+    return NULL;
+
+  static char buf[LINUX_PATH_MAX];
+  const char *g;
+  if (mount_guest_path_of(host, guest, sizeof guest)) {
+    g = guest;
+  } else if (host_to_guest_path(host, buf, sizeof buf)) {
+    g = buf;                     /* no mount in the way: the passthrough /dev */
+  } else {
+    return NULL;
+  }
+
+  if (strncmp(g, "/dev/", 5) != 0)
+    return NULL;
+  const char *leaf = g + 5;
+  return (*leaf != '\0' && strchr(leaf, '/') == NULL) ? leaf : NULL;
+}
+
+/*
+ * The host device a placeholder stands for, or NULL if nothing does.
+ *
+ * Numbers first, since they are exact wherever Linux fixes them; the name is
+ * consulted only for an entry that has no numbers of its own.
+ */
+static const char *
+host_device_for(uint32_t mode, uint32_t dev, int dirfd, const char *path)
 {
   if ((mode & S_IFMT) != S_IFCHR)
     return NULL;
+
   unsigned maj = dev >> 8, min = dev & 0xff;
-  if (maj == 1) {
-    switch (min) {
-    case 3:  return "/dev/null";
-    case 5:  return "/dev/zero";
-    case 8:  return "/dev/random";
-    case 9:  return "/dev/urandom";
-    case 11: return "/dev/null";        /* kmsg; see above */
-    }
-  }
-  if (maj == 5 && min == 0)
-    return "/dev/tty";
+  for (size_t i = 0; i < NR_GUEST_DEVICES; i++)
+    if (guest_devices[i].maj != 0 && guest_devices[i].maj == maj &&
+        guest_devices[i].min == min)
+      return guest_devices[i].host;
+
+  const char *leaf = dev_leaf_of(dirfd, path);
+  if (leaf == NULL)
+    return NULL;
+  for (size_t i = 0; i < NR_GUEST_DEVICES; i++)
+    if (guest_devices[i].maj == 0 && guest_devices[i].name != NULL &&
+        strcmp(guest_devices[i].name, leaf) == 0)
+      return guest_devices[i].host;
   return NULL;
 }
 
@@ -3948,8 +4034,18 @@ darwinfs_openat(struct fs *fs, struct dir *dir, const char *path, int l_flags, i
         guest_dev_read(abs, &d)) {
       if (fd >= 0)
         close(fd);
-      const char *host = host_device_for(d.mode, d.dev);
-      fd = host ? syswrap(open(host, flags, mode)) : -LINUX_ENXIO;
+      const char *host = host_device_for(d.mode, d.dev, dir->fd, path);
+      if (host == NULL) {
+        fd = -LINUX_ENXIO;
+      } else {
+        fd = syswrap(open(host, flags, mode));
+        /* A device nabi knows the meaning of but the host does not have -
+         * binder without mSL/DevFS loaded - is a node with no driver, which is
+         * what ENXIO says. Answering ENOENT would claim the node is not there,
+         * and the guest just created it. */
+        if (fd == -LINUX_ENOENT)
+          fd = -LINUX_ENXIO;
+      }
     }
   }
 
