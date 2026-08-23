@@ -66,6 +66,9 @@ void _start(void)
 
   want("a numbered device still resolves", mk_open("/dev/null",1,3), 1);
   want("and another one", mk_open("/dev/zero",1,5), 1);
+  /* The pty multiplexer, which is a device like any other once the guest owns
+   * /dev - and is how init gives a command it runs somewhere to write to. */
+  want("the pty multiplexer resolves", mk_open("/dev/ptmx",5,2), 1);
   want("a device nothing provides is ENXIO", mk_open("/dev/nosuchthing",99,99), -ENXIO);
 
   /* A name is a device only in /dev. */

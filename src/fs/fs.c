@@ -2917,6 +2917,15 @@ static const struct guest_device guest_devices[] = {
   { "kmsg",      1, 11, NULL, kmsg_open },
   { "tty",       5,  0, "/dev/tty",     NULL },
   /*
+   * The pty multiplexer. It worked as a passthrough and stopped the moment a
+   * guest mounted its own /dev over it, which is what Android does - opening
+   * the node ueventd had just made answered ENXIO. Android's init opens it to
+   * give a command it runs somewhere to write its output, so
+   * `update_linker_config` failed with "No such device or address" and the
+   * linker was left with no configuration at all.
+   */
+  { "ptmx",      5,  2, "/dev/ptmx",    NULL },
+  /*
    * The binder devices, whose numbers are assigned rather than fixed. These are
    * the host's only while mSL/DevFS is loaded; without it the open fails and
    * the guest is told ENXIO, which is the truthful answer for a node with no
