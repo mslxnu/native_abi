@@ -230,6 +230,13 @@ bool task_should_stop(void);
 noreturn void task_stop_self(void);
 /* The per-process state neither startup path may skip; see fs.c. Anything new
  * of that kind goes in there, not beside a call to it. */
+/* Binder, served by nabi rather than by a kernel extension. */
+void binder_emul_init(void);
+int  binder_emul_open(int flags, int *out_fd);
+void binder_emul_close(int fd);
+bool binder_emul_is(int fd);
+int  binder_emul_ioctl(int fd, int cmd, uint64_t arg);
+
 /* /dev/kmsg, served by nabi because there is no kernel here to keep a log. */
 void kmsg_init(void);
 int  kmsg_open(int flags, int *out_fd);

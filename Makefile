@@ -133,6 +133,7 @@ COMMON_SRCS := src/main.c \
                src/fs/diskimage.c \
                src/fs/loop.c \
                src/fs/kmsg.c \
+               src/fs/binder.c \
                src/fs/inotify.c \
                src/fs/fanotify.c \
                src/fs/handle.c \

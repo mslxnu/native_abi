@@ -202,6 +202,7 @@ reinit_process_tables(void)
   signalfds_init();
   userfaultfd_init();
   kmsg_init();
+  binder_emul_init();
 }
 
 void
@@ -935,6 +936,7 @@ darwinfs_close(struct file *file)
   abstract_close(file->fd);
   seqpacket_close(file->fd);
   kmsg_close(file->fd);
+  binder_emul_close(file->fd);
   procfs_close_fd(file->fd);
   if (file->dirp != NULL) {
     closedir(file->dirp);       /* takes the dup with it */
@@ -1715,8 +1717,11 @@ darwinfs_ioctl(struct file *file, int cmd, uint64_t val0)
   int fd = file->fd;
   int r;
 
-  if (binder_ioctl(cmd))
+  if (binder_ioctl(cmd)) {
+    if (binder_emul_is(fd))
+      return binder_emul_ioctl(fd, cmd, val0);
     return binder_ioctl_host(file, cmd, val0);
+  }
 
   switch (cmd) {
   case LINUX_TCGETS: {
@@ -2731,6 +2736,47 @@ static bool host_to_guest_path(const char *host, char *out, size_t outsz);
  * /dev/null still worked, purely because one is found by number and the other
  * is not.
  */
+/*
+ * Which binder the guest gets.
+ *
+ * The host's, while mSL/DevFS is loaded, because it is a real driver and
+ * faster than anything here. nabi's own otherwise, because a kext cannot be a
+ * requirement for running Android. NABI_BINDER forces one or the other, which
+ * is what makes the two comparable: the same conformance probe can be run
+ * against both and the answers held side by side.
+ */
+static int binder_emul_open_if(int flags, int *out_fd);
+static bool binder_emulated(void);
+
+/*
+ * The binder devices by name, when nabi is the one serving them. -1 for
+ * anything else, so the caller carries on with the ordinary lookup.
+ */
+static int
+binder_dev_open(const char *guest_path, int flags, int *out_fd)
+{
+  if (guest_path == NULL || strncmp(guest_path, "/dev/", 5) != 0)
+    return -1;
+  const char *leaf = guest_path + 5;
+  if (strcmp(leaf, "binder") != 0 && strcmp(leaf, "hwbinder") != 0 &&
+      strcmp(leaf, "vndbinder") != 0)
+    return -1;
+  if (!binder_emulated())
+    return -1;
+  return binder_emul_open(flags, out_fd) == 0 ? 0 : -1;
+}
+
+static bool
+binder_emulated(void)
+{
+  const char *how = getenv("NABI_BINDER");
+  if (how != NULL && strcmp(how, "emulated") == 0)
+    return true;
+  if (how != NULL && strcmp(how, "host") == 0)
+    return false;
+  return access("/dev/binder", F_OK) != 0;
+}
+
 struct guest_device {
   const char *name;              /* matched in the guest's /dev; NULL for none */
   unsigned    maj, min;          /* Linux's numbers; 0/0 when it has none fixed */
@@ -2760,9 +2806,9 @@ static const struct guest_device guest_devices[] = {
    * the guest is told ENXIO, which is the truthful answer for a node with no
    * driver behind it.
    */
-  { "binder",    0,  0, "/dev/binder",    NULL },
-  { "hwbinder",  0,  0, "/dev/hwbinder",  NULL },
-  { "vndbinder", 0,  0, "/dev/vndbinder", NULL },
+  { "binder",   0,  0, "/dev/binder",      binder_emul_open_if },
+  { "hwbinder", 0,  0, "/dev/hwbinder",    binder_emul_open_if },
+  { "vndbinder",0,  0, "/dev/vndbinder",   binder_emul_open_if },
 };
 
 #define NR_GUEST_DEVICES (sizeof guest_devices / sizeof guest_devices[0])
@@ -2804,6 +2850,21 @@ dev_leaf_of(int dirfd, const char *path)
  * Numbers first, since they are exact wherever Linux fixes them; the name is
  * consulted only for an entry that has no numbers of its own.
  */
+/*
+ * The device table's hook for binder. It is only nabi's when nothing better is
+ * available or the caller asked for it, so the entry keeps its host device too
+ * and the choice is made here rather than by having two tables.
+ */
+static int
+binder_emul_open_if(int flags, int *out_fd)
+{
+  if (!binder_emulated()) {
+    errno = ENODEV;              /* fall back to the host's device */
+    return -1;
+  }
+  return binder_emul_open(flags, out_fd);
+}
+
 static const struct guest_device *
 guest_device_for(uint32_t mode, uint32_t dev, int dirfd, const char *path)
 {
@@ -4055,8 +4116,15 @@ darwinfs_openat(struct fs *fs, struct dir *dir, const char *path, int l_flags, i
         fd = -LINUX_ENXIO;
       } else if (dv->open != NULL) {
         int served = -1;
-        fd = dv->open(l_flags, &served) == 0 ? served
-                                             : -darwin_to_linux_errno(errno);
+        if (dv->open(l_flags, &served) == 0) {
+          fd = served;
+        } else if (dv->host != NULL) {
+          fd = syswrap(open(dv->host, flags, mode));   /* the host's, then */
+          if (fd == -LINUX_ENOENT)
+            fd = -LINUX_ENXIO;
+        } else {
+          fd = -darwin_to_linux_errno(errno);
+        }
       } else {
         fd = syswrap(open(dv->host, flags, mode));
         /* A device nabi knows the meaning of but the host does not have -
@@ -5147,7 +5215,16 @@ user_openat(int atdirfd, const char *name, int flags, int mode)
 
   /* A loop device, which is a name nabi answers rather than a node the host
    * has - /dev is a passthrough and these cannot be created in it. */
-  if (loop_open(lookup, &fd) == 0) {
+  /*
+   * A binder device nabi is serving itself. Checked by name here as well as by
+   * the device table below, because the two are reached differently: the table
+   * answers for a node the guest made with mknod, and this answers for the
+   * name straight through a passed-through /dev - which is how a guest that
+   * has not mounted its own /dev opens it, and how the conformance probe does.
+   */
+  if (binder_dev_open(lookup, flags, &fd) == 0) {
+    ;
+  } else if (loop_open(lookup, &fd) == 0) {
     ;
   } else if (procfs_open(lookup, &fd) < 0) {
     fd = do_openat(atdirfd, name, flags, mode);

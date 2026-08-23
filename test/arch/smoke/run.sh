@@ -1171,6 +1171,23 @@ else
     fail=1
 fi
 
+# binderprobe, against nabi's own binder rather than the kext's. The same
+# conformance probe is the oracle for both, which is the point of having the
+# emulation selectable: NABI_BINDER=emulated forces it even where /dev/binder
+# exists. Asserted by how far it gets, not by passing outright - delivery
+# between processes is not implemented yet, so twoproc is where it stops. The
+# stage banner prints before the stage runs, so reaching [twoproc] means
+# version, arena, manager, oneway and epoll all passed.
+cp "$here/binderprobe" "$root/"; chmod +x "$root/binderprobe"
+out=$(NABI_BINDER=emulated "$NABI" -m "$root" /binderprobe 2>&1)
+if printf '%s\n' "$out" | grep -q '\[twoproc\]'; then
+    echo "  ok  binderprobe (emulated) -> through oneway and epoll"
+else
+    echo "  FAIL binderprobe (emulated) -> did not reach twoproc"
+    printf '%s\n' "$out" | tail -3 | sed 's/^/       /'
+    fail=1
+fi
+
 # kmsgtest: /dev/kmsg, served by nabi because there is no kernel here to keep a
 # log. It was mapped onto /dev/null, so a guest's own account of its boot was
 # destroyed as it was written - Android's init says everything it has to say
