@@ -6,6 +6,10 @@
 
 #include <sys/socket.h>
 #include <sys/un.h>
+
+/* Big enough for any address the guest can be handed: two bytes of family and
+ * Linux's 108-byte sun_path, which is longer than every other family's. */
+#define L_SOCKADDR_MAX (2 + 108)
 #include <sys/ucred.h>
 #include <netinet/in.h>
 #include <stdlib.h>
@@ -445,15 +449,56 @@ err:
   return -1;
 }
 
-void
-darwin_to_linux_sockaddr(struct l_sockaddr *l_sockaddr, const struct sockaddr *sockaddr)
+socklen_t
+darwin_to_linux_sockaddr(struct l_sockaddr *l_sockaddr, size_t outcap,
+                         const struct sockaddr *sockaddr)
 {
   if (sockaddr == NULL || l_sockaddr == NULL) {
-    return;
+    return 0;
   }
   assert((void*)l_sockaddr != (void*)sockaddr);
-  memcpy(l_sockaddr, sockaddr, sockaddr->sa_len);
+  size_t n = sockaddr->sa_len;
+  if (n > outcap)
+    n = outcap;
+  memcpy(l_sockaddr, sockaddr, n);
   l_sockaddr->sa_family = darwin_to_linux_sa_family(sockaddr->sa_family);
+
+  /*
+   * A filesystem socket's address is a path, and the path the host knows is
+   * not the one the guest asked for: bind translated it into the rootfs on the
+   * way in, so getsockname has to translate it back on the way out. Handing
+   * over the host's name gives the guest an address it never used and cannot
+   * use.
+   *
+   * bionic's android_get_control_socket does exactly this comparison - it
+   * getsocknames the descriptor init passed it and checks the path is
+   * /dev/socket/<name> - so with the host's path coming back, every Android
+   * service that takes a socket from init failed to recognise its own. That is
+   * what stopped prng_seeder, which then hangs on purpose, and boringssl's
+   * self test blocks forever reading from the socket prng_seeder never served.
+   *
+   * The length changes with the name, which is why this reports one rather
+   * than leaving the caller to use the host's.
+   *
+   * Abstract names are not translated: the host name for one is a hash of the
+   * guest's, and a hash does not come back. Nothing has needed it yet, and
+   * doing it properly means remembering the name a socket was bound with.
+   */
+  if (sockaddr->sa_family == AF_UNIX) {
+    const struct sockaddr_un *dun = (const struct sockaddr_un *) sockaddr;
+    size_t off = offsetof(struct sockaddr_un, sun_path);
+    if (sockaddr->sa_len > off && dun->sun_path[0] != '\0') {
+      char guest[LINUX_PATH_MAX];
+      if (guest_path_of_host(dun->sun_path, guest, sizeof guest)) {
+        size_t glen = strlen(guest);
+        if (off + glen + 1 <= outcap) {
+          memcpy((char *) l_sockaddr + off, guest, glen + 1);
+          n = off + glen + 1;
+        }
+      }
+    }
+  }
+  return (socklen_t) n;
 }
 
 DEFINE_SYSCALL(connect, int, sockfd, gaddr_t, addr_ptr, uint64_t, addrlen)
@@ -952,13 +997,20 @@ DEFINE_SYSCALL(recvfrom, int, socket, gaddr_t, buf_ptr, int, length, int, flags,
 {
   socklen_t *socklen_ptr = NULL;
   struct sockaddr *sock_ptr = NULL;
+  l_socklen_t addrbuflen = 0;    /* the guest's buffer, kept for the answer */
   if (addr_ptr != 0) {
-    l_socklen_t addrbuflen;
     if (copy_from_user(&addrbuflen, addrlen_ptr, sizeof addrbuflen))
       return -LINUX_EFAULT;
+    /*
+     * The host is given room for the whole address rather than the guest's
+     * buffer, because the guest's is not the measure of it: an address is
+     * translated on the way out and the result can be longer, and a truncated
+     * one cannot be translated at all. Linux has the whole address and copies
+     * as much of it as the caller asked for, which is what happens below.
+     */
     socklen_ptr = alloca(sizeof *socklen_ptr);
-    *socklen_ptr = addrbuflen;
-    sock_ptr = alloca(addrbuflen);
+    *socklen_ptr = sizeof(struct sockaddr_storage);
+    sock_ptr = alloca(sizeof(struct sockaddr_storage));
   }
   /* The flags were being handed to Darwin unconverted. They are not the same
    * numbers: Linux's MSG_DONTWAIT is 0x40, which is Darwin's MSG_WAITALL, so a
@@ -984,11 +1036,14 @@ DEFINE_SYSCALL(recvfrom, int, socket, gaddr_t, buf_ptr, int, length, int, flags,
   if (copy_to_user(buf_ptr, buf, ret))
     return -LINUX_EFAULT;
   if (addr_ptr != 0) {
-    char addr[sock_ptr->sa_len];
-    darwin_to_linux_sockaddr((struct l_sockaddr *) addr, sock_ptr);
-    if (copy_to_user(addr_ptr, addr, sizeof addr))
+    char addr[L_SOCKADDR_MAX];
+    socklen_t n = darwin_to_linux_sockaddr((struct l_sockaddr *) addr,
+                                           sizeof addr, sock_ptr);
+    l_socklen_t give = addrbuflen < (l_socklen_t) n ? addrbuflen : (l_socklen_t) n;
+    if (copy_to_user(addr_ptr, addr, give))
       return -LINUX_EFAULT;
-    if (copy_to_user(addrlen_ptr, socklen_ptr, sizeof *socklen_ptr))
+    l_socklen_t told = (l_socklen_t) n;   /* Linux reports the whole address */
+    if (copy_to_user(addrlen_ptr, &told, sizeof told))
       return -LINUX_EFAULT;
   }
   /* What was there, not what fitted. */
@@ -1581,13 +1636,20 @@ do_accept(int sockfd, gaddr_t addr_ptr, gaddr_t addrlen_ptr, int flags)
 {
   socklen_t *socklen_ptr = NULL;
   struct sockaddr *sock_ptr = NULL;
+  l_socklen_t addrbuflen = 0;    /* the guest's buffer, kept for the answer */
   if (addr_ptr != 0) {
-    l_socklen_t addrbuflen;
     if (copy_from_user(&addrbuflen, addrlen_ptr, sizeof addrbuflen))
       return -LINUX_EFAULT;
+    /*
+     * The host is given room for the whole address rather than the guest's
+     * buffer, because the guest's is not the measure of it: an address is
+     * translated on the way out and the result can be longer, and a truncated
+     * one cannot be translated at all. Linux has the whole address and copies
+     * as much of it as the caller asked for, which is what happens below.
+     */
     socklen_ptr = alloca(sizeof *socklen_ptr);
-    *socklen_ptr = addrbuflen;
-    sock_ptr = alloca(addrbuflen);
+    *socklen_ptr = sizeof(struct sockaddr_storage);
+    sock_ptr = alloca(sizeof(struct sockaddr_storage));
   }
   pthread_rwlock_wrlock(&proc.fileinfo.fdtable_lock);
   int ret = syswrap(accept(sockfd, sock_ptr, socklen_ptr));
@@ -1621,12 +1683,15 @@ do_accept(int sockfd, gaddr_t addr_ptr, gaddr_t addrlen_ptr, int flags)
     goto err;
   }
   if (addr_ptr != 0) {
-    char addr[sock_ptr->sa_len];
-    darwin_to_linux_sockaddr((struct l_sockaddr *) addr, sock_ptr);
-    if (copy_to_user(addr_ptr, addr, sizeof addr)) {
+    char addr[L_SOCKADDR_MAX];
+    socklen_t n = darwin_to_linux_sockaddr((struct l_sockaddr *) addr,
+                                           sizeof addr, sock_ptr);
+    l_socklen_t give = addrbuflen < (l_socklen_t) n ? addrbuflen : (l_socklen_t) n;
+    if (copy_to_user(addr_ptr, addr, give)) {
       ret = -LINUX_EFAULT;
       goto err;
     }
+    *socklen_ptr = (socklen_t) n;
     if (copy_to_user(addrlen_ptr, socklen_ptr, sizeof *socklen_ptr)) {
       ret = -LINUX_EFAULT;
       goto err;
@@ -1738,13 +1803,20 @@ DEFINE_SYSCALL(getsockname, int, sockfd, gaddr_t, addr_ptr, gaddr_t, addrlen_ptr
 {
   socklen_t *socklen_ptr = NULL;
   struct sockaddr *sock_ptr = NULL;
+  l_socklen_t addrbuflen = 0;    /* the guest's buffer, kept for the answer */
   if (addr_ptr != 0) {
-    l_socklen_t addrbuflen;
     if (copy_from_user(&addrbuflen, addrlen_ptr, sizeof addrbuflen))
       return -LINUX_EFAULT;
+    /*
+     * The host is given room for the whole address rather than the guest's
+     * buffer, because the guest's is not the measure of it: an address is
+     * translated on the way out and the result can be longer, and a truncated
+     * one cannot be translated at all. Linux has the whole address and copies
+     * as much of it as the caller asked for, which is what happens below.
+     */
     socklen_ptr = alloca(sizeof *socklen_ptr);
-    *socklen_ptr = addrbuflen;
-    sock_ptr = alloca(addrbuflen);
+    *socklen_ptr = sizeof(struct sockaddr_storage);
+    sock_ptr = alloca(sizeof(struct sockaddr_storage));
   }
   if (netlink_is(sockfd)) {
     /* Darwin has no sockaddr for this; the answer is built whole. */
@@ -1770,11 +1842,14 @@ DEFINE_SYSCALL(getsockname, int, sockfd, gaddr_t, addr_ptr, gaddr_t, addrlen_ptr
     return ret;
   }
   if (addr_ptr != 0) {
-    char addr[sock_ptr->sa_len];
-    darwin_to_linux_sockaddr((struct l_sockaddr *) addr, sock_ptr);
-    if (copy_to_user(addr_ptr, addr, sizeof addr))
+    char addr[L_SOCKADDR_MAX];
+    socklen_t n = darwin_to_linux_sockaddr((struct l_sockaddr *) addr,
+                                           sizeof addr, sock_ptr);
+    l_socklen_t give = addrbuflen < (l_socklen_t) n ? addrbuflen : (l_socklen_t) n;
+    if (copy_to_user(addr_ptr, addr, give))
       return -LINUX_EFAULT;
-    if (copy_to_user(addrlen_ptr, socklen_ptr, sizeof *socklen_ptr))
+    l_socklen_t told = (l_socklen_t) n;   /* Linux reports the whole address */
+    if (copy_to_user(addrlen_ptr, &told, sizeof told))
       return -LINUX_EFAULT;
   }
   return ret;
@@ -1784,24 +1859,34 @@ DEFINE_SYSCALL(getpeername, int, sockfd, gaddr_t, addr_ptr, gaddr_t, addrlen_ptr
 {
   socklen_t *socklen_ptr = NULL;
   struct sockaddr *sock_ptr = NULL;
+  l_socklen_t addrbuflen = 0;    /* the guest's buffer, kept for the answer */
   if (addr_ptr != 0) {
-    l_socklen_t addrbuflen;
     if (copy_from_user(&addrbuflen, addrlen_ptr, sizeof addrbuflen))
       return -LINUX_EFAULT;
+    /*
+     * The host is given room for the whole address rather than the guest's
+     * buffer, because the guest's is not the measure of it: an address is
+     * translated on the way out and the result can be longer, and a truncated
+     * one cannot be translated at all. Linux has the whole address and copies
+     * as much of it as the caller asked for, which is what happens below.
+     */
     socklen_ptr = alloca(sizeof *socklen_ptr);
-    *socklen_ptr = addrbuflen;
-    sock_ptr = alloca(addrbuflen);
+    *socklen_ptr = sizeof(struct sockaddr_storage);
+    sock_ptr = alloca(sizeof(struct sockaddr_storage));
   }
   int ret = syswrap(getpeername(sockfd, sock_ptr, socklen_ptr));
   if (ret < 0) {
     return ret;
   }
   if (addr_ptr != 0) {
-    char addr[sock_ptr->sa_len];
-    darwin_to_linux_sockaddr((struct l_sockaddr *) addr, sock_ptr);
-    if (copy_to_user(addr_ptr, addr, sizeof addr))
+    char addr[L_SOCKADDR_MAX];
+    socklen_t n = darwin_to_linux_sockaddr((struct l_sockaddr *) addr,
+                                           sizeof addr, sock_ptr);
+    l_socklen_t give = addrbuflen < (l_socklen_t) n ? addrbuflen : (l_socklen_t) n;
+    if (copy_to_user(addr_ptr, addr, give))
       return -LINUX_EFAULT;
-    if (copy_to_user(addrlen_ptr, socklen_ptr, sizeof *socklen_ptr))
+    l_socklen_t told = (l_socklen_t) n;   /* Linux reports the whole address */
+    if (copy_to_user(addrlen_ptr, &told, sizeof told))
       return -LINUX_EFAULT;
   }
   return ret;

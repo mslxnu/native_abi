@@ -2944,15 +2944,9 @@ dev_leaf_of(int dirfd, const char *path)
   if (!abs_path_at(dirfd, path, host, sizeof host))
     return NULL;
 
-  static char buf[LINUX_PATH_MAX];
-  const char *g;
-  if (mount_guest_path_of(host, guest, sizeof guest)) {
-    g = guest;
-  } else if (host_to_guest_path(host, buf, sizeof buf)) {
-    g = buf;                     /* no mount in the way: the passthrough /dev */
-  } else {
+  if (!guest_path_of_host(host, guest, sizeof guest))
     return NULL;
-  }
+  const char *g = guest;
 
   if (strncmp(g, "/dev/", 5) != 0)
     return NULL;
@@ -3799,6 +3793,14 @@ DEFINE_SYSCALL(read, int, fd, gaddr_t, buf_ptr, size_t, size)
   }
 
   if (buf != NULL && kmsg_read(fd, buf, size, &r)) {
+    if (r > 0 && copy_to_user(buf_ptr, buf, (size_t) r))
+      r = -LINUX_EFAULT;
+    free(buf);
+    return r;
+  }
+  /* cgroup.procs is a real file, and what is in it is not the whole truth: a
+   * process that has died is still named there. */
+  if (buf != NULL && cgroup_read_procs(fd, buf, size, &r)) {
     if (r > 0 && copy_to_user(buf_ptr, buf, (size_t) r))
       r = -LINUX_EFAULT;
     free(buf);
@@ -5280,6 +5282,24 @@ host_to_guest_path(const char *host, char *out, size_t outsz)
     return true;
   }
   return false;               /* not a guest path at all */
+}
+
+/*
+ * The guest path a host path is reached by, or false.
+ *
+ * A mount first, because that is what mounting means - whatever the host path
+ * would otherwise be called, the mount is what the guest sees it through - and
+ * the rootfs and the passthroughs after. The reverse of guest_to_host_path,
+ * and needed wherever nabi has to hand a host name back to the guest under the
+ * name the guest knows it by: a device node in a /dev the guest mounted, or
+ * the address of a unix socket.
+ */
+bool
+guest_path_of_host(const char *host, char *out, size_t outsz)
+{
+  if (mount_guest_path_of(host, out, outsz))
+    return true;
+  return host_to_guest_path(host, out, outsz);
 }
 
 bool

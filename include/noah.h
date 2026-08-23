@@ -331,6 +331,7 @@ void pdeathsig_clear(void);
 
 /* The guest path a descriptor names, when it has one. */
 bool guest_path_of_fd(int fd, char *out, size_t outsz);
+bool guest_path_of_host(const char *host, char *out, size_t outsz);
 int vkern_open_exec(const char *path);
 int procfs_open(const char *path, int *out_fd);
 void procfs_close_fd(int fd);
