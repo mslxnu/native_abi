@@ -39,6 +39,7 @@
 #include <sys/file.h>
 #include <sys/stat.h>
 #include <limits.h>
+#include <poll.h>
 #include <unistd.h>
 
 #include "linux/errno.h"
@@ -59,12 +60,18 @@
 #define BC_DECREFS          0x40046307u
 #define BC_INCREFS_DONE     0x40106308u
 #define BC_ACQUIRE_DONE     0x40106309u
+#define BC_TRANSACTION_SG   0x40486311u
+#define BC_REPLY_SG         0x40486312u
 #define BC_REGISTER_LOOPER  0x0000630Bu
 #define BC_ENTER_LOOPER     0x0000630Cu
 #define BC_EXIT_LOOPER      0x0000630Du
 
 /* Commands the guest reads. */
 #define BR_TRANSACTION           0x80407202u
+#define BR_TRANSACTION_SEC_CTX   0x80487202u
+
+/* flat_binder_object.flags: this node wants the sec-ctx form. */
+#define FLAT_BINDER_FLAG_TXN_SECURITY_CTX 0x1000u
 #define BR_REPLY                 0x80407203u
 #define BR_TRANSACTION_COMPLETE  0x00007206u
 #define BR_NOOP                  0x0000720Cu
@@ -78,10 +85,30 @@
 #define FLAT_OBJ_SIZE   24
 #define FLAT_OBJ_COOKIE 16
 /* B_PACK_CHARS('f','d','*',B_TYPE_LARGE), as mSL-DevFS's binder.h spells it. */
-#define LINUX_BINDER_TYPE_FD_EMUL 0x66642a85u
+#define LINUX_BINDER_TYPE_FD_EMUL  0x66642a85u
+#define LINUX_BINDER_TYPE_FDA_EMUL 0x66646185u
+#define LINUX_BINDER_TYPE_PTR_EMUL 0x70742a85u
+
+/* A scatter-gather buffer object: a pointer into the sender's memory that the
+ * receiver must be given a copy of, and where in its parent to write the copy's
+ * address. Forty bytes. */
+struct bbuf_obj {
+  uint32_t type, flags;
+  uint64_t buffer, length, parent, parent_offset;
+};
+/* An array of descriptors living inside a buffer object. Thirty-two bytes. */
+struct bfda_obj {
+  uint32_t type, pad;
+  uint64_t num_fds, parent, parent_offset;
+};
+#define BUFFER_FLAG_HAS_PARENT 0x01u
+
+/* Everything binder puts in a buffer is eight-byte aligned. */
+static uint64_t balign(uint64_t v) { return (v + 7) & ~(uint64_t) 7; }
 
 #define BINDER_MAX_EP     32
 #define BINDER_MAX_ALLOCS 128
+#define BINDER_MAX_FIXUPS 4
 #define BINDER_PENDING    (64 * 1024)
 
 /*
@@ -117,11 +144,37 @@ struct bmsg {
   uint32_t code, flags;
   uint32_t sender_pid, sender_euid;
   uint64_t data_size, offsets_size;
+  /* Where the parts sit inside `data`, which is the buffer as the receiver
+   * will see it: the parcel, the offsets, then the scatter-gather copies. */
+  uint64_t offs_at, extra_at, total;
+  /*
+   * For each descriptor this message names, in the order they are walked: the
+   * endpoint it is an open of, or zero if it is an ordinary file.
+   *
+   * A descriptor that arrives from the broker is a real descriptor, but only
+   * the process that opened it knows it was a binder device - here it is the
+   * reading end of a fifo, and an ioctl on it would go to the host and come
+   * back ENOTTY. Saying so with the message is what lets the receiver adopt it
+   * as an endpoint rather than guess from the file it points at.
+   */
+  uint32_t fd_ep[16];
+  uint32_t fd_n;
   unsigned char data[BSHM_PAYLOAD];
 };
 
 struct bep_shared {
   uint32_t used;
+  /*
+   * How many descriptors, in any process, are open on this endpoint.
+   *
+   * A descriptor is not the endpoint. One is inherited across a fork and
+   * another arrives from the broker, and closing either must not take the
+   * endpoint away from whoever else still holds one. Without this, a child
+   * that inherited its parent's binder descriptors destroyed them on exit -
+   * the parent's own opens went on working locally while every other process
+   * stopped being able to find them.
+   */
+  uint32_t refs;
   int32_t  pid;
   uint32_t id;
   uint32_t is_mgr;
@@ -149,6 +202,7 @@ struct binder_ep {
   int      wr;                   /* our own end, for waking a local reader */
   uint32_t id;                   /* this endpoint's place in the shared table */
   bool     is_mgr;
+  bool     secctx;               /* wants transactions in the sec-ctx form */
   uint32_t max_threads;
 
   uint64_t arena_addr, arena_size, arena_brk;
@@ -157,6 +211,17 @@ struct binder_ep {
   /* Commands waiting to be read, as the bytes the guest will be given. */
   unsigned char pending[BINDER_PENDING];
   size_t   pending_len, pending_off;
+
+  /*
+   * Pointers inside the pending bytes that point at other pending bytes.
+   *
+   * The security-context string travels in the read buffer with a pointer to
+   * it beside it, so the pointer's value is the guest address the string will
+   * land at - which nothing knows until the guest asks for a read and names
+   * the buffer. Queueing records the two offsets and the read patches them.
+   */
+  struct { size_t at, to; } fixups[BINDER_MAX_FIXUPS];
+  unsigned fixup_n;
 };
 
 static struct binder_ep eps[BINDER_MAX_EP];
@@ -253,6 +318,9 @@ ep_of(int fd)
   return NULL;
 }
 
+static void ep_adopt(int fd, uint32_t id);
+static void ep_adopt_locked(int fd, uint32_t id);
+
 static struct binder_ep *
 ep_free(void)
 {
@@ -262,14 +330,112 @@ ep_free(void)
   return NULL;
 }
 
+/*
+ * Take a descriptor that arrived from another process and treat it as what it
+ * is: an open of an endpoint. It gets a slot of its own here so ioctls on it
+ * are answered, and shares the shared-table entry with the process that opened
+ * it, because it is the same endpoint - not a second one.
+ *
+ * Two of them: the plain one takes both locks, and the _locked one is for the
+ * paths that already hold them - a caller holding eps_lock cannot ask for it
+ * again, and the shared table is guarded by a file lock that does not nest.
+ */
+static void
+ep_adopt_locked(int fd, uint32_t id)
+{
+  if (ep_of(fd) != NULL)
+    return;
+  struct binder_ep *e = ep_free();
+  if (e == NULL)
+    return;
+  memset(e, 0, sizeof *e);
+  e->wr = -1;
+  e->id = id;
+  e->fd = fd;
+
+  /* Another descriptor on the endpoint, so it must outlive this one. */
+  for (int i = 0; i < BINDER_MAX_EP; i++)
+    if (shm->ep[i].used && shm->ep[i].id == id) {
+      shm->ep[i].refs++;
+      break;
+    }
+}
+
+static void
+ep_adopt(int fd, uint32_t id)
+{
+  if (!shm_attach())
+    return;
+  pthread_mutex_lock(&eps_lock);
+  shm_lock();
+  ep_adopt_locked(fd, id);
+  shm_unlock();
+  pthread_mutex_unlock(&eps_lock);
+}
+
+/*
+ * The endpoint a descriptor is an open of, or zero.
+ *
+ * Asked of the descriptor's *name*. Every endpoint's wake channel is a fifo
+ * called "...-wake-<id>", so the id is recoverable from the descriptor alone -
+ * no table, no registry walk, and it works however the descriptor arrived.
+ * That matters because they arrive by routes that leave no record: inherited
+ * across a fork, which on arm64 is an exec into an empty table, or handed over
+ * by the broker from another process entirely.
+ */
+static uint32_t
+ep_id_of_fd(int fd)
+{
+  struct stat st;
+  if (fd < 0 || fstat(fd, &st) != 0 || !S_ISFIFO(st.st_mode))
+    return 0;
+
+  char path[PATH_MAX];
+  if (fcntl(fd, F_GETPATH, path) != 0)
+    return 0;
+  /*
+   * Matched on the shape of the name rather than on a path prefix. The two
+   * spellings of one directory do not compare equal: macOS answers F_GETPATH
+   * with /private/var/... for what was created as /var/..., and TMPDIR
+   * conventionally ends in a separator, so the path built from it has a
+   * doubled one. Requiring "nabi-binder-" and "-wake-" in the last component
+   * says the same thing without depending on how the directory is spelled.
+   */
+  const char *leaf = strrchr(path, '/');
+  leaf = leaf ? leaf + 1 : path;
+  if (strncmp(leaf, "nabi-binder-", 12) != 0)
+    return 0;
+  const char *mark = strstr(leaf, "-wake-");
+  if (mark == NULL)
+    return 0;
+
+  unsigned long id = strtoul(mark + 6, NULL, 10);
+  return (uint32_t) id;
+}
+
+/*
+ * Is this descriptor an open of one of our endpoints?
+ *
+ * The local table first, and the name only when the table has never heard of
+ * it - which is the first time a descriptor arrives from elsewhere, and only
+ * that once, because the answer is written down.
+ */
 bool
 binder_emul_is(int fd)
 {
   pthread_mutex_lock(&eps_lock);
   bool yes = ep_of(fd) != NULL;
   pthread_mutex_unlock(&eps_lock);
-  return yes;
+  if (yes || fd < 0)
+    return yes;
+
+  uint32_t id = ep_id_of_fd(fd);
+  if (id == 0)
+    return false;
+  ep_adopt(fd, id);
+  return true;
 }
+
 
 /*
  * Which endpoint a handle names. Only handle 0 exists so far, and it is the
@@ -331,6 +497,17 @@ static void
 ep_queue_cmd(struct binder_ep *e, uint32_t cmd)
 {
   ep_queue(e, &cmd, sizeof cmd);
+}
+
+/* Note that the eight bytes at "at" are to hold the address of "to". */
+static void
+ep_queue_fixup(struct binder_ep *e, size_t at, size_t to)
+{
+  if (e->fixup_n < BINDER_MAX_FIXUPS) {
+    e->fixups[e->fixup_n].at = at;
+    e->fixups[e->fixup_n].to = to;
+    e->fixup_n++;
+  }
 }
 
 /*
@@ -398,6 +575,7 @@ binder_emul_open(int flags, int *out_fd)
   memset(&shm->ep[slot], 0, sizeof shm->ep[slot]);
   shm->ep[slot].id = shm->next_id++;
   shm->ep[slot].pid = (int32_t) getpid();
+  shm->ep[slot].refs = 1;
   shm->ep[slot].used = 1;
   uint32_t id = shm->ep[slot].id;
   shm_unlock();
@@ -456,18 +634,27 @@ binder_emul_close(int fd)
   if (id == 0)
     return;
 
+  bool last = false;
   if (shm_attach()) {
     shm_lock();
     for (int i = 0; i < BINDER_MAX_EP; i++)
       if (shm->ep[i].used && shm->ep[i].id == id) {
-        shm->ep[i].used = 0;     /* the manager goes with it, if it was one */
+        if (shm->ep[i].refs > 0)
+          shm->ep[i].refs--;
+        if (shm->ep[i].refs == 0) {
+          shm->ep[i].used = 0;   /* the manager goes with it, if it was one */
+          last = true;
+        }
         break;
       }
     shm_unlock();
   }
-  char path[PATH_MAX];
-  wake_path(id, path, sizeof path);
-  unlink(path);
+  /* Only the last descriptor takes the endpoint's wake channel with it. */
+  if (last) {
+    char path[PATH_MAX];
+    wake_path(id, path, sizeof path);
+    unlink(path);
+  }
 }
 
 /* The 64-byte transaction on the wire, at the offsets binder.h lays out. */
@@ -486,7 +673,8 @@ struct btr {
  * can change what the other is reading.
  */
 static int
-do_transaction(struct binder_ep *from, const struct btr *tr, bool reply)
+do_transaction(struct binder_ep *from, const struct btr *tr, bool reply,
+               uint64_t buffers_size)
 {
   int slot = reply ? -1 : shm_ep_for_handle((uint32_t) tr->target);
   if (reply) {
@@ -500,9 +688,18 @@ do_transaction(struct binder_ep *from, const struct btr *tr, bool reply)
   if (slot < 0)
     return -LINUX_ENOENT;
 
-  uint64_t total = tr->data_size + tr->offsets_size;
+  /*
+   * The receiver's buffer is the data, then the offsets, then whatever the
+   * scatter-gather objects point at - each part eight-byte aligned, which is
+   * how the receiver knows where to look without being told.
+   */
+  uint64_t data_at = 0;
+  uint64_t offs_at = balign(tr->data_size);
+  uint64_t extra_at = offs_at + balign(tr->offsets_size);
+  uint64_t total = extra_at + buffers_size;
   if (total > BSHM_PAYLOAD)
     return -LINUX_ENOMEM;        /* staged, so a record is the limit */
+  (void) data_at;
 
   /*
    * Staged into shared memory rather than written into the receiver's arena.
@@ -529,7 +726,12 @@ do_transaction(struct binder_ep *from, const struct btr *tr, bool reply)
   m->sender_euid = 0;
   m->data_size = tr->data_size;
   m->offsets_size = tr->offsets_size;
+  m->fd_n = 0;
+  m->extra_at = extra_at;
+  m->offs_at = offs_at;
+  m->total = total;
   int err = 0;
+  memset(m->data, 0, total);
   if (tr->data_size > 0) {
     void *src = guest_to_host(tr->buffer);
     if (src == NULL) err = -LINUX_EFAULT;
@@ -538,7 +740,45 @@ do_transaction(struct binder_ep *from, const struct btr *tr, bool reply)
   if (err == 0 && tr->offsets_size > 0) {
     void *src = guest_to_host(tr->offsets);
     if (src == NULL) err = -LINUX_EFAULT;
-    else memcpy(m->data + tr->data_size, src, tr->offsets_size);
+    else memcpy(m->data + offs_at, src, tr->offsets_size);
+  }
+  if (err != 0) {
+    shm_unlock();
+    return err;
+  }
+
+  /*
+   * Scatter-gather: an object that points somewhere else in the sender's
+   * memory has that memory copied in beside the parcel, and its pointer
+   * rewritten to say where. The rewrite here is an *offset* into the buffer
+   * rather than an address, because the address is not known yet - it depends
+   * on where the receiver's arena allocation lands, which only the receiving
+   * process can decide. collect_messages turns these into real pointers.
+   */
+  if (m->offsets_size >= 8) {
+    uint64_t *offs = (uint64_t *)(void *)(m->data + offs_at);
+    size_t n = (size_t)(m->offsets_size / 8);
+    uint64_t put = extra_at;
+    for (size_t i = 0; i < n && err == 0; i++) {
+      uint64_t at = offs[i];
+      if (at + sizeof(uint32_t) > m->data_size)
+        continue;
+      uint32_t type;
+      memcpy(&type, m->data + at, sizeof type);
+      if (type != LINUX_BINDER_TYPE_PTR_EMUL)
+        continue;
+      if (at + sizeof(struct bbuf_obj) > m->data_size)
+        continue;
+      struct bbuf_obj bo;
+      memcpy(&bo, m->data + at, sizeof bo);
+      if (put + bo.length > total) { err = -LINUX_ENOMEM; break; }
+      void *src = guest_to_host(bo.buffer);
+      if (src == NULL) { err = -LINUX_EFAULT; break; }
+      memcpy(m->data + put, src, bo.length);
+      bo.buffer = put;           /* an offset for now; see above */
+      memcpy(m->data + at, &bo, sizeof bo);
+      put += balign(bo.length);
+    }
   }
   if (err != 0) {
     shm_unlock();
@@ -570,6 +810,44 @@ do_transaction(struct binder_ep *from, const struct btr *tr, bool reply)
         continue;
       uint64_t cookie = (uint64_t) getpid();
       memcpy(data + at + FLAT_OBJ_COOKIE, &cookie, sizeof cookie);
+    }
+  }
+
+  /*
+   * Descriptor arrays. The numbers live inside a buffer object rather than in
+   * the parcel, so they are found through the parent the object names - an
+   * offset into the parcel, which is where mSL's driver puts it. Each one is
+   * registered with the broker so the receiver can ask for a descriptor of its
+   * own; the numbers themselves stay the sender's until then.
+   */
+  if (m->offsets_size >= 8) {
+    uint64_t *offs = (uint64_t *)(void *)(m->data + offs_at);
+    size_t n = (size_t)(m->offsets_size / 8);
+    for (size_t i = 0; i < n; i++) {
+      uint64_t at = offs[i];
+      if (at + sizeof(struct bfda_obj) > m->data_size)
+        continue;
+      uint32_t type;
+      memcpy(&type, m->data + at, sizeof type);
+      if (type != LINUX_BINDER_TYPE_FDA_EMUL)
+        continue;
+      struct bfda_obj fo;
+      memcpy(&fo, m->data + at, sizeof fo);
+      if (fo.parent + sizeof(struct bbuf_obj) > m->data_size)
+        continue;
+      struct bbuf_obj parent;
+      memcpy(&parent, m->data + fo.parent, sizeof parent);
+      uint64_t base = parent.buffer + fo.parent_offset;   /* an offset by now */
+      for (uint64_t k = 0; k < fo.num_fds; k++) {
+        if (base + (k + 1) * 8 > total)
+          break;
+        uint64_t num;
+        memcpy(&num, m->data + base + k * 8, sizeof num);
+        binder_broker_register((uint32_t) getpid(), (uint32_t) num);
+        struct binder_ep *fe = ep_of((int) num);
+        if (m->fd_n < 16)
+          m->fd_ep[m->fd_n++] = fe ? fe->id : 0;
+      }
     }
   }
 
@@ -608,7 +886,7 @@ collect_messages(struct binder_ep *e)
     struct bmsg *m = &shm->ep[slot].q[i];
     if (!m->used)
       continue;
-    uint64_t total = m->data_size + m->offsets_size;
+    uint64_t total = m->total ? m->total : (m->data_size + m->offsets_size);
     uint64_t at = arena_take(e, total ? total : 8);
     if (at == 0)
       break;                     /* no room yet; it stays queued */
@@ -627,10 +905,106 @@ collect_messages(struct binder_ep *e)
     out.data_size = m->data_size;
     out.offsets_size = m->offsets_size;
     out.buffer = at;
-    out.offsets = m->offsets_size ? at + m->data_size : 0;
+    out.offsets = m->offsets_size ? at + m->offs_at : 0;
 
-    ep_queue_cmd(e, m->is_reply ? BR_REPLY : BR_TRANSACTION);
-    ep_queue(e, &out, sizeof out);
+    /*
+     * The pointers can be made real now, because the arena address is finally
+     * known. A buffer object's offset becomes an address in this process's
+     * arena, and if it said where its parent should point, that is written too.
+     */
+    uint32_t fdi = 0;
+    if (m->offsets_size >= 8) {
+      unsigned char *base = (unsigned char *) dst;
+      uint64_t *offs = (uint64_t *)(void *)(base + m->offs_at);
+      size_t n = (size_t)(m->offsets_size / 8);
+      for (size_t i = 0; i < n; i++) {
+        uint64_t o = offs[i];
+        if (o + sizeof(uint32_t) > m->data_size)
+          continue;
+        uint32_t type;
+        memcpy(&type, base + o, sizeof type);
+
+        if (type == LINUX_BINDER_TYPE_PTR_EMUL &&
+            o + sizeof(struct bbuf_obj) <= m->data_size) {
+          struct bbuf_obj bo;
+          memcpy(&bo, base + o, sizeof bo);
+          uint64_t addr = at + bo.buffer;
+          bo.buffer = addr;
+          memcpy(base + o, &bo, sizeof bo);
+          if ((bo.flags & BUFFER_FLAG_HAS_PARENT) &&
+              bo.parent + sizeof(struct bbuf_obj) <= m->data_size) {
+            struct bbuf_obj par;
+            memcpy(&par, base + bo.parent, sizeof par);
+            uint64_t slot = (par.buffer - at) + bo.parent_offset;
+            if (slot + 8 <= m->total)
+              memcpy(base + slot, &addr, sizeof addr);
+          }
+          continue;
+        }
+
+        /*
+         * A descriptor array: each number is the sender's, and means nothing
+         * here. The broker gives this process a descriptor of its own for each
+         * one, and the number it gets is written back into the array - which is
+         * the substitution Linux's driver does when it installs the file.
+         */
+        if (type == LINUX_BINDER_TYPE_FDA_EMUL &&
+            o + sizeof(struct bfda_obj) <= m->data_size) {
+          struct bfda_obj fo;
+          memcpy(&fo, base + o, sizeof fo);
+          if (fo.parent + sizeof(struct bbuf_obj) > m->data_size)
+            continue;
+          struct bbuf_obj par;
+          memcpy(&par, base + fo.parent, sizeof par);
+          uint64_t slot = (par.buffer - at) + fo.parent_offset;
+          for (uint64_t k = 0; k < fo.num_fds; k++) {
+            if (slot + (k + 1) * 8 > m->total)
+              break;
+            uint64_t num;
+            memcpy(&num, base + slot + k * 8, sizeof num);
+            int got = binder_broker_request(m->sender_pid, (uint32_t) num);
+            /*
+             * The guest has to be able to use it, which means it has to be in
+             * the descriptor table - a host descriptor the guest was never
+             * given is EBADF the moment it tries, before anything gets far
+             * enough to notice it names a binder endpoint.
+             */
+            if (got >= 0 && register_fd(got, false) != 0) {
+              close(got);
+              got = -1;
+            }
+            uint64_t mine = (got >= 0) ? (uint64_t) got : (uint64_t) -1;
+            if (got >= 0 && fdi < m->fd_n && m->fd_ep[fdi] != 0)
+              ep_adopt_locked(got, m->fd_ep[fdi]);
+            fdi++;
+            memcpy(base + slot + k * 8, &mine, sizeof mine);
+          }
+        }
+      }
+    }
+
+    /*
+     * A node registered with TXN_SECURITY_CTX is told who the sender is, in
+     * the longer form that carries the label: the same transaction followed by
+     * a pointer to a context string, with the string itself in the read buffer
+     * after it. There is no SELinux here to ask, so every sender gets the same
+     * placeholder - enough for a caller that only looks at the label to run,
+     * and honest that it is not a decision anyone made.
+     */
+    if (e->secctx && !m->is_reply) {
+      static const char label[] = "u:r:untrusted_app:s0";
+      uint64_t placeholder = 0;
+      ep_queue_cmd(e, BR_TRANSACTION_SEC_CTX);
+      ep_queue(e, &out, sizeof out);
+      size_t at = e->pending_len;
+      ep_queue(e, &placeholder, sizeof placeholder);
+      size_t to = e->pending_len;
+      ep_queue(e, label, sizeof label);
+      ep_queue_fixup(e, at, to);
+    } else {
+      ep_queue_cmd(e, m->is_reply ? BR_REPLY : BR_TRANSACTION);
+      ep_queue(e, &out, sizeof out);
+    }
     m->used = 0;
   }
   shm_unlock();
@@ -689,7 +1063,27 @@ consume_writes(struct binder_ep *e, uint64_t buf, uint64_t size,
         return -LINUX_EFAULT;
       memcpy(&tr, q, sizeof tr);
       off += sizeof tr;
-      int r = do_transaction(e, &tr, cmd == BC_REPLY);
+      int r = do_transaction(e, &tr, cmd == BC_REPLY, 0);
+      if (r < 0)
+        return r;
+      break;
+    }
+
+    /*
+     * The scatter-gather form: the same transaction followed by how much room
+     * the objects inside it will need. Nothing else differs, which is the
+     * point of it - the sender says up front what the buffer must hold so the
+     * receiver's allocation is made once.
+     */
+    case BC_TRANSACTION_SG:
+    case BC_REPLY_SG: {
+      struct { struct btr tr; uint64_t buffers_size; } sg;
+      void *q = guest_to_host(buf + off);
+      if (q == NULL)
+        return -LINUX_EFAULT;
+      memcpy(&sg, q, sizeof sg);
+      off += sizeof sg;
+      int r = do_transaction(e, &sg.tr, cmd == BC_REPLY_SG, sg.buffers_size);
       if (r < 0)
         return r;
       break;
@@ -710,6 +1104,35 @@ serve_reads(struct binder_ep *e, uint64_t buf, uint64_t size,
   if (size == 0)
     return 0;
   collect_messages(e);           /* anything another process left for us */
+
+  /*
+   * A read with nothing to read waits, which is what a binder read does: a
+   * looper's whole life is one blocking read, and a caller that has just sent
+   * a transaction sits in one until the reply comes back. Returning empty
+   * straight away turns every such wait into a spin, and a caller that spins a
+   * fixed number of times gives up before a peer that is still starting - on
+   * arm64 a fork is an exec, so a freshly forked sender takes long enough to
+   * lose that race every time.
+   *
+   * The wait is on the endpoint's wake fifo, and eps_lock is dropped for it:
+   * held, it would stop every other thread in this process from touching
+   * binder for as long as this one has nothing to do. Bounded, so a wakeup
+   * that goes missing costs a return trip rather than the process.
+   */
+  bool block = (fcntl(e->fd, F_GETFL) & O_NONBLOCK) == 0;
+  for (int waited = 0;
+       block && e->pending_len == e->pending_off && waited < 5000;
+       waited += 200) {
+    struct pollfd pfd = { .fd = e->fd, .events = POLLIN };
+    int wfd = e->fd;
+    pthread_mutex_unlock(&eps_lock);
+    poll(&pfd, 1, 200);
+    pthread_mutex_lock(&eps_lock);
+    if (ep_of(wfd) != e)         /* closed under us while we waited */
+      return 0;
+    collect_messages(e);
+  }
+
   size_t have = e->pending_len - e->pending_off;
   if (have == 0)
     return 0;
@@ -718,9 +1141,26 @@ serve_reads(struct binder_ep *e, uint64_t buf, uint64_t size,
   if (dst == NULL)
     return -LINUX_EFAULT;
   memcpy(dst, e->pending + e->pending_off, n);
+
+  /* Now the buffer has an address, so the pointers into it can be filled in. */
+  for (unsigned i = 0; i < e->fixup_n; ) {
+    size_t at = e->fixups[i].at, to = e->fixups[i].to;
+    bool in = at >= e->pending_off && at + 8 <= e->pending_off + n &&
+              to >= e->pending_off && to < e->pending_off + n;
+    if (in) {
+      uint64_t addr = buf + (to - e->pending_off);
+      memcpy((unsigned char *) dst + (at - e->pending_off), &addr, sizeof addr);
+      e->fixups[i] = e->fixups[--e->fixup_n];
+    } else {
+      i++;
+    }
+  }
+
   e->pending_off += n;
-  if (e->pending_off == e->pending_len)
+  if (e->pending_off == e->pending_len) {
     e->pending_off = e->pending_len = 0;
+    e->fixup_n = 0;
+  }
   *consumed = n;
 
   /* Drain the wake bytes along with the work they stood for. */
@@ -762,6 +1202,21 @@ binder_emul_ioctl(int fd, int cmd, uint64_t arg)
 
   case LINUX_BINDER_SET_CONTEXT_MGR:
   case LINUX_BINDER_SET_CONTEXT_MGR_EXT:
+    /*
+     * The _EXT form names the node being registered, and its flags say which
+     * form of transaction that node wants. Asked for rather than assumed: a
+     * manager registered without the flag is given the plain 64-byte
+     * BR_TRANSACTION and would mis-read the longer one as its own fields.
+     */
+    e->secctx = false;
+    if (cmd == LINUX_BINDER_SET_CONTEXT_MGR_EXT) {
+      uint32_t fbo_flags;                     /* flat_binder_object.flags */
+      unsigned char *p = guest_to_host(arg);
+      if (p == NULL) { r = -LINUX_EFAULT; break; }
+      memcpy(&fbo_flags, p + 4, sizeof fbo_flags);
+      e->secctx = (fbo_flags & FLAT_BINDER_FLAG_TXN_SECURITY_CTX) != 0;
+    }
+
     /* One at a time across the whole instance, not just this process - that is
      * what makes handle 0 mean one thing to everybody. */
     if (!shm_attach()) { r = -LINUX_ENOMEM; break; }

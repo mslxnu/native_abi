@@ -1174,17 +1174,19 @@ fi
 # binderprobe, against nabi's own binder rather than the kext's. The same
 # conformance probe is the oracle for both, which is the point of having the
 # emulation selectable: NABI_BINDER=emulated forces it even where /dev/binder
-# exists. Asserted by how far it gets, not by passing outright - delivery
-# between processes is not implemented yet, so twoproc is where it stops. The
-# stage banner prints before the stage runs, so reaching [fda] means version,
-# arena, manager, oneway, epoll, twoproc and fd all passed. Scatter-gather
-# transactions are not implemented, so fda is where it stops.
+# exists, so the emulation is held to what the driver does rather than to a
+# description of it. Held to the whole probe now, not to how far it gets:
+# version, arena, manager, oneway, epoll, cross-process delivery, descriptor
+# transfer, scatter-gather with a file-descriptor array, and the
+# security-context form of a transaction.
 cp "$here/binderprobe" "$root/"; chmod +x "$root/binderprobe"
 out=$(NABI_BINDER=emulated "$NABI" -m "$root" /binderprobe 2>&1)
-if printf '%s\n' "$out" | grep -q '\[fda\]'; then
-    echo "  ok  binderprobe (emulated) -> through twoproc and fd"
+rc=$?
+last=$(printf '%s\n' "$out" | tail -1)
+if [ "$rc" -eq 0 ] && [ "$last" = "binderprobe ok" ]; then
+    echo "  ok  binderprobe (emulated) -> \"$last\", exit 0"
 else
-    echo "  FAIL binderprobe (emulated) -> did not reach fda"
+    echo "  FAIL binderprobe (emulated) -> \"$last\", exit $rc"
     printf '%s\n' "$out" | tail -3 | sed 's/^/       /'
     fail=1
 fi
