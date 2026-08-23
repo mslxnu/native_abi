@@ -789,6 +789,42 @@ peercred_out(int fd, gaddr_t optval_ptr, gaddr_t optlen_ptr, l_socklen_t want)
   return 0;
 }
 
+/*
+ * SO_DOMAIN and SO_PROTOCOL: what a socket was made with.
+ *
+ * Darwin has neither, and neither needs it to - the answers are properties of
+ * the socket that can be recovered. The domain is the family its own address
+ * is in, which is what getsockname reports; the protocol is 0 for every family
+ * nabi passes through, since none of them has more than one.
+ *
+ * Android's property service asks the domain of every connection it accepts,
+ * and closed the connection when the question came back ENOPROTOOPT. The
+ * client sees that as end-of-file where it expected a four-byte answer, so
+ * every property set failed - which is how ueventd's "cold boot done" never
+ * reached init, and init waited at wait_for_coldboot_done for ever.
+ */
+static int
+sockinfo_out(int fd, int optname, gaddr_t optval_ptr, gaddr_t optlen_ptr,
+             l_socklen_t want)
+{
+  int value = 0;
+  if (optname == LINUX_SO_DOMAIN) {
+    struct sockaddr_storage ss;
+    socklen_t n = sizeof ss;
+    if (getsockname(fd, (struct sockaddr *) &ss, &n) < 0)
+      return -darwin_to_linux_errno(errno);
+    value = darwin_to_linux_sa_family(ss.ss_family);
+  }
+
+  l_socklen_t give = want < (l_socklen_t) sizeof value
+                         ? want : (l_socklen_t) sizeof value;
+  if (copy_to_user(optval_ptr, &value, give))
+    return -LINUX_EFAULT;
+  if (copy_to_user(optlen_ptr, &give, sizeof give))
+    return -LINUX_EFAULT;
+  return 0;
+}
+
 DEFINE_SYSCALL(getsockopt, int, fd, int, level, int, optname, gaddr_t, optval_ptr, gaddr_t, optlen_ptr)
 {
   l_socklen_t l_optlen;
@@ -797,6 +833,9 @@ DEFINE_SYSCALL(getsockopt, int, fd, int, level, int, optname, gaddr_t, optval_pt
 
   if (level == LINUX_SOL_SOCKET && optname == LINUX_SO_PEERCRED)
     return peercred_out(fd, optval_ptr, optlen_ptr, l_optlen);
+  if (level == LINUX_SOL_SOCKET &&
+      (optname == LINUX_SO_DOMAIN || optname == LINUX_SO_PROTOCOL))
+    return sockinfo_out(fd, optname, optval_ptr, optlen_ptr, l_optlen);
 
   char *optval = malloc(l_optlen);
   unsigned int optlen = l_optlen;

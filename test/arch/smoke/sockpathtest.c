@@ -21,6 +21,13 @@
  *   - the same through accept, where the address comes from the other side,
  *   - and a buffer too small truncates but is still told the whole length,
  *     which is what Linux does and what a caller sizing a second buffer needs.
+ *   - SO_DOMAIN answers what the socket was made with. Darwin has no such
+ *     option, so nabi has to work it out rather than pass it on; asking the
+ *     host returned ENOPROTOOPT. Android's property service asks it of every
+ *     connection it accepts and closes the connection when the question fails,
+ *     which the client sees as end-of-file where it expected a four-byte
+ *     answer - so every property set failed, ueventd's "cold boot done" never
+ *     reached init, and init waited at wait_for_coldboot_done for ever.
  */
 static long sys6(long n,long a,long b,long c,long d,long e,long f){
   register long x8 asm("x8")=n; register long x0 asm("x0")=a; register long x1 asm("x1")=b;
@@ -36,11 +43,17 @@ static long sys6(long n,long a,long b,long c,long d,long e,long f){
 #define SYS_accept4 242
 #define SYS_connect 203
 #define SYS_getsockname 204
+#define SYS_getsockopt 209
 #define SYS_clone 220
 #define SYS_wait4 260
 #define SYS_exit_group 94
 #define AT_FDCWD (-100)
 #define AF_UNIX 1
+#define AF_INET 2
+#define SOL_SOCKET 1
+#define SO_DOMAIN 39
+#define SO_PROTOCOL 38
+#define SOCK_DGRAM 2
 #define SOCK_STREAM 1
 #define SIGCHLD 17
 
@@ -137,6 +150,33 @@ void _start(void)
     long status = 0;
     sys6(SYS_wait4, kid, (long)&status, 0, 0, 0, 0);
     want("the client connected", (status >> 8) & 0xff, 0);
+  }
+
+  /* What the socket was made with, which Darwin cannot be asked. */
+  {
+    unsigned int vlen = sizeof(int);
+    int dom = -1;
+    want("getsockopt(SO_DOMAIN)",
+         sys6(SYS_getsockopt, sfd, SOL_SOCKET, SO_DOMAIN, (long)&dom,
+              (long)&vlen, 0), 0);
+    want("which is the family it was made with", dom, AF_UNIX);
+    want("and the length is an int", vlen, (long) sizeof(int));
+
+    int inet = (int) sys6(SYS_socket, AF_INET, SOCK_DGRAM, 0, 0,0,0);
+    if (inet >= 0) {
+      dom = -1; vlen = sizeof(int);
+      want("getsockopt(SO_DOMAIN) on an inet socket",
+           sys6(SYS_getsockopt, inet, SOL_SOCKET, SO_DOMAIN, (long)&dom,
+                (long)&vlen, 0), 0);
+      want("says AF_INET", dom, AF_INET);
+      sys6(SYS_close, inet, 0,0,0,0,0);
+    }
+
+    int proto = -1; vlen = sizeof(int);
+    want("getsockopt(SO_PROTOCOL)",
+         sys6(SYS_getsockopt, sfd, SOL_SOCKET, SO_PROTOCOL, (long)&proto,
+              (long)&vlen, 0), 0);
+    want("which is 0 for a unix socket", proto, 0);
   }
 
   sys6(SYS_close, sfd, 0,0,0,0,0);
