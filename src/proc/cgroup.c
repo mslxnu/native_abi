@@ -395,7 +395,15 @@ cgroup_read_procs(int fd, char *out, size_t size, int *ret)
     if (*line != '\0') {
       int32_t nspid = (int32_t) atoi(line);
       int32_t host = pidns_to_host(nspid);
-      bool alive = host >= 0 && !(kill((pid_t) host, 0) < 0 && errno == ESRCH);
+      /*
+       * getpgid rather than kill(pid, 0), because a zombie answers the two
+       * differently and the zombie is the case this is for. Linux takes a task
+       * out of its cgroup in do_exit, before anyone reaps it, so a process
+       * waiting to be reaped is already gone from here - and kill(pid, 0)
+       * succeeds for one, which left libprocessgroup signalling something that
+       * could never answer.
+       */
+      bool alive = host >= 0 && getpgid((pid_t) host) >= 0;
       size_t llen = strlen(line);
       if (alive && len + llen + 2 < sizeof live) {
         memcpy(live + len, line, llen);
