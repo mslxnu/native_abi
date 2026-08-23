@@ -1271,6 +1271,19 @@ elif [ "${ok_plain:-0}" = 1 ]; then
     fail=1
 fi
 
+# bindersibtest: two sibling processes must find the same binder registry when
+# their parent never opened the device. A fork hides this - the parent has
+# already named the registry - which is why binderprobe's twoproc stage never
+# caught it, and why every Android service ended up in a registry of its own.
+cp "$here/bindersibtest" "$root/"; chmod +x "$root/bindersibtest"
+out=$(NABI_BINDER=emulated "$NABI" -m "$root" /bindersibtest 2>&1 | tail -1); rc=$?
+if [ "$out" = "bindersib ok" ]; then
+    echo "  ok  bindersibtest -> \"$out\""
+else
+    echo "  FAIL bindersibtest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 # bindermmaptest: mmap of the binder device, which is how a real client asks for
 # its arena - and what every process in Android does. Emulated only: the kext's
 # driver answers mmap with ENODEV, so the shared probe cannot ask for it.

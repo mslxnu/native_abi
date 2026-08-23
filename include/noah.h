@@ -234,6 +234,7 @@ noreturn void task_stop_self(void);
  * of that kind goes in there, not beside a call to it. */
 /* Binder, served by nabi rather than by a kernel extension. */
 void binder_emul_init(void);
+void binder_emul_publish(void);
 bool binder_emulated(void);
 int  binder_emul_open(const char *ctx, int flags, int *out_fd);
 void binder_emul_close(int fd);

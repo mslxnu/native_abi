@@ -264,6 +264,29 @@ shm_path(char *out, size_t n)
   setenv(BINDER_SHM_ENV, out, 1);
 }
 
+/*
+ * Name the registry once, for the whole instance, before any guest runs.
+ *
+ * Every process that speaks binder has to find the same one, and the name was
+ * being decided by whichever process happened to want it first - each of them
+ * settling on its own pid and publishing that to children it would never have.
+ * Android's init does not open binder itself, so servicemanager, vold and each
+ * of the other services made a registry apiece, every one of them the only
+ * endpoint in it: transactions to handle 0 came back ENOENT with a live
+ * servicemanager sitting in the next process along.
+ *
+ * Published here rather than keyed on the boot tag, which would be simpler and
+ * wrong in the other direction: the tag is per machine boot, so two guests
+ * running at once - or a test suite running beside one - would share a registry
+ * and each other's endpoints.
+ */
+void
+binder_emul_publish(void)
+{
+  char path[PATH_MAX];
+  shm_path(path, sizeof path);   /* computes and publishes, or keeps what is set */
+}
+
 /* The wake channel for one endpoint: a fifo, because any process may open it
  * by name and a byte written to it wakes a poll on the read end. A socketpair
  * cannot do that - only the process holding the other end can poke it. */

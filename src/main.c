@@ -768,6 +768,11 @@ main(int argc, char *argv[], char **envp)
    */
   binder_broker_init();
 
+  /* And the emulated driver's registry, for the same reason and at the same
+   * moment: every process that speaks binder has to find the one the instance
+   * root named, and a guest's init may never open the device itself. */
+  binder_emul_publish();
+
   /* Taken now, while the root descriptor still points at the image named on
    * the command line: it is carried in the environment from here, and a guest
    * that pivot_roots later must not be moved to a different mount table for
