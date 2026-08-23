@@ -348,6 +348,84 @@ procs_file_update(const char *cgroup_path, int32_t nspid, bool add)
  * F_GETPATH answers reliably and a dup carries it for free - which is the part
  * that had to be fixed twice when the note was keyed by descriptor number.
  */
+/*
+ * Reading cgroup.procs, with the dead left out.
+ *
+ * Linux takes a process out of its cgroup when it exits; nothing here does,
+ * because membership is a line in a file and a process that dies writes
+ * nothing. So the file went on naming processes that were gone, and a caller
+ * that believes it is the one thing that cannot make progress: libprocessgroup
+ * kills a cgroup by reading this file and signalling what it finds, and a pid
+ * that answers ESRCH for ever is a loop it never leaves - "getpgid(30) failed:
+ * No such process" over and over, then "Failed to kill process cgroup, 1
+ * processes remain".
+ *
+ * Filtered on the way out rather than cleaned up on the way in, because a
+ * process does not always get to say it is leaving: one killed outright runs
+ * no exit path at all, and its line would stay for as long as the cgroup did.
+ * The file is small and read rarely.
+ */
+bool
+cgroup_read_procs(int fd, char *out, size_t size, int *ret)
+{
+  char path[PATH_MAX];
+  if (fcntl(fd, F_GETPATH, path) < 0)
+    return false;
+  if (!cgroup_is_hierarchy_path(path))
+    return false;
+  const char *base = strrchr(path, '/');
+  if (base == NULL || strcmp(base, "/cgroup.procs") != 0)
+    return false;
+
+  char body[4096] = "";
+  int rfd = open(path, O_RDONLY);
+  if (rfd >= 0) {
+    ssize_t n = read(rfd, body, sizeof body - 1);
+    close(rfd);
+    if (n > 0)
+      body[n] = '\0';
+  }
+
+  char live[4096];
+  size_t len = 0;
+  for (char *line = body; *line; ) {
+    char *nl = strchr(line, '\n');
+    if (nl != NULL)
+      *nl = '\0';
+    if (*line != '\0') {
+      int32_t nspid = (int32_t) atoi(line);
+      int32_t host = pidns_to_host(nspid);
+      bool alive = host >= 0 && !(kill((pid_t) host, 0) < 0 && errno == ESRCH);
+      size_t llen = strlen(line);
+      if (alive && len + llen + 2 < sizeof live) {
+        memcpy(live + len, line, llen);
+        len += llen;
+        live[len++] = '\n';
+      }
+    }
+    if (nl == NULL)
+      break;
+    line = nl + 1;
+  }
+
+  /* Served from the descriptor's own offset, so a second read ends the file
+   * rather than repeating it. */
+  off_t off = lseek(fd, 0, SEEK_CUR);
+  if (off < 0)
+    off = 0;
+  if ((size_t) off >= len) {
+    *ret = 0;
+    return true;
+  }
+  size_t give = len - (size_t) off;
+  if (give > size)
+    give = size;
+  memcpy(out, live + off, give);
+  lseek(fd, off + (off_t) give, SEEK_SET);
+  *ret = (int) give;
+  return true;
+}
+
 bool
 cgroup_write_procs(int fd, const char *buf, size_t size, int *out)
 {

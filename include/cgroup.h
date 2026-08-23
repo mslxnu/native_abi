@@ -35,6 +35,8 @@ void        cgroup_ns_create(uint64_t ino, const char *root);
 /* Writing to cgroup.procs. */
 int  cgroup_move(const char *cgroup_path, int32_t nspid);
 bool cgroup_write_procs(int fd, const char *buf, size_t size, int *out);
+/* Reading it, with processes that have died left out. */
+bool cgroup_read_procs(int fd, char *out, size_t size, int *ret);
 
 /* Writing to cgroup.subtree_control: refused, no controllers can be enabled. */
 bool cgroup_write_control(int fd, const char *buf, size_t size, int *out);

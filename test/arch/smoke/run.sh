@@ -1191,6 +1191,18 @@ else
     fail=1
 fi
 
+# sockpathtest: a unix socket reports the name the guest bound, not the host
+# path bind translated it into. bionic's android_get_control_socket compares the
+# two, so every Android service that takes a socket from init depends on it.
+cp "$here/sockpathtest" "$root/"; chmod +x "$root/sockpathtest"
+out=$("$NABI" -m "$root" /sockpathtest 2>&1 | tail -1); rc=$?
+if [ "$out" = "sockpath ok" ]; then
+    echo "  ok  sockpathtest -> \"$out\""
+else
+    echo "  FAIL sockpathtest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 # execfmttest: execve of a file nothing here can run must be an error the caller
 # survives, not a segmentation fault. The format is checked before the address
 # space is torn down, which is where Linux puts the point of no return.

@@ -186,6 +186,16 @@ void _start(void)
   sys6(SYS_wait4, kid, (long) &status, 0, 0, 0, 0);
   want("the moved process reports its new cgroup", (status >> 8) & 0xff, 0);
 
+  /*
+   * And now that it has exited, it is not in the cgroup any more. Linux takes
+   * a process out when it dies; nothing here does, because membership is a
+   * line in a file and a dead process writes nothing. A caller that believes
+   * the file cannot make progress: libprocessgroup empties a cgroup by
+   * signalling what it reads there, and a pid that answers ESRCH for ever is a
+   * loop it never leaves.
+   */
+  want("a process that has exited is no longer listed", lists(two_procs, kid), 0);
+
   put(fails == 0 ? "cgmove ok\n" : "cgmove failed\n");
   sys6(SYS_exit_group, fails ? 1 : 0, 0,0,0,0,0);
 }
