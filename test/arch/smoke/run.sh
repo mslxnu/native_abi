@@ -1171,6 +1171,21 @@ else
     fail=1
 fi
 
+# kmsgtest: /dev/kmsg, served by nabi because there is no kernel here to keep a
+# log. It was mapped onto /dev/null, so a guest's own account of its boot was
+# destroyed as it was written - Android's init says everything it has to say
+# there and nowhere else. Checks the record format Linux gives readers, one
+# read per record, EAGAIN at the end rather than EOF, EINVAL for a record that
+# will not fit, and that what one process writes another can read.
+cp "$here/kmsgtest" "$root/"; chmod +x "$root/kmsgtest"
+out=$("$NABI" -m "$root" /kmsgtest 2>&1 | tail -1); rc=$?
+if [ "$out" = "kmsg ok" ]; then
+    echo "  ok  kmsgtest -> \"$out\""
+else
+    echo "  FAIL kmsgtest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 # devnodetest: the devices nabi answers for once the guest owns /dev. A node
 # made with mknod is a placeholder, and Linux names devices two ways: by number
 # for the ones whose major/minor it fixes, and by name for the ones it assigns

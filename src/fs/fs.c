@@ -201,6 +201,7 @@ reinit_process_tables(void)
   init_host_passthrough();
   signalfds_init();
   userfaultfd_init();
+  kmsg_init();
 }
 
 void
@@ -933,6 +934,7 @@ darwinfs_close(struct file *file)
   loop_close(file->fd);
   abstract_close(file->fd);
   seqpacket_close(file->fd);
+  kmsg_close(file->fd);
   procfs_close_fd(file->fd);
   if (file->dirp != NULL) {
     closedir(file->dirp);       /* takes the dup with it */
@@ -2733,31 +2735,34 @@ struct guest_device {
   const char *name;              /* matched in the guest's /dev; NULL for none */
   unsigned    maj, min;          /* Linux's numbers; 0/0 when it has none fixed */
   const char *host;              /* the host device that means the same thing */
+  /* Set when nabi serves the device itself rather than borrowing the host's.
+   * The two are exclusive: a device is either something the host already has
+   * or something there is no host equivalent of. */
+  int       (*open)(int flags, int *out_fd);
 };
 
 static const struct guest_device guest_devices[] = {
-  { "null",      1,  3, "/dev/null"    },
-  { "zero",      1,  5, "/dev/zero"    },
-  { "random",    1,  8, "/dev/random"  },
-  { "urandom",   1,  9, "/dev/urandom" },
+  { "null",      1,  3, "/dev/null",    NULL },
+  { "zero",      1,  5, "/dev/zero",    NULL },
+  { "random",    1,  8, "/dev/random",  NULL },
+  { "urandom",   1,  9, "/dev/urandom", NULL },
   /*
-   * kmsg is the kernel's log, and there is no kernel here to have one. What a
-   * writer wants is for the write to be accepted and to go nowhere, which is
-   * /dev/null exactly. Reading it back would be a lie - nothing that writes to
-   * kmsg expects to read its own lines - but nothing can read it either, which
-   * is why init's diagnostics are invisible unless a trace is running.
+   * kmsg is the kernel's log, and there is no kernel here to have one - so
+   * nabi keeps it. It was /dev/null until it was served properly, which threw
+   * away the guest's own account of its boot at the moment it was written:
+   * Android's init says everything it has to say here and nowhere else.
    */
-  { "kmsg",      1, 11, "/dev/null"    },
-  { "tty",       5,  0, "/dev/tty"     },
+  { "kmsg",      1, 11, NULL, kmsg_open },
+  { "tty",       5,  0, "/dev/tty",     NULL },
   /*
    * The binder devices, whose numbers are assigned rather than fixed. These are
    * the host's only while mSL/DevFS is loaded; without it the open fails and
    * the guest is told ENXIO, which is the truthful answer for a node with no
    * driver behind it.
    */
-  { "binder",    0,  0, "/dev/binder"    },
-  { "hwbinder",  0,  0, "/dev/hwbinder"  },
-  { "vndbinder", 0,  0, "/dev/vndbinder" },
+  { "binder",    0,  0, "/dev/binder",    NULL },
+  { "hwbinder",  0,  0, "/dev/hwbinder",  NULL },
+  { "vndbinder", 0,  0, "/dev/vndbinder", NULL },
 };
 
 #define NR_GUEST_DEVICES (sizeof guest_devices / sizeof guest_devices[0])
@@ -2799,8 +2804,8 @@ dev_leaf_of(int dirfd, const char *path)
  * Numbers first, since they are exact wherever Linux fixes them; the name is
  * consulted only for an entry that has no numbers of its own.
  */
-static const char *
-host_device_for(uint32_t mode, uint32_t dev, int dirfd, const char *path)
+static const struct guest_device *
+guest_device_for(uint32_t mode, uint32_t dev, int dirfd, const char *path)
 {
   if ((mode & S_IFMT) != S_IFCHR)
     return NULL;
@@ -2809,7 +2814,7 @@ host_device_for(uint32_t mode, uint32_t dev, int dirfd, const char *path)
   for (size_t i = 0; i < NR_GUEST_DEVICES; i++)
     if (guest_devices[i].maj != 0 && guest_devices[i].maj == maj &&
         guest_devices[i].min == min)
-      return guest_devices[i].host;
+      return &guest_devices[i];
 
   const char *leaf = dev_leaf_of(dirfd, path);
   if (leaf == NULL)
@@ -2817,7 +2822,7 @@ host_device_for(uint32_t mode, uint32_t dev, int dirfd, const char *path)
   for (size_t i = 0; i < NR_GUEST_DEVICES; i++)
     if (guest_devices[i].maj == 0 && guest_devices[i].name != NULL &&
         strcmp(guest_devices[i].name, leaf) == 0)
-      return guest_devices[i].host;
+      return &guest_devices[i];
   return NULL;
 }
 
@@ -3546,6 +3551,10 @@ DEFINE_SYSCALL(write, int, fd, gaddr_t, buf_ptr, size_t, size)
    * success while the namespace went unchanged. It is diverted before the
    * descriptor is looked up at all.
    */
+  if (kmsg_write(fd, buf, size, &r)) {
+    free(buf);
+    return r;
+  }
   if (procfs_write_timens(fd, buf, size, &r))
     goto out;
 
@@ -3610,6 +3619,12 @@ DEFINE_SYSCALL(read, int, fd, gaddr_t, buf_ptr, size_t, size)
     return r;
   }
 
+  if (buf != NULL && kmsg_read(fd, buf, size, &r)) {
+    if (r > 0 && copy_to_user(buf_ptr, buf, (size_t) r))
+      r = -LINUX_EFAULT;
+    free(buf);
+    return r;
+  }
   if (buf != NULL && signalfd_read(fd, buf, size, &r)) {
     if (r > 0 && copy_to_user(buf_ptr, buf, (size_t) r))
       r = -LINUX_EFAULT;
@@ -4034,11 +4049,16 @@ darwinfs_openat(struct fs *fs, struct dir *dir, const char *path, int l_flags, i
         guest_dev_read(abs, &d)) {
       if (fd >= 0)
         close(fd);
-      const char *host = host_device_for(d.mode, d.dev, dir->fd, path);
-      if (host == NULL) {
+      const struct guest_device *dv =
+          guest_device_for(d.mode, d.dev, dir->fd, path);
+      if (dv == NULL) {
         fd = -LINUX_ENXIO;
+      } else if (dv->open != NULL) {
+        int served = -1;
+        fd = dv->open(l_flags, &served) == 0 ? served
+                                             : -darwin_to_linux_errno(errno);
       } else {
-        fd = syswrap(open(host, flags, mode));
+        fd = syswrap(open(dv->host, flags, mode));
         /* A device nabi knows the meaning of but the host does not have -
          * binder without mSL/DevFS loaded - is a node with no driver, which is
          * what ENXIO says. Answering ENOENT would claim the node is not there,

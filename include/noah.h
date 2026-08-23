@@ -230,6 +230,15 @@ bool task_should_stop(void);
 noreturn void task_stop_self(void);
 /* The per-process state neither startup path may skip; see fs.c. Anything new
  * of that kind goes in there, not beside a call to it. */
+/* /dev/kmsg, served by nabi because there is no kernel here to keep a log. */
+void kmsg_init(void);
+int  kmsg_open(int flags, int *out_fd);
+void kmsg_close(int fd);
+bool kmsg_is(int fd);
+bool kmsg_write(int fd, const char *buf, size_t size, int *ret);
+bool kmsg_read(int fd, char *buf, size_t size, int *ret);
+bool kmsg_lseek(int fd, off_t offset, int whence, int *ret);
+
 void reinit_process_tables(void);
 void init_fileinfo(int rootfd);
 void signalfds_init(void);
