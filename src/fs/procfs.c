@@ -1221,12 +1221,25 @@ procfs_fd_number(const char *path)
  * Returns false for anything not ours, which is the ordinary case.
  */
 bool
-procfs_stat(const char *path, uint32_t *mode, uint64_t *size, uint64_t *ino)
+procfs_stat(const char *path, bool nofollow, uint32_t *mode, uint64_t *size,
+            uint64_t *ino)
 {
   int which = -1;
   enum procfs_file kind = own_procfs_file_n(path, &which);
 
   switch (kind) {
+  case PROCFS_EXE:
+    /*
+     * Only for a caller that asked not to follow. Following it reaches the
+     * program itself, and resolution has already rewritten the path to get
+     * there, so this is the lstat case alone - where the answer is the link.
+     */
+    if (!nofollow || proc.ident.exe == NULL)
+      return false;
+    *mode = 0777 | 0120000;                 /* lrwxrwxrwx */
+    *size = strlen(proc.ident.exe);
+    *ino  = 3;
+    return true;
   case PROCFS_NSDIR:
     *mode = 0500 | 0040000;                 /* dr-x------, as Linux has it */
     *size = 0;
@@ -1629,6 +1642,34 @@ procfs_readlink(const char *path, char *buf, size_t bufsize)
     n = bufsize;
   memcpy(buf, link, n);
   return (int) n;
+}
+
+/*
+ * The executable /proc/<pid>/exe names, as a guest path.
+ *
+ * Answered during path resolution so that the name behaves like the symlink it
+ * is: stat, access and open all reach the program, which is what they reach on
+ * Linux. readlink is served before resolution, so the link itself still reads
+ * back as a link rather than as whatever it points at.
+ *
+ * Only ever this process's own, because own_procfs_file_n refuses a pid that is
+ * not ours - another process's executable is not something nabi knows. The
+ * host's procfs cannot answer any of this: from its side the executable of
+ * every one of these processes is the emulator.
+ *
+ * Android's apexd is what found it missing. It stats /proc/self/exe during
+ * start-up, got ENOENT, and aborted - which init reports as
+ * "reboot,bootloader,bootstrap-apexd-failed", three steps from the cause.
+ */
+bool
+procfs_exe_path(const char *name, char *out, size_t outsz)
+{
+  int which = -1;
+  if (own_procfs_file_n(name, &which) != PROCFS_EXE)
+    return false;
+  if (proc.ident.exe == NULL || proc.ident.exe[0] == '\0')
+    return false;
+  return strlcpy(out, proc.ident.exe, outsz) < outsz;
 }
 
 /*

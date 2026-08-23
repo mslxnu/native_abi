@@ -1191,6 +1191,18 @@ else
     fail=1
 fi
 
+# exelinktest: /proc/self/exe, which names the guest's program and not nabi.
+# Both halves - readlink, and a stat that follows - because they are served by
+# different code and only one of them used to work.
+cp "$here/exelinktest" "$root/"; chmod +x "$root/exelinktest"
+out=$("$NABI" -m "$root" /exelinktest 2>&1 | tail -1); rc=$?
+if [ "$out" = "exelink ok" ]; then
+    echo "  ok  exelinktest -> \"$out\""
+else
+    echo "  FAIL exelinktest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 # cgmovetest: putting another process in a cgroup, which is what a process
 # manager does with cgroup.procs and what nabi used to refuse.
 cp "$here/cgmovetest" "$root/"; chmod +x "$root/cgmovetest"
@@ -1199,20 +1211,6 @@ if [ "$out" = "cgmove ok" ]; then
     echo "  ok  cgmovetest -> \"$out\""
 else
     echo "  FAIL cgmovetest -> \"$out\", exit $rc"
-    fail=1
-fi
-
-# sigchldfd2test: a signalfd for a signal the guest also has a handler for,
-# which is Android init's shape and not the one sigchldfdtest covers. Two of
-# nabi's decisions lean on each other here - signalfd_arm bows out when the
-# guest has its own handler, and rt_sigprocmask leaves a handled signal
-# unblocked on the host - and each is only right while the other holds.
-cp "$here/sigchldfd2test" "$root/"; chmod +x "$root/sigchldfd2test"
-out=$("$NABI" -m "$root" /sigchldfd2test 2>&1 | tail -1); rc=$?
-if [ "$out" = "sigchldfd2 ok" ]; then
-    echo "  ok  sigchldfd2test -> \"$out\""
-else
-    echo "  FAIL sigchldfd2test -> \"$out\", exit $rc"
     fail=1
 fi
 

@@ -420,7 +420,9 @@ bool    tee_any_readable(int nfds, const fd_set *want);
 int     tee_mark_readable(int nfds, fd_set *out, const fd_set *want);
 void    tee_sweep(void);
 bool procfs_pidns_path(const char *name, char *out, size_t outsz, bool *denied);
-bool procfs_stat(const char *path, uint32_t *mode, uint64_t *size, uint64_t *ino);
+bool procfs_exe_path(const char *name, char *out, size_t outsz);
+bool procfs_stat(const char *path, bool nofollow, uint32_t *mode,
+                 uint64_t *size, uint64_t *ino);
 bool procfs_refresh_fddir(int fd);
 int fdtable_open_fds(int *out, int max);
 int guest_to_host_path(const char *name, char *out, size_t outsz);

@@ -4750,6 +4750,7 @@ resolve_path(const struct dir *parent, const char *name, int flags, struct path 
   /* resolve mountpoints */
   char mntpath[PATH_MAX];
   char pidpath[PATH_MAX];       /* separate: mount_resolve reads what this wrote */
+  char exepath[LINUX_PATH_MAX]; /* the same, for /proc/<pid>/exe */
   if (*name == '/') {
     if (name[1] == '\0') {
       dir.fd = proc.fileinfo.rootfd;
@@ -4771,6 +4772,16 @@ resolve_path(const struct dir *parent, const char *name, int flags, struct path 
         return -LINUX_ENOENT;
       name = pidpath;
     }
+
+    /*
+     * /proc/<pid>/exe is the program, and following it is what stat, access
+     * and open do. Rewritten to the guest path it names, so the rest of this
+     * walk resolves it like any other name - the host's procfs would answer
+     * with nabi's own binary, which is true of the process and useless to the
+     * guest. readlink never reaches here; it is served before resolution.
+     */
+    if (procfs_exe_path(name, exepath, sizeof exepath))
+      name = exepath;
 
     if (mount_resolve(name, mntpath, sizeof mntpath, &path->rdonly)) {
       name = mntpath;
@@ -5836,7 +5847,8 @@ DEFINE_SYSCALL(newfstatat, int, dirfd, gstr_t, path_ptr, gaddr_t, st_ptr, int, f
   /* A /proc entry nabi serves itself, which the host has no file for. */
   {
     uint32_t mode; uint64_t size, ino;
-    if (procfs_stat(pathname, &mode, &size, &ino)) {
+    if (procfs_stat(pathname, (flags & LINUX_AT_SYMLINK_NOFOLLOW) != 0,
+                    &mode, &size, &ino)) {
       memset(&st, 0, sizeof st);
       st.st_mode = mode;
       st.st_size = (l_off_t) size;
@@ -5893,7 +5905,8 @@ DEFINE_SYSCALL(statx, int, dirfd, gstr_t, path_ptr, int, flags, unsigned int, ma
   bool served = false;
   {
     uint32_t pmode; uint64_t psize, pino;
-    if (procfs_stat(pathname, &pmode, &psize, &pino)) {
+    if (procfs_stat(pathname, (flags & LINUX_AT_SYMLINK_NOFOLLOW) != 0,
+                    &pmode, &psize, &pino)) {
       memset(&st, 0, sizeof st);
       st.st_mode = pmode;
       st.st_size = (off_t) psize;
