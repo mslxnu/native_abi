@@ -396,6 +396,48 @@ nsproxy_unshare(unsigned long flags)
   return 0;
 }
 
+/*
+ * Start this process as pid 1 of a pid namespace of its own.
+ *
+ * Not what unshare(CLONE_NEWPID) does, and deliberately so: unshare puts the
+ * caller's *children* in the new namespace and leaves the caller where it was,
+ * because Linux cannot renumber a running process. Here there is nothing to
+ * renumber yet - this runs before the guest has started - so the process can
+ * be put in the namespace it just made and take the first number in it.
+ *
+ * It exists because being pid 1 is not decoration. libprocessgroup refuses to
+ * set up cgroups for anything else ("Cgroup setup can be done only by init
+ * process"), so Android's init cannot get past its own start without it, and
+ * being pid 1 is simply what init is on a device. It was being arranged from
+ * outside with a helper that cloned into a namespace and exec'd nabi, which
+ * worked but put the guest's trace in a per-pid sink instead of the main one
+ * and was one more thing to rebuild after every reboot.
+ *
+ * The namespace is held twice - as this process's own and as the one its
+ * children join - so that a fork lands in the same namespace rather than a
+ * child of it.
+ */
+int
+nsproxy_become_pid1(void)
+{
+  pthread_mutex_lock(&ns_lock);
+  struct namespace *ns = ns_new(NS_PID, current_nsproxy.ns[NS_PID]);
+  if (ns == NULL) {
+    pthread_mutex_unlock(&ns_lock);
+    return -LINUX_ENOMEM;
+  }
+  ns->refcount++;
+  ns_put(current_nsproxy.pid_for_children);
+  ns_put(current_nsproxy.ns[NS_PID]);
+  current_nsproxy.pid_for_children = ns;
+  current_nsproxy.ns[NS_PID] = ns;
+  pthread_mutex_unlock(&ns_lock);
+
+  /* First into an empty table, which is what makes it pid 1. */
+  pidns_add_child((int32_t) getpid());
+  return 0;
+}
+
 int
 nsproxy_clone(unsigned long clone_flags)
 {

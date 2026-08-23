@@ -1191,6 +1191,25 @@ else
     fail=1
 fi
 
+# pid1test: --pid1, which starts the guest as pid 1 of a pid namespace of its
+# own. Run both ways, because the option has to do something and has to be the
+# only thing that does it: without it the guest keeps an ordinary pid, and a
+# default that quietly made everything init would be worse than not having it.
+cp "$here/pid1test" "$root/"; chmod +x "$root/pid1test"
+out=$("$NABI" -m "$root" /pid1test 2>&1 | tail -1)
+one=$("$NABI" --pid1 -m "$root" /pid1test 2>&1 | tail -1)
+case "$out" in
+    "pid1 ok self=1 "*) echo "  FAIL pid1test -> pid 1 without --pid1: \"$out\""; fail=1 ;;
+    "pid1 ok self="*)   ok_plain=1 ;;
+    *)                  echo "  FAIL pid1test -> \"$out\""; fail=1 ;;
+esac
+if [ "$one" = "pid1 ok self=1 ppid=0" ] && [ "${ok_plain:-0}" = 1 ]; then
+    echo "  ok  pid1test -> an ordinary pid by default, \"$one\" with --pid1"
+elif [ "${ok_plain:-0}" = 1 ]; then
+    echo "  FAIL pid1test --pid1 -> \"$one\""
+    fail=1
+fi
+
 # binderfstest: the filesystem that makes binders, served by nabi rather than by
 # the kext. Forced to the emulation, because that is the side that has to work
 # without one - and because the two do not answer alike: the kext's binderfs is

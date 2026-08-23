@@ -75,6 +75,11 @@ guest-code cache sync.
   Run a second time with `NABI_BINDER=emulated`, against nabi's own binder
   instead of the kext's - the same probe is the oracle for both, which is what
   makes the two comparable.
+- `pid1test` — `--pid1`, which starts the guest as pid 1 of a pid namespace of
+  its own. Run both ways: an ordinary pid by default, 1 with the option. The
+  interesting check is that a fork lands in the *same* namespace rather than a
+  nested one - a child that called itself 1 while its parent called it 2 would
+  pass any test that only compared magnitudes.
 - `binderfstest` — binderfs served by nabi: `BINDERFS_CTL_ADD` makes a device,
   it appears in the directory listing, and it is a *separate* binder. Each
   device takes its own context manager, which is the property the whole split

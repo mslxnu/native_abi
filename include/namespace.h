@@ -201,6 +201,7 @@ uint64_t ns_ino_time_for_children(void);
  * cannot be renumbered underneath itself any more than its clock can be moved.
  */
 uint64_t ns_ino_pid_for_children(void);
+int  nsproxy_become_pid1(void);
 bool     pidns_active(void);
 
 /* Whether this process is in a network namespace of its own, which here means

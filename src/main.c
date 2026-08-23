@@ -636,8 +636,11 @@ main(int argc, char *argv[], char **envp)
   char root[PATH_MAX] = {};
 
   int c;
+  bool as_pid1 = false;
   char debug_paths[MAX_DEBUG_PATH][PATH_MAX] = {};
+  enum { OPT_PID1 = 0x100 };
   struct option long_options[] = {
+    { "pid1", no_argument, NULL, OPT_PID1 },
     { "user", required_argument, NULL, 'u'},
     { "output", required_argument, NULL, 'o'},
     { "strace", required_argument, NULL, 's'},
@@ -705,6 +708,18 @@ main(int argc, char *argv[], char **envp)
       }
       break;
     }
+    case OPT_PID1:
+      /*
+       * Run the guest as pid 1.
+       *
+       * For init, which is the only thing that wants it - and wants it for a
+       * concrete reason rather than for appearances: libprocessgroup will set
+       * up cgroups for pid 1 and nothing else, so Android's init stops at its
+       * own first step without this. Off by default, because a shell that
+       * thinks it is init would be told it cannot be killed.
+       */
+      as_pid1 = true;
+      break;
     case 'm':
       if (realpath(optarg, root) == NULL) {
         perror("Invalid --mnt flag: ");
@@ -714,7 +729,7 @@ main(int argc, char *argv[], char **envp)
       break;
     case 'h':
     default:
-      printf("Usage: nabi -h | [-o output] [-w warning] [-s strace] [-u uid[:gid]] -m /virtual/filesystem/root executable ...\n");
+      printf("Usage: nabi -h | [-o output] [-w warning] [-s strace] [-u uid[:gid]] [--pid1] -m /virtual/filesystem/root executable ...\n");
       exit(0);
     }
   }
@@ -729,6 +744,20 @@ main(int argc, char *argv[], char **envp)
   vmm_create();
 
   init_vkernel(root);
+
+  /*
+   * After init_vkernel, because the namespace set it replaces is made there,
+   * and before anything forks, because a process cannot be renumbered once it
+   * has descendants that know its number.
+   */
+  if (as_pid1) {
+    int r = nsproxy_become_pid1();
+    if (r < 0) {
+      fprintf(stderr, "nabi: could not start as pid 1: %s\n",
+              strerror(linux_to_darwin_errno(-r)));
+      exit(1);
+    }
+  }
 
   /*
    * The binder descriptor broker. The first process - the instance root -
