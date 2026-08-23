@@ -617,9 +617,25 @@ signalfd_poke(struct signalfd_state *sf)
 }
 
 /*
+ * What has arrived for the signalfds, as opposed to for a thread.
+ *
+ * task.sigpending is thread-local, and a signal sent to a *process* is taken by
+ * whichever of its threads does not block it - the host's choice, not ours. So
+ * the arrival was recorded in one thread's pending set while the thread reading
+ * the descriptor looked at its own, found nothing, drained the byte that had
+ * woken it, and slept again. Android's init says so out loud: "epoll() woke us
+ * up, but we waited with no SIGCHLD!", over and over.
+ *
+ * A descriptor is not a thread. This is the set the descriptor answers from,
+ * shared across the process and cleared when a read reports the signal.
+ */
+static _Atomic uint64_t signalfd_arrived;
+
+/*
  * Make every signalfd whose mask names `lsig` readable. Runs inside the host
- * signal handler, so it takes no lock and only does a fixed array walk and a
- * nonblocking send: nothing that can block or raise a signal of its own.
+ * signal handler, so it takes no lock and only does a fixed array walk, an
+ * atomic or, and a nonblocking send: nothing that can block or raise a signal
+ * of its own.
  */
 void
 signalfd_note_signal(int lsig)
@@ -627,6 +643,7 @@ signalfd_note_signal(int lsig)
   if (lsig <= 0 || lsig > LINUX_NSIG)
     return;
   uint64_t bit = 1UL << (lsig - 1);
+  atomic_fetch_or(&signalfd_arrived, bit);
   for (int i = 0; i < SIGNALFD_MAX; i++) {
     struct signalfd_state *sf = &signalfds[i];
     if (sf->fd < 0)
@@ -654,10 +671,13 @@ signalfd_read(int fd, char *out, size_t size, int *ret)
 
   for (;;) {
     pthread_rwlock_rdlock(&proc.sig_lock);
-    uint64_t pending = task.sigpending & sf->mask.__mask;
+    /* This thread's, or any thread's: the descriptor belongs to the process. */
+    uint64_t pending =
+        (task.sigpending | atomic_load(&signalfd_arrived)) & sf->mask.__mask;
     if (pending != 0) {
       int sig = __builtin_ffsl(pending);
       atomic_fetch_and(&task.sigpending, ~(1UL << (sig - 1)));
+      atomic_fetch_and(&signalfd_arrived, ~(1UL << (sig - 1)));
       pthread_rwlock_unlock(&proc.sig_lock);
 
       /* Drain everything the arrival woke: the descriptor must not stay
@@ -703,7 +723,9 @@ signalfd_read(int fd, char *out, size_t size, int *ret)
     while (recv(fd, drain, sizeof drain, MSG_DONTWAIT) > 0)
       ;
     pthread_rwlock_rdlock(&proc.sig_lock);
-    bool arrived = (task.sigpending & sf->mask.__mask) != 0;
+    bool arrived =
+        ((task.sigpending | atomic_load(&signalfd_arrived)) & sf->mask.__mask)
+        != 0;
     pthread_rwlock_unlock(&proc.sig_lock);
     if (arrived)
       continue;
