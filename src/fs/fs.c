@@ -5317,7 +5317,9 @@ guest_path_of_fd(int fd, char *out, size_t outsz)
   char host[PATH_MAX];
   if (fcntl(fd, F_GETPATH, host) != 0)
     return false;
-  return host_to_guest_path(host, out, outsz);
+  /* Through a mount if one puts it there: a file under a bind mount is named
+   * by the mount, not by what the mount is over. */
+  return guest_path_of_host(host, out, outsz);
 }
 
 static bool

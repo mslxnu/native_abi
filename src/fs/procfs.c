@@ -1608,27 +1608,31 @@ procfs_readlink(const char *path, char *buf, size_t bufsize)
     if (fd < 0 || fd >= proc.fileinfo.vkern_fdtable.start ||
         fcntl(fd, F_GETPATH, fdpath) < 0 || fdpath[0] == '\0')
       return -1;
-    /* F_GETPATH answers in the host's terms, and the guest cannot use that
+    /*
+     * F_GETPATH answers in the host's terms, and the guest cannot use that
      * answer: what it reads here it will turn around and open. systemd's
      * fsync_directory_of_file opens the parent of whatever this returns, and
      * a rootfs path handed back whole sends it to /Volumes/... - a name that
      * only means something on the far side of the boundary.
      *
+     * A mount is asked about first, and that is not a detail. A file reached
+     * through a bind mount has two names, and the one the guest opened it by
+     * is the mount's - stripping the rootfs prefix instead gives the name
+     * underneath, which is a different place as far as anything checking
+     * paths is concerned. Android mounts every APEX that way, and bionic's
+     * linker reads this link to learn where a library really came from: it saw
+     * /system/apex/com.android.runtime/lib64/bionic/libc.so where its own
+     * configuration permits /apex/com.android.runtime/lib64/bionic, decided
+     * libc was outside the namespace, and refused to link anything at all.
+     *
      * A passthrough prefix needs no translation and gets none: /Users and
-     * /tmp are the same name on both sides, and none of them is under the
-     * root, so the prefix test leaves them alone by construction. */
+     * /tmp are the same name on both sides.
+     */
     {
-      char rootpath[PATH_MAX];
-      size_t rn;
-      if (fcntl(proc.fileinfo.rootfd, F_GETPATH, rootpath) == 0 &&
-          (rn = strlen(rootpath)) > 0) {
-        while (rn > 1 && rootpath[rn - 1] == '/')
-          rn--;
-        if (rn > 1 && strncmp(fdpath, rootpath, rn) == 0 &&
-            (fdpath[rn] == '/' || fdpath[rn] == '\0')) {
-          link = fdpath[rn] ? fdpath + rn : "/";
-          break;
-        }
+      static char gbuf[LINUX_PATH_MAX];
+      if (guest_path_of_host(fdpath, gbuf, sizeof gbuf)) {
+        link = gbuf;
+        break;
       }
     }
     link = fdpath;
