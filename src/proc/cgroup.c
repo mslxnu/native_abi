@@ -33,6 +33,7 @@
  */
 #include <dirent.h>
 #include <errno.h>
+#include <signal.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <stdio.h>
@@ -153,10 +154,30 @@ cgroup_is_hierarchy_path(const char *hostpath)
  * has escaped the namespace root (which cannot happen by moving, only by the
  * root being removed) falls back to "/", as Linux does.
  */
+static bool find_in_tree(const char *dir, const char *rel, int32_t nspid,
+                         char *out, size_t n);
+
 int
 cgroup_proc_text(char *out, size_t n)
 {
+  /*
+   * The files first, and the shortcut only when they have nothing to say.
+   *
+   * A process can be moved by another one - init moves every service it
+   * starts - and the process being moved is not told. Reading current_cgroup
+   * would have it report where it used to be, and disagree with what
+   * /proc/<its own pid>/cgroup says about it from anywhere else. The fallback
+   * is for a process that has never been written into a procs file at all: a
+   * forked child, which is in its parent's cgroup by inheritance.
+   */
+  char found[CGROUP_PATH_MAX];
+  char hroot[PATH_MAX];
+  cgroup_root_dir(hroot, sizeof hroot);
   const char *mine = current_cgroup;
+  if (find_in_tree(hroot, "", pidns_to_ns((int32_t) getpid()),
+                   found, sizeof found))
+    mine = found;
+
   const char *root = cgroup_ns_root();
 
   const char *shown = mine;
@@ -259,10 +280,17 @@ cgroup_proc_text_for(int32_t nspid, char *out, size_t n)
 /*
  * Moving a process, which is what writing to cgroup.procs does.
  *
- * Only this process can be moved, because membership is kept in the process
- * itself rather than in a table something else could reach - the same reason
- * every other piece of per-process state here lives where it does. Asking to
- * move another one is refused rather than silently ignored.
+ * Any process, not only this one. Moving another was refused for a while on the
+ * grounds that membership lived in the process being moved, and that was never
+ * quite true: the procs files are the record - it is what makes
+ * /proc/<pid>/cgroup answerable for a pid that is not us - and a file can be
+ * written on any process's behalf. current_cgroup is a shortcut this process
+ * keeps for itself, not the thing being changed.
+ *
+ * Refusing it stopped Android before it started. init puts each service it
+ * forks into a cgroup of its own by writing the child's pid, which is what
+ * every process manager does and the ordinary use of the file; with the write
+ * refused, createProcessGroup failed for every service and init rebooted.
  */
 /* Add or remove a pid in a cgroup's procs file, so that reading it back shows
  * what joining it did. The file is the record; current_cgroup is the shortcut
@@ -388,9 +416,6 @@ cgroup_write_control(int fd, const char *buf, size_t size, int *out)
 int
 cgroup_move(const char *cgroup_path, int32_t nspid)
 {
-  if (nspid != 0 && nspid != pidns_to_ns((int32_t) getpid()))
-    return -LINUX_EPERM;
-
   char host[PATH_MAX], root[PATH_MAX];
   cgroup_root_dir(root, sizeof root);
   snprintf(host, sizeof host, "%s%s", root,
@@ -400,8 +425,40 @@ cgroup_move(const char *cgroup_path, int32_t nspid)
   if (stat(host, &st) < 0 || !S_ISDIR(st.st_mode))
     return -LINUX_ENOENT;
 
-  procs_file_update(current_cgroup, pidns_to_ns((int32_t) getpid()), false);
-  cgroup_set_current(cgroup_path);
-  procs_file_update(cgroup_path, pidns_to_ns((int32_t) getpid()), true);
+  /* Zero means the writer, which is how a process joins a cgroup itself. */
+  int32_t self = pidns_to_ns((int32_t) getpid());
+  int32_t who = nspid == 0 ? self : nspid;
+
+  /*
+   * A pid that names no process cannot be moved, and saying so is better than
+   * writing a number into a file that will never name anything. Two ways to
+   * fail: outside this namespace, or not alive. The namespace test alone was
+   * not enough - outside a pid namespace the translation is the identity, so
+   * every number looked like a process and any of them was accepted.
+   */
+  if (who != self) {
+    int32_t host = pidns_to_host(who);
+    if (host < 0)
+      return -LINUX_ESRCH;
+    if (kill((pid_t) host, 0) < 0 && errno == ESRCH)
+      return -LINUX_ESRCH;
+  }
+
+  /*
+   * Taken out of wherever it is before being put where it is going, or it
+   * would be in two cgroups at once - which is not a state Linux has. Our own
+   * is known without looking; another process's is found in the files, since
+   * that is where it is written down.
+   */
+  char from[CGROUP_PATH_MAX] = "/";
+  if (who == self)
+    snprintf(from, sizeof from, "%s", current_cgroup);
+  else
+    (void) find_in_tree(root, "", who, from, sizeof from);
+
+  procs_file_update(from, who, false);
+  if (who == self)
+    cgroup_set_current(cgroup_path);
+  procs_file_update(cgroup_path, who, true);
   return 0;
 }
