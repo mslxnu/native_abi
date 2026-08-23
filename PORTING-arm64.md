@@ -5933,3 +5933,157 @@ invalidation lets a guest handle on `/` read a file from the tree it had just
 been confined out of, which is what the test now reports.
 
 311 of 375.
+
+### 3.5.107 Transactions that carry more than bytes
+
+The emulated binder answered seven of the conformance probe's nine stages. The
+two it did not were the ones where a transaction stops being a flat block of
+bytes: scatter-gather, which carries pointed-to buffers and arrays of file
+descriptors alongside the payload, and the security-context form, which tells a
+receiver who is calling it. Both are on the path Android actually takes, so
+"seven of nine" was not a score worth keeping.
+
+**Scatter-gather stages through shared memory rather than through the
+receiver's arena.** The obvious implementation is for the sender to write the
+pointed-to buffers where the receiver will read them, and it cannot be done
+here: the arena is the receiver's own anonymous memory, registered with
+`BINDER_MSL_SET_ARENA`, and a sender in another process has no way to reach it.
+So a buffer travels in the shared registry as an *offset* into the staged blob,
+and becomes an address only at the moment the receiver allocates - which is
+also the only moment it could, since until then there is no address to write.
+The parent links that `BUFFER_FLAG_HAS_PARENT` describes are filled in there
+too, for the same reason. Descriptors inside an array go through the broker
+exactly as a single `BINDER_TYPE_FD` does.
+
+**Underneath it, a descriptor is not an endpoint.** This is what actually broke
+the file-descriptor-array stage, and it took a while to see because the symptom
+was three steps from the cause: a received descriptor did not answer ioctls. It
+turned out the probe's parent closes its two descriptors immediately after
+forking, and that was tearing down the endpoint the child was still holding and
+about to send. Two changes fix it. Endpoints are reference counted in the
+shared registry, so closing one descriptor does not take the endpoint away from
+whoever else has one. And a descriptor's endpoint is recovered from the *name*
+of the fifo it points at rather than from a table, which is what makes an
+inherited descriptor work at all - on arm64 a fork is an exec, so a child comes
+up holding its parent's descriptors and remembering nothing about them.
+
+The name is matched on its shape - `nabi-binder-…-wake-<id>` - and not by
+comparing it against the directory it should be in. That is the third time this
+port has been caught by the same thing: macOS answers `F_GETPATH` with
+`/private/var/...` for what was created as `/var/...`, and `TMPDIR`
+conventionally ends in a separator, so the path built from it carries a doubled
+one. Two spellings of one directory never compare equal, and every prefix test
+written against them is wrong in a way that looks like the feature not working.
+
+**Reads block, and that was the whole of the security-context failure.** The
+form itself is a few lines: a node registered with
+`FLAT_BINDER_FLAG_TXN_SECURITY_CTX` receives the longer
+`BR_TRANSACTION_SEC_CTX` with a pointer to a label, and one registered without
+it receives the plain form and would mis-read the longer one as its own fields.
+The reason nothing arrived was elsewhere. That stage has no handshake - it forks
+and reads, relying on the read to wait - and `serve_reads` returned empty
+immediately, turning every wait into a spin. A caller that spins a fixed number
+of times loses that race against a peer that is still starting, and on arm64 a
+fork is an exec, so it lost every time. Binder reads now wait on the endpoint's
+fifo, bounded, dropping `eps_lock` while they do: held, one idle looper would
+stop every other thread in its process from touching binder.
+
+Two deadlocks fell out of that. `serve_reads` calls into code that adopts
+descriptors while already holding `eps_lock`, and `collect_messages` does it
+while also holding a file lock that does not nest - hence the `_locked`
+variants, which say in their names which locks the caller is expected to be
+holding.
+
+One thing was removed rather than kept. Fixing the descriptor-array stage
+started with an eager walk of every open descriptor at process start, to claim
+the inherited ones; the name-based recovery then made it redundant, and
+deliberately breaking it showed the probe passing without it. It ran a
+four-thousand-entry `fcntl` scan on every fork in a binder-using guest - which
+is every zygote fork on Android - to guard a race it could not be shown to
+guard, so it went.
+
+The label is a placeholder. There is no SELinux here to ask, and answering with
+an invented string is honest in a way that answering with nothing is not: a
+caller that only checks that it *has* a label runs, and the string says plainly
+that it was not a decision anyone made.
+
+No new syscalls: all of this is `ioctl` on a device nabi serves.
+
+### 3.5.108 Three binders, not three names for one
+
+A device does not have a binder. It has several - `/dev/binder` for framework
+calls, `/dev/hwbinder` for HALs, `/dev/vndbinder` for vendor code - and they are
+separate on purpose. Handle 0 is the context manager, and it is a *different*
+object in each, which is what stops a vendor process from reaching a framework
+object simply by asking for the one object every client can find without being
+told about it. NABI had the three as three names for a single context. That was
+fine for exactly as long as nothing opened two of them.
+
+So an endpoint records which binder it is an open of, and the two places where
+handle 0 means something - resolving it, and registering the manager that
+answers it - work within a context rather than across the instance. The name
+comes from the node: the device table now hands each entry its own name to its
+open hook, and a descriptor that arrives from another process takes the context
+along with the endpoint it adopts.
+
+**binderfs is the same fact, arriving from the other direction.** It is how
+those devices come into being now - init mounts it and tells it what to create,
+instead of the kernel bringing fixed nodes along - and NABI answered a
+`binderfs` mount with the kext's `/dev/binderfs`, which is exactly the
+dependency that has to go. When nabi is serving binder, the mount is backed by a
+directory of its own: a control node to begin with, and a file for each
+`BINDERFS_CTL_ADD`. Opening one of those files is turned into an endpoint whose
+context is the file's name.
+
+The device files are real files even though opening one never reads them, and
+that is not tidiness. A container lists the directory to check that what it
+asked for is there, so a device that works but cannot be seen reads as a failed
+mount - a failure that surfaces later and points somewhere else.
+
+**A path is recognised as binderfs by the name of the directory holding it, not
+by asking the mount table.** Android reaches these devices through symlinks from
+`/dev`, and a resolved symlink has already left the mount behind, so the table
+cannot answer for the paths that actually arrive. Same shape as the fifo names
+in the last section, and for the same underlying reason.
+
+The major and minor numbers handed back are invented, because nothing here
+allocates device numbers. They are answered rather than zeroed because a caller
+that goes on to `mknod` wants them to agree with what it was told, and the minor
+counts what is already in the directory so two calls never name one node. If
+anything ever checks those numbers against something authoritative it will not
+match, and that is the soft spot in this.
+
+No new syscalls: `BINDERFS_CTL_ADD` is an ioctl, and it was already claimed.
+
+### 3.5.109 So that init can be init
+
+Being pid 1 is not decoration. `libprocessgroup` will set up cgroups for pid 1
+and refuses for anything else - "Cgroup setup can be done only by init process"
+- so Android's init cannot get past its own first step in a process numbered
+like any other. It had been arranged from outside, with a helper that cloned
+into a pid namespace and exec'd nabi into it. That worked, and had two costs
+worth ending: it put the guest's trace in a per-pid sink rather than the main
+one, and it was one more thing to rebuild after every reboot.
+
+`--pid1` makes a pid namespace and puts the calling process in it. That is
+deliberately *not* what `unshare(CLONE_NEWPID)` does - unshare puts the caller's
+children in the new namespace and leaves the caller where it was, because Linux
+cannot renumber a process that is already running. Here there is nothing to
+renumber yet: this happens after the namespace set is built and before the guest
+starts, so the process can take the first number in a table that is still empty.
+
+The namespace is held twice over, as this process's own and as the one its
+children join, so a fork lands beside the parent rather than below it. That is
+the mistake worth guarding against, because it hides: a child that called itself
+1 while its parent called it 2 would satisfy any check that only compared
+magnitudes. So the test has the child report the pid it *sees* and compares it
+against the pid the parent saw it get - and getting that test right took three
+attempts, each failure mine. Exit statuses are eight bits wide, so the first
+version compared a truncated number against a whole one; the second kept the
+child's pid in a single variable that the second fork overwrote before the
+comparison ran.
+
+Off by default. A shell that thought it was init would be told it cannot be
+killed.
+
+No new syscalls: `--pid1` is an option, not a call.
