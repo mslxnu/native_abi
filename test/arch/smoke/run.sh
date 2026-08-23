@@ -1191,6 +1191,18 @@ else
     fail=1
 fi
 
+# execfmttest: execve of a file nothing here can run must be an error the caller
+# survives, not a segmentation fault. The format is checked before the address
+# space is torn down, which is where Linux puts the point of no return.
+cp "$here/execfmttest" "$root/"; chmod +x "$root/execfmttest"
+out=$("$NABI" -m "$root" /execfmttest 2>&1 | tail -1); rc=$?
+if [ "$out" = "execfmt ok" ]; then
+    echo "  ok  execfmttest -> \"$out\""
+else
+    echo "  FAIL execfmttest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 # exelinktest: /proc/self/exe, which names the guest's program and not nabi.
 # Both halves - readlink, and a stat that follows - because they are served by
 # different code and only one of them used to work.

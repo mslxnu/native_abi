@@ -222,7 +222,7 @@ load_elf(Elf64_Ehdr *ehdr, int argc, char *argv[], char **envp, bool secure,
     return -LINUX_ENOEXEC;
   }
   if (ehdr->e_machine != GUEST_EM_MACHINE) {
-    fprintf(stderr, "not an x64 executable");
+    fprintf(stderr, "not an executable for this machine");
     fflush(stderr);
     return -LINUX_ENOEXEC;
   }
@@ -671,6 +671,46 @@ prepare_newproc(void)
   close_cloexec();
 }
 
+/*
+ * Whether this file is something the guest can be replaced *with*, asked before
+ * anything is torn down.
+ *
+ * execve has a point of no return - the old program is gone and there is
+ * nothing to give an error back to - and Linux puts it after the format has
+ * been accepted, so a binary the kernel cannot run comes back as ENOEXEC with
+ * the caller still standing. nabi tore the address space down first and only
+ * then looked at the file, so ENOEXEC returned into a process that no longer
+ * had a program: the caller took SIGSEGV instead of an error.
+ *
+ * Android's init exec_starts /vendor/bin/boringssl_self_test32, which is an
+ * EM_ARM ELF32 - a machine Apple Silicon cannot execute a single instruction
+ * of. The service died of a segmentation fault where it should have failed to
+ * start, which says nothing about the actual reason.
+ *
+ * The class is checked as well as the machine. An ELF32 header is shorter than
+ * an ELF64 one, so reading e_machine out of it only works by the accident that
+ * the two layouts agree that far, and everything past e_version does not.
+ */
+static int
+exec_format_ok(const char *data, size_t size)
+{
+  if (4 <= size && memcmp(data, ELFMAG, 4) == 0) {
+    if (size < sizeof(Elf64_Ehdr))
+      return -LINUX_ENOEXEC;
+    const Elf64_Ehdr *e = (const Elf64_Ehdr *) data;
+    if (e->e_ident[EI_CLASS] != ELFCLASS64)
+      return -LINUX_ENOEXEC;
+    if (e->e_type != ET_EXEC && e->e_type != ET_DYN)
+      return -LINUX_ENOEXEC;
+    if (e->e_machine != GUEST_EM_MACHINE)
+      return -LINUX_ENOEXEC;
+    return 0;
+  }
+  if (2 <= size && data[0] == '#' && data[1] == '!')
+    return 0;
+  return -LINUX_ENOEXEC;                  /* nothing here knows how to run it */
+}
+
 int
 do_exec(const char *elf_path, int argc, char *argv[], char **envp)
 {
@@ -715,8 +755,6 @@ do_exec(const char *elf_path, int argc, char *argv[], char **envp)
   uint32_t g_uid = 0, g_gid = 0, g_mode = st.st_mode;
   guest_view_of_fd(fd, &g_uid, &g_gid, &g_mode);
 
-  prepare_newproc();
-
   /* The host only reads this mapping - to check the magic and copy segments
    * into guest memory - so PROT_READ is enough. PROT_EXEC additionally fails on
    * Apple Silicon, which refuses to map an arbitrary (unsigned) file
@@ -728,6 +766,15 @@ do_exec(const char *elf_path, int argc, char *argv[], char **envp)
   }
 
   vkern_close(fd);
+
+  /* Before the point of no return, so a file that cannot be run is an error
+   * the caller lives to see. */
+  if ((err = exec_format_ok(data, (size_t) st.st_size)) < 0) {
+    munmap(data, st.st_size);
+    return err;
+  }
+
+  prepare_newproc();
 
   drop_privilege();
 
