@@ -604,9 +604,33 @@ type_is(const char *type, const char *want)
  * context fsopen() named a type on. A second answer here would be a second set
  * of filesystems NABI claims to support.
  */
+/*
+ * A tmpfs mount's root mode: "mode=" from the options, else Linux's default of
+ * 0777 masked by the umask.
+ */
+static mode_t
+tmpfs_mode(const char *data)
+{
+  const char *p = data;
+  while (p != NULL && *p != '\0') {
+    if (strncmp(p, "mode=", 5) == 0) {
+      char *end;
+      long v = strtol(p + 5, &end, 8);
+      if (end != p + 5 && v >= 0 && v <= 07777)
+        return (mode_t) v;
+    }
+    p = strchr(p, ',');
+    if (p != NULL)
+      p++;
+  }
+  mode_t um = umask(0);
+  umask(um);
+  return 0777 & ~um;
+}
+
 static int
 backing_for_type(const char *type, const char *source, unsigned long flags,
-                 bool probe_only, struct mount_entry *e)
+                 const char *data, bool probe_only, struct mount_entry *e)
 {
   if (type_is(type, "tmpfs")) {
     char dirtpl[PATH_MAX];
@@ -615,6 +639,16 @@ backing_for_type(const char *type, const char *source, unsigned long flags,
              tmp && *tmp ? tmp : "/tmp");
     if (mkdtemp(dirtpl) == NULL)
       return -darwin_to_linux_errno(errno);
+    /*
+     * The mode the mount was asked for, or Linux's default for one that was
+     * not asked. mkdtemp makes 0700, which is nobody's idea of a tmpfs: a
+     * guest process that is not root cannot even walk into it. Android mounts
+     * /dev as a tmpfs and runs almost nothing as root, so every service that
+     * opened a device got EACCES on the directory rather than on the file -
+     * prng_seeder reported it as "Unable to open hwrng /dev/hw_random" and
+     * hung, taking boringssl's self test and then init down with it.
+     */
+    chmod(dirtpl, tmpfs_mode(data));
     snprintf(e->source, sizeof e->source, "tmpfs");
     snprintf(e->hostdir, sizeof e->hostdir, "%s", dirtpl);
     snprintf(e->type, sizeof e->type, "tmpfs");
@@ -769,6 +803,7 @@ DEFINE_SYSCALL(mount, gstr_t, source_ptr, gstr_t, target_ptr, gstr_t, type_ptr,
   char source[MOUNT_PATH_MAX] = "none";
   char target[MOUNT_PATH_MAX];
   char type[16] = "";
+  char data[256] = "";           /* the options string, for the types that read one */
 
   if (!may_mount())
     return -LINUX_EPERM;
@@ -777,6 +812,8 @@ DEFINE_SYSCALL(mount, gstr_t, source_ptr, gstr_t, target_ptr, gstr_t, type_ptr,
     return -LINUX_EFAULT;
   if (strncpy_from_user(target, target_ptr, sizeof target) < 0)
     return -LINUX_EFAULT;
+  if (data_ptr != 0 && strncpy_from_user(data, data_ptr, sizeof data) < 0)
+    data[0] = '\0';             /* unreadable options are no options, not a failure */
   if (source_ptr != 0 && strncpy_from_user(source, source_ptr, sizeof source) < 0)
     return -LINUX_EFAULT;
   if (type_ptr != 0 && strncpy_from_user(type, type_ptr, sizeof type) < 0)
@@ -943,7 +980,7 @@ DEFINE_SYSCALL(mount, gstr_t, source_ptr, gstr_t, target_ptr, gstr_t, type_ptr,
     /* Everything a filesystem *type* can be here, which is also everything
      * fsopen can name - so the two ask the same function rather than growing
      * two answers that could disagree. */
-    int br = backing_for_type(type, source, flags, false, &e);
+    int br = backing_for_type(type, source, flags, data, false, &e);
     if (br < 0)
       return br;
   }
@@ -1333,7 +1370,7 @@ DEFINE_SYSCALL(fsopen, gstr_t, fsname_ptr, unsigned int, flags)
   struct mount_entry probe;
   memset(&probe, 0, sizeof probe);
   /* A type check, with nothing yet named to mount. */
-  int r = backing_for_type(type, type, 0, true, &probe);
+  int r = backing_for_type(type, type, 0, NULL, true, &probe);
   if (r < 0)
     return r;
   /* Nothing is allocated yet - that probe may have made a tmpfs directory, and
@@ -1455,7 +1492,7 @@ DEFINE_SYSCALL(fsmount, int, fsfd, unsigned int, flags, unsigned int, attr_flags
    * the two mean the same thing to anything that has to honour it. */
   if ((r = backing_for_type(h.type, h.source,
                             (attr_flags & LINUX_MOUNT_ATTR_RDONLY)
-                              ? LINUX_MS_RDONLY : 0, false, &e)) < 0)
+                              ? LINUX_MS_RDONLY : 0, NULL, false, &e)) < 0)
     return r;
   snprintf(e.source, sizeof e.source, "%s", h.source);
 
