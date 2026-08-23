@@ -72,6 +72,8 @@ void handle_signal(void);
 bool has_sigpending(void);
 /* The host thread mask a guest mask implies; see src/ipc/signal.c. */
 void host_sigmask_of(const l_sigset_t *lmask, sigset_t *out);
+/* The guest started as somebody who never had capabilities. */
+void cap_start_unprivileged(void);
 bool sigrestart_wanted(void);
 int send_signal(pid_t pid, int sig);
 void signalfd_note_signal(int lsig);
@@ -188,11 +190,25 @@ struct pfutex_entry {
 /* TODO: collect garbage entries */
 KHASH_MAP_INIT_INT64(pfutex, struct list_head *)
 
+/*
+ * The securebits Linux keeps per process. Each rule has a bit and a lock bit
+ * one above it; the locks are the odd-numbered ones.
+ */
+#define SECBIT_NOROOT              0x01
+#define SECBIT_NO_SETUID_FIXUP     0x04
+#define SECBIT_KEEP_CAPS           0x10
+#define SECBIT_NO_CAP_AMBIENT_RAISE 0x40
+#define SECUREBITS_BITS  0x55          /* the four rules: bits 0, 2, 4, 6 */
+#define SECUREBITS_LOCKS 0xaa          /* each one's lock, the bit above it */
+#define SECUREBITS_KNOWN (SECUREBITS_BITS | SECUREBITS_LOCKS)
+
 struct proc {
   int nr_tasks;
   struct list_head tasks;
   pthread_rwlock_t lock;
   struct cred cred;
+  /* The securebits this process asked for; see prctl in src/proc/process.c. */
+  uint32_t securebits;
   struct mm *mm;
   struct {
     pthread_rwlock_t sig_lock;

@@ -20,6 +20,7 @@
  * The highest capability that exists, which is what bounds a full set. Reporting
  * bits above it set would name capabilities no kernel has defined.
  */
+#define LINUX_CAP_SETPCAP   8
 #define LINUX_CAP_LAST_CAP  40  /* CAP_CHECKPOINT_RESTORE */
 
 struct l_user_cap_header {

@@ -1271,6 +1271,19 @@ elif [ "${ok_plain:-0}" = 1 ]; then
     fail=1
 fi
 
+# capuidtest: what a change of user does to the capabilities - the securebits,
+# the bounding set, and whether a permitted set survives becoming another user.
+# Android's init sets the bits, changes user, and only then installs the
+# capabilities a service is to run with.
+cp "$here/capuidtest" "$root/"; chmod +x "$root/capuidtest"
+out=$("$NABI" -m "$root" /capuidtest 2>&1 | tail -1); rc=$?
+if [ "$out" = "capuid ok" ]; then
+    echo "  ok  capuidtest -> \"$out\""
+else
+    echo "  FAIL capuidtest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 # bindersibtest: two sibling processes must find the same binder registry when
 # their parent never opened the device. A fork hides this - the parent has
 # already named the registry - which is why binderprobe's twoproc stage never

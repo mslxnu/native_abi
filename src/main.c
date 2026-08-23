@@ -380,6 +380,9 @@ init_first_proc(const char *root)
   /* Published before any guest code runs, so a peer that asks about this
    * process finds an answer whether or not it ever changes ids. */
   cred_publish(initial_uid, initial_gid);
+  /* A guest told to start as somebody else never had capabilities to lose. */
+  if (initial_uid != 0)
+    cap_start_unprivileged();
 
   task.tid = getpid();
 }

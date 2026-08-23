@@ -203,15 +203,24 @@ may_become_gid(l_gid_t want)
          want == proc.cred.gid || want == proc.cred.egid ||
          want == proc.cred.sgid;
 }
+static void cap_after_setresuid(bool was_priv, bool now_unpriv,
+                                l_uid_t old_euid, l_uid_t new_euid);
+
 
 int
 do_setresuid(l_uid_t ruid, l_uid_t euid, l_uid_t suid)
 {
   if (!may_become(ruid) || !may_become(euid) || !may_become(suid))
     return -LINUX_EPERM;
+  l_uid_t was_uid = proc.cred.uid, was_euid = proc.cred.euid,
+          was_suid = proc.cred.suid;
   if (ruid != (l_uid_t) -1) proc.cred.uid  = ruid;
   if (euid != (l_uid_t) -1) proc.cred.euid = euid;
   if (suid != (l_uid_t) -1) proc.cred.suid = suid;
+  cap_after_setresuid(was_uid == 0 || was_euid == 0 || was_suid == 0,
+                      proc.cred.uid != 0 && proc.cred.euid != 0 &&
+                          proc.cred.suid != 0,
+                      was_euid, proc.cred.euid);
   /* Every change to the effective id carries the filesystem id with it. Linux
    * does this so that setfsuid is the only way the two can differ, which is
    * what makes it safe for the filesystem checks to consult fsuid alone. */
@@ -961,6 +970,11 @@ DEFINE_SYSCALL(tkill, l_pid_t, tid, int, sig)
 static uint64_t cap_effective   = ~0ULL;
 static uint64_t cap_permitted   = ~0ULL;
 static uint64_t cap_inheritable = 0;
+/*
+ * The bounding set: the ceiling on what this process, or anything it execs,
+ * can ever hold. It only shrinks, which is the whole of its contract.
+ */
+static uint64_t cap_bounding    = ~0ULL;
 static pthread_mutex_t cap_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /*
@@ -977,6 +991,62 @@ static pthread_mutex_t cap_lock = PTHREAD_MUTEX_INITIALIZER;
  * capability model it would have been satisfied by either way.
  */
 static int cap_keepcaps = 0;
+
+/*
+ * What a change of user does to the capabilities, which is Linux's rule and not
+ * an approximation of it.
+ *
+ * A process that gives up the last of its root ids loses its permitted and
+ * effective sets - unless it said to keep them, which is the whole purpose of
+ * PR_SET_KEEPCAPS and of the securebit behind it. Giving up an effective root
+ * id alone clears the effective set; taking one back restores it from the
+ * permitted one. SECBIT_NO_SETUID_FIXUP turns all of it off, for a caller that
+ * would rather manage its own.
+ *
+ * This used to be nothing at all: keepcaps was remembered and reported and
+ * changed no outcome, because capget and capset answered from the euid instead
+ * of from a set carried across the change. That is fine for a process dropping
+ * privilege and giving up its capabilities with it, which is what the flag was
+ * added for here. It is exactly wrong for the other caller: Android's init sets
+ * the securebits, changes to the service's user, and *then* installs the
+ * capabilities that service is to run with - and the last step is a non-root
+ * process asking for a non-empty set, which was refused. "cap_set_proc(0)
+ * failed: Operation not permitted", and init aborts rather than start a service
+ * without the capabilities it asked for.
+ */
+static void
+cap_after_setresuid(bool was_priv, bool now_unpriv, l_uid_t old_euid,
+                    l_uid_t new_euid)
+{
+  if (proc.securebits & SECBIT_NO_SETUID_FIXUP)
+    return;
+  bool keep = cap_keepcaps || (proc.securebits & SECBIT_KEEP_CAPS);
+  pthread_mutex_lock(&cap_lock);
+  if (was_priv && now_unpriv && !keep) {
+    cap_permitted = 0;
+    cap_effective = 0;
+  }
+  if (old_euid == 0 && new_euid != 0)
+    cap_effective = 0;
+  if (old_euid != 0 && new_euid == 0)
+    cap_effective = cap_permitted;
+  pthread_mutex_unlock(&cap_lock);
+}
+
+/*
+ * A guest told to start as somebody other than root never had capabilities to
+ * lose, so it starts without them. Without this the sets would keep the full
+ * value they are initialised with and be reported to a process that has no
+ * claim on them - which mattered only once the sets were believed rather than
+ * gated on the euid.
+ */
+void
+cap_start_unprivileged(void)
+{
+  pthread_mutex_lock(&cap_lock);
+  cap_effective = cap_permitted = cap_inheritable = 0;
+  pthread_mutex_unlock(&cap_lock);
+}
 
 /*
  * PR_SET_DUMPABLE, which says whether this process may be core-dumped and
@@ -1163,18 +1233,15 @@ DEFINE_SYSCALL(capget, gaddr_t, header_ptr, gaddr_t, data_ptr)
 
   uint64_t eff, perm, inh;
   pthread_mutex_lock(&cap_lock);
-  bool root;
-  pthread_rwlock_rdlock(&proc.cred.lock);
-  root = proc.cred.euid == 0;
-  pthread_rwlock_unlock(&proc.cred.lock);
   /*
-   * Not root means not capable, whatever was recorded - the recorded set is a
-   * ceiling a process lowered for itself, not a way to hold a capability the
-   * credentials do not give it.
+   * The sets as they stand. They are carried across a change of user by the
+   * rule Linux uses - see cap_after_setresuid - rather than being gated on the
+   * euid at the moment of asking, which reported nothing for a process that
+   * had deliberately kept them.
    */
-  eff  = root ? (cap_effective   & CAP_FULL_SET) : 0;
-  perm = root ? (cap_permitted   & CAP_FULL_SET) : 0;
-  inh  = root ? (cap_inheritable & CAP_FULL_SET) : 0;
+  eff  = cap_effective   & CAP_FULL_SET;
+  perm = cap_permitted   & CAP_FULL_SET;
+  inh  = cap_inheritable & CAP_FULL_SET;
   pthread_mutex_unlock(&cap_lock);
 
   struct l_user_cap_data data[LINUX_CAPABILITY_U32S_3] = {{0, 0, 0}, {0, 0, 0}};
@@ -1216,11 +1283,6 @@ DEFINE_SYSCALL(capset, gaddr_t, header_ptr, gaddr_t, data_ptr)
     inh  |= (uint64_t) data[1].inheritable << 32;
   }
 
-  bool root;
-  pthread_rwlock_rdlock(&proc.cred.lock);
-  root = proc.cred.euid == 0;
-  pthread_rwlock_unlock(&proc.cred.lock);
-
   pthread_mutex_lock(&cap_lock);
   /*
    * The two rules Linux enforces and a caller can be wrong about: the effective
@@ -1235,7 +1297,7 @@ DEFINE_SYSCALL(capset, gaddr_t, header_ptr, gaddr_t, data_ptr)
    * then reducing the set; that last step arrives as a non-root caller asking
    * for the empty set, and dbus-daemon's system bus got EPERM for it.
    */
-  uint64_t held = root ? cap_permitted : 0;
+  uint64_t held = cap_permitted;
   int ret = 0;
   if ((eff & ~perm) || (perm & ~held) || (inh & ~held)) {
     ret = -LINUX_EPERM;
@@ -1670,6 +1732,70 @@ DEFINE_SYSCALL(prctl, int, option, unsigned long, arg1, unsigned long, arg2, uns
     return seccomp_prctl_set(arg1, (gaddr_t) arg2);
   case LINIX_PR_GET_SECCOMP:
     return seccomp_mode_get();
+
+  /*
+   * The securebits, which are the rules a process wants applied to its own
+   * transitions across uid 0 - keep capabilities across a setuid, do not grant
+   * them for being root, and the locks that make each of those irreversible.
+   *
+   * There is no capability model here for them to change, so they change
+   * nothing; they are remembered and handed back so that a caller reading its
+   * own settings is told what it set. Refusing the pair is what could not
+   * stand: Android's init reads them for every service it starts and treats
+   * the failure as fatal - "prctl(PR_GET_SECUREBITS) failed for logd: Invalid
+   * argument" - so logd never started and init aborted.
+   *
+   * The locking bits are honoured to the extent that anything here can: once a
+   * lock bit is set, the bit it locks cannot be changed again, which is the
+   * whole of what a lock does and is checkable without a capability model.
+   */
+  /*
+   * The capability bounding set. Reading it is unprivileged; dropping from it
+   * needs CAP_SETPCAP, and drops are all that can be done - Linux has no way
+   * to put a capability back, which is what makes the set a bound rather than
+   * a setting.
+   *
+   * Refusing the pair stopped Android before any service ran. init drops every
+   * capability a service is not to have from the bound before it execs it, one
+   * prctl per capability, and reports the first refusal as "cap_drop_bound(0)
+   * failed: Operation not permitted" - then aborts rather than start a service
+   * with more power than it asked for. Which is the right instinct, and the
+   * reason answering this honestly matters more than it looks.
+   */
+  case LINIX_PR_CAPBSET_READ:
+    if (arg1 > LINUX_CAP_LAST_CAP)
+      return -LINUX_EINVAL;
+    return (int) ((cap_bounding >> arg1) & 1);
+  case LINIX_PR_CAPBSET_DROP: {
+    if (arg1 > LINUX_CAP_LAST_CAP)
+      return -LINUX_EINVAL;
+    pthread_mutex_lock(&cap_lock);
+    bool may = (cap_effective & (1ULL << LINUX_CAP_SETPCAP)) != 0;
+    if (may)
+      cap_bounding &= ~(1ULL << arg1);
+    pthread_mutex_unlock(&cap_lock);
+    return may ? 0 : -LINUX_EPERM;
+  }
+
+  case LINIX_PR_GET_SECUREBITS:
+    /* No argument checking, because Linux does none: the remaining arguments
+     * of a prctl are whatever the caller's varargs left on the stack, and
+     * Android's reads them uninitialised. Refusing on their account is how
+     * this came back EINVAL for a call that had asked for nothing. */
+    return (int) proc.securebits;
+  case LINIX_PR_SET_SECUREBITS: {
+    uint32_t want = (uint32_t) arg1;
+    uint32_t have = proc.securebits;
+    uint32_t locks = have & SECUREBITS_LOCKS;
+    /* Linux's three refusals, in its order: a locked rule may not change, a
+     * lock may not be cleared, and no bit outside the set may be named. */
+    if (((locks >> 1) & (have ^ want)) || (locks & ~want) ||
+        (want & ~(uint32_t) SECUREBITS_KNOWN))
+      return -LINUX_EPERM;
+    proc.securebits = want;
+    return 0;
+  }
+
   default:
     warnk("unkown prctl cmd: %d\n", option);
     return -LINUX_EINVAL;
