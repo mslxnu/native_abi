@@ -33,6 +33,9 @@ static long sys6(long n,long a,long b,long c,long d,long e,long f){
  * constant with the code under test cannot catch that constant being wrong,
  * which is exactly how the first version of this test passed while every guest
  * pty allocation still failed. */
+#define SYS_mount 40
+#define SYS_mknodat 33
+#define S_IFCHR 0020000
 #define TIOCGPTN   0x80045430
 #define TIOCSPTLCK 0x40045431
 #define TCGETS     0x5401
@@ -144,6 +147,60 @@ void _start(void)
   if (r != 5 || buf[0] != 'p' || buf[1] != 'i' || buf[2] != 'n' ||
       buf[3] != 'g' || buf[4] != '\n') {
     put("pty FAIL: slave read back "); putd(r); put(" wrong bytes\n");
+    sys6(SYS_exit, 1, 0,0,0,0,0);
+  }
+
+  sys6(SYS_close, s, 0,0,0,0,0);
+  sys6(SYS_close, m, 0,0,0,0,0);
+
+  /*
+   * And again with a tmpfs of the guest's own on /dev, which is what Android
+   * does before it uses a pty at all.
+   *
+   * Everything above passed with /dev as a passthrough, and that is why this
+   * was missed: the slave's name was rewritten to the host's tty only after
+   * the mount table had spoken, so once something was mounted on /dev the name
+   * resolved to a file inside that tmpfs which nothing had created, and the
+   * open was ENOENT. init's logwrapper opens the slave to give a command a
+   * terminal, so every command init ran that way reported "Cannot open
+   * child_ptty: No such file or directory".
+   *
+   * The master has to be reopened: the tmpfs hides the /dev the first one came
+   * from, and a node for it has to be made the way Android's does.
+   */
+  if ((r = sys6(SYS_mount, (long) "none", (long) "/dev", (long) "tmpfs",
+                0, 0, 0)) != 0)
+    fail("mount a tmpfs on /dev", r);
+  sys6(SYS_mknodat, AT_FDCWD, (long) "/dev/ptmx", S_IFCHR | 0666,
+       (5 << 8) | 2, 0, 0);
+
+  m = sys6(SYS_openat, AT_FDCWD, (long) "/dev/ptmx", O_RDWR|O_NOCTTY, 0, 0, 0);
+  if (m < 0) fail("open /dev/ptmx under a guest /dev", m);
+  { int z = 0;
+    if ((r = sys6(SYS_ioctl, m, TIOCSPTLCK, (long) &z, 0, 0, 0)) < 0)
+      fail("unlockpt under a guest /dev", r); }
+  n = 0xffffffffu;
+  if ((r = sys6(SYS_ioctl, m, TIOCGPTN, (long) &n, 0, 0, 0)) < 0)
+    fail("TIOCGPTN under a guest /dev", r);
+  {
+    char d[12]; int i = 0;
+    unsigned int v = n;
+    if (v == 0) d[i++] = '0';
+    while (v) { d[i++] = (char) ('0' + v % 10); v /= 10; }
+    int q = 9;
+    while (i) path[q++] = d[--i];
+    path[q] = 0;
+  }
+  s = sys6(SYS_openat, AT_FDCWD, (long) path, O_RDWR|O_NOCTTY, 0, 0, 0);
+  if (s < 0) fail("open the slave under a guest /dev", s);
+
+  if ((r = sys6(SYS_write, m, (long) msg, sizeof msg - 1, 0, 0, 0)) < 0)
+    fail("write to the master under a guest /dev", r);
+  if ((r = sys6(SYS_read, s, (long) buf, sizeof buf, 0, 0, 0)) < 0)
+    fail("read from the slave under a guest /dev", r);
+  if (r != 5) {
+    put("pty FAIL: slave under a guest /dev read back "); putd(r);
+    put(" bytes\n");
     sys6(SYS_exit, 1, 0,0,0,0,0);
   }
 

@@ -4816,7 +4816,24 @@ resolve_path(const struct dir *parent, const char *name, int flags, struct path 
     if (procfs_exe_path(name, exepath, sizeof exepath))
       name = exepath;
 
-    if (mount_resolve(name, mntpath, sizeof mntpath, &path->rdonly)) {
+    /*
+     * A pty slave is a pty slave whatever is mounted on /dev.
+     *
+     * This used to be tried only after the mount table had spoken, which meant
+     * it never ran once a guest mounted its own /dev: /dev/pts/5 resolved to a
+     * file inside that tmpfs, which nothing had created, and the open was
+     * ENOENT. Android mounts a tmpfs on /dev and then talks to ptys through it
+     * - init's logwrapper opens the slave to give a command a terminal, and
+     * reported "Cannot open child_ptty: No such file or directory" for every
+     * command it ran that way, `update_linker_config` among them.
+     *
+     * First, and on the guest's own spelling, because the answer is a host
+     * device name and putting it through the mount table again would send it
+     * back into the tmpfs.
+     */
+    if (devpts_to_host(name, ptsname, sizeof ptsname)) {
+      name = ptsname;
+    } else if (mount_resolve(name, mntpath, sizeof mntpath, &path->rdonly)) {
       name = mntpath;
       /*
        * A devtmpfs or devpts mount backed by the host's /dev lands on
