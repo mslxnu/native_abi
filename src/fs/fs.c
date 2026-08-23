@@ -7396,7 +7396,7 @@ DEFINE_SYSCALL(ppoll, gaddr_t, fds_ptr, int, nfds, gaddr_t, tmo_ptr, gaddr_t, si
     if (copy_from_user(&lset, sigmask_ptr, sizeof lset))
       return -LINUX_EFAULT;
     sigset_t dset;
-    linux_to_darwin_sigset(&lset, &dset);
+    host_sigmask_of(&lset, &dset);
     sigprocmask(SIG_SETMASK, &dset, &saved);
     have_mask = true;
   }

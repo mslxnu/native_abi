@@ -570,6 +570,47 @@ DEFINE_SYSCALL(rt_sigaction, int, sig, gaddr_t, act, gaddr_t, oact, size_t, size
   return err;
 }
 
+/*
+ * The host thread's mask for a guest mask, which is not quite the same set.
+ *
+ * A signal the guest blocks *and* handles must still reach the host's handler,
+ * or it would never be recorded as pending: __host_signal_handler is the one
+ * place nabi learns a signal exists, and a signalfd wanting one would wait
+ * forever on a signal that arrived and was swallowed by the host's own
+ * blocking. Leaving handled signals unblocked costs nothing, because nabi's own
+ * delivery already honours the guest mask - has_sigpending and pop_signal
+ * subtract it - and sigrestart_wanted re-runs a blocking call interrupted by a
+ * signal the guest cannot yet receive. A signal without a handler keeps its
+ * host disposition and stays blocked, so a default action cannot fire behind
+ * the guest's back.
+ *
+ * One function because there is one rule, and the places that put a guest mask
+ * on the host are not all in one file: sigprocmask, the entry to a signal
+ * handler and the return from one, sigsuspend, and every wait that takes a mask
+ * of its own. Each of them translated the mask directly for a while, and each
+ * was a way to lose a signal nabi had to see. Entering a handler was the one
+ * that mattered: Android's init blocks SIGCHLD and watches it on a signalfd, so
+ * the first signal it took through a handler of its own left SIGCHLD blocked on
+ * the host for good - after which no service exit was ever reported, init
+ * waited its ten seconds, called the service hung, and rebooted. Intermittent,
+ * because it depended on init happening to take a signal first.
+ */
+void
+host_sigmask_of(const l_sigset_t *lmask, sigset_t *out)
+{
+  sigemptyset(out);
+  for (int sig = 1; sig <= LINUX_NSIG; sig++) {
+    if (!LINUX_SIGISMEMBER(lmask, sig))
+      continue;
+    l_handler_t h = proc.sigaction[sig - 1].lsa_handler;
+    if (h != LINUX_SIG_DFL && h != LINUX_SIG_IGN)
+      continue;
+    if (signalfd_wants(sig))
+      continue;
+    sigaddset(out, linux_to_darwin_signal(sig));
+  }
+}
+
 DEFINE_SYSCALL(rt_sigprocmask, int, how, gaddr_t, nset, gaddr_t, oset, size_t, size)
 {
   l_sigset_t lset;
@@ -609,32 +650,7 @@ DEFINE_SYSCALL(rt_sigprocmask, int, how, gaddr_t, nset, gaddr_t, oset, size_t, s
       return -LINUX_EINVAL;
   }
 
-  /*
-   * The host thread's mask is not quite the guest's. A signal the guest blocks
-   * *and* handles must still reach the host's handler, or it would never be
-   * recorded as pending: __host_signal_handler is the one place nabi learns a
-   * signal exists, and a signalfd wanting one would wait forever on a signal
-   * that arrived and was swallowed by the host's own blocking. Leaving handled
-   * signals unblocked here costs nothing, because nabi's own delivery already
-   * honours the guest mask - has_sigpending and pop_signal subtract it - and
-   * sigrestart_wanted re-runs a blocking call interrupted by a signal the guest
-   * cannot yet receive. A signal without a handler keeps its host disposition
-   * and stays blocked, so a default action cannot fire behind the guest's back.
-   */
-  sigemptyset(&dset);
-  for (int sig = 1; sig <= LINUX_NSIG; sig++) {
-    if (!LINUX_SIGISMEMBER(&task.sigmask, sig))
-      continue;
-    l_handler_t h = proc.sigaction[sig - 1].lsa_handler;
-    if (h != LINUX_SIG_DFL && h != LINUX_SIG_IGN)
-      continue;
-    /* ...and one a signalfd is watching is handled too, by nabi rather than by
-     * the guest. Blocking it here would swallow exactly what the descriptor
-     * exists to report. */
-    if (signalfd_wants(sig))
-      continue;
-    sigaddset(&dset, linux_to_darwin_signal(sig));
-  }
+  host_sigmask_of(&task.sigmask, &dset);
 
   int err = syswrap(pthread_sigmask(SIG_SETMASK, &dset, NULL));
   if (err < 0) {
@@ -659,7 +675,7 @@ DEFINE_SYSCALL(rt_sigsuspend, gaddr_t, nset, size_t, size)
   LINUX_SIGDELSET(&lnset, LINUX_SIGSTOP);
 
   sigset_t dwset, doset;
-  linux_to_darwin_sigset(&lnset, &dwset);
+  host_sigmask_of(&lnset, &dwset);
   pthread_sigmask(SIG_SETMASK, &dwset, &doset);
   
   task.sigmask = lnset;

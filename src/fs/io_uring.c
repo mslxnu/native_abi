@@ -1271,7 +1271,7 @@ DEFINE_SYSCALL(io_uring_enter, int, fd, uint32_t, to_submit,
         return -LINUX_EFAULT;
       }
       sigset_t dset;
-      linux_to_darwin_sigset(&lset, &dset);
+      host_sigmask_of(&lset, &dset);
       sigprocmask(SIG_SETMASK, &dset, &saved);
       have_mask = true;
     }

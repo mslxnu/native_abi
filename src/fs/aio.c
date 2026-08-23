@@ -563,7 +563,7 @@ DEFINE_SYSCALL(io_pgetevents, gaddr_t, ctx_id, long, min_nr, long, nr,
       if (copy_from_user(&lset, (gaddr_t) sig.mask_ptr, sizeof lset))
         return -LINUX_EFAULT;
       sigset_t dset;
-      linux_to_darwin_sigset(&lset, &dset);
+      host_sigmask_of(&lset, &dset);
       sigprocmask(SIG_SETMASK, &dset, &saved);
       have_mask = true;
     }

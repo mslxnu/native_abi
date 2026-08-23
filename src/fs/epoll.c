@@ -465,7 +465,7 @@ DEFINE_SYSCALL(epoll_pwait, int, epfd, gaddr_t, events, int, maxevents, int, tim
     if (copy_from_user(&lset, sigmask_ptr, sizeof lset))
       return -LINUX_EFAULT;
     sigset_t dset;
-    linux_to_darwin_sigset(&lset, &dset);
+    host_sigmask_of(&lset, &dset);
     sigprocmask(SIG_SETMASK, &dset, &saved);
     have_mask = true;
   }

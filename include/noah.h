@@ -70,6 +70,8 @@ typedef atomic_uint_least64_t atomic_sigbits_t;
 #define INIT_SIGBIT(sigbit) (*(sigbit) = ATOMIC_VAR_INIT(0))
 void handle_signal(void);
 bool has_sigpending(void);
+/* The host thread mask a guest mask implies; see src/ipc/signal.c. */
+void host_sigmask_of(const l_sigset_t *lmask, sigset_t *out);
 bool sigrestart_wanted(void);
 int send_signal(pid_t pid, int sig);
 void signalfd_note_signal(int lsig);

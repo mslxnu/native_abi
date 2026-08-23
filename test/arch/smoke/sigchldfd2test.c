@@ -22,6 +22,15 @@
  *     has to be recorded without being delivered.
  *   - and a second child works the same way, so the first is not a one-off
  *     left over from something armed at creation.
+ *   - it still works after the guest has taken *some other* signal through a
+ *     handler of its own. Entering a handler and returning from one both put
+ *     the guest's mask on the host, and doing that literally re-blocked every
+ *     signal the guest blocks - including the one the signalfd is watching,
+ *     which nabi has to keep receiving to report it at all. After that no
+ *     child exit was ever reported again. Android's init showed this as an
+ *     intermittent "Exec service is hung? Waited 10.0023 without SIGCHLD",
+ *     intermittent because it depended on init happening to take a signal
+ *     first.
  */
 static long sys6(long n,long a,long b,long c,long d,long e,long f){
   register long x8 asm("x8")=n; register long x0 asm("x0")=a; register long x1 asm("x1")=b;
@@ -40,7 +49,9 @@ static long sys6(long n,long a,long b,long c,long d,long e,long f){
 #define SYS_epoll_pwait 22
 #define SYS_read 63
 #define SYS_getpid 172
+#define SYS_kill 129
 
+#define SIGUSR1 10
 #define SIGCHLD 17
 #define SIGCHLD_BIT (1UL << (SIGCHLD - 1))
 #define SIG_BLOCK 0
@@ -63,6 +74,8 @@ static void want(const char *what, long got, long expect){
 
 static volatile int handler_ran;
 static void handler(int s) { (void) s; handler_ran = 1; }
+static volatile int usr1_ran;
+static void usr1(int s) { (void) s; usr1_ran = 1; }
 
 /* A child that does a little work before exiting, so the exit does not land in
  * the same instant as the fork - init's services all run for a while. */
@@ -117,6 +130,37 @@ void _start(void)
   }
 
   want("the handler did not run for a blocked signal", handler_ran, 0);
+
+  /*
+   * Now take an unrelated signal through a handler, and do it all again. The
+   * handler runs and returns, which is where the guest's mask was being copied
+   * onto the host wholesale; if it is, SIGCHLD is blocked there from here on
+   * and nothing below will ever be reported.
+   */
+  long uact[4] = { (long) usr1, 0, 0, 0 };
+  want("rt_sigaction(SIGUSR1)",
+       sys6(SYS_rt_sigaction, SIGUSR1, (long)uact, 0, 8, 0, 0), 0);
+  long me = sys6(SYS_getpid, 0,0,0,0,0,0);
+  want("kill(self, SIGUSR1)", sys6(SYS_kill, me, SIGUSR1, 0,0,0,0), 0);
+  for (int spin = 0; spin < 1000000 && !usr1_ran; spin++)
+    sys6(SYS_getpid, 0,0,0,0,0,0);
+  want("the SIGUSR1 handler ran", usr1_ran, 1);
+
+  for (int round = 0; round < 2; round++) {
+    long kid = spawn();
+    want("fork after a handler ran", kid > 0, 1);
+    if (kid <= 0)
+      break;
+    struct epoll_event got;
+    long n = sys6(SYS_epoll_pwait, ep, (long)&got, 1, 10000, 0, 0);
+    want("a child exit is still reported after a handler ran", n, 1);
+    if (n == 1) {
+      long rr = sys6(SYS_read, sfd, (long)buf, sizeof buf, 0, 0, 0);
+      want("and its record is SIGCHLD",
+           rr == SI_SIZE && *(unsigned int *)buf == SIGCHLD, 1);
+    }
+    sys6(SYS_wait4, kid, 0, 0, 0, 0, 0);
+  }
 
   sys6(SYS_close, sfd, 0,0,0,0,0);
   sys6(SYS_close, ep, 0,0,0,0,0);

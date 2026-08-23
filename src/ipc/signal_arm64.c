@@ -218,7 +218,7 @@ arch_setup_sigframe(int signum)
     LINUX_SIGADDSET(&newmask, signum);
   task.sigmask = newmask;
   sigset_t dset;
-  linux_to_darwin_sigset(&newmask, &dset);
+  host_sigmask_of(&newmask, &dset);
   sigprocmask(SIG_SETMASK, &dset, NULL);
 
   /* Push the frame; the aarch64 ABI requires a 16-byte-aligned stack. */
@@ -260,7 +260,7 @@ arch_rt_sigreturn(void)
 
   task.sigmask = frame.uc.uc_sigmask;
   sigset_t dset;
-  linux_to_darwin_sigset(&task.sigmask, &dset);
+  host_sigmask_of(&task.sigmask, &dset);
   sigprocmask(SIG_SETMASK, &dset, NULL);
 
   /* restore_sigcontext already set x0 (regs[0]); return it so the syscall

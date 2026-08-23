@@ -128,7 +128,7 @@ arch_setup_sigframe(int signum)
     LINUX_SIGADDSET(&newmask, signum);
   }
   task.sigmask = newmask;
-  linux_to_darwin_sigset(&newmask, &dset);
+  host_sigmask_of(&newmask, &dset);
   sigprocmask(SIG_SETMASK, &dset, NULL);
 
   /* OK, push them then... */
@@ -163,7 +163,7 @@ arch_rt_sigreturn(void)
   restore_sigcontext(&frame.sf_sc.uc_mcontext);
   sigset_t dset;
   task.sigmask = frame.sf_sc.uc_mcontext.sc_mask;
-  linux_to_darwin_sigset(&task.sigmask, &dset);
+  host_sigmask_of(&task.sigmask, &dset);
   sigprocmask(SIG_SETMASK, &dset, NULL);
 
   uint64_t rip;
