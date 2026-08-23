@@ -31,8 +31,10 @@
  *           Backed with the host's device tree. A devtmpfs mount is the
  *           kernel's /dev, which is the host's /dev here, so a container's own
  *           /dev reaches the real devices; devpts is served by the same
- *           /dev/ttysNNN rewrite the passthrough uses; binderfs answers with
- *           /dev/binderfs.
+ *           /dev/ttysNNN rewrite the passthrough uses. binderfs answers with
+ *           /dev/binderfs while the kext is loaded, and with a directory of
+ *           nabi's own otherwise - holding a control node to start with, and
+ *           the devices the guest creates through it as it creates them.
  *
  * Everything else - a real filesystem, overlay - is EINVAL or ENODEV rather
  * than a success that did nothing. There is no block device layer here to mount

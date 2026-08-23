@@ -69,6 +69,18 @@ guest-code cache sync.
   and receives a real, usable fd back, keyed by the sender's pid in the cookie).
   Its fda stage sends a `BINDER_TYPE_FDA` array of two descriptors: the broker
   moves each over `SCM_RIGHTS` and the manager substitutes them in the array.
+  Its secctx stage registers the manager with
+  `FLAT_BINDER_FLAG_TXN_SECURITY_CTX` and checks the longer
+  `BR_TRANSACTION_SEC_CTX` form comes back with the label in the read buffer.
+  Run a second time with `NABI_BINDER=emulated`, against nabi's own binder
+  instead of the kext's - the same probe is the oracle for both, which is what
+  makes the two comparable.
+- `binderfstest` — binderfs served by nabi: `BINDERFS_CTL_ADD` makes a device,
+  it appears in the directory listing, and it is a *separate* binder. Each
+  device takes its own context manager, which is the property the whole split
+  exists for - `/dev/binder`, `/dev/hwbinder` and `/dev/vndbinder` are three
+  binders, not three names for one, so handle 0 means a different object in
+  each and a vendor call cannot reach a framework object.
 - `pathtest` — a guest path merely starting with a host-passthrough name
   (`/tmpmark` vs `/tmp`) must resolve in the rootfs, not on the host.
 - `protecttest` — `mprotect` a page read-only and write to it; the write must trap.

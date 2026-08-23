@@ -1191,6 +1191,22 @@ else
     fail=1
 fi
 
+# binderfstest: the filesystem that makes binders, served by nabi rather than by
+# the kext. Forced to the emulation, because that is the side that has to work
+# without one - and because the two do not answer alike: the kext's binderfs is
+# the host's, whose control node is root-only, so the same test against it
+# would be measuring the host's permissions.
+cp "$here/binderfstest" "$root/"; chmod +x "$root/binderfstest"
+out=$(NABI_BINDER=emulated "$NABI" -m "$root" /binderfstest 2>&1); rc=$?
+last=$(printf '%s\n' "$out" | tail -1)
+if [ "$rc" -eq 0 ] && [ "$last" = "binderfs ok" ]; then
+    echo "  ok  binderfstest -> \"$last\""
+else
+    echo "  FAIL binderfstest -> \"$last\", exit $rc"
+    printf '%s\n' "$out" | grep FAIL | head -4 | sed 's/^/       /'
+    fail=1
+fi
+
 # kmsgtest: /dev/kmsg, served by nabi because there is no kernel here to keep a
 # log. It was mapped onto /dev/null, so a guest's own account of its boot was
 # destroyed as it was written - Android's init says everything it has to say

@@ -660,10 +660,38 @@ backing_for_type(const char *type, const char *source, unsigned long flags,
     return 0;
   }
   if (type_is(type, "binderfs")) {
-    /* The binder control files, which live at /dev/binderfs on the host. */
+    /*
+     * The kext's binderfs while it is loaded, and a directory of nabi's own
+     * otherwise. A fresh binderfs holds exactly one thing - the control node
+     * that BINDERFS_CTL_ADD is spoken to - and the devices the guest asks for
+     * appear beside it as it asks. It is a real directory because a container
+     * lists it and expects to find what it created, which is also why the
+     * device files are made even though opening one never reads them.
+     */
     snprintf(e->source, sizeof e->source, "%s", source);
-    snprintf(e->hostdir, sizeof e->hostdir, "%s", "/dev/binderfs");
     snprintf(e->type, sizeof e->type, "%s", type);
+    if (!binder_emulated()) {
+      snprintf(e->hostdir, sizeof e->hostdir, "%s", "/dev/binderfs");
+      return 0;
+    }
+    if (probe_only)
+      return 0;
+
+    char dirtpl[PATH_MAX];
+    const char *tmp = getenv("TMPDIR");
+    snprintf(dirtpl, sizeof dirtpl, "%s/nabi-binderfs-XXXXXX",
+             tmp && *tmp ? tmp : "/tmp");
+    if (mkdtemp(dirtpl) == NULL)
+      return -darwin_to_linux_errno(errno);
+    char ctl[PATH_MAX];
+    snprintf(ctl, sizeof ctl, "%s/binder-control", dirtpl);
+    int cfd = open(ctl, O_CREAT | O_RDWR, 0600);
+    if (cfd < 0) {
+      rmdir(dirtpl);
+      return -darwin_to_linux_errno(errno);
+    }
+    close(cfd);
+    snprintf(e->hostdir, sizeof e->hostdir, "%s", dirtpl);
     return 0;
   }
   if (type_is(type, "proc") || type_is(type, "sysfs") ||

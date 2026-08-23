@@ -108,6 +108,9 @@ static uint64_t balign(uint64_t v) { return (v + 7) & ~(uint64_t) 7; }
 
 #define BINDER_MAX_EP     32
 #define BINDER_MAX_ALLOCS 128
+/* Longest binder context name kept; binderfs allows 255, nothing uses it. */
+#define BINDER_CTX_NAME 32
+
 #define BINDER_MAX_FIXUPS 4
 #define BINDER_PENDING    (64 * 1024)
 
@@ -178,6 +181,17 @@ struct bep_shared {
   int32_t  pid;
   uint32_t id;
   uint32_t is_mgr;
+  /*
+   * Which binder this endpoint is an open of.
+   *
+   * Not one driver with one namespace: /dev/binder, /dev/hwbinder and
+   * /dev/vndbinder are separate contexts on a device, and binderfs exists to
+   * make more of them. Each has its own context manager, so handle 0 means a
+   * different object depending on which one you opened - which is the whole
+   * point of the split, since it is what keeps framework calls and vendor
+   * calls from reaching each other.
+   */
+  char     ctx[BINDER_CTX_NAME];
   struct bmsg q[BSHM_MSG_MAX];
 };
 
@@ -201,6 +215,7 @@ struct binder_ep {
   int      fd;                   /* the descriptor the guest holds; -1 free */
   int      wr;                   /* our own end, for waking a local reader */
   uint32_t id;                   /* this endpoint's place in the shared table */
+  char     ctx[BINDER_CTX_NAME]; /* the binder this is an open of */
   bool     is_mgr;
   bool     secctx;               /* wants transactions in the sec-ctx form */
   uint32_t max_threads;
@@ -357,6 +372,7 @@ ep_adopt_locked(int fd, uint32_t id)
   for (int i = 0; i < BINDER_MAX_EP; i++)
     if (shm->ep[i].used && shm->ep[i].id == id) {
       shm->ep[i].refs++;
+      snprintf(e->ctx, sizeof e->ctx, "%s", shm->ep[i].ctx);
       break;
     }
 }
@@ -449,12 +465,13 @@ binder_emul_is(int fd)
  * the shared registry, because the manager is usually in another process.
  */
 static int
-shm_ep_for_handle(uint32_t handle)
+shm_ep_for_handle(uint32_t handle, const char *ctx)
 {
   if (handle != 0 || !shm_attach())
     return -1;
   for (int i = 0; i < BINDER_MAX_EP; i++)
-    if (shm->ep[i].used && shm->ep[i].is_mgr)
+    if (shm->ep[i].used && shm->ep[i].is_mgr &&
+        strcmp(shm->ep[i].ctx, ctx) == 0)
       return i;
   return -1;
 }
@@ -554,8 +571,10 @@ arena_release(struct binder_ep *e, uint64_t addr)
 }
 
 int
-binder_emul_open(int flags, int *out_fd)
+binder_emul_open(const char *ctx, int flags, int *out_fd)
 {
+  if (ctx == NULL || *ctx == '\0')
+    ctx = "binder";
   if (!shm_attach()) {
     errno = ENOMEM;
     return -1;
@@ -576,6 +595,7 @@ binder_emul_open(int flags, int *out_fd)
   shm->ep[slot].id = shm->next_id++;
   shm->ep[slot].pid = (int32_t) getpid();
   shm->ep[slot].refs = 1;
+  snprintf(shm->ep[slot].ctx, sizeof shm->ep[slot].ctx, "%s", ctx);
   shm->ep[slot].used = 1;
   uint32_t id = shm->ep[slot].id;
   shm_unlock();
@@ -613,6 +633,7 @@ binder_emul_open(int flags, int *out_fd)
   memset(e, 0, sizeof *e);
   e->wr = -1;
   e->id = id;
+  snprintf(e->ctx, sizeof e->ctx, "%s", ctx);
   e->fd = fd;                    /* published last, as the poke walks the table */
   pthread_mutex_unlock(&eps_lock);
 
@@ -676,7 +697,7 @@ static int
 do_transaction(struct binder_ep *from, const struct btr *tr, bool reply,
                uint64_t buffers_size)
 {
-  int slot = reply ? -1 : shm_ep_for_handle((uint32_t) tr->target);
+  int slot = reply ? -1 : shm_ep_for_handle((uint32_t) tr->target, from->ctx);
   if (reply) {
     /* A reply goes back to whoever is waiting for it. Only the same endpoint
      * so far, which is what the one-thread case needs; a reply across
@@ -1222,7 +1243,8 @@ binder_emul_ioctl(int fd, int cmd, uint64_t arg)
     if (!shm_attach()) { r = -LINUX_ENOMEM; break; }
     shm_lock();
     for (int i = 0; i < BINDER_MAX_EP; i++)
-      if (shm->ep[i].used && shm->ep[i].is_mgr && shm->ep[i].id != e->id) {
+      if (shm->ep[i].used && shm->ep[i].is_mgr && shm->ep[i].id != e->id &&
+          strcmp(shm->ep[i].ctx, e->ctx) == 0) {
         r = -LINUX_EBUSY;
         break;
       }

@@ -1710,6 +1710,8 @@ binder_ioctl_host(struct file *file, int cmd, uint64_t val0)
   return binder_small_ioctl(file, cmd, val0, bs, size);
 }
 
+static int binderfs_ctl_add(int fd, uint64_t arg);
+
 int
 darwinfs_ioctl(struct file *file, int cmd, uint64_t val0)
 {
@@ -1718,6 +1720,11 @@ darwinfs_ioctl(struct file *file, int cmd, uint64_t val0)
   int r;
 
   if (binder_ioctl(cmd)) {
+    if (cmd == (int) LINUX_BINDERFS_CTL_ADD && binder_emulated()) {
+      r = binderfs_ctl_add(fd, val0);
+      if (r != -LINUX_ENOTTY)    /* not this binderfs; let the host answer */
+        return r;
+    }
     if (binder_emul_is(fd))
       return binder_emul_ioctl(fd, cmd, val0);
     return binder_ioctl_host(file, cmd, val0);
@@ -2745,28 +2752,137 @@ static bool host_to_guest_path(const char *host, char *out, size_t outsz);
  * is what makes the two comparable: the same conformance probe can be run
  * against both and the answers held side by side.
  */
-static int binder_emul_open_if(int flags, int *out_fd);
-static bool binder_emulated(void);
+static int binder_emul_open_if(const char *name, int flags, int *out_fd);
 
 /*
  * The binder devices by name, when nabi is the one serving them. -1 for
  * anything else, so the caller carries on with the ordinary lookup.
  */
+/*
+ * Something inside a binderfs of nabi's own making, or false.
+ *
+ * Told by the name of the directory rather than by asking the mount table,
+ * because the question is asked of paths that reach it by routes the table
+ * cannot answer for - a symlink from /dev/binder into the binderfs, which is
+ * how Android arranges it, resolves to the host directory directly.
+ */
+static bool
+binderfs_leaf(const char *host, char *dir, size_t dirn, const char **leaf)
+{
+  const char *slash = strrchr(host, '/');
+  if (slash == NULL || slash == host)
+    return false;
+  size_t dlen = (size_t)(slash - host);
+  if (dlen >= dirn)
+    return false;
+  memcpy(dir, host, dlen);
+  dir[dlen] = '\0';
+
+  const char *base = strrchr(dir, '/');
+  base = base != NULL ? base + 1 : dir;
+  if (strncmp(base, "nabi-binderfs-", 14) != 0)
+    return false;
+  *leaf = slash + 1;
+  return **leaf != '\0';
+}
+
 static int
 binder_dev_open(const char *guest_path, int flags, int *out_fd)
 {
-  if (guest_path == NULL || strncmp(guest_path, "/dev/", 5) != 0)
+  if (guest_path == NULL || !binder_emulated())
     return -1;
-  const char *leaf = guest_path + 5;
+
+  /*
+   * A device made through binderfs. Its name is its context, so opening
+   * /dev/binderfs/vndbinder gets the vndbinder, not a second /dev/binder. The
+   * control node is left alone: it is a real file, and what makes it the
+   * control node is the ioctl, not the open.
+   */
+  char host[PATH_MAX], dir[PATH_MAX];
+  const char *leaf;
+  bool rdonly;
+  if (mount_resolve(guest_path, host, sizeof host, &rdonly) &&
+      binderfs_leaf(host, dir, sizeof dir, &leaf)) {
+    if (strcmp(leaf, "binder-control") == 0)
+      return -1;
+    return binder_emul_open(leaf, flags, out_fd) == 0 ? 0 : -1;
+  }
+
+  if (strncmp(guest_path, "/dev/", 5) != 0)
+    return -1;
+  leaf = guest_path + 5;
   if (strcmp(leaf, "binder") != 0 && strcmp(leaf, "hwbinder") != 0 &&
       strcmp(leaf, "vndbinder") != 0)
     return -1;
-  if (!binder_emulated())
-    return -1;
-  return binder_emul_open(flags, out_fd) == 0 ? 0 : -1;
+  return binder_emul_open(leaf, flags, out_fd) == 0 ? 0 : -1;
 }
 
-static bool
+/*
+ * BINDERFS_CTL_ADD: make another binder.
+ *
+ * The device is a file in the binderfs directory, created so the guest can
+ * see what it asked for - a container lists the directory to check. Nothing
+ * ever reads it: opening one is intercepted and turned into an endpoint whose
+ * context is the file's name.
+ *
+ * The numbers handed back are made up, because nothing here allocates device
+ * numbers. They are answered anyway rather than zeroed, since a caller that
+ * goes on to mknod the device wants them to agree with what it was told, and
+ * the minor counts the devices already in the directory so two calls never
+ * name the same node.
+ */
+#define BINDERFS_MAJOR 511
+
+static int
+binderfs_ctl_add(int fd, uint64_t arg)
+{
+  struct binderfs_device {
+    char     name[255 + 1];
+    uint32_t major, minor;
+  } d;
+
+  char ctlpath[PATH_MAX], dir[PATH_MAX];
+  const char *leaf;
+  if (fcntl(fd, F_GETPATH, ctlpath) < 0)
+    return -LINUX_ENOTTY;
+  if (!binderfs_leaf(ctlpath, dir, sizeof dir, &leaf) ||
+      strcmp(leaf, "binder-control") != 0)
+    return -LINUX_ENOTTY;
+  if (copy_from_user(&d, arg, sizeof d))
+    return -LINUX_EFAULT;
+
+  d.name[sizeof d.name - 1] = '\0';
+  if (d.name[0] == '\0' || strchr(d.name, '/') != NULL ||
+      strcmp(d.name, ".") == 0 || strcmp(d.name, "..") == 0 ||
+      strcmp(d.name, "binder-control") == 0)
+    return -LINUX_EINVAL;
+
+  unsigned minor = 0;
+  DIR *dp = opendir(dir);
+  if (dp == NULL)
+    return -darwin_to_linux_errno(errno);
+  for (struct dirent *de; (de = readdir(dp)) != NULL; )
+    if (de->d_name[0] != '.' && strcmp(de->d_name, "binder-control") != 0)
+      minor++;
+  closedir(dp);
+
+  char path[PATH_MAX];
+  snprintf(path, sizeof path, "%s/%s", dir, d.name);
+  int nfd = open(path, O_CREAT | O_EXCL | O_RDWR, 0600);
+  if (nfd < 0)
+    return -darwin_to_linux_errno(errno);
+  close(nfd);
+
+  d.major = BINDERFS_MAJOR;
+  d.minor = minor;
+  if (copy_to_user(arg, &d, sizeof d)) {
+    unlink(path);
+    return -LINUX_EFAULT;
+  }
+  return 0;
+}
+
+bool
 binder_emulated(void)
 {
   const char *how = getenv("NABI_BINDER");
@@ -2784,7 +2900,7 @@ struct guest_device {
   /* Set when nabi serves the device itself rather than borrowing the host's.
    * The two are exclusive: a device is either something the host already has
    * or something there is no host equivalent of. */
-  int       (*open)(int flags, int *out_fd);
+  int       (*open)(const char *name, int flags, int *out_fd);
 };
 
 static const struct guest_device guest_devices[] = {
@@ -2856,13 +2972,15 @@ dev_leaf_of(int dirfd, const char *path)
  * and the choice is made here rather than by having two tables.
  */
 static int
-binder_emul_open_if(int flags, int *out_fd)
+binder_emul_open_if(const char *name, int flags, int *out_fd)
 {
   if (!binder_emulated()) {
     errno = ENODEV;              /* fall back to the host's device */
     return -1;
   }
-  return binder_emul_open(flags, out_fd);
+  /* The node's own name is the context: the three devices are three binders,
+   * not three names for one. */
+  return binder_emul_open(name, flags, out_fd);
 }
 
 static const struct guest_device *
@@ -4116,7 +4234,7 @@ darwinfs_openat(struct fs *fs, struct dir *dir, const char *path, int l_flags, i
         fd = -LINUX_ENXIO;
       } else if (dv->open != NULL) {
         int served = -1;
-        if (dv->open(l_flags, &served) == 0) {
+        if (dv->open(dv->name, l_flags, &served) == 0) {
           fd = served;
         } else if (dv->host != NULL) {
           fd = syswrap(open(dv->host, flags, mode));   /* the host's, then */

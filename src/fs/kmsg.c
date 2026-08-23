@@ -150,8 +150,9 @@ kmsg_is(int fd)
  * and written with is decided here rather than by the file's own contents.
  */
 int
-kmsg_open(int flags, int *out_fd)
+kmsg_open(const char *name, int flags, int *out_fd)
 {
+  (void) name;                   /* one kernel log, whatever the node is called */
   int fd = kmsg_log_open();
   if (fd < 0)
     return -1;
