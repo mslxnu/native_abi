@@ -957,6 +957,7 @@ darwinfs_close(struct file *file)
   loop_close(file->fd);
   abstract_close(file->fd);
   seqpacket_close(file->fd);
+  passcred_close(file->fd);
   kmsg_close(file->fd);
   binder_emul_close(file->fd);
   procfs_close_fd(file->fd);

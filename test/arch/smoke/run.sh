@@ -1271,6 +1271,19 @@ elif [ "${ok_plain:-0}" = 1 ]; then
     fail=1
 fi
 
+# seqcredtest: the AF_UNIX features Android asks for that Darwin has not got -
+# a SOCK_SEQPACKET socket that can be listened on, and SO_PASSCRED actually
+# delivering SCM_CREDENTIALS. init needs the first for lmkd's socket and the
+# second to create it at all.
+cp "$here/seqcredtest" "$root/"; chmod +x "$root/seqcredtest"
+out=$("$NABI" -m "$root" /seqcredtest 2>&1 | tail -1); rc=$?
+if [ "$out" = "seqcred ok" ]; then
+    echo "  ok  seqcredtest -> \"$out\""
+else
+    echo "  FAIL seqcredtest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 # capuidtest: what a change of user does to the capabilities - the securebits,
 # the bounding set, and whether a permitted set survives becoming another user.
 # Android's init sets the bits, changes user, and only then installs the

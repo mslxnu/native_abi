@@ -99,11 +99,85 @@ guest_sa_family(const char *addr, size_t addrlen)
 KHASH_MAP_INIT_INT(seqfd, bool)         /* fd -> the peer has gone */
 static khash_t(seqfd) *seqpacket_fds;
 
+/*
+ * SO_PASSCRED: the receiver asking to be told who sent each message.
+ *
+ * Darwin has no such option - its SCM_CREDS is sent by the sender rather than
+ * asked for by the receiver - so the request is remembered here and the
+ * credentials are put together when a message is received. Passing it to the
+ * host returned ENOPROTOOPT, and Android's init treats that as fatal to
+ * creating the socket: "Failed to set SO_PASSCRED 'lmkd': Protocol not
+ * available", so lmkd never got a socket, exited, and took init with it after
+ * four tries.
+ *
+ * Kept per descriptor in this process. A process that merely *inherits* the
+ * descriptor does not inherit the flag, which is a real gap and not one this
+ * hides: on Linux the setting belongs to the socket. It costs nothing yet
+ * because the setter and the reader are the same process in every case seen so
+ * far - init sets it on the socket it hands to lmkd, and lmkd's own clients
+ * arrive later on descriptors accept() returns here.
+ */
+KHASH_MAP_INIT_INT(passcred, bool)
+static khash_t(passcred) *passcred_fds;
+
+static void
+passcred_set(int fd, bool on)
+{
+  if (passcred_fds == NULL)
+    passcred_fds = kh_init(passcred);
+  int ret;
+  khiter_t k = kh_put(passcred, passcred_fds, fd, &ret);
+  kh_value(passcred_fds, k) = on;
+}
+
+static bool
+passcred_get(int fd)
+{
+  if (passcred_fds == NULL)
+    return false;
+  khiter_t k = kh_get(passcred, passcred_fds, fd);
+  return k != kh_end(passcred_fds) && kh_value(passcred_fds, k);
+}
+
+void
+passcred_close(int fd)
+{
+  if (passcred_fds == NULL)
+    return;
+  khiter_t k = kh_get(passcred, passcred_fds, fd);
+  if (k != kh_end(passcred_fds))
+    kh_del(passcred, passcred_fds, k);
+}
+
+static bool peer_ucred(int fd, struct l_ucred *out);
+
+/*
+ * Which of Darwin's two it becomes depends on what the caller will do with it,
+ * because neither is the whole of what SOCK_SEQPACKET is.
+ *
+ * A socketpair is a connected pair and nothing else will ever be done to it -
+ * no listen, no accept, no connect - so a datagram pair is the closer fit and
+ * keeps the message boundaries. That is the case this was written for: init
+ * makes its channel to property_service that way.
+ *
+ * A socket made with socket(2) is on its way to bind, listen and accept, or to
+ * connect, and a datagram socket has none of those: listen on one is
+ * EOPNOTSUPP, which is where Android's lmkd stopped. It inherits its listening
+ * socket from init, calls listen, and exits when that fails - four times, after
+ * which init calls it a critical process that will not start and reboots. So
+ * that one becomes a stream, and the boundaries are what is given up.
+ *
+ * Losing them is a real difference and worth naming: two messages sent back to
+ * back can arrive as one read. Every caller here frames its own messages -
+ * lmkd's protocol carries a length, and so does property_service's - but a
+ * caller that relied on the boundary alone would be wrong in a way nothing
+ * reports.
+ */
 static int
-seqpacket_darwin_type(int family, int dtype)
+seqpacket_darwin_type(int family, int dtype, bool pair)
 {
   if (family == LINUX_AF_UNIX && dtype == LINUX_SOCK_SEQPACKET)
-    return SOCK_DGRAM;
+    return pair ? SOCK_DGRAM : SOCK_STREAM;
   return dtype;
 }
 
@@ -175,7 +249,7 @@ DEFINE_SYSCALL(socket, int, family, int, type, int, protocol)
   pthread_rwlock_wrlock(&proc.fileinfo.fdtable_lock);
   int dtype = type & ~(LINUX_SOCK_NONBLOCK | LINUX_SOCK_CLOEXEC);
   int fd = syswrap(socket(linux_to_darwin_sa_family(family),
-                          seqpacket_darwin_type(family, dtype), protocol));
+                          seqpacket_darwin_type(family, dtype, false), protocol));
   seqpacket_note(fd, family, dtype);
   ret = fd;
   if (fd < 0) {
@@ -671,6 +745,17 @@ DEFINE_SYSCALL(setsockopt, int, fd, int, level, int, optname, gaddr_t, optval_pt
     r = -LINUX_EFAULT;
     goto out;
   }
+  /* Remembered rather than passed on: Darwin has no such option, and the
+   * credentials it asks for are put together at receive time. */
+  if (level == LINUX_SOL_SOCKET && optname == LINUX_SO_PASSCRED) {
+    int on = 0;
+    if (opt_len >= sizeof on)
+      memcpy(&on, optval, sizeof on);
+    passcred_set(fd, on != 0);
+    r = 0;
+    goto out;
+  }
+
   int host_name = to_host_sockopt_name(optname);
   if (host_name < 0 && sockopt_is_advisory(level, optname)) {
     r = 0;              /* accepted and ignored - see sockopt_is_advisory */
@@ -714,35 +799,18 @@ out:
 }
 
 /*
- * SO_PEERCRED: who is on the other end, in the guest's own terms.
+ * Who is on the other end, as Linux reports it.
  *
- * Linux hands back a struct ucred - pid, uid, gid - taken from the peer at the
- * moment it connected, and it is the kernel saying so rather than the peer, so
- * it is used as proof of identity. D-Bus's EXTERNAL authentication is exactly
- * that: the client writes "AUTH EXTERNAL <uid in hex>" and the bus reads the
- * socket's credentials and refuses if the two disagree.
- *
- * Darwin has the same idea in two pieces - LOCAL_PEERCRED for the ids and
- * LOCAL_PEERPID for the process - and both answer in *host* terms. That is the
- * disagreement: every guest process here runs as the one account nabi was
- * started under, and believes it is root. The client said uid 0 and the bus was
- * told 501, so the bus answered REJECTED EXTERNAL and closed the connection,
- * which dbus reports to its caller as "Did not receive a reply" - the real
- * answer having arrived, and been a refusal.
- *
- * So the ids come back through the same mapping the filesystem uses: the
- * account nabi runs as is the guest's root, anything else keeps the id it has.
- * That makes the credential the bus reads agree with the one the client
- * asserts, because both are the guest's view of the same process. The pid goes
- * through the pid namespace for the same reason.
+ * Used twice: for SO_PEERCRED, which asks about the connection, and for the
+ * SCM_CREDENTIALS attached to a message when the receiver asked for those.
  */
-static int
-peercred_out(int fd, gaddr_t optval_ptr, gaddr_t optlen_ptr, l_socklen_t want)
+static bool
+peer_ucred(int fd, struct l_ucred *out)
 {
   struct xucred xu;
   socklen_t xl = sizeof xu;
   if (getsockopt(fd, SOL_LOCAL, LOCAL_PEERCRED, &xu, &xl) < 0)
-    return syswrap(-1);
+    return false;
 
   /* The pid is a separate option and a newer one; a peer that cannot be named
    * is reported as 0, which is what Linux does for a socket whose peer has
@@ -752,12 +820,7 @@ peercred_out(int fd, gaddr_t optval_ptr, gaddr_t optlen_ptr, l_socklen_t want)
   if (getsockopt(fd, SOL_LOCAL, LOCAL_PEERPID, &hpid, &pl) < 0)
     hpid = 0;
 
-  struct l_ucred {
-    int32_t  pid;
-    uint32_t uid;
-    uint32_t gid;
-  } uc;
-  uc.pid = hpid > 0 ? (int32_t) pidns_to_ns(hpid) : 0;
+  out->pid = hpid > 0 ? (int32_t) pidns_to_ns(hpid) : 0;
 
   /*
    * What the peer says it is, and only failing that what the host says.
@@ -773,12 +836,22 @@ peercred_out(int fd, gaddr_t optval_ptr, gaddr_t optlen_ptr, l_socklen_t want)
    */
   uint32_t puid, pgid;
   if (hpid > 0 && cred_of_host_pid((int32_t) hpid, &puid, &pgid)) {
-    uc.uid = puid;
-    uc.gid = pgid;
+    out->uid = puid;
+    out->gid = pgid;
   } else {
-    uc.uid = host_uid_to_guest(xu.cr_uid);
-    uc.gid = host_gid_to_guest(xu.cr_ngroups > 0 ? xu.cr_groups[0] : xu.cr_uid);
+    out->uid = host_uid_to_guest(xu.cr_uid);
+    out->gid = host_gid_to_guest(xu.cr_ngroups > 0 ? xu.cr_groups[0]
+                                                   : xu.cr_uid);
   }
+  return true;
+}
+
+static int
+peercred_out(int fd, gaddr_t optval_ptr, gaddr_t optlen_ptr, l_socklen_t want)
+{
+  struct l_ucred uc;
+  if (!peer_ucred(fd, &uc))
+    return syswrap(-1);
 
   /* Linux truncates to the caller's buffer and reports how much it wrote. */
   l_socklen_t n = want < (l_socklen_t) sizeof uc ? want : (l_socklen_t) sizeof uc;
@@ -836,6 +909,16 @@ DEFINE_SYSCALL(getsockopt, int, fd, int, level, int, optname, gaddr_t, optval_pt
   if (level == LINUX_SOL_SOCKET &&
       (optname == LINUX_SO_DOMAIN || optname == LINUX_SO_PROTOCOL))
     return sockinfo_out(fd, optname, optval_ptr, optlen_ptr, l_optlen);
+  if (level == LINUX_SOL_SOCKET && optname == LINUX_SO_PASSCRED) {
+    int on = passcred_get(fd) ? 1 : 0;
+    l_socklen_t give = l_optlen < (l_socklen_t) sizeof on
+                           ? l_optlen : (l_socklen_t) sizeof on;
+    if (copy_to_user(optval_ptr, &on, give))
+      return -LINUX_EFAULT;
+    if (copy_to_user(optlen_ptr, &give, sizeof give))
+      return -LINUX_EFAULT;
+    return 0;
+  }
 
   char *optval = malloc(l_optlen);
   unsigned int optlen = l_optlen;
@@ -1215,11 +1298,12 @@ cmsg_to_host(gaddr_t control, size_t controllen, struct msghdr *hdr, void **buf_
  * count would otherwise walk off the end of what it was given.
  */
 static int
-cmsg_to_guest(const struct msghdr *hdr, gaddr_t control, size_t controllen,
-              int flags, bool *truncated)
+cmsg_to_guest(int fd, const struct msghdr *hdr, gaddr_t control,
+              size_t controllen, int flags, bool *truncated)
 {
   *truncated = false;
-  if (control == 0 || hdr->msg_controllen == 0)
+  bool want_cred = passcred_get(fd);
+  if (control == 0 || (hdr->msg_controllen == 0 && !want_cred))
     return 0;
 
   char *out = calloc(1, controllen ? controllen : 1);
@@ -1269,6 +1353,29 @@ cmsg_to_guest(const struct msghdr *hdr, gaddr_t control, size_t controllen,
     memcpy(out + outlen, &c, sizeof c);
     memcpy(out + outlen + sizeof c, fds, payload);
     outlen += L_CMSG_ALIGN(c.cmsg_len);
+  }
+
+  /*
+   * And who sent it, if the receiver asked to be told. Linux puts this in
+   * whether or not anything else is there, which is the whole use of the
+   * option: a receiver that authenticates its clients gets the credentials
+   * with the message rather than having to ask about the connection.
+   */
+  if (ret == 0 && want_cred) {
+    struct l_ucred uc;
+    size_t need = L_CMSG_ALIGN(sizeof(struct l_cmsg_wire)) + sizeof uc;
+    if (outlen + need > controllen) {
+      *truncated = true;
+    } else if (peer_ucred(fd, &uc)) {
+      struct l_cmsg_wire c = {
+        .cmsg_len = sizeof(struct l_cmsg_wire) + sizeof uc,
+        .cmsg_level = LINUX_SOL_SOCKET,
+        .cmsg_type = LINUX_SCM_CREDENTIALS,
+      };
+      memcpy(out + outlen, &c, sizeof c);
+      memcpy(out + outlen + sizeof c, &uc, sizeof uc);
+      outlen += L_CMSG_ALIGN(c.cmsg_len);
+    }
   }
 
   if (ret == 0 && outlen > 0 && copy_to_user(control, out, outlen))
@@ -1484,8 +1591,8 @@ do_recvmsg(int sockfd, struct l_msghdr *lmsg, gaddr_t msg_ptr, int flags)
   }
   {
     bool truncated = false;
-    int n = cmsg_to_guest(&dmsg, lmsg->msg_control, lmsg->msg_controllen,
-                          flags, &truncated);
+    int n = cmsg_to_guest(sockfd, &dmsg, lmsg->msg_control,
+                          lmsg->msg_controllen, flags, &truncated);
     if (n < 0) {
       r = n;
       goto out;
@@ -1950,7 +2057,7 @@ DEFINE_SYSCALL(socketpair, int, family, int, type, int, protocol, gaddr_t, usock
    */
   int dtype = type & ~(LINUX_SOCK_NONBLOCK | LINUX_SOCK_CLOEXEC);
   int ret = syswrap(socketpair(linux_to_darwin_sa_family(family),
-                               seqpacket_darwin_type(family, dtype), protocol, fds));
+                               seqpacket_darwin_type(family, dtype, true), protocol, fds));
   if (ret < 0)
     goto err;
   seqpacket_note(fds[0], family, dtype);
