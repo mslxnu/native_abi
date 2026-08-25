@@ -796,6 +796,8 @@ do_exec(const char *elf_path, int argc, char *argv[], char **envp)
      * rewritten argv as cmdline, which is exactly the inner call.
      */
     proc_set_ident(elf_path, argc, argv);
+    /* The ambient set is what an exec carries; see cap_after_exec. */
+    cap_after_exec();
     if (g_mode & (S_ISUID | S_ISGID)) {
       elevate_privilege(g_uid, g_gid, g_mode);
     }

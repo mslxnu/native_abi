@@ -1296,6 +1296,20 @@ else
     fail=1
 fi
 
+# capambtest: the ambient capability set, and that an execve carries it. It is
+# the only way to hand capabilities to a program that is not setuid and has
+# none of its own, and Android's init uses nothing else. Needs its helper,
+# which reports what arrived on the far side of the exec.
+cp "$here/capambtest" "$here/capambhelper" "$root/"
+chmod +x "$root/capambtest" "$root/capambhelper"
+out=$("$NABI" -m "$root" /capambtest 2>&1 | tail -1); rc=$?
+if [ "$out" = "capamb ok" ]; then
+    echo "  ok  capambtest -> \"$out\""
+else
+    echo "  FAIL capambtest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 # capuidtest: what a change of user does to the capabilities - the securebits,
 # the bounding set, and whether a permitted set survives becoming another user.
 # Android's init sets the bits, changes user, and only then installs the

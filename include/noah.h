@@ -74,6 +74,7 @@ bool has_sigpending(void);
 void host_sigmask_of(const l_sigset_t *lmask, sigset_t *out);
 /* The guest started as somebody who never had capabilities. */
 void cap_start_unprivileged(void);
+void cap_after_exec(void);
 bool sigrestart_wanted(void);
 int send_signal(pid_t pid, int sig);
 void signalfd_note_signal(int lsig);

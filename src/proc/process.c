@@ -975,6 +975,13 @@ static uint64_t cap_inheritable = 0;
  * can ever hold. It only shrinks, which is the whole of its contract.
  */
 static uint64_t cap_bounding    = ~0ULL;
+/*
+ * The ambient set: the capabilities that survive an execve into a program with
+ * none of its own. It is how a process hands power to something it is about to
+ * run without that program being setuid or carrying file capabilities, and it
+ * is the only way to do so.
+ */
+static uint64_t cap_ambient     = 0;
 static pthread_mutex_t cap_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /*
@@ -1022,9 +1029,15 @@ cap_after_setresuid(bool was_priv, bool now_unpriv, l_uid_t old_euid,
     return;
   bool keep = cap_keepcaps || (proc.securebits & SECBIT_KEEP_CAPS);
   pthread_mutex_lock(&cap_lock);
-  if (was_priv && now_unpriv && !keep) {
-    cap_permitted = 0;
-    cap_effective = 0;
+  if (was_priv && now_unpriv) {
+    if (!keep) {
+      cap_permitted = 0;
+      cap_effective = 0;
+    }
+    /* The ambient set goes whatever keepcaps says, unless the process asked
+     * for it to stay - Linux keeps these two decisions apart. */
+    if (!(proc.securebits & SECBIT_NO_CAP_AMBIENT_RAISE))
+      cap_ambient = 0;
   }
   if (old_euid == 0 && new_euid != 0)
     cap_effective = 0;
@@ -1040,6 +1053,25 @@ cap_after_setresuid(bool was_priv, bool now_unpriv, l_uid_t old_euid,
  * claim on them - which mattered only once the sets were believed rather than
  * gated on the euid.
  */
+/*
+ * What an execve does to the capabilities.
+ *
+ * For a program with none of its own - which is every program here, since
+ * nothing carries file capabilities - Linux gives the new image the ambient
+ * set in both its permitted and effective sets, and keeps the ambient set
+ * itself. That is the whole mechanism by which a process hands capabilities to
+ * something it runs, and Android's init relies on nothing else: it raises the
+ * ambient bits and execs, having already given up its own.
+ */
+void
+cap_after_exec(void)
+{
+  pthread_mutex_lock(&cap_lock);
+  cap_permitted |= cap_ambient;
+  cap_effective |= cap_ambient;
+  pthread_mutex_unlock(&cap_lock);
+}
+
 void
 cap_start_unprivileged(void)
 {
@@ -1762,6 +1794,60 @@ DEFINE_SYSCALL(prctl, int, option, unsigned long, arg1, unsigned long, arg2, uns
    * with more power than it asked for. Which is the right instinct, and the
    * reason answering this honestly matters more than it looks.
    */
+  /*
+   * The ambient set. Android's init asks whether it exists before it will
+   * accept a `capabilities` line at all - "capabilities requested but the
+   * kernel does not support ambient capabilities" - and then hands a service
+   * its capabilities by raising them here and letting the execve carry them.
+   *
+   * Without it init dropped its own permitted set to nothing before the exec,
+   * because ambient was supposed to be holding the capabilities by then, and
+   * logd's own capset for CAP_SYSLOG came back EPERM against an empty
+   * permitted set. logd exits, init restarts it, and the restart fails on a
+   * read-only property the first attempt had already set.
+   *
+   * Linux's conditions for raising, and they are the whole of what makes an
+   * ambient capability safe: it must already be both permitted and
+   * inheritable, so nothing can be added that the process did not have, and
+   * SECBIT_NO_CAP_AMBIENT_RAISE refuses it outright.
+   */
+  case LINIX_PR_CAP_AMBIENT: {
+    switch (arg1) {
+    case 1:                                   /* PR_CAP_AMBIENT_IS_SET */
+      if (arg2 > LINUX_CAP_LAST_CAP)
+        return -LINUX_EINVAL;
+      return (int) ((cap_ambient >> arg2) & 1);
+    case 2: {                                 /* PR_CAP_AMBIENT_RAISE */
+      if (arg2 > LINUX_CAP_LAST_CAP)
+        return -LINUX_EINVAL;
+      uint64_t bit = 1ULL << arg2;
+      pthread_mutex_lock(&cap_lock);
+      bool may = (cap_permitted & bit) && (cap_inheritable & bit) &&
+                 !(proc.securebits & SECBIT_NO_CAP_AMBIENT_RAISE);
+      if (may)
+        cap_ambient |= bit;
+      pthread_mutex_unlock(&cap_lock);
+      return may ? 0 : -LINUX_EPERM;
+    }
+    case 3:                                   /* PR_CAP_AMBIENT_LOWER */
+      if (arg2 > LINUX_CAP_LAST_CAP)
+        return -LINUX_EINVAL;
+      pthread_mutex_lock(&cap_lock);
+      cap_ambient &= ~(1ULL << arg2);
+      pthread_mutex_unlock(&cap_lock);
+      return 0;
+    case 4:                                   /* PR_CAP_AMBIENT_CLEAR_ALL */
+      if (arg2)
+        return -LINUX_EINVAL;
+      pthread_mutex_lock(&cap_lock);
+      cap_ambient = 0;
+      pthread_mutex_unlock(&cap_lock);
+      return 0;
+    default:
+      return -LINUX_EINVAL;
+    }
+  }
+
   case LINIX_PR_CAPBSET_READ:
     if (arg1 > LINUX_CAP_LAST_CAP)
       return -LINUX_EINVAL;
