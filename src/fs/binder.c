@@ -139,7 +139,17 @@ static uint64_t balign(uint64_t v) { return (v + 7) & ~(uint64_t) 7; }
  * than truncated. Android's ordinary traffic is far below this - bulk data
  * goes by descriptor or shared memory, not in the parcel.
  */
-#define BSHM_MSG_MAX  8
+/*
+ * Messages one endpoint can have waiting.
+ *
+ * Linux does not have this number: its queue is a list, and what actually
+ * bounds a receiver is the size of the buffer it mapped. This is an artefact
+ * of keeping the queue in a fixed shared region, so it is set well above what
+ * a busy endpoint needs rather than at the smallest number that works -
+ * Android's boot filled a queue of eight a hundred times over, and each time
+ * the sender was told EAGAIN.
+ */
+#define BSHM_MSG_MAX 32
 #define BSHM_PAYLOAD  8192
 #define BSHM_MAGIC    0x42494e44u
 
@@ -827,8 +837,29 @@ do_transaction(struct binder_ep *from, const struct btr *tr, bool reply,
   for (int i = 0; i < BSHM_MSG_MAX; i++)
     if (!dst->q[i].used) { m = &dst->q[i]; break; }
   if (m == NULL) {
+    /*
+     * The receiver is behind. Linux does not fail a call for this - the sender
+     * waits for room - so neither does this, for a bounded while. The lock is
+     * released between tries because the room can only come from the receiver,
+     * which is another process reading through the same file.
+     *
+     * Failing instead is not a quiet failure but it is an obscure one: the
+     * ioctl returns EAGAIN, libbinder reports the transaction failed, and what
+     * reaches the log is whatever the caller says about its own work - "Unable
+     * to start VoldNativeService", from a service whose registration was
+     * refused because something else was busy.
+     */
+    for (int spin = 0; spin < 40 && m == NULL; spin++) {
+      shm_unlock();
+      usleep(5000);
+      shm_lock();
+      for (int i = 0; i < BSHM_MSG_MAX; i++)
+        if (!dst->q[i].used) { m = &dst->q[i]; break; }
+    }
+  }
+  if (m == NULL) {
     shm_unlock();
-    return -LINUX_EAGAIN;        /* the receiver is behind; binder blocks here */
+    return -LINUX_EAGAIN;        /* still no room after waiting for it */
   }
 
   m->is_reply = reply;

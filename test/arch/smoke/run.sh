@@ -1336,6 +1336,20 @@ else
     fail=1
 fi
 
+# binderbusytest: a sender waits for a receiver that is behind rather than
+# being refused. Linux's queue is a list bounded by the receiver's buffer; this
+# one has a count, and reaching it used to fail the transaction outright -
+# which Android's boot did about a hundred times, taking vold's registration
+# with it in roughly one run in four.
+cp "$here/binderbusytest" "$root/"; chmod +x "$root/binderbusytest"
+out=$(NABI_BINDER=emulated "$NABI" -m "$root" /binderbusytest 2>&1 | tail -1); rc=$?
+if [ "$out" = "binderbusy ok" ]; then
+    echo "  ok  binderbusytest -> \"$out\""
+else
+    echo "  FAIL binderbusytest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 # binderreplytest: a reply that crosses a process boundary. BC_REPLY names no
 # target - the driver is expected to know which call the replying thread is
 # inside - so without a record of that, a process could only answer itself and
