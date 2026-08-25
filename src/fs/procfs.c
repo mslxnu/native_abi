@@ -166,7 +166,8 @@ build_maps(size_t *len_out)
  */
 enum procfs_file { PROCFS_NONE, PROCFS_MAPS, PROCFS_CMDLINE, PROCFS_COMM,
                    PROCFS_EXE, PROCFS_FD, PROCFS_MOUNTS, PROCFS_FDDIR, PROCFS_TASKDIR,
-                   PROCFS_RANDOM_UUID, PROCFS_RANDOM_BOOT_ID, PROCFS_NS, PROCFS_NSDIR,
+                   PROCFS_RANDOM_UUID, PROCFS_RANDOM_BOOT_ID, PROCFS_NGROUPS_MAX,
+                   PROCFS_NS, PROCFS_NSDIR,
                    PROCFS_SYSVIPC_SHM, PROCFS_SYSVIPC_SEM, PROCFS_SYSVIPC_MSG,
                    PROCFS_NS_FORCHILDREN, PROCFS_TIMENS_OFFSETS,
                    PROCFS_UID_MAP, PROCFS_GID_MAP, PROCFS_SETGROUPS,
@@ -227,6 +228,18 @@ own_procfs_file_n(const char *path, int *fd_out)
     return PROCFS_SYSVIPC_SEM;
   if (strcmp(rest, "sysvipc/msg") == 0)
     return PROCFS_SYSVIPC_MSG;
+  /*
+   * The largest number of supplementary groups a process may have. Linux's own
+   * number, with no Darwin sysctl behind it, so mSL/FHS's mirror of the kern.*
+   * tree does not have it either.
+   *
+   * glibc reads it before it will size a group list, and anything that asks who
+   * a user is - sudo, on every run - goes through that path. A guest that finds
+   * the file missing falls back to a guess, which is survivable; it is still a
+   * file every Linux has and cheaper to answer than to explain.
+   */
+  if (strcmp(rest, "sys/kernel/ngroups_max") == 0)
+    return PROCFS_NGROUPS_MAX;
   if (strcmp(rest, "sys/kernel/random/uuid") == 0)
     return PROCFS_RANDOM_UUID;
   if (strcmp(rest, "sys/kernel/random/boot_id") == 0)
@@ -861,6 +874,21 @@ build_sysvipc(enum procfs_file which, size_t *len_out)
     }
   }
   *len_out = len;
+  return out;
+}
+
+/*
+ * Linux's NGROUPS_MAX, which is what the kernel would let a process have. The
+ * number is Linux's own and has been 65536 since 2.6.4; nothing here enforces
+ * it, so reporting anything else would only mislead a caller sizing an array.
+ */
+static char *
+build_ngroups_max(size_t *len)
+{
+  char *out = malloc(16);
+  if (out == NULL)
+    return NULL;
+  *len = (size_t) snprintf(out, 16, "65536\n");
   return out;
 }
 
@@ -1511,6 +1539,9 @@ procfs_open(const char *path, int *out_fd)
     break;
   case PROCFS_STATUS:
     content = build_status(fdno, &len);
+    break;
+  case PROCFS_NGROUPS_MAX:
+    content = build_ngroups_max(&len);
     break;
   case PROCFS_RANDOM_UUID:
     content = build_random_uuid(&len);

@@ -453,6 +453,20 @@ guest-code cache sync.
   file's whole contract (no controller can be enabled). It unmounts what it
   mounted, so the mount namespace is left as it was found.
 
+- `pagesztest` — `AT_PAGESZ` against the granularity `mmap` actually hands out,
+  walked off the process's own stack like `auxvtest`. A guest computes with the
+  page size it is told, and glibc computes with it in a place that aborts: any
+  allocation past the mmap threshold is served by a mapping of its own, and
+  freeing one checks that its address and length are page-aligned by that
+  number. On Apple Silicon this said 16KiB — the stage-2 block size — while
+  guest mappings had been 4KiB-granular ever since the two granules were
+  separated, so roughly three large frees in four aborted with
+  `munmap_chunk(): invalid pointer`. That message names the heap, and the heap
+  was fine; `apt install` and `dnf install` died on both distributions with no
+  hint of where to look. The sizes mapped here are deliberately awkward — 4095,
+  4097, 65528 — because a mapping that happens to land on a coarser boundary
+  passes an alignment check while proving nothing.
+
 - `auxvtest` — the auxiliary vector a process starts with, walked off its own
   stack rather than through `getauxval`, so it checks what NABI actually put
   there with no libc in between to paper over a gap. `AT_SECURE` is why it

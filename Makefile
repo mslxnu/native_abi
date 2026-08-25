@@ -175,10 +175,10 @@ WRAPPER := $(OUT)/nabi.pl
 # error: CI ran both builds in one job and went green without ever compiling the
 # second one.
 #
-# The stamp is named for the architecture and is a normal prerequisite, so
-# switching ARCH creates a file newer than the binary and forces the relink.
-# Switching back does the same. Building the same architecture twice touches
-# nothing.
+# The stamp is named for the architecture, so its absence is what says the
+# architecture changed. What acts on that is the parse-time check further down,
+# not a comparison of dates: see the comment on ARCH_OUTPUTS for why a stamp
+# merely newer than the binary is not enough.
 ARCH_STAMP := $(OUT)/.built-for-$(ARCH)
 # The front end, installed under the family name, and the shell helper it
 # calls. Both are plain scripts with nothing to build, so they are taken from
@@ -207,7 +207,6 @@ build: $(NABI) $(WRAPPER)
 # hv_vm_create() returning HV_DENIED, and reads like a permissions problem
 # rather than a build problem.
 $(ARCH_STAMP): | $(OUT)
-	@rm -f $(OUT)/.built-for-*
 	@touch $@
 
 $(NABI): $(SRCS) $(HEADERS) $(ARCH_STAMP) | $(OUT)
@@ -342,6 +341,30 @@ $(CKPT_TEST): test/arch/test_checkpoint.c src/proc/checkpoint.c src/mm/arena.c $
 # reading a sysctl - see the comment in the source. Codesigned like nabi,
 # because the entitlement is what the call needs.
 HV_PROBE := $(OUT)/hv_probe
+
+# Everything that is machine code for one architecture, and so wrong for the
+# other. Named here, below all of them, because the check that follows runs
+# while this file is read and sees only what is already defined.
+ARCH_OUTPUTS := $(NABI) $(DECODE_TEST) $(ARM64_TEST) $(MMU_TEST) $(VMMAP_TEST) \
+		$(BOOT_TEST) $(MUNMAP_TEST) $(REENTRY_TEST) $(ARENA_TEST) \
+		$(CKPT_TEST) $(HV_PROBE)
+
+# Switching architecture, done before make has looked at a single file.
+#
+# It cannot be a rule. GNU make 3.81 - the one Xcode ships - compares mtimes at
+# one-second granularity, so a link followed by a touch of the stamp inside the
+# same second leaves the two equal, and equal is not newer: the relink does not
+# happen. Nothing moves either file afterwards, so it never happens. That is how
+# `make ARCH=x86_64 && make` answered "Nothing to be done" with an Intel binary
+# still sitting in out/nabi, which then died in hv_vm_create with HV_DENIED and
+# read like a missing entitlement rather than a build that never ran.
+#
+# Deleting the outputs from inside the stamp's recipe does not fix it either -
+# by then make has already stat'd them and goes on believing they are there,
+# leaving no binary at all. So the deletion happens here, before any of that:
+# make stats the tree afterwards and simply finds the files gone, which no clock
+# granularity can round away.
+$(shell test -f $(ARCH_STAMP) || { mkdir -p $(OUT); rm -f $(OUT)/.built-for-* $(ARCH_OUTPUTS); touch $(ARCH_STAMP); })
 $(HV_PROBE): test/arch/hv_probe.c $(ARCH_STAMP) | $(OUT)
 	$(CC) $(CFLAGS) -o $@ test/arch/hv_probe.c $(FRAMEWORKS)
 	$(CODESIGN) --force --sign $(SIGNCERT) --entitlements $(ENTITLEMENTS) $@

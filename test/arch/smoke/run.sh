@@ -722,6 +722,25 @@ else
     fail=1
 fi
 
+# pagesztest: AT_PAGESZ has to be the granule the guest's own mappings use, not
+# the stage-2 block size. A guest computes with the number it is given: glibc
+# serves anything past its mmap threshold with a mapping of its own and, freeing
+# one, checks that the address and the length are page-aligned by that number.
+# Told 16KiB while mmap handed out 4KiB-aligned addresses, every large free
+# aborted with "munmap_chunk(): invalid pointer" - a heap corruption message for
+# an arithmetic disagreement - and `apt install` and `dnf install` both died.
+# The check is that mmap's addresses are aligned to what the auxv advertised,
+# over several awkward sizes, since a mapping that lands on a coarser boundary
+# by luck proves nothing.
+cp "$here/pagesztest" "$root/"; chmod +x "$root/pagesztest"
+out=$("$NABI" -m "$root" /pagesztest 2>&1); rc=$?
+if [ "$rc" -eq 0 ] && [ "$out" = "pagesz ok" ]; then
+    echo "  ok  pagesztest -> \"$out\", exit 0"
+else
+    echo "  FAIL pagesztest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 # auxvtest: the auxiliary vector, walked off the process's own stack rather than
 # through getauxval - so it checks what NABI put there with no libc in between.
 # AT_SECURE is why it exists: getauxval sets errno for an entry that is absent,

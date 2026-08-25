@@ -22,17 +22,28 @@
 #include "elf.h"
 
 /*
- * What to report as AT_PAGESZ. The truth unless an image is known to need
- * otherwise; see the note at the call site.
+ * What to report as AT_PAGESZ: the granule the guest's own mappings use.
+ *
+ * Which is GUEST_MMAP_GRANULE and not the stage-2 block size. The two were the
+ * same thing once, and this said STAGE2_GRANULE back when that was true; they
+ * were separated so that a guest could map at 4KiB - see include/mm.h - and
+ * this was left behind, telling every guest on Apple Silicon that its pages
+ * were 16KiB while mmap went on handing out 4KiB-aligned addresses.
+ *
+ * A guest told its pages are bigger than they are computes with the number it
+ * was given. glibc's allocator serves anything past its mmap threshold with a
+ * mapping of its own and, when freeing one, checks that the address and length
+ * are page-aligned - by the page size it was told. A 4KiB-aligned mapping is
+ * not 16KiB-aligned, so the check failed and the process aborted:
+ * "munmap_chunk(): invalid pointer", which reads as heap corruption and is
+ * nothing of the kind. Every large allocation was affected, so `sudo apt
+ * install` and `sudo dnf install` both died on both distributions, and had
+ * done since the two granules were separated.
  */
 static uint64_t
 guest_pagesz(void)
 {
-#if defined(__arm64__)
-  uint64_t real = STAGE2_GRANULE;
-#else
-  uint64_t real = PAGE_SIZEOF(PAGE_4KB);
-#endif
+  uint64_t real = GUEST_MMAP_GRANULE;
   const char *o = getenv("NABI_AT_PAGESZ");
   if (o == NULL || *o == '\0')
     return real;
@@ -55,10 +66,14 @@ guest_pagesz(void)
 
 
 /*
- * The page granule ELF segments are aligned to when loaded. Must match the
- * guest's AT_PAGESZ and the mmap granule (src/mm/mmap.c): 16KiB on Apple
+ * The page granule ELF segments are aligned to when loaded: 16KiB on Apple
  * Silicon, so a segment never shares a 16KiB stage-2 block with its neighbour
  * (which vmm_munmap cannot split), 4KiB on x86.
+ *
+ * Deliberately *not* the same as AT_PAGESZ, which is the smaller granule the
+ * guest's own mappings use. Aligning the image more coarsely than the guest
+ * expects is safe - 16KiB is a whole number of 4KiB pages - while telling the
+ * guest a page size larger than mmap uses is not; see guest_pagesz.
  */
 #if defined(__arm64__)
 #define LOAD_GRANULE STAGE2_GRANULE

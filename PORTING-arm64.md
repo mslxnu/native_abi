@@ -6087,3 +6087,83 @@ Off by default. A shell that thought it was init would be told it cannot be
 killed.
 
 No new syscalls: `--pid1` is an option, not a call.
+
+### 3.5.110 A page size that was not the page size
+
+`sudo apt install git` and `sudo dnf install git` both died the same way:
+
+```
+munmap_chunk(): invalid pointer
+Aborted
+```
+
+Which names the heap, and the heap was fine. What was wrong was a number.
+
+`AT_PAGESZ` is how a guest learns how big its pages are, and it said 16KiB on
+Apple Silicon - `STAGE2_GRANULE`, the size of a stage-2 block. That had been
+true once, back when the guest mapped in the same unit the host did. The two
+were separated so that a guest could map at 4KiB (3.5.x, and see the comment on
+`GUEST_MMAP_GRANULE`), because Android's allocator will not run with 16KiB
+pages at all; `mmap` moved to the smaller granule and this was left behind. So
+every guest was told 16KiB while `mmap` went on handing back addresses aligned
+to 4KiB.
+
+A guest computes with the number it is given, and glibc computes with it in a
+place that aborts. Anything past the allocator's mmap threshold is served by a
+mapping of its own, and `munmap_chunk` checks, before unmapping one, that the
+chunk's address and total size are page-aligned - by the page size it was told.
+Three 4KiB-aligned addresses in four are not 16KiB-aligned. So the check failed,
+and glibc reported it as what that check normally catches: a corrupted pointer
+handed to `free`. Nothing was corrupt. The allocator and the kernel simply
+disagreed about what a page was, and the allocator was right about its own
+arithmetic and wrong about the premise.
+
+It affected every large allocation, which is why it presented as "the package
+managers are broken" rather than as anything to do with memory. `sudo` alone was
+enough to trigger it: it builds the invoking user's group list on every run.
+Fixing it turned `sudo id` back into `uid=0(root)`, and `dnf install git` into
+83 packages and `Complete!`.
+
+`LOAD_GRANULE` stays at 16KiB and is now documented as deliberately *not* the
+same number. The asymmetry is the point: aligning the image more coarsely than
+the guest expects is safe, since 16KiB is a whole number of 4KiB pages and a
+segment then never shares a stage-2 block with its neighbour - a block
+`vmm_munmap` could not split. Telling the guest a page size *larger* than the
+one `mmap` uses is not safe, and this is what it costs.
+
+`pagesztest` walks the auxiliary vector off its own stack, the way `auxvtest`
+does, and checks that every address `mmap` returns is aligned to what was
+advertised there. The sizes are deliberately awkward - 4095, 4097, 65528 -
+because a mapping that lands on a coarser boundary by luck passes an alignment
+check while proving nothing: reintroducing the bug fails five of the eight, not
+all of them.
+
+No new syscalls. The value was always being reported; it was reporting the
+wrong thing.
+
+### 3.5.111 Two architectures, one filename
+
+Found while verifying the above, and worth its own note because it can make any
+verification a lie.
+
+Both builds write `out/nabi`, with no architecture in the name. A stamp file
+named for the architecture already existed to force the relink when `ARCH`
+changes - and it did not work in one direction. GNU make 3.81, the version Xcode
+ships, compares modification times at one-second granularity. Linking the x86_64
+binary and then touching the arm64 stamp inside the same second left the two
+equal, and equal is not newer, so the relink did not happen. Neither file moved
+again afterwards, so it never happened: `make ARCH=x86_64 && make` reported
+"Nothing to be done" and left an Intel binary in place.
+
+That binary then failed in `hv_vm_create` with `HV_DENIED`, which reads as a
+missing entitlement - a signing problem, a permissions problem, anything but a
+build that never ran.
+
+Deleting the stale outputs from inside the stamp's own recipe does not fix it
+either. By then make has already stat'd them and goes on believing they exist,
+so the relink is still skipped and now there is no binary at all - which is how
+the first attempt at this went. The check has to happen before make looks at the
+tree, so it is a `$(shell)` evaluated while the Makefile is read: if the stamp
+for this architecture is absent, every arch-specific output is removed and the
+stamp created. Afterwards make stats the tree and simply finds the files gone.
+Absence is not a quantity, so no clock granularity can round it away.
