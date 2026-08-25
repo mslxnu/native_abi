@@ -1296,6 +1296,19 @@ else
     fail=1
 fi
 
+# nicetest: setpriority answered with the guest's credentials. Raising a
+# priority needs CAP_SYS_NICE, which the guest may hold while the account nabi
+# runs as does not - and init sets the zygote's priority before exec'ing it and
+# treats the refusal as fatal.
+cp "$here/nicetest" "$root/"; chmod +x "$root/nicetest"
+out=$("$NABI" -m "$root" /nicetest 2>&1 | tail -1); rc=$?
+if [ "$out" = "nice ok" ]; then
+    echo "  ok  nicetest -> \"$out\""
+else
+    echo "  FAIL nicetest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 # capambtest: the ambient capability set, and that an execve carries it. It is
 # the only way to hand capabilities to a program that is not setuid and has
 # none of its own, and Android's init uses nothing else. Needs its helper,

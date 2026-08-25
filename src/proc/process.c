@@ -2153,6 +2153,11 @@ DEFINE_SYSCALL(getrusage, int, who, gaddr_t, rusage_ptr)
   return 0;
 }
 
+/* The nice this process asked for, when the host would not take it; see
+ * setpriority below. */
+static int nice_wanted = 0;
+static bool nice_pretended = false;
+
 DEFINE_SYSCALL(getpriority, int, which, int, who)
 {
   /*
@@ -2177,12 +2182,76 @@ DEFINE_SYSCALL(getpriority, int, which, int, who)
   int nice = getpriority(which, who);
   if (nice == -1 && errno != 0)
     return -darwin_to_linux_errno(errno);
+  /* What this process asked for, if the host would not take it - see
+   * setpriority. Answering with the host's value would contradict the success
+   * this already reported. */
+  if (nice_pretended && which == PRIO_PROCESS && (who == 0 || who == getpid()))
+    nice = nice_wanted;
   return 20 - nice;
 }
 
+/*
+ * Whether the *guest* may raise a process's priority, which is not the same
+ * question the host answers.
+ *
+ * Lowering the nice value needs CAP_SYS_NICE on Linux. The guest that asks may
+ * well have it - Android's init is root and holds it - while the account nabi
+ * runs as does not, so the host refuses a request the guest was entitled to
+ * make. Asked here with the guest's own credentials, as file access is.
+ */
+static bool
+may_renice(void)
+{
+  bool root;
+  pthread_rwlock_rdlock(&proc.cred.lock);
+  root = proc.cred.euid == 0;
+  pthread_rwlock_unlock(&proc.cred.lock);
+  if (root)
+    return true;
+  pthread_mutex_lock(&cap_lock);
+  bool cap = (cap_effective & (1ULL << LINUX_CAP_SYS_NICE)) != 0;
+  pthread_mutex_unlock(&cap_lock);
+  return cap;
+}
+
+/*
+ * setpriority, answered with the guest's credentials.
+ *
+ * The host is asked first and its answer stands whenever it is not about
+ * privilege: a value out of range is still EINVAL, a process that does not
+ * exist is still ESRCH. What cannot stand is EPERM for a guest that holds
+ * CAP_SYS_NICE, because that is nabi's own unprivileged account speaking and
+ * not anything about the guest.
+ *
+ * The value is then remembered rather than applied, and getpriority reports it
+ * back. That is a real gap and worth stating plainly: the guest's scheduling
+ * request has no effect, and only the answer to "what did I ask for" is
+ * truthful. Failing instead is worse and not more honest - Android's init sets
+ * the zygote's priority before exec'ing it and treats the refusal as fatal
+ * ("cannot set attribute for zygote"), so the whole framework never starts
+ * over a nice value nothing here could have honoured either way.
+ */
 DEFINE_SYSCALL(setpriority, int, which, int, who, int, niceval)
 {
-  return syswrap(setpriority(which, who, niceval));
+  errno = 0;
+  int r = setpriority(which, who, niceval);
+  if (r == 0) {
+    /* The host took it, so it is the truth again and any value remembered
+     * from a request it would not take is stale. */
+    if (which == PRIO_PROCESS && (who == 0 || who == getpid()))
+      nice_pretended = false;
+    return 0;
+  }
+  int e = errno;
+  if ((e == EPERM || e == EACCES) && may_renice()) {
+    if (which == PRIO_PROCESS && (who == 0 || who == getpid())) {
+      nice_wanted = niceval;
+      nice_pretended = true;
+    }
+    return 0;
+  }
+  errno = e;
+  return syswrap(-1);
 }
 
 /* ------------------------------------------------------------- scheduling

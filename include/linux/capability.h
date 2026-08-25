@@ -21,6 +21,7 @@
  * bits above it set would name capabilities no kernel has defined.
  */
 #define LINUX_CAP_SETPCAP   8
+#define LINUX_CAP_SYS_NICE  23
 #define LINUX_CAP_LAST_CAP  40  /* CAP_CHECKPOINT_RESTORE */
 
 struct l_user_cap_header {
