@@ -2809,6 +2809,38 @@ binderfs_leaf(const char *host, char *dir, size_t dirn, const char **leaf)
   return **leaf != '\0';
 }
 
+/*
+ * /sys/fs/cgroup, which on Linux is simply there.
+ *
+ * The cgroup subsystem creates it, and the unified hierarchy is mounted on it;
+ * a guest that wants a cgroup expects to find it without having asked. Here
+ * /sys is either the host's sysfs, which is read-only and answers mkdir with
+ * ENOENT, or a directory in the rootfs image, which is read-only too - so the
+ * path did not exist and could not be made, and libprocessgroup gave up before
+ * it ever tried to mount anything: "mkdir() failed for /sys/fs/cgroup", then
+ * "Failed to setup cgroup2 cgroup", and Android's init started every process
+ * group at the root and said so for the rest of its life.
+ *
+ * Answered with the hierarchy nabi already keeps, which is the same one every
+ * cgroup mount is backed by - so a guest reaches the same cgroups whether it
+ * mounted them itself or not, which is what a guest would find on Linux.
+ * Asked after the mount table, so a guest that does mount something there - a
+ * tmpfs, as some init systems do - still gets what it mounted.
+ */
+static bool
+cgroupfs_to_host(const char *name, char *out, size_t outsz)
+{
+  static const char pre[] = "/sys/fs/cgroup";
+  size_t n = sizeof pre - 1;
+  if (strncmp(name, pre, n) != 0 || (name[n] != '\0' && name[n] != '/'))
+    return false;
+
+  char root[PATH_MAX];
+  if (cgroup_hierarchy(root, sizeof root) < 0)
+    return false;
+  return (size_t) snprintf(out, outsz, "%s%s", root, name + n) < outsz;
+}
+
 static int
 binder_dev_open(const char *guest_path, int flags, int *out_fd)
 {
@@ -4785,6 +4817,7 @@ resolve_path(const struct dir *parent, const char *name, int flags, struct path 
   char mntpath[PATH_MAX];
   char pidpath[PATH_MAX];       /* separate: mount_resolve reads what this wrote */
   char exepath[LINUX_PATH_MAX]; /* the same, for /proc/<pid>/exe */
+  char cgpath[PATH_MAX];        /* and for /sys/fs/cgroup */
   if (*name == '/') {
     if (name[1] == '\0') {
       dir.fd = proc.fileinfo.rootfd;
@@ -4843,6 +4876,8 @@ resolve_path(const struct dir *parent, const char *name, int flags, struct path 
        */
       if (devpts_to_host(name, ptsname, sizeof ptsname))
         name = ptsname;
+    } else if (cgroupfs_to_host(name, cgpath, sizeof cgpath)) {
+      name = cgpath;              /* the hierarchy, wherever /sys comes from */
     } else if (!is_host_passthrough(name)) {
       dir.fd = proc.fileinfo.rootfd;
       name++;
@@ -5248,6 +5283,16 @@ guest_to_host_path(const char *name, char *out, size_t outsz)
   if (name[0] == '/') {
     char mnt[PATH_MAX];
     if (mount_resolve(name, mnt, sizeof mnt, NULL)) {
+      if (strlcpy(out, mnt, outsz) >= outsz)
+        return -LINUX_ENAMETOOLONG;
+      return 0;
+    }
+    /* And the hierarchy nabi keeps at Linux's place for it, in the same order
+     * resolve_path asks - after a mount, before the passthrough. The two have
+     * to agree: this is the answer cgroup_after_mkdir uses to decide whether a
+     * new directory is a cgroup, and a directory that resolves one way and is
+     * classified the other is a cgroup with none of a cgroup's files. */
+    if (cgroupfs_to_host(name, mnt, sizeof mnt)) {
       if (strlcpy(out, mnt, outsz) >= outsz)
         return -LINUX_ENAMETOOLONG;
       return 0;

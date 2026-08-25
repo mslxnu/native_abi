@@ -521,6 +521,9 @@ static const struct { const char *src, *tgt, *type, *opts; } base[] = {
   { "tmpfs",     "/tmp",  "tmpfs",     "rw,nosuid,nodev" },
   { "proc",      "/proc", "proc",      "rw,nosuid,nodev,noexec,relatime" },
   { "sysfs",     "/sys",  "sysfs",     "rw,nosuid,nodev,noexec,relatime" },
+  /* The unified hierarchy, which is where Linux puts it and where a guest
+   * looks for it without having mounted anything. See cgroupfs_to_host. */
+  { "cgroup2",   "/sys/fs/cgroup", "cgroup2", "rw,nosuid,nodev,noexec,relatime" },
 };
 
 int

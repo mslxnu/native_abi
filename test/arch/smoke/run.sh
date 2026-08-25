@@ -1271,6 +1271,18 @@ elif [ "${ok_plain:-0}" = 1 ]; then
     fail=1
 fi
 
+# sysfscgtest: /sys/fs/cgroup is there without anything having mounted it, as
+# it is on Linux. libprocessgroup gives up before it tries to mount when the
+# directory cannot be made, and /sys is read-only whichever side it comes from.
+cp "$here/sysfscgtest" "$root/"; chmod +x "$root/sysfscgtest"
+out=$("$NABI" -m "$root" /sysfscgtest 2>&1 | tail -1); rc=$?
+if [ "$out" = "sysfscg ok" ]; then
+    echo "  ok  sysfscgtest -> \"$out\""
+else
+    echo "  FAIL sysfscgtest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 # seqcredtest: the AF_UNIX features Android asks for that Darwin has not got -
 # a SOCK_SEQPACKET socket that can be listened on, and SO_PASSCRED actually
 # delivering SCM_CREDENTIALS. init needs the first for lmkd's socket and the
