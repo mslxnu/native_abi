@@ -1323,6 +1323,19 @@ else
     fail=1
 fi
 
+# binderreplytest: a reply that crosses a process boundary. BC_REPLY names no
+# target - the driver is expected to know which call the replying thread is
+# inside - so without a record of that, a process could only answer itself and
+# every real call hung. Android's boot is made of these.
+cp "$here/binderreplytest" "$root/"; chmod +x "$root/binderreplytest"
+out=$(NABI_BINDER=emulated "$NABI" -m "$root" /binderreplytest 2>&1 | tail -1); rc=$?
+if [ "$out" = "binderreply ok" ]; then
+    echo "  ok  binderreplytest -> \"$out\""
+else
+    echo "  FAIL binderreplytest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 # bindersibtest: two sibling processes must find the same binder registry when
 # their parent never opened the device. A fork hides this - the parent has
 # already named the registry - which is why binderprobe's twoproc stage never

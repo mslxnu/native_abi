@@ -111,6 +111,9 @@ static uint64_t balign(uint64_t v) { return (v + 7) & ~(uint64_t) 7; }
 /* Longest binder context name kept; binderfs allows 255, nothing uses it. */
 #define BINDER_CTX_NAME 32
 
+/* Calls one endpoint can be answering at once, one per looper thread. */
+#define BINDER_MAX_CALLS 16
+
 #define BINDER_MAX_FIXUPS 4
 #define BINDER_PENDING    (64 * 1024)
 
@@ -146,6 +149,12 @@ struct bmsg {
   uint64_t cookie;
   uint32_t code, flags;
   uint32_t sender_pid, sender_euid;
+  /*
+   * Which endpoint sent it, so a reply can find its way back. The pid is not
+   * enough: a process may hold several endpoints, and a reply belongs to the
+   * one the call came in on.
+   */
+  uint32_t sender_ep;
   uint64_t data_size, offsets_size;
   /* Where the parts sit inside `data`, which is the buffer as the receiver
    * will see it: the parcel, the offsets, then the scatter-gather copies. */
@@ -222,6 +231,24 @@ struct binder_ep {
 
   uint64_t arena_addr, arena_size, arena_brk;
   struct binder_alloc allocs[BINDER_MAX_ALLOCS];
+
+  /*
+   * The calls this endpoint is in the middle of answering, by the thread
+   * answering them.
+   *
+   * A reply has no address of its own: BC_REPLY names no target, because on
+   * Linux the driver knows which transaction the replying thread is inside.
+   * So the pairing is recorded when a transaction is handed to a thread and
+   * looked up when that thread replies. Keyed by thread because that is what
+   * makes it unambiguous - one endpoint is read by every looper in the
+   * process, each answering a different caller.
+   *
+   * Without it a reply could only be delivered to the endpoint that sent it,
+   * which is to say a process could only answer itself. vdc asks vold to mark
+   * a boot attempt and waits; the answer went nowhere, and init waited on the
+   * two of them until it declared the service hung.
+   */
+  struct { uint64_t tid; uint32_t sender_ep; } calls[BINDER_MAX_CALLS];
 
   /* Commands waiting to be read, as the bytes the guest will be given. */
   unsigned char pending[BINDER_PENDING];
@@ -710,6 +737,41 @@ struct btr {
   uint64_t buffer, offsets;
 };
 
+/* This thread, as the call table names it. */
+static uint64_t
+call_tid(void)
+{
+  return (uint64_t) pthread_mach_thread_np(pthread_self());
+}
+
+/* Remember that this thread is answering a call from `sender`. */
+static void
+call_note(struct binder_ep *e, uint32_t sender)
+{
+  uint64_t me = call_tid();
+  for (int i = 0; i < BINDER_MAX_CALLS; i++)
+    if (e->calls[i].tid == me || e->calls[i].tid == 0) {
+      e->calls[i].tid = me;
+      e->calls[i].sender_ep = sender;
+      return;
+    }
+}
+
+/* Who this thread owes a reply to, and forget it - a reply is answered once. */
+static uint32_t
+call_take(struct binder_ep *e)
+{
+  uint64_t me = call_tid();
+  for (int i = 0; i < BINDER_MAX_CALLS; i++)
+    if (e->calls[i].tid == me) {
+      uint32_t s = e->calls[i].sender_ep;
+      e->calls[i].tid = 0;
+      e->calls[i].sender_ep = 0;
+      return s;
+    }
+  return 0;
+}
+
 /*
  * One BC_TRANSACTION or BC_REPLY: allocate in the *receiver's* arena, copy the
  * payload there, and hand the receiver a pointer into its own memory. That
@@ -722,12 +784,19 @@ do_transaction(struct binder_ep *from, const struct btr *tr, bool reply,
 {
   int slot = reply ? -1 : shm_ep_for_handle((uint32_t) tr->target, from->ctx);
   if (reply) {
-    /* A reply goes back to whoever is waiting for it. Only the same endpoint
-     * so far, which is what the one-thread case needs; a reply across
-     * processes needs the transaction stack that is not built yet. */
+    /*
+     * A reply goes back to whoever is waiting for it, which BC_REPLY does not
+     * say: the driver is expected to know which call the replying thread is
+     * inside. So it is looked up - and only failing that does the reply go
+     * back to this endpoint, which is the one-process case that worked before
+     * any of this and still has to.
+     */
+    uint32_t to = call_take(from);
+    if (to == 0)
+      to = from->id;
     slot = -1;
     for (int i = 0; i < BINDER_MAX_EP && shm_attach(); i++)
-      if (shm->ep[i].used && shm->ep[i].id == from->id) { slot = i; break; }
+      if (shm->ep[i].used && shm->ep[i].id == to) { slot = i; break; }
   }
   if (slot < 0)
     return -LINUX_ENOENT;
@@ -767,6 +836,7 @@ do_transaction(struct binder_ep *from, const struct btr *tr, bool reply,
   m->code = tr->code;
   m->flags = tr->flags;
   m->sender_pid = (uint32_t) getpid();
+  m->sender_ep  = from->id;      /* so a reply can find its way back */
   m->sender_euid = 0;
   m->data_size = tr->data_size;
   m->offsets_size = tr->offsets_size;
@@ -950,6 +1020,15 @@ collect_messages(struct binder_ep *e)
     out.offsets_size = m->offsets_size;
     out.buffer = at;
     out.offsets = m->offsets_size ? at + m->offs_at : 0;
+
+    /*
+     * A call this thread is now answering, so its reply can be sent back to
+     * the caller. Only a call: a reply is the end of one, and a one-way
+     * transaction is not a call at all - neither is owed an answer, and
+     * recording either would leave a stale debt for the next real one.
+     */
+    if (!m->is_reply && !(m->flags & TF_ONE_WAY))
+      call_note(e, m->sender_ep);
 
     /*
      * The pointers can be made real now, because the arena address is finally
