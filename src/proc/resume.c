@@ -100,6 +100,22 @@ checkpoint_restore(int ckpt_fd, int arena_fd)
   for (uint32_t i = 0; i < hdr.nr_pt_chunks; i++)
     (void) arena_map_private(pt_chunks[i].arena_off, 1);
 
+  /*
+   * Now that every private mapping has been asked for, resolve the arena-backed
+   * ones again.
+   *
+   * A later request can merge with an earlier one - two regions are often
+   * slices of a single arena allocation, and the arena keeps one private view
+   * per block rather than handing out a second copy-on-write copy of the same
+   * bytes; see arena_map_private. Merging replaces the earlier mapping, so a
+   * pointer taken from it before the merge names memory that has been unmapped.
+   * Nothing here has written through those pointers yet, so re-asking is the
+   * whole of the repair.
+   */
+  for (uint32_t i = 0; i < hdr.nr_regions; i++)
+    if (regions[i].arena_off >= 0)
+      region_hva[i] = arena_hva_of(regions[i].arena_off);
+
   vmm_create();
 
   vmm_arm64_s2_restore(s2, hdr.nr_s2);

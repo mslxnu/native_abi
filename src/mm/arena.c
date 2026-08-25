@@ -442,15 +442,64 @@ arena_map_private(off_t off, size_t size)
       return (char *) arena_spans[i].addr + (off - arena_spans[i].off);
   }
 
-  void *p = mmap(NULL, block_size, PROT_READ | PROT_WRITE, MAP_PRIVATE,
-                 arena_backing_fd, block);
+  /*
+   * Overlapping an existing private mapping without being inside it, which is
+   * the case containment alone gets wrong.
+   *
+   * Two regions can be slices of one arena allocation - the mm layer splits a
+   * region whenever a guest unmaps part of one - so the second slice asks for a
+   * range that starts inside the first slice's block and runs past its end.
+   * Containment fails, and mapping it again produces a *second* MAP_PRIVATE
+   * view of the same file bytes. Two private views are two copy-on-write
+   * copies: a store through one is invisible through the other.
+   *
+   * Nothing announces that. Both copies begin with identical bytes, so the
+   * handover looks perfect at the moment it is made and every check of it
+   * passes. What follows is that the guest reaches its memory through stage 2,
+   * which was pointed at one copy, while this side reaches the same memory
+   * through the region's haddr, which is the other - so a write the guest
+   * makes is not the write NABI reads, and each of them sees the other's memory
+   * frozen at the instant of the fork. In a shell that lands in glibc's arena:
+   * "malloc_consolidate(): unaligned fastbin chunk detected", or an assertion
+   * in sysmalloc, in a process that has done nothing but be forked.
+   *
+   * It needs guest mappings finer than a block to happen at all, so it stayed
+   * hidden until AT_PAGESZ stopped claiming 16KiB pages (see guest_pagesz) and
+   * regions could be 4KiB slices of a 16KiB block. It also needs the fork to
+   * come from a process that was itself resumed, since only a resumed process
+   * maps the arena a piece at a time - which is why `x=$(y=$(cmd))` broke and a
+   * single subshell did not.
+   *
+   * So the mapping is merged instead: everything overlapping is unmapped and
+   * replaced by one mapping of the union, leaving one private view per arena
+   * block. Doing it here is safe because every caller is checkpoint_restore,
+   * which maps before the VM exists and before a single byte has been written -
+   * the pointers it has taken are re-resolved once all the mapping is done.
+   */
+  off_t lo = block, hi = block + (off_t) block_size;
+  for (size_t i = 0; i < nr_arena_spans; i++) {
+    if (!arena_spans[i].priv)
+      continue;
+    off_t slo = arena_spans[i].off;
+    off_t shi = slo + (off_t) arena_spans[i].size;
+    if (hi <= slo || lo >= shi)
+      continue;
+    if (slo < lo) lo = slo;
+    if (shi > hi) hi = shi;
+    munmap(arena_spans[i].addr, arena_spans[i].size);
+    arena_spans[i] = arena_spans[--nr_arena_spans];
+    i--;
+  }
+
+  void *p = mmap(NULL, (size_t)(hi - lo), PROT_READ | PROT_WRITE, MAP_PRIVATE,
+                 arena_backing_fd, lo);
   if (p == MAP_FAILED)
     panic("could not privately map arena offset %lld: %s",
           (long long) off, strerror(errno));
   /* Registered like any other span, so the restore can look the mapping up by
    * offset and so a later handover from this process flushes it. */
-  arena_span_record(p, block_size, block, true);
-  return (char *) p + (off - block);
+  arena_span_record(p, (size_t)(hi - lo), lo, true);
+  return (char *) p + (off - lo);
 }
 
 /* Adopt an arena handed over by another process (the exec'd child's side). */

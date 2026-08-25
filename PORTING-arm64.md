@@ -6167,3 +6167,74 @@ tree, so it is a `$(shell)` evaluated while the Makefile is read: if the stamp
 for this architecture is absent, every arch-specific output is removed and the
 stamp created. Afterwards make stats the tree and simply finds the files gone.
 Absence is not a quantity, so no clock granularity can round it away.
+
+### 3.5.112 Two copies of one page
+
+The page-size fix in 3.5.110 uncovered this, and it is the more serious of the
+two. A shell would print, having done nothing at all:
+
+```
+malloc_consolidate(): unaligned fastbin chunk detected
+malloc(): unaligned fastbin chunk detected 3
+Fatal glibc error: malloc.c:2610 (sysmalloc): assertion failed
+```
+
+Three different messages, all naming the allocator, none of them true. The heap
+was exactly as its owner had left it. What had changed was who could see it.
+
+A fork here is a fork plus an exec: the parent flushes guest memory to a file
+and the child maps that file `MAP_PRIVATE`, so the child starts from the
+parent's bytes and diverges copy-on-write. A child that was itself resumed maps
+the arena a piece at a time - one private mapping per region, taken as the
+checkpoint is read. `arena_map_private` would hand back an existing mapping when
+the range asked for sat *inside* one, and otherwise make a new one. Which is
+correct until two ranges overlap without either containing the other.
+
+That is not exotic. The mm layer splits a region whenever a guest unmaps part of
+one, and the halves keep the arena offset of the allocation they came from - so
+after a hole is punched, two regions are interior slices of a single 16KiB
+block. The first asks for one block and gets a mapping of it; the second starts
+inside that block and runs past its end, containment fails, and the block is
+mapped a second time. Two `MAP_PRIVATE` mappings of the same file bytes are two
+copy-on-write copies. A store through one is invisible through the other.
+
+Nothing announces it, because both copies begin identical. Every check made at
+the moment of the handover passes - the region contents matched byte for byte,
+the break and the stack pointer and the thread pointer all matched, no two guest
+pages shared an intermediate address, and every stage-2 block was accounted for.
+The divergence only exists once someone writes, and then it is total: the guest
+reaches its memory through stage 2, which was pointed at one copy, while this
+side reaches the same memory through the region's host pointer, which is the
+other. A write the guest makes is not the write NABI reads, and each sees the
+other frozen at the instant of the fork.
+
+Both preconditions arrived at once. Regions finer than a block need guest
+mappings finer than a block, which is exactly what 3.5.110 stopped lying about;
+and mapping the arena piecemeal needs a parent that was itself resumed. So it
+took a fork from a fork - `x=$(y=$(cmd))`, or any subshell that runs a command,
+which a login shell does before it reaches a prompt. A single subshell was fine,
+which is why `apt install` worked and `msl login fedora` did not.
+
+The repair is to keep one private view per arena block: a request that overlaps
+without being contained now unmaps what it overlaps and replaces it with one
+mapping of the union. That is safe where it happens - every caller is
+`checkpoint_restore`, mapping before the VM exists and before a byte has been
+written - but it does move mappings that were already handed out, so the
+pointers taken during the region loop are re-resolved once all of the mapping is
+done.
+
+Finding it took discarding four wrong answers first: that the child's memory was
+copied wrongly, that a partial `munmap` was cutting into a neighbouring block,
+that arena blocks were being dropped from the snapshot, and that the vCPU state
+was not surviving. Each was checked and each was clean, and that is the useful
+part of the record - the handover is faithful in every dimension that can be
+compared at the time it happens. The bug was in a dimension that cannot: two
+addresses that agree about the present and disagree about every future.
+
+`forkmemtest` ends by writing a *different* pattern in a grandchild and reading
+it back through a pipe, so the bytes make the round trip through the same
+pointer any syscall would use. Reading back what a page already held passes
+through either copy; with the bug present the two answers are exact bitwise
+complements.
+
+No new syscalls.

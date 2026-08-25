@@ -453,6 +453,23 @@ guest-code cache sync.
   file's whole contract (no controller can be enabled). It unmounts what it
   mounted, so the mount namespace is left as it was found.
 
+- `forkmemtest` — what survives a fork, asked of two generations. The mapped
+  regions, a dirtied private file mapping, the break's *value* as well as its
+  contents, and then the same questions again in a grandchild. The second
+  generation is the one that matters: a process that was itself resumed maps
+  the arena a piece at a time, and two regions can be 4KiB slices of a single
+  16KiB block once a mapping has had a hole punched in it. Mapping that block
+  twice makes two copy-on-write copies of the same bytes — the guest reaches
+  one through stage 2, NABI reaches the other through the region's host
+  pointer, and a store through either is invisible to the other. Both copies
+  start out identical, which is why the last check writes a *different* pattern
+  and then reads it back through a pipe: `write(2)` copies out of guest memory
+  and `read(2)` copies back in, so the bytes make the round trip through the
+  same pointer any syscall would use. Reading back what was already there
+  passes through either copy and proves nothing. With the bug present the two
+  answers are exact bitwise complements — the kernel is reading the page as it
+  stood at the moment of the fork.
+
 - `pagesztest` — `AT_PAGESZ` against the granularity `mmap` actually hands out,
   walked off the process's own stack like `auxvtest`. A guest computes with the
   page size it is told, and glibc computes with it in a place that aborts: any

@@ -722,6 +722,27 @@ else
     fail=1
 fi
 
+# forkmemtest: what a fork owes a child, and what it owes a grandchild.
+# fork here is fork-plus-exec - the parent flushes guest memory to a file the
+# child maps privately - so "the child sees the parent's memory" is arranged
+# rather than automatic. The check that matters is the second generation and the
+# kernel's view: a resumed process maps the arena a piece at a time, two regions
+# can be 4KiB slices of one 16KiB block, and mapping that block twice gives two
+# copy-on-write copies of it. Both start identical, so nothing shows until
+# something writes - after which the guest reaches one copy through stage 2 and
+# NABI reaches the other through the region, and neither sees the other's
+# stores. A shell hits it constantly: `x=$(y=$(cmd))` died in glibc's allocator
+# with "malloc_consolidate(): unaligned fastbin chunk detected", in a process
+# that had done nothing but be forked.
+cp "$here/forkmemtest" "$root/"; chmod +x "$root/forkmemtest"
+out=$("$NABI" -m "$root" /forkmemtest 2>&1 | tail -1); rc=$?
+if [ "$out" = "forkmem ok" ]; then
+    echo "  ok  forkmemtest -> \"$out\""
+else
+    echo "  FAIL forkmemtest -> \"$out\""
+    fail=1
+fi
+
 # pagesztest: AT_PAGESZ has to be the granule the guest's own mappings use, not
 # the stage-2 block size. A guest computes with the number it is given: glibc
 # serves anything past its mmap threshold with a mapping of its own and, freeing
