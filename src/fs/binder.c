@@ -587,13 +587,43 @@ ep_queue_fixup(struct binder_ep *e, size_t at, size_t to)
   }
 }
 
+/* Does anything still in use sit in [off, off+len) of the arena? */
+static bool
+arena_busy(const struct binder_ep *e, uint64_t off, uint64_t len)
+{
+  uint64_t base = e->arena_addr;
+  for (int i = 0; i < BINDER_MAX_ALLOCS; i++) {
+    if (!e->allocs[i].live)
+      continue;
+    uint64_t s = e->allocs[i].addr - base;
+    if (s < off + len && off < s + e->allocs[i].size)
+      return true;
+  }
+  return false;
+}
+
 /*
- * Space in the receiver's arena for a payload.
+ * Space in the receiver's arena, which has to be reusable.
  *
- * A bump allocator with a free list of one bit per allocation. Binder's own is
- * a best-fit over a red-black tree, which matters when an arena lives for the
- * lifetime of a process; this does not reuse space yet, and says so rather
- * than pretending otherwise.
+ * This was a bump allocator and only a bump allocator: the mark went up and
+ * never came down, and a freed record was kept for ever so that a double free
+ * could be recognised. Both of those make the arena a one-shot. An endpoint
+ * stopped being able to receive anything after arena_size bytes had passed
+ * through it, or after BINDER_MAX_ALLOCS messages, whichever came first - and
+ * stopped for good, because nothing ever gave any of it back.
+ *
+ * That is an intermittent failure by construction: whether a given call gets
+ * through depends on how much traffic went before it. vold's registration with
+ * servicemanager failed in about one Android boot in four, and nothing about
+ * "Unable to start VoldNativeService" points here.
+ *
+ * So the mark wraps, and a candidate range is taken only if nothing live is
+ * sitting in it. Binder's own allocator is a best-fit over a red-black tree,
+ * which earns its keep when an arena lives as long as the process does; this
+ * is a mark that goes round, which is enough for a queue that drains. Freed records are reusable now, which costs the double-free
+ * check - binder_emul_ioctl checks BC_FREE_BUFFER against the live records
+ * instead, so a free of something already freed is still refused, just not
+ * remembered for ever.
  */
 static uint64_t
 arena_take(struct binder_ep *e, uint64_t size)
@@ -601,13 +631,17 @@ arena_take(struct binder_ep *e, uint64_t size)
   if (e->arena_size == 0)
     return 0;
   uint64_t want = (size + 7) & ~(uint64_t) 7;
-  if (e->arena_brk + want > e->arena_size)
+  if (want == 0 || want > e->arena_size)
     return 0;
+
+  if (e->arena_brk + want > e->arena_size)
+    e->arena_brk = 0;            /* round again; what is free is at the front */
+  if (arena_busy(e, e->arena_brk, want))
+    return 0;                    /* still in use - the message waits, as before */
+
   for (int i = 0; i < BINDER_MAX_ALLOCS; i++) {
     if (e->allocs[i].live)
       continue;
-    if (e->allocs[i].addr != 0)
-      continue;                  /* a freed record, kept so a double free is seen */
     e->allocs[i].addr = e->arena_addr + e->arena_brk;
     e->allocs[i].size = want;
     e->allocs[i].live = true;

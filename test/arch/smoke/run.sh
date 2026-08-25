@@ -1336,6 +1336,19 @@ else
     fail=1
 fi
 
+# binderarenatest: the receiver's arena is reusable. It was a bump allocator
+# whose mark never came down, so an endpoint stopped receiving for good after
+# its arena's worth of traffic - an intermittent failure by construction, since
+# whether a call gets through depends on what went before it.
+cp "$here/binderarenatest" "$root/"; chmod +x "$root/binderarenatest"
+out=$(NABI_BINDER=emulated "$NABI" -m "$root" /binderarenatest 2>&1 | tail -1); rc=$?
+if [ "$out" = "binderarena ok" ]; then
+    echo "  ok  binderarenatest -> \"$out\""
+else
+    echo "  FAIL binderarenatest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 # binderbusytest: a sender waits for a receiver that is behind rather than
 # being refused. Linux's queue is a list bounded by the receiver's buffer; this
 # one has a count, and reaching it used to fail the transaction outright -
