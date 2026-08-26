@@ -359,23 +359,49 @@ shm_attach(void)
   int fd = open(path, O_RDWR | O_CREAT, 0600);
   if (fd < 0)
     return false;
+  /*
+   * Everything from here to the magic being set has to be one step. Two
+   * processes attaching at the same instant both found the magic unset and both
+   * initialised: the second one's memset wiped endpoints the first had already
+   * published, and reset next_id, so two live endpoints ended up with the same
+   * id. What that did was hand the context-manager flag to the wrong one -
+   * servicemanager registered and the flag landed on a vndbinder endpoint that
+   * happened to share its id - and then every client's transaction to handle 0
+   * came back ENOENT with a live, correctly registered servicemanager in the
+   * next process along. vold reported "Unable to start VoldNativeService" and
+   * init rebooted the guest for a failed vold, which is the intermittent
+   * failure that had been blamed on four different things before this.
+   *
+   * The window is as wide as the memset, which is why raising the endpoint cap
+   * made it far more likely rather than less: the registry went from 8MB to
+   * 136MB and the race went from rare to most boots.
+   */
+  flock(fd, LOCK_EX);
+  /* A file this call has just created is already zero - ftruncate makes it so -
+   * so the only thing that needs clearing is one left by something else. */
+  struct stat sst;
+  bool fresh = fstat(fd, &sst) == 0 && sst.st_size == 0;
   if (ftruncate(fd, sizeof(struct bshm)) < 0) {
+    flock(fd, LOCK_UN);
     close(fd);
     return false;
   }
   void *p = mmap(NULL, sizeof(struct bshm), PROT_READ | PROT_WRITE,
                  MAP_SHARED, fd, 0);
   if (p == MAP_FAILED) {
+    flock(fd, LOCK_UN);
     close(fd);
     return false;
   }
   shm = p;
   shm_fd = fd;
   if (shm->magic != BSHM_MAGIC) {
-    memset(shm, 0, sizeof *shm);
+    if (!fresh)
+      memset(shm, 0, sizeof *shm);
     shm->magic = BSHM_MAGIC;
     shm->next_id = 1;
   }
+  flock(fd, LOCK_UN);
   return true;
 }
 
@@ -1511,9 +1537,14 @@ binder_emul_ioctl(int fd, int cmd, uint64_t arg)
         r = -LINUX_EBUSY;
         break;
       }
+    /* Matched on the context as well as the id. An id is meant to be unique and
+     * now is, but this is the one place where getting it wrong is silent: the
+     * flag goes on some other endpoint, that endpoint answers to nothing, and
+     * the manager that did register is never found again. */
     if (r == 0)
       for (int i = 0; i < BINDER_MAX_EP; i++)
-        if (shm->ep[i].used && shm->ep[i].id == e->id) {
+        if (shm->ep[i].used && shm->ep[i].id == e->id &&
+            strcmp(shm->ep[i].ctx, e->ctx) == 0) {
           shm->ep[i].is_mgr = 1;
           e->is_mgr = true;
           break;

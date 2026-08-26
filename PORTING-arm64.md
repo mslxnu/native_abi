@@ -6309,3 +6309,59 @@ one is mounted by vold, and the harness stands a tmpfs in its place without the
 tree init expects to find under it. And `kill` on a process group that is in the
 middle of dying answers EPERM where Linux would say ESRCH; libprocessgroup
 retries through it, so it is noise rather than a stop.
+
+### 3.5.114 The registry that two processes built at once
+
+vold had failed in roughly one Android boot in four for a long time -
+"Unable to start VoldNativeService", then `reboot,vold-failed`. Three binder
+bugs were found and fixed while chasing it and none of them changed the rate,
+which is recorded here as a warning against assuming the next one will.
+
+This is the one. The shared registry is a file every process that speaks binder
+maps, and `shm_attach` decided whether to initialise it by reading a magic
+number *outside* the lock:
+
+```c
+if (shm->magic != BSHM_MAGIC) {
+  memset(shm, 0, sizeof *shm);      /* and only then */
+  shm->magic = BSHM_MAGIC;          /* is the magic set */
+  shm->next_id = 1;
+}
+```
+
+Two processes attaching at the same instant both find the magic unset, because
+the first one does not set it until after the memset. Both initialise. The
+second one's memset erases endpoints the first has already published and puts
+`next_id` back to 1, so the next endpoint created is handed an id that a live
+endpoint already has.
+
+What a duplicate id does is subtle enough to have hidden this for months.
+`BINDER_SET_CONTEXT_MGR` finds the endpoint to flag by searching the registry
+for the caller's id - and with two matches it flags whichever comes first.
+Twice we watched servicemanager register successfully, return 0, and the
+`is_mgr` flag land on a `vndbinder` endpoint in a different process that
+happened to share its id. From then on `shm_ep_for_handle(0, "binder")` found
+nothing: every client's transaction to handle 0 came back ENOENT with a live,
+correctly registered servicemanager sitting in the next process along. vold is
+simply the first thing that cannot survive it.
+
+The window is exactly as wide as the memset, which is why raising the endpoint
+cap in 3.5.113 turned a one-in-four failure into every boot: the registry went
+from 8MB to 136MB and the race went from unlucky to near-certain. That is the
+only reason it became diagnosable - it stopped being intermittent.
+
+Both halves are fixed. The check and the initialisation are one step under
+`flock`, and the memset is skipped when the file was created by this very call,
+since `ftruncate` has already made it zero - which removes the cost as well as
+the race. And the context-manager flag is now matched on the binder's *name* as
+well as the id, because that is the one place where getting it wrong says
+nothing: the flag goes on an endpoint that answers to no one, and the manager
+that did register is never found again.
+
+Three boots in a row after it, where before there had been none: 334, 352 and
+357 services with no reboot, and a longer run reaching 509. What is left is not
+a bug but a gap - the emulated driver implements handle 0 and nothing else, so a
+client can reach the context manager and no other service. `vdc checkpoint
+markBootAttempt` looks vold up by name, is handed a handle that names nothing,
+and waits; `post-fs-data` never runs, and the zygote finds no /data to build a
+cache in. Object references are the next piece.
