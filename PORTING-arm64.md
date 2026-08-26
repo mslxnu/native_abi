@@ -6365,3 +6365,68 @@ client can reach the context manager and no other service. `vdc checkpoint
 markBootAttempt` looks vold up by name, is handed a handle that names nothing,
 and waits; `post-fs-data` never runs, and the zygote finds no /data to build a
 cache in. Object references are the next piece.
+
+### 3.5.115 Objects that can be reached by name
+
+The emulated driver knew one handle: zero, the context manager. That is enough
+to reach servicemanager and nothing else, and Android is built the other way
+round - a service registers *with* the manager, the manager hands it out to
+whoever asks, and every call after that goes to a handle the driver invented.
+
+So a client could look a service up, be given a reference, and transact into
+nothing. `vdc checkpoint markBootAttempt` found vold, called it, and waited;
+init waited on vdc; `post-fs` never finished, `post-fs-data` never ran, and the
+zygote's complaint about `/data/dalvik-cache` - which reads like a problem with
+the shape of /data - was four steps downstream of a handle that named nothing.
+
+A node is the thing a handle names: an object, who owns it, and what the owner
+calls it. Outbound, an object the sender owns becomes a node and travels as a
+handle; inbound to the owner, a handle that names one of the receiver's own
+objects becomes the pointer it knows it by, because a process has to recognise
+its own object when it comes home. The numbering is shared across the instance
+rather than per-process as Linux's is. That is a simplification and not a
+shortcut: a handle is opaque to everyone holding one, so nothing can tell, and
+it removes the per-process translation table the real driver needs.
+
+Three things fell out of it that were not obvious from the outside.
+
+The first was that a missing command is not an error but a loop. With handles
+real, servicemanager linked to death on every service it stored -
+`BC_REQUEST_DEATH_NOTIFICATION`, which the driver did not know. An unknown BC
+fails the *whole* write, and libbinder answers a failed write by logging it and
+trying again, so one missing command produced three quarters of a million lines
+of the same four calls and nothing else ever started. The death-notification
+family is accepted now. Nothing sends `BR_DEAD_BINDER` yet, which is a real gap
+and a far smaller one than refusing the command; clearing is answered, because
+the caller blocks until it is.
+
+The second was that a thread had no id. `gettid` goes through the pid namespace
+like everything else the guest can see, and a thread was never enrolled in one -
+so `pidns_to_ns` said what it says about a process it does not know, and every
+thread in every `--pid1` guest reported tid 0. Linux numbers threads and
+processes out of one range, which is why `tgkill` takes one of each; so threads
+are enrolled too.
+
+The third was the delivery itself. libbinder reads a transaction's target
+pointer and cookie together and casts the cookie straight to the object it is a
+call on. Both were being delivered as zero, which is not an error to libbinder -
+it is a call on "the context object", the single nameless object that only a
+context manager registers. servicemanager has one, which is why handle 0 had
+always worked; vold does not, so the first call that ever reached it was a
+transact on a null pointer. It had never been reached before because nothing
+could reach it.
+
+`binderhandletest` covers the mechanism in two processes: an object its owner
+sends arrives as a handle rather than as a pointer into another address space,
+that handle reaches the process owning the object, and the same handle sent back
+to its owner is a pointer again. Removing the resolution makes it fail with
+ENOENT on the call rather than hang - which took two attempts to arrange, since
+the first version waited on an answer that a refused send was never going to
+produce.
+
+Android is not further along by the measure that is easy to quote. It reaches
+17 services now where it reached 357, and that is not a regression so much as a
+change of subject: the 357 were services starting while init waited on a vdc
+that could never finish, and now vold gets far enough to be called and crashes
+in libbinder reading a pointer out of parcel text. That is the next thing, and
+it is a real one rather than an absence.

@@ -30,6 +30,19 @@ init_task(unsigned long clone_flags, gaddr_t child_tid, gaddr_t tls)
 
   if (clone_flags & LINUX_CLONE_THREAD) {
     pthread_threadid_np(NULL, &task.tid);
+    /*
+     * And into the pid namespace, because Linux numbers threads and processes
+     * out of the same range - a tid *is* a pid, which is why tgkill takes one
+     * of each and why /proc/<pid>/task is full of them.
+     *
+     * Without this a thread was in no namespace at all, and pidns_to_ns says
+     * of a process it does not know that it does not exist: gettid answered
+     * zero for every thread in every guest running under --pid1. bionic keeps
+     * that number and uses it to tell its threads apart, so vold's binder
+     * looper and its main thread agreed they were the same thread.
+     */
+    if (pidns_active())
+      (void) pidns_add_child((int32_t) task.tid);
   } else {
     task.tid = getpid();
   }

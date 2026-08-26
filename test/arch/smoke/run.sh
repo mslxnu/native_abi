@@ -1403,6 +1403,26 @@ else
     fail=1
 fi
 
+# binderhandletest: an object passed by reference, and called through it. The
+# emulated driver knew one handle - zero, the context manager - which is enough
+# to reach servicemanager and nothing else, while Android is built the other way
+# round: a service registers *with* the manager, is handed out to whoever asks,
+# and every call after that goes to a handle the driver invented. So a client
+# could look a service up, be given a reference, and transact into nothing -
+# `vdc checkpoint markBootAttempt` found vold, called it, and waited until init
+# gave up on post-fs, which is why post-fs-data never ran. Checked: an object
+# its owner sends arrives as a handle rather than as a pointer into another
+# address space, that handle reaches the process owning the object, and the
+# same handle sent back to its owner becomes the owner's pointer again.
+cp "$here/binderhandletest" "$root/"; chmod +x "$root/binderhandletest"
+out=$(NABI_BINDER=emulated "$NABI" -m "$root" /binderhandletest 2>&1 | tail -1)
+if [ "$out" = "binderhandle ok" ]; then
+    echo "  ok  binderhandletest -> \"$out\""
+else
+    echo "  FAIL binderhandletest -> \"$out\""
+    fail=1
+fi
+
 # binderreplytest: a reply that crosses a process boundary. BC_REPLY names no
 # target - the driver is expected to know which call the replying thread is
 # inside - so without a record of that, a process could only answer itself and

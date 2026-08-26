@@ -75,6 +75,17 @@
 #define BR_REPLY                 0x80407203u
 #define BR_TRANSACTION_COMPLETE  0x00007206u
 #define BR_NOOP                  0x0000720Cu
+#define BR_CLEAR_DEATH_NOTIFICATION_DONE 0x80087210u
+/*
+ * Death notification. struct binder_handle_cookie is __packed - a u32 handle
+ * followed immediately by a u64 cookie, twelve bytes rather than the sixteen
+ * the alignment would otherwise give it - which is also what the ioctl number
+ * encodes.
+ */
+#define BC_REQUEST_DEATH_NOTIFICATION 0x400c630Eu
+#define BC_CLEAR_DEATH_NOTIFICATION   0x400c630Fu
+#define BC_DEAD_BINDER_DONE           0x40086310u
+#define BC_HANDLE_COOKIE_SIZE 12
 
 #define TF_ONE_WAY 0x01u
 
@@ -88,6 +99,24 @@
 #define LINUX_BINDER_TYPE_FD_EMUL  0x66642a85u
 #define LINUX_BINDER_TYPE_FDA_EMUL 0x66646185u
 #define LINUX_BINDER_TYPE_PTR_EMUL 0x70742a85u
+/*
+ * An object a parcel carries by reference rather than by value: either one the
+ * sender owns (BINDER) or one it only holds a reference to (HANDLE). Same
+ * B_PACK_CHARS spelling as the three above - 's','b','*' and 's','h','*', with
+ * the weak forms spelled with a 'w'.
+ */
+#define LINUX_BINDER_TYPE_BINDER      0x73622a85u
+#define LINUX_BINDER_TYPE_WEAK_BINDER 0x77622a85u
+#define LINUX_BINDER_TYPE_HANDLE      0x73682a85u
+#define LINUX_BINDER_TYPE_WEAK_HANDLE 0x77682a85u
+
+/* The 24 bytes of a flat_binder_object, named. The union at eight is the
+ * owner's pointer for a BINDER and the handle in its low half for a HANDLE. */
+struct bflat_obj {
+  uint32_t type, flags;
+  uint64_t binder;
+  uint64_t cookie;
+};
 
 /* A scatter-gather buffer object: a pointer into the sender's memory that the
  * receiver must be given a copy of, and where in its parent to write the copy's
@@ -179,6 +208,12 @@ struct bmsg {
    * one the call came in on.
    */
   uint32_t sender_ep;
+  /*
+   * The handle this was addressed to, or zero for the context manager and for
+   * a reply. Kept because the receiver has to be told which of *its* objects
+   * the call is for, in its own terms - see collect_messages.
+   */
+  uint32_t target_node;
   uint64_t data_size, offsets_size;
   /* Where the parts sit inside `data`, which is the buffer as the receiver
    * will see it: the parcel, the offsets, then the scatter-gather copies. */
@@ -228,10 +263,30 @@ struct bep_shared {
   struct bmsg q[BSHM_MSG_MAX];
 };
 
+/*
+ * One object that can be reached by reference: who owns it, and what they call
+ * it. This is what a handle names.
+ *
+ * The handle a guest is given is this table's index, which makes it the same
+ * number in every process. Linux's handles are per-process and this is not,
+ * which is a simplification rather than a shortcut: a handle is opaque to
+ * everyone who holds one, so nothing can tell the difference, and one shared
+ * numbering removes the per-process translation table the real driver needs.
+ * Zero is never allocated - it means the context manager, to everybody.
+ */
+#define BINDER_MAX_NODES 4096
+struct bnode_shared {
+  uint32_t used;
+  uint32_t owner;                /* the endpoint id whose object this is */
+  uint64_t ptr;                  /* what the owner calls it */
+  uint64_t cookie;
+};
+
 struct bshm {
   uint32_t magic;
   uint32_t next_id;
   struct bep_shared ep[BINDER_MAX_EP];
+  struct bnode_shared node[BINDER_MAX_NODES];
 };
 
 static struct bshm *shm;
@@ -567,13 +622,56 @@ binder_emul_is(int fd)
 static int
 shm_ep_for_handle(uint32_t handle, const char *ctx)
 {
-  if (handle != 0 || !shm_attach())
+  if (!shm_attach())
     return -1;
+  if (handle == 0) {
+    for (int i = 0; i < BINDER_MAX_EP; i++)
+      if (shm->ep[i].used && shm->ep[i].is_mgr &&
+          strcmp(shm->ep[i].ctx, ctx) == 0)
+        return i;
+    return -1;
+  }
+  /*
+   * Any other handle names a node, and the node names the endpoint that owns
+   * the object. The context is checked as well: the three binders are three
+   * separate worlds, and a handle from one of them must not resolve in another
+   * however the number was arrived at.
+   */
+  if (handle >= BINDER_MAX_NODES || !shm->node[handle].used)
+    return -1;
+  uint32_t owner = shm->node[handle].owner;
   for (int i = 0; i < BINDER_MAX_EP; i++)
-    if (shm->ep[i].used && shm->ep[i].is_mgr &&
+    if (shm->ep[i].used && shm->ep[i].id == owner &&
         strcmp(shm->ep[i].ctx, ctx) == 0)
       return i;
   return -1;
+}
+
+/*
+ * The handle for an object its owner has just named, made if this is the first
+ * time anyone has been told about it.
+ *
+ * Looked up by owner and pointer rather than counted: a service registers
+ * itself once and is then handed out to every client that asks for it, and each
+ * of those must arrive at the same handle or a client would hold a reference
+ * that compares unequal to everyone else's.
+ */
+static uint32_t
+shm_node_for(uint32_t owner, uint64_t ptr, uint64_t cookie)
+{
+  for (uint32_t i = 1; i < BINDER_MAX_NODES; i++)
+    if (shm->node[i].used && shm->node[i].owner == owner &&
+        shm->node[i].ptr == ptr)
+      return i;
+  for (uint32_t i = 1; i < BINDER_MAX_NODES; i++)
+    if (!shm->node[i].used) {
+      shm->node[i].used = 1;
+      shm->node[i].owner = owner;
+      shm->node[i].ptr = ptr;
+      shm->node[i].cookie = cookie;
+      return i;
+    }
+  return 0;
 }
 
 /* Wake whoever is waiting on an endpoint, wherever it is. */
@@ -974,6 +1072,7 @@ do_transaction(struct binder_ep *from, const struct btr *tr, bool reply,
   m->flags = tr->flags;
   m->sender_pid = (uint32_t) getpid();
   m->sender_ep  = from->id;      /* so a reply can find its way back */
+  m->target_node = reply ? 0 : (uint32_t) tr->target;
   m->sender_euid = 0;
   m->data_size = tr->data_size;
   m->offsets_size = tr->offsets_size;
@@ -992,6 +1091,66 @@ do_transaction(struct binder_ep *from, const struct btr *tr, bool reply,
     void *src = guest_to_host(tr->offsets);
     if (src == NULL) err = -LINUX_EFAULT;
     else memcpy(m->data + offs_at, src, tr->offsets_size);
+  }
+  if (err != 0) {
+    shm_unlock();
+    return err;
+  }
+
+  /*
+   * Objects passed by reference, translated for the receiver.
+   *
+   * A parcel can carry an object the sender owns (BINDER, naming the sender's
+   * own pointer) or one it merely holds a reference to (HANDLE). Neither means
+   * anything as it stands to the process on the other side: a pointer belongs
+   * to the address space it came from, and until now a handle belonged to
+   * nothing at all, because only handle 0 existed. So a service could register
+   * itself with the context manager and be handed back to a client, and the
+   * client's transactions went to a number that named nothing - `vdc checkpoint
+   * markBootAttempt` looked vold up, was given a reference, and waited on it
+   * until init gave up on post-fs. Everything downstream of that waited too:
+   * post-fs-data never ran and the zygote found no /data to build a cache in.
+   *
+   * Outbound, an object the sender owns becomes a node - the one thing that
+   * outlives the message - and travels as a handle naming it. Inbound to the
+   * owner, the reverse: a handle that names one of the receiver's own objects
+   * is turned back into the pointer the receiver knows it by, because a process
+   * must recognise its own object when it comes home. A handle to anyone else's
+   * object is passed along unchanged, since the numbering is shared.
+   */
+  if (m->offsets_size >= 8) {
+    uint64_t *offs = (uint64_t *)(void *)(m->data + offs_at);
+    size_t n = (size_t)(m->offsets_size / 8);
+    for (size_t i = 0; i < n && err == 0; i++) {
+      uint64_t at = offs[i];
+      if (at + sizeof(struct bflat_obj) > m->data_size)
+        continue;
+      struct bflat_obj fo;
+      memcpy(&fo, m->data + at, sizeof fo);
+
+      if (fo.type == LINUX_BINDER_TYPE_BINDER ||
+          fo.type == LINUX_BINDER_TYPE_WEAK_BINDER) {
+        uint32_t h = shm_node_for(from->id, fo.binder, fo.cookie);
+        if (h == 0) { err = -LINUX_ENOMEM; break; }
+        fo.type = fo.type == LINUX_BINDER_TYPE_BINDER
+                    ? LINUX_BINDER_TYPE_HANDLE : LINUX_BINDER_TYPE_WEAK_HANDLE;
+        fo.binder = h;           /* the handle sits in the low half */
+        fo.cookie = 0;
+        memcpy(m->data + at, &fo, sizeof fo);
+      } else if (fo.type == LINUX_BINDER_TYPE_HANDLE ||
+                 fo.type == LINUX_BINDER_TYPE_WEAK_HANDLE) {
+        uint32_t h = (uint32_t) fo.binder;
+        if (h == 0 || h >= BINDER_MAX_NODES || !shm->node[h].used)
+          continue;              /* handle 0, or one nothing backs; leave it */
+        if (shm->node[h].owner != dst->id)
+          continue;              /* someone else's, and the number travels */
+        fo.type = fo.type == LINUX_BINDER_TYPE_HANDLE
+                    ? LINUX_BINDER_TYPE_BINDER : LINUX_BINDER_TYPE_WEAK_BINDER;
+        fo.binder = shm->node[h].ptr;
+        fo.cookie = shm->node[h].cookie;
+        memcpy(m->data + at, &fo, sizeof fo);
+      }
+    }
   }
   if (err != 0) {
     shm_unlock();
@@ -1149,6 +1308,25 @@ collect_messages(struct binder_ep *e)
     struct btr out;
     memset(&out, 0, sizeof out);
     out.cookie = m->cookie;
+    /*
+     * Which object of the receiver's this call is for, in the receiver's own
+     * terms. libbinder reads the two together and the cookie is the one that
+     * matters: it casts it straight to the BBinder and calls transact on it.
+     * A transaction delivered with both left at zero is not an error to it -
+     * it is a call on "the context object", the single nameless object a
+     * context manager registers - so vold, which has no such thing, called
+     * transact on a null pointer the moment anything reached it. It had never
+     * been reached before, because until handles existed nothing could.
+     *
+     * Zero for the context manager itself, which is the case that already
+     * worked: handle 0 has no node behind it and servicemanager is exactly the
+     * process that does have a context object.
+     */
+    if (m->target_node != 0 && m->target_node < BINDER_MAX_NODES &&
+        shm->node[m->target_node].used) {
+      out.target = shm->node[m->target_node].ptr;
+      out.cookie = shm->node[m->target_node].cookie;
+    }
     out.code = m->code;
     out.flags = m->flags;
     out.sender_pid = m->sender_pid;
@@ -1301,6 +1479,44 @@ consume_writes(struct binder_ep *e, uint64_t buf, uint64_t size,
     case BC_INCREFS_DONE:
     case BC_ACQUIRE_DONE:
       off += 16;                 /* node pointer and cookie */
+      break;
+
+    /*
+     * Death notification, accepted and not yet acted on.
+     *
+     * Nothing here ever sends BR_DEAD_BINDER, so a process that asks to be told
+     * when a service dies is not told. That is a gap, and it is a smaller one
+     * than refusing the command: an unknown BC fails the whole write, and
+     * libbinder's answer to a failed write is to log it and try again. The
+     * moment handles became real, servicemanager linked to death on every
+     * service it stored, so the refusal put it in a loop - EINVAL, log, retry -
+     * that never ended and never started anything else. Its trace was three
+     * quarters of a million lines of the same four calls.
+     *
+     * Clearing is answered, because the caller waits for that one: libbinder
+     * blocks in unlinkToDeath until BR_CLEAR_DEATH_NOTIFICATION_DONE comes back
+     * carrying the cookie it asked with.
+     */
+    case BC_REQUEST_DEATH_NOTIFICATION:
+      off += BC_HANDLE_COOKIE_SIZE;
+      break;
+
+    case BC_CLEAR_DEATH_NOTIFICATION: {
+      if (off + BC_HANDLE_COOKIE_SIZE > size)
+        return -LINUX_EINVAL;
+      uint64_t cookie;
+      void *q = guest_to_host(buf + off + 4);   /* past the handle */
+      if (q == NULL)
+        return -LINUX_EFAULT;
+      memcpy(&cookie, q, sizeof cookie);
+      off += BC_HANDLE_COOKIE_SIZE;
+      ep_queue_cmd(e, BR_CLEAR_DEATH_NOTIFICATION_DONE);
+      ep_queue(e, &cookie, sizeof cookie);
+      break;
+    }
+
+    case BC_DEAD_BINDER_DONE:
+      off += 8;                  /* the cookie of a death we never reported */
       break;
 
     case BC_FREE_BUFFER: {
