@@ -793,6 +793,66 @@ DEFINE_SYSCALL(mremap, gaddr_t, old_addr, size_t, old_size, size_t, new_size, in
     goto out;
   }
 
+#if defined(__arm64__)
+  /*
+   * Growing where it stands, which is what Linux does whenever the space above
+   * a mapping is free - and what makes realloc on a large buffer cheap.
+   *
+   * Without it every grow allocated the whole new size, copied the old bytes
+   * into it, tore the mapping down a page at a time and built it up again. That
+   * is linear in the size of the region for each call, and a caller that grows
+   * a buffer in steps calls it once per step: dnf's download buffer went from
+   * 1.7MB upwards in 64KiB increments, 2199 times in one process, and nabi
+   * spent essentially all of its time in mremap - re-mapping some ten gigabytes
+   * of pages to move two megabytes of data. It also abandoned the old
+   * allocation each time, since arena storage is released only as a whole
+   * chunk, so the arena's apparent size grew with the square of the buffer and
+   * eventually could not be extended at all: "could not grow the guest memory
+   * arena ... No space left on device".
+   *
+   * The conditions are the two that make it safe rather than merely faster: the
+   * guest addresses above the region have to be unclaimed, and the arena and
+   * host memory behind it have to be extendable in place - see arena_extend,
+   * which refuses unless both are true. When it refuses, the move path below
+   * runs exactly as before.
+   */
+  if (!(flags & LINUX_MREMAP_FIXED) && new_size > region->size &&
+      region->arena_off >= 0 && region->size == old_size &&
+      (region->mm_flags & LINUX_MAP_ANONYMOUS) &&
+      find_region_range(region->gaddr + region->size,
+                        new_size - region->size, proc.mm) == NULL) {
+    void *grown = arena_extend(region->arena_off, region->size, new_size,
+                               region->haddr);
+    if (grown != NULL) {
+      size_t add = new_size - region->size;
+      gaddr_t at = region->gaddr + region->size;
+      void *hat = (char *) region->haddr + region->size;
+      /* Only the pages that were not there before: the rest keep the stage-1
+       * and stage-2 entries they already have, which is the whole saving. */
+      /* Assigned directly, the way the shrink path above does: the tree is
+       * ordered by address and the range this grows into was just checked to
+       * be unclaimed, so no neighbour's ordering changes. */
+      region->size = new_size;
+      /*
+       * And past the allocator's cursor, which is the other thing that has to
+       * agree that this space is taken. alloc_region is a bump allocator: it
+       * hands out current_mmap_top and never consults the region tree, so
+       * "nothing is mapped there" - which is what was checked above - is not
+       * the same as "nothing will be". Growing into the space the next mmap was
+       * going to get produced exactly that collision, one region recorded on
+       * top of another, a few hundred allocations later:
+       *   recording overlapping regions: new [0xccefd000, 0xcd53e000)
+       *   over existing [0xccccc000, 0xcd07e000)
+       */
+      if (region->gaddr + new_size > proc.mm->current_mmap_top)
+        proc.mm->current_mmap_top = region->gaddr + new_size;
+      vmm_mmap(at, add, region->prot, hat);
+      ret = region->gaddr;
+      goto out;
+    }
+  }
+#endif
+
   gaddr_t dst = (flags & LINUX_MREMAP_FIXED) ? new_addr : alloc_region(new_size);
 
   /* new_size > old_size, or moving to a new address */

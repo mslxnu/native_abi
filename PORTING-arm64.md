@@ -6430,3 +6430,87 @@ change of subject: the 357 were services starting while init waited on a vdc
 that could never finish, and now vold gets far enough to be called and crashes
 in libbinder reading a pointer out of parcel text. That is the next thing, and
 it is a real one rather than an absence.
+
+### 3.5.116 A crash that waited for an answer
+
+`panic` printed the message, the backtrace, and then this:
+
+```
+Set the ulimit value to unlimited to generate the coredump? [Y/n]
+```
+
+and called `getchar`.
+
+stdin belongs to the guest. In a pipeline there is nobody to answer, so the
+read never returns: the process does not exit, nothing further is printed, and
+the failure stops being a crash and becomes a hang. That is what `dnf update`
+looked like from the outside - it sat there after the confirmation prompt with
+every process idle - and the "y" the user typed to dnf went to this prompt
+instead, which is why it appeared twice in the transcript and why dnf never saw
+it.
+
+It also could not have worked. The limit is consulted when a core is written,
+and by then the process has already faulted; raising it afterwards produces
+nothing. So the line is a statement now - run with `ulimit -c unlimited` if you
+want a core - and the panic ends.
+
+Worth noticing for its own sake: this had been in every panic path since the
+beginning, and it hid every crash that happened anywhere but an interactive
+terminal. The overlapping-region panic in the next section was invisible for
+the same reason, and appeared the moment this was fixed.
+
+### 3.5.117 Growing a mapping where it stands
+
+`dnf check-update` took **8m55s**, of which **3m39s** was nabi's own CPU. A
+sample said where: essentially all of it in `mremap`.
+
+Linux extends a mapping in place whenever the space above it is free. nabi
+always moved: it allocated the whole new size from the arena, copied the old
+bytes across, tore the mapping down a guest page at a time and built the new
+one up the same way. That is the cost of the whole region on every call, and a
+caller that grows a buffer in steps calls it once per step. dnf's download
+buffer went from 1.7MB upwards in 64KiB increments - 2199 times in one process,
+re-mapping something like ten gigabytes of pages to move two megabytes of data.
+
+It also abandoned the old allocation each time, because arena storage is
+released only as a whole chunk and a grown region is not known to be one. So
+the arena's apparent size grew with the *square* of the buffer, and eventually
+could not be extended at all: "could not grow the guest memory arena to
+37748736 bytes: No space left on device", on a disk with 27GiB free.
+
+The fast path is allowed when three things hold, none of which can be arranged
+and all of which are therefore asked: the guest addresses above the region are
+unclaimed, the region is the top of the arena so the offsets above it are not
+somebody else's, and the host address space immediately after its mapping is
+free. `arena_extend` answers the last two and refuses otherwise; the move path
+runs unchanged when it does.
+
+Two things had to give way.
+
+`vmm_mmap` asserted that its host address was 16KiB-aligned. That was true when
+a region owned whole stage-2 blocks, and stopped being needed when blocks became
+shared - the loop finds the block containing each host page and maps the page at
+its offset inside it, which works wherever the page sits. The assertion outlived
+its reason and had become a limit: growing in place means continuing from where
+a region ends, and a region measured in 4KiB pages ends inside a block more
+often than not.
+
+And `alloc_region` is a bump allocator that never consults the region tree. So
+"nothing is mapped above this region", which is what the fast path checks, is
+not the same as "nothing will be" - growing into the space the next mmap was
+about to get put one region on top of another, and panicked *hundreds of
+allocations later*, nowhere near the mremap that caused it. The cursor is moved
+past the grown region now.
+
+`dnf check-update` takes **1m54s**, with **58s** of nabi CPU: about five times
+faster in wall clock and four in CPU. `mremapgrowtest` does not measure that - a
+timing test would be a flaky one - it checks what has to remain true for the
+fast path to be permitted: the bytes survive each grow, a mapping made after a
+grow does not land inside the grown region, and the whole thing still unmaps as
+one. Leaving the allocator's cursor behind makes it fail with the region zeroed
+under it, which is exactly what it looked like in the guest.
+
+One run of the suite failed this test and has not done so again in twenty-three
+attempts since, standalone and in the suite. Rather than guess at it, the runner
+now prints the test's whole output on failure instead of the last line, so the
+offset and the value it found survive to be read.

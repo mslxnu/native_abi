@@ -204,6 +204,7 @@ int   arena_snapshot(void);
 void *arena_hva_of(off_t off);
 void  arena_unmap(void *addr, size_t size);
 void *arena_map_private(off_t off, size_t size);
+void *arena_extend(off_t off, size_t old_size, size_t new_size, void *haddr);
 void  arena_adopt(int fd);
 int   arena_fd(void);
 

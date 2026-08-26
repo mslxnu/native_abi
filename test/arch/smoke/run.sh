@@ -743,6 +743,31 @@ else
     fail=1
 fi
 
+# mremapgrowtest: a buffer grown in steps, the way realloc grows one. Linux
+# extends a mapping where it stands when the space above it is free; nabi
+# allocated the whole new size, copied, and rebuilt the mapping a page at a
+# time, which is the whole region's cost on every step. dnf's download buffer
+# grew 64KiB at a time, 2199 times in one process, and `dnf check-update` took
+# 8m55s of which 3m39s was nabi re-mapping pages. Speed is not what is checked
+# here - that would be a flaky test. What is checked is what has to hold for
+# the fast path to be allowed: the bytes survive each grow, a mapping made
+# afterwards does not land inside the grown region (alloc_region is a bump
+# allocator and never consults the region tree, so growing into space it was
+# about to hand out put one region on top of another), and the whole thing
+# still unmaps as one.
+cp "$here/mremapgrowtest" "$root/"; chmod +x "$root/mremapgrowtest"
+# The whole output on failure, not just the verdict: this test names the offset
+# and the value it found, and a bare "mremapgrow failed" throws that away - which
+# it did once, on a run that has not repeated.
+full=$("$NABI" -m "$root" /mremapgrowtest 2>&1); out=$(printf '%s' "$full" | tail -1)
+if [ "$out" = "mremapgrow ok" ]; then
+    echo "  ok  mremapgrowtest -> \"$out\""
+else
+    echo "  FAIL mremapgrowtest -> \"$out\""
+    printf '%s\n' "$full" | sed 's/^/        /'
+    fail=1
+fi
+
 # pagesztest: AT_PAGESZ has to be the granule the guest's own mappings use, not
 # the stage-2 block size. A guest computes with the number it is given: glibc
 # serves anything past its mmap threshold with a mapping of its own and, freeing

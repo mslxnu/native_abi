@@ -444,7 +444,19 @@ void
 vmm_mmap(gaddr_t gaddr, size_t size, int prot, void *haddr)
 {
   assert((gaddr & (PAGE_SIZEOF(PAGE_4KB) - 1)) == 0);
-  assert(((uintptr_t) haddr & (STAGE2_GRANULE - 1)) == 0);
+  /*
+   * A guest page, not a stage-2 block. This asked for block alignment back
+   * when a region owned whole blocks; the loop below stopped needing it when
+   * blocks became shared - it finds the block containing each host page and
+   * maps the page at its offset inside it, which works wherever the page sits.
+   * What it does still need is that the offset be a whole number of guest
+   * pages, which is this.
+   *
+   * The stricter form outlived its reason and became a limit: mremap can only
+   * grow a mapping in place by continuing from where it ends, and a region
+   * that is a 4KiB multiple ends in the middle of a block more often than not.
+   */
+  assert(((uintptr_t) haddr & (PAGE_SIZEOF(PAGE_4KB) - 1)) == 0);
 
   /*
    * A stage-2 block per *host page*, not per region.

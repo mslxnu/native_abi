@@ -298,6 +298,69 @@ arena_alloc(size_t size, off_t *off_out)
 }
 
 /*
+ * Extend an allocation where it stands, or say it cannot be done.
+ *
+ * Only the allocation at the top of the arena can grow, because the offsets
+ * either side of it belong to somebody else - and only if the host address
+ * space immediately after its mapping happens to be free, since a guest region
+ * is reached as haddr plus an offset and has to stay one contiguous run.
+ *
+ * Neither condition can be arranged, so both are asked rather than assumed, and
+ * the answer is NULL when either fails. The caller then does what it always
+ * did: allocate, copy, and move. What this saves when it works is that copy and
+ * the whole page-by-page teardown and rebuild of the mapping either side of it.
+ *
+ * The hint is passed to mmap without MAP_FIXED on purpose. MAP_FIXED would
+ * succeed by unmapping whatever was there, which here would be another guest's
+ * region or one of nabi's own mappings; asking for the address and checking
+ * what came back is the difference between growing into free space and taking
+ * somebody else's.
+ */
+void *
+arena_extend(off_t off, size_t old_size, size_t new_size, void *haddr)
+{
+  if (arena_backing_fd < 0 || haddr == NULL)
+    return NULL;
+  size_t old_r = roundup(old_size, ARENA_GRANULE);
+  size_t new_r = roundup(new_size, ARENA_GRANULE);
+  if (new_r <= old_r)
+    return haddr;                       /* nothing to add */
+  if (off + (off_t) old_r != arena_brk)
+    return NULL;                        /* not the top; the space is not ours */
+
+  size_t add = new_r - old_r;
+  off_t want_end = arena_brk + (off_t) add;
+  if (want_end > arena_capacity) {
+    off_t want = roundup(want_end, ARENA_GROW_STEP);
+    if (ftruncate(arena_backing_fd, want) < 0)
+      return NULL;
+    arena_capacity = want;
+  }
+
+  char *hint = (char *) haddr + old_r;
+  void *p = mmap(hint, add, PROT_READ | PROT_WRITE, MAP_PRIVATE,
+                 arena_backing_fd, arena_brk);
+  if (p == MAP_FAILED)
+    return NULL;
+  if (p != hint) {
+    munmap(p, add);
+    return NULL;                        /* something is already there */
+  }
+
+  arena_brk = want_end;
+
+  /* One span, still: the region is one contiguous run of host memory and of
+   * arena bytes, and a handover describes it as one. */
+  for (size_t i = 0; i < nr_arena_spans; i++)
+    if (arena_spans[i].addr == haddr && arena_spans[i].off == off) {
+      arena_spans[i].size = new_r;
+      return haddr;
+    }
+  arena_span_record(p, add, arena_brk - (off_t) add, false);
+  return haddr;
+}
+
+/*
  * Release an arena range.
  *
  * The storage goes back to the filesystem; the offset does not go back to the
