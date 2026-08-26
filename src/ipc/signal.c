@@ -951,6 +951,56 @@ DEFINE_SYSCALL(kill, l_pid_t, pid, int, sig)
     if (h < 0)
       return -LINUX_ESRCH;
     pid = h;
+  } else if (pid < -1) {
+    /*
+     * A process group, which is a pid and has to be translated like one. It was
+     * not, so the number went to the host's group of that name - somebody
+     * else's, or nobody's.
+     *
+     * Android's libprocessgroup kills a service by its group on every restart
+     * and every shutdown, so "kill(-146, 9) failed: Operation not permitted"
+     * followed by "Failed to kill process cgroup ... 1 processes remain"
+     * appeared for each one, and init sat in a restart loop waiting for
+     * processes that were never signalled. setpgid already translates both of
+     * its arguments, so the group a guest names does exist here - it is the
+     * host pid of whichever process made the group - and this is the same
+     * lookup in the other direction.
+     */
+    pid_t h = pidns_to_host(-pid);
+    if (h < 0)
+      return -LINUX_ESRCH;
+    pid = -h;
+  } else if (pid == -1 && pidns_active()) {
+    /*
+     * "Everything I am allowed to signal", which inside a pid namespace means
+     * everything in that namespace and outside it means every process this
+     * account owns. Handing the host a bare -1 would mean the second while the
+     * guest asked for the first - init sends it during shutdown, so a guest
+     * shutting down would have signalled the user's shell and whatever else
+     * they were running.
+     *
+     * Sent one at a time instead. Linux excludes the caller and pid 1 from the
+     * broadcast, and so does this.
+     */
+    int32_t hosts[PIDNS_MAX];
+    size_t n = pidns_hosts(hosts, sizeof hosts / sizeof hosts[0]);
+    if (n > sizeof hosts / sizeof hosts[0])
+      n = sizeof hosts / sizeof hosts[0];
+    pid_t self = getpid();
+    /* Resolved once: asking per member would re-read the namespace's table for
+     * every one of them. */
+    pid_t init = pidns_to_host(1);
+    int sent = 0, last = -LINUX_ESRCH;
+    for (size_t i = 0; i < n; i++) {
+      if (hosts[i] == self || hosts[i] == init)
+        continue;
+      int r = send_signal(hosts[i], sig);
+      if (r == 0)
+        sent++;
+      else
+        last = r;
+    }
+    return sent > 0 ? 0 : last;
   }
   return send_signal(pid, sig);
 }

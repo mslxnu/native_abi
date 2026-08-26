@@ -6238,3 +6238,74 @@ through either copy; with the bug present the two answers are exact bitwise
 complements.
 
 No new syscalls.
+
+### 3.5.113 Four things between init and a system
+
+With the fork bug of 3.5.112 out of the way, Android's init got far enough to
+show what was next. Four faults, none related to each other, each of which
+stopped the boot on its own; together they took a run from 44 services and a
+reboot to 508 services, the zygote starting, and no reboot at all.
+
+**A tid the guest could not use.** `CLONE_CHILD_SETTID` stores the new thread's
+id in guest memory, and it was stored as the host's number rather than the
+guest's. Everywhere else the guest can see an id it goes through the pid
+namespace first - `getpid` does, `gettid` does - and this is one of those
+places, because the word is read back as a tid by whoever asked for it. Without
+a pid namespace the translation is the identity, which is why nothing had
+noticed. Under `--pid1` it is not: bionic keeps the word clone wrote as its
+cached id, and the first thing an Android service does is `setpgid(0, that)`,
+naming a process that does not exist in the namespace. Every service start
+logged "cannot set attribute for <name>: setpgid failed: No such process".
+
+**setrlimit answering ENOSYS.** On the reasoning that a modern libc routes
+setrlimit through `prlimit64` and nothing would call the old syscall. Android's
+init calls it: `setrlimit` in init.rc goes straight to the syscall, so
+`setrlimit nice 40 40` and `setrlimit nofile 32768 32768` both failed at
+early-init, before a single service had started. It now delegates to prlimit64,
+which already knows which resources Darwin does not have and which hard limits
+the host will refuse - both of which belong in one place rather than two.
+
+**No binder devices.** On a real device the three binder nodes come from the
+kernel at boot and are simply there; init.rc never creates them and ueventd
+acts on uevents an emulated driver cannot send. Then init mounts a tmpfs over
+/dev and whatever was underneath is gone as well. So servicemanager - the first
+thing to want binder, and a critical service - opened `/dev/binder`, got ENOENT
+and aborted. init restarted it four times and rebooted the guest, which is
+exactly what a failed critical service is supposed to cause. The nodes are now
+created when a guest mounts its own /dev, since the driver they belong to is
+one NABI provides.
+
+**A registry that filled up and then lied about it.** With the nodes present,
+servicemanager worked - and then stopped working part-way through a boot, with
+"unable to mmap transaction memory". A descriptor released through close gives
+its endpoint slot back; a process killed never closes anything, which is how
+every Android service ends. The 32 slots filled during a boot and stayed full.
+
+What made that hard to read was the fallback: when the emulated open failed the
+device table fell through to the host's `/dev/binder`, which on this machine
+exists, because mSL/DevFS is loaded. The guest was handed a working descriptor
+for a *different* driver, whose arena the emulated mmap has never heard of - so
+the failure surfaced as ENODEV from mmap rather than as anything about
+endpoints, and the first services of a boot worked while later ones did not,
+which reads as a race. Slots whose owner has died are now reclaimed when the
+registry is next asked for one, and the cap is 512 rather than 32: a couple of
+hundred services all holding binder is what a system image looks like.
+
+**And one that was quietly dangerous.** `kill` translated a positive pid through
+the pid namespace and left everything else alone. A negative pid is a process
+group and needs the same translation - libprocessgroup kills a service by its
+group on every restart, so each one logged "kill(-146, 9) failed: Operation not
+permitted" and init waited on processes that had never been signalled. `kill(-1)`
+was worse: inside a pid namespace it means every process in that namespace, and
+passing it to the host means every process the account owns. init sends it
+during shutdown, so a guest shutting down would have signalled the user's shell
+and whatever else they had running. It is now sent one process at a time, to the
+namespace's members, excluding the caller and pid 1 the way Linux does.
+
+Still open at the end of this. The zygote starts and then cycles: it exits 127
+with "Error creating cache dir /data/dalvik-cache/arm64 : No such file or
+directory", which is about the shape of /data rather than about NABI - the real
+one is mounted by vold, and the harness stands a tmpfs in its place without the
+tree init expects to find under it. And `kill` on a process group that is in the
+middle of dying answers EPERM where Linux would say ESRCH; libprocessgroup
+retries through it, so it is noise rather than a stop.

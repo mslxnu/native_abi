@@ -43,7 +43,9 @@ init_task(unsigned long clone_flags, gaddr_t child_tid, gaddr_t tls)
   }
 
   if (task.set_child_tid != 0) {
-    int tid = do_gettid();
+    /* The number the guest will read back, so through the pid namespace; see
+     * guest_tid. */
+    int32_t tid = guest_tid();
     if (copy_to_user(task.set_child_tid, &tid, sizeof tid)) {
       assert(false);
     }
@@ -234,7 +236,7 @@ resume_apply_clone(unsigned long clone_flags, gaddr_t child_tid, gaddr_t tls)
     task.clear_child_tid = child_tid;
 
   if (task.set_child_tid != 0) {
-    int tid = do_gettid();
+    int32_t tid = guest_tid();
     if (copy_to_user(task.set_child_tid, &tid, sizeof tid))
       warnk("resume: could not write the child tid\n");
   }

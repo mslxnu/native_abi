@@ -208,7 +208,11 @@ bool     pidns_active(void);
  * one with no network at all. See src/net/net.c. */
 bool     netns_active(void);
 int32_t  pidns_to_ns(int32_t host);     /* 0 when it is not a member */
+/* How many processes one pid namespace can hold. Here rather than in pidns.c
+ * because kill(-1) has to size a buffer for all of them. */
+#define PIDNS_MAX 512
 int32_t  pidns_to_host(int32_t ns);     /* -1 when there is no such pid */
+size_t   pidns_hosts(int32_t *out, size_t max);  /* every member, for kill(-1) */
 int32_t  pidns_add_child(int32_t host); /* the parent registers; returns its own view */
 void     pidns_create(uint64_t ino, uint64_t parent_ino);
 

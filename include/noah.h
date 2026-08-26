@@ -35,6 +35,7 @@ ssize_t strnlen_user(gaddr_t gaddr, size_t n);
 /* linux emulation */
 
 uint64_t do_gettid(void);
+int32_t  guest_tid(void);      /* what gettid(2) would answer */
 int do_exec(const char *elf_path, int argc, char *argv[], char **envp);
 int do_faccessat(int l_dirfd, const char *l_path, int l_mode, int l_flags);
 int do_access(const char *path, int l_mode);

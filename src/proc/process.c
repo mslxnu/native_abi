@@ -609,6 +609,29 @@ uint64_t do_gettid()
   return task.tid;
 }
 
+/*
+ * The thread id as the guest knows it, which is what has to be written into
+ * guest memory.
+ *
+ * do_gettid answers with the host's number. Everywhere the guest can see that
+ * number it has to go through the pid namespace first - gettid(2) does, getpid
+ * does - and CLONE_CHILD_SETTID is one of those places, because the word it
+ * stores is read back as a tid by whatever asked for it.
+ *
+ * It was stored raw, which was invisible until a guest actually had a pid
+ * namespace, since without one the translation is the identity. Under --pid1 it
+ * is not: Android's init forks a service, bionic keeps the word clone wrote as
+ * its cached id, and the child's very next act is setpgid(0, that) - which names
+ * a process that does not exist in the namespace, so every service start
+ * reported "cannot set attribute for <name>: setpgid failed: No such process".
+ */
+int32_t
+guest_tid(void)
+{
+  uint64_t r = do_gettid();
+  return (int32_t) pidns_to_ns((int32_t) r);
+}
+
 DEFINE_SYSCALL(gettid)
 {
   /* A guest thread is a host thread and nabi reports the process for it, so a
@@ -699,11 +722,6 @@ DEFINE_SYSCALL(getrlimit, int, l_resource, gaddr_t, rl_ptr)
   return r;
 }
 
-DEFINE_SYSCALL(setrlimit, unsigned int, resource, gaddr_t, rlim)
-{
-  warnk("setrlimit is not implemented\n");
-  return -LINUX_ENOSYS;
-}
 
 /*
  * prlimit64 is how modern glibc/musl both query and set resource limits (plain
@@ -796,6 +814,24 @@ DEFINE_SYSCALL(prlimit64, int, pid, unsigned int, l_resource, gaddr_t, new_ptr, 
   }
 
   return 0;
+}
+
+/*
+ * setrlimit, which is prlimit64 on this process with no old value wanted.
+ *
+ * It answered ENOSYS, on the reasoning that a modern libc routes setrlimit
+ * through prlimit64 and nothing would call this. Android's init calls it: its
+ * `setrlimit` command in init.rc goes straight to the syscall, so `setrlimit
+ * nice 40 40` and `setrlimit nofile 32768 32768` both failed at early-init with
+ * "Function not implemented" before it had started a single service.
+ *
+ * Delegating rather than reimplementing is the point - the resources Darwin
+ * does not have are emulated, and a hard limit the host will not grant is
+ * clamped instead of refused, and both of those belong to one place.
+ */
+DEFINE_SYSCALL(setrlimit, unsigned int, l_resource, gaddr_t, rlim)
+{
+  return sys_prlimit64(0, l_resource, rlim, 0);
 }
 
 DEFINE_SYSCALL(exit, int, reason)

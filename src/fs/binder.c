@@ -106,7 +106,21 @@ struct bfda_obj {
 /* Everything binder puts in a buffer is eight-byte aligned. */
 static uint64_t balign(uint64_t v) { return (v + 7) & ~(uint64_t) 7; }
 
-#define BINDER_MAX_EP     32
+/*
+ * How many endpoints one instance can hold open at once.
+ *
+ * Was 32, which is a plausible number for a container and far too few for a
+ * system image: Android starts a couple of hundred services and most of them
+ * open binder and keep it open for as long as they run. Reclaiming the slots
+ * of processes that died got a boot from 93 services to 206, and then ran out
+ * again - so the cap itself was the remaining half of it.
+ *
+ * The registry is one file of BINDER_MAX_EP * ~260KB, mapped by every process
+ * that speaks binder, so this is not free; it is sparse and only the endpoints
+ * actually in use are ever touched, which is what makes the larger number
+ * affordable rather than merely bigger.
+ */
+#define BINDER_MAX_EP     512
 #define BINDER_MAX_ALLOCS 128
 /* Longest binder context name kept; binderfs allows 255, nothing uses it. */
 #define BINDER_CTX_NAME 32
@@ -680,6 +694,38 @@ binder_emul_open(const char *ctx, int flags, int *out_fd)
   int slot = -1;
   for (int i = 0; i < BINDER_MAX_EP; i++)
     if (!shm->ep[i].used) { slot = i; break; }
+  if (slot < 0) {
+    /*
+     * Full, which usually means it is holding endpoints nobody owns any more.
+     * A descriptor released through close gives its slot back, and a process
+     * that is killed never closes anything - which is the ordinary way an
+     * Android service ends: init sends SIGKILL to the whole process group on
+     * every restart and every shutdown. So the registry filled up during a
+     * boot and stayed full.
+     *
+     * What that looked like was not "out of endpoints". The open fell back to
+     * the host's /dev/binder - the kext's, when it happens to be loaded - and
+     * handed the guest a descriptor for a different driver, whose arena the
+     * emulated mmap knows nothing about. servicemanager got ENODEV mapping its
+     * transaction memory and aborted with "unable to mmap transaction memory",
+     * four times, and init rebooted the guest for a failed critical service.
+     * The first services of a boot worked, so it looked like a race.
+     *
+     * Reaped here rather than by a sweep on a timer: this is the only moment
+     * the answer matters, and it costs one signal-less kill per slot.
+     */
+    for (int i = 0; i < BINDER_MAX_EP; i++) {
+      if (!shm->ep[i].used || shm->ep[i].pid <= 0)
+        continue;
+      /* ESRCH is gone; EPERM is alive and someone else's, which counts as
+       * alive - the one answer that must not free a live endpoint. */
+      if (kill((pid_t) shm->ep[i].pid, 0) == 0 || errno != ESRCH)
+        continue;
+      shm->ep[i].used = 0;
+      if (slot < 0)
+        slot = i;
+    }
+  }
   if (slot < 0) {
     shm_unlock();
     errno = EMFILE;

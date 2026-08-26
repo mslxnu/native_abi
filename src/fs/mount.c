@@ -988,6 +988,15 @@ DEFINE_SYSCALL(mount, gstr_t, source_ptr, gstr_t, target_ptr, gstr_t, type_ptr,
       return br;
   }
 
+  /*
+   * A guest that mounts its own /dev has just hidden whatever was underneath
+   * it, and expects the kernel's devices to be there. The binder nodes are the
+   * ones NABI itself provides, so it is NABI that has to put them back; see
+   * binder_dev_nodes.
+   */
+  if (e.hostdir[0] != '\0' && strcmp(target, "/dev") == 0)
+    binder_dev_nodes(e.hostdir);
+
   uint32_t pp = parent_peer_of(&t, target);
 
   if (at >= 0)

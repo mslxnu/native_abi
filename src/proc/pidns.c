@@ -51,7 +51,6 @@
 #include "linux/common.h"
 #include "linux/errno.h"
 
-#define PIDNS_MAX 512
 
 struct pidns_file {
   uint64_t parent_ino;
@@ -167,6 +166,33 @@ pidns_to_host(int32_t ns)
     if (f.map[i].ns == ns)
       return f.map[i].host;
   return -1;
+}
+
+/*
+ * Every host pid this namespace contains, for the callers that have to act on
+ * all of them at once rather than on one by number - kill(-1) is the only one.
+ * Returns how many exist, which may exceed max.
+ */
+size_t
+pidns_hosts(int32_t *out, size_t max)
+{
+  if (!pidns_active())
+    return 0;
+
+  int fd = pidns_open(ns_ino_of(NS_PID), false);
+  if (fd < 0)
+    return 0;
+  struct pidns_file f;
+  bool ok = pidns_read(fd, &f);
+  close(fd);
+  if (!ok)
+    return 0;
+
+  size_t n = 0;
+  for (uint32_t i = 0; i < f.n; i++, n++)
+    if (n < max)
+      out[n] = f.map[i].host;
+  return n;
 }
 
 /* Add a host pid to one namespace's table, under its lock. */

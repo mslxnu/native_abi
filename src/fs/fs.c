@@ -3041,6 +3041,51 @@ binder_emul_open_if(const char *name, int flags, int *out_fd)
   return binder_emul_open(name, flags, out_fd);
 }
 
+/*
+ * The nodes a binder driver leaves in /dev, made because this one has no kernel
+ * to leave them.
+ *
+ * On a real device the three binder devices come from the kernel at boot -
+ * CONFIG_ANDROID_BINDER_DEVICES names them - and appear under devtmpfs before
+ * anything looks. Android's init.rc therefore never creates them and neither
+ * does ueventd, which acts on uevents the emulated driver has no way to send.
+ * Then init mounts a tmpfs over /dev, and what was passed through underneath is
+ * gone as well.
+ *
+ * So servicemanager - the first thing to want binder, and a critical service -
+ * opened /dev/binder, got ENOENT, and aborted with "Binder driver '/dev/binder'
+ * could not be opened. Terminating". init restarted it four times and then
+ * rebooted the guest, which is what a critical service failing before boot
+ * completes is supposed to do.
+ *
+ * The device number is deliberately one nothing claims: the table matches
+ * binder by *name*, and only reaches the name after the fixed major/minor pairs
+ * have all missed, so any major outside those is as good as another and one
+ * that collided would answer as the wrong device.
+ */
+#define BINDER_FAKE_MAJOR 0x1ff
+
+void
+binder_dev_nodes(const char *hostdir)
+{
+  if (!binder_emulated())
+    return;
+  static const char *const names[] = { "binder", "hwbinder", "vndbinder" };
+  for (size_t i = 0; i < sizeof names / sizeof names[0]; i++) {
+    char path[PATH_MAX];
+    snprintf(path, sizeof path, "%s/%s", hostdir, names[i]);
+    int fd = open(path, O_CREAT | O_RDWR, 0666);
+    if (fd < 0)
+      continue;
+    close(fd);
+    /* 0666, as a kernel makes them: every process that speaks binder opens its
+     * own endpoint, and almost none of them are root. */
+    chmod(path, 0666);
+    struct guest_dev d = { S_IFCHR, (BINDER_FAKE_MAJOR << 8) | (uint32_t) i };
+    setxattr(path, GUEST_DEV_XATTR, &d, sizeof d, 0, 0);
+  }
+}
+
 static const struct guest_device *
 guest_device_for(uint32_t mode, uint32_t dev, int dirfd, const char *path)
 {

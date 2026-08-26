@@ -165,6 +165,9 @@ struct l_statmount {
 #define MOUNT_MAX      64
 #define MOUNT_PATH_MAX 256
 
+/* The binder device nodes, created in a freshly mounted /dev; see fs.c. */
+void binder_dev_nodes(const char *hostdir);
+
 struct mount_entry {
   char     source[MOUNT_PATH_MAX];   /* what the guest named */
   char     target[MOUNT_PATH_MAX];   /* where it appears */
