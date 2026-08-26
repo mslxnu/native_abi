@@ -192,17 +192,28 @@ panic(const char *fmt, ...)
   free(given);
   free(mes);
 
+  /*
+   * Said rather than asked.
+   *
+   * This used to offer to raise RLIMIT_CORE and read the answer with getchar,
+   * which is a question a crashing emulator is in no position to ask. stdin
+   * belongs to the guest: in a pipeline there is nobody to answer and the read
+   * never returns, so a panic stopped being a crash and became a hang - no
+   * message where the user was looking, no exit, nothing to see. That is what
+   * `dnf update` looked like from the outside, and the keystroke the user did
+   * type went to this prompt instead of to dnf.
+   *
+   * Raising the limit here would not have produced a core for *this* crash
+   * anyway: the limit is read when the core is written, but a process that has
+   * already faulted has nothing to gain from a limit set afterwards. The limit
+   * has to be raised before the run, so that is what it says.
+   */
   struct rlimit lim;
   getrlimit(RLIMIT_CORE, &lim);
-  if (lim.rlim_cur == 0) {
-    fprintf(stderr, "%sSet the ulimit value to unlimited to generate the coredump? [Y/n] %s", magenda, reset);
-    char ans = getchar();
-    if (ans == '\n' || ans == '\r' || ans == 'Y' || ans == 'y') {
-      lim.rlim_cur = RLIM_INFINITY;
-      lim.rlim_max = RLIM_INFINITY;
-      setrlimit(RLIMIT_CORE, &lim);
-    }
-  }
+  if (lim.rlim_cur == 0)
+    fprintf(stderr, "%sno coredump: run with `ulimit -c unlimited` to get one%s\n",
+            magenda, reset);
+
   
   fprintf(stderr, "%saborting..%s\n", magenda, reset);
   die_with_forcedsig(LINUX_SIGABRT);
