@@ -690,6 +690,20 @@ out:
 DEFINE_SYSCALL(mmap, gaddr_t, addr, size_t, len, int, prot, int, flags, int, fd, off_t, offset)
 {
   uint64_t ret;
+  /*
+   * Linux refuses a zero-length mapping, and so must this - it used to reach
+   * the arena, which asked mmap for nothing, got EINVAL from the host and
+   * panicked the whole guest.
+   *
+   * It is not a hypothetical call. A Wayland client is handed a keymap as a
+   * descriptor and a size, and a compositor with no keymap to offer sends a
+   * size of zero; xkbcommon maps what it is told. So `wayland-info` against a
+   * compositor that had not published one took nabi down with "could not map
+   * guest memory arena offset ...: Invalid argument", from a program that on
+   * Linux gets an errno and carries on.
+   */
+  if (len == 0)
+    return -LINUX_EINVAL;
   pthread_rwlock_wrlock(&proc.mm->alloc_lock);
   /* Only a fixed mapping can land on an existing range; anything else is
    * placed where nothing is. */

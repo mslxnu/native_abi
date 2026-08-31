@@ -743,6 +743,38 @@ else
     fail=1
 fi
 
+# falloctest: how a Wayland client gets a buffer. fallocate reported success
+# without changing the file's size - macOS's F_PREALLOCATE reserves blocks and
+# leaves st_size alone, which is not what Linux does - so a client sized a
+# memfd, mapped it MAP_SHARED and drew into it, and the first store past the end
+# of a zero-length file was SIGBUS in the *host* process: weston-simple-shm
+# ended as "Bus error: 10" with nothing in any log. And mmap of zero bytes
+# panicked instead of answering EINVAL, which wayland-info hit on connect,
+# because a compositor with no keymap to publish sends a size of zero.
+cp "$here/falloctest" "$root/"; chmod +x "$root/falloctest"
+out=$("$NABI" -m "$root" /falloctest 2>&1 | tail -1)
+if [ "$out" = "falloc ok" ]; then
+    echo "  ok  falloctest -> \"$out\""
+else
+    echo "  FAIL falloctest -> \"$out\""
+    fail=1
+fi
+
+# mkdirmodetest: a directory whose mode denies its own owner, then chowned.
+# Ownership is recorded in an extended attribute and writing one needs write
+# permission on the object, while chown on Linux needs no such thing. dpkg
+# unpacks mkdir-0, chown, chmod in that order, so man-db could not unpack and
+# took x11-apps, wayland-utils and weston down with it behind an unmet
+# dependency. mkdir now splits the mode the way chmod already did.
+cp "$here/mkdirmodetest" "$root/"; chmod +x "$root/mkdirmodetest"
+out=$("$NABI" -m "$root" /mkdirmodetest 2>&1 | tail -1)
+if [ "$out" = "mkdirmode ok" ]; then
+    echo "  ok  mkdirmodetest -> \"$out\""
+else
+    echo "  FAIL mkdirmodetest -> \"$out\""
+    fail=1
+fi
+
 # mremapgrowtest: a buffer grown in steps, the way realloc grows one. Linux
 # extends a mapping where it stands when the space above it is free; nabi
 # allocated the whole new size, copied, and rebuilt the mapping a page at a

@@ -6514,3 +6514,60 @@ One run of the suite failed this test and has not done so again in twenty-three
 attempts since, standalone and in the suite. Rather than guess at it, the runner
 now prints the test's whole output on failure instead of the last line, so the
 offset and the value it found survive to be read.
+
+### 3.5.118 A Linux window on the screen
+
+Both display paths work, and neither needed a display subsystem in nabi.
+
+**X11 took no code at all.** `/tmp` is a host passthrough, so a guest sees
+`/tmp/.X11-unix/X0` exactly as the host does, and nabi already had AF_UNIX with
+real path translation. An aarch64 Linux `xdpyinfo` returned the full server info
+from XQuartz, and `xeyes -geometry 300x200+80+80` produced a `300x222+80+80`
+window that `xlsclients` attributes to `parent-host` - the guest's hostname -
+beside the host's own `redstar /opt/X11/bin/xterm`. The only fiddly part is the
+cookie, which must be keyed to the *guest's* hostname and is re-minted whenever
+XQuartz restarts. `xhost +` would also work and is not worth it: it turns off
+access control on the user's machine to save one `xauth` line.
+
+**Wayland took three fixes**, none of them about Wayland.
+
+The first was `mkdir`. Ownership is recorded in an extended attribute, because
+the host has one account and no way to give a file to another - and writing an
+extended attribute needs write permission on the object, while chown on Linux
+needs no such thing. `chmod` already split the mode for exactly this reason: the
+host gets one it can work with and the guest's own is recorded beside it.
+`mkdir` passed the guest's mode straight through, so a mode-0 directory really
+existed and could not be chowned. dpkg unpacks mkdir-0, chown, chmod in that
+order, so `man-db` failed to unpack and took `x11-apps`, `wayland-utils` and
+`weston` with it behind an unmet dependency.
+
+The second was `fallocate`, which reported success and did not change the file's
+size: macOS's `F_PREALLOCATE` reserves blocks and leaves `st_size` alone. That is
+not an error a caller can see. `wl_shm` is the path - a client makes a memfd,
+sizes it with `posix_fallocate`, maps it `MAP_SHARED` and draws into it - and
+`mmap` does not check a file's size, so the mapping succeeded too. The first
+store past the end of a zero-length file is SIGBUS **in the host process**, so
+`weston-simple-shm` ended as "Bus error: 10" with nothing in any log, because a
+host memory fault is not a guest one.
+
+The third was `mmap` of zero bytes, which reached the arena, asked the host to
+map nothing, got EINVAL and panicked. Linux answers EINVAL and the caller
+carries on. A compositor with no keymap to publish sends a size of zero and
+xkbcommon maps what it is told, so `wayland-info` hit it on connect.
+
+After those three, `weston-simple-shm` runs against Wawona: 1270 `sendmsg` and
+1271 `ppoll` in twenty seconds, which is the frame callback arriving and the
+attach-damage-commit going back out, about sixty-three times a second. Confirmed
+on screen.
+
+What makes this different from the existing ways of putting Linux graphics on
+macOS is what is *not* in the path. No VM, no container, no waypipe, no network
+transport and no copy: the client is an ordinary macOS process, the socket is a
+plain unix socket, and the buffer it passes is a real host file descriptor -
+`memfd_create` makes a file and unlinks it, so the compositor maps the client's
+memory directly.
+
+The limit is unchanged and is the whole of what remains. This is software
+rendering. There is no `/dev/dri`, no dmabuf and no GPU surface anywhere in nabi,
+so anything on EGL or GBM does not run - and waydroid's SurfaceFlinger sits
+squarely behind that, a long way past "a Linux window on the screen".

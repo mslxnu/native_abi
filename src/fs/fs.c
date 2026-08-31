@@ -7806,18 +7806,52 @@ DEFINE_SYSCALL(flock, int, fd, int, operation)
   return syswrap(flock(fd, operation));
 }
 
+/*
+ * fallocate, whose whole job is the size.
+ *
+ * F_PREALLOCATE reserves blocks and leaves st_size alone; Linux's fallocate
+ * makes the file that big. Doing only the reservation therefore answered
+ * success and changed nothing observable, and the caller went on believing it
+ * had a file of the size it asked for.
+ *
+ * What that costs is not an error but a crash, one level down and in another
+ * process. wl_shm is the case: a Wayland client makes a memfd, sizes it with
+ * posix_fallocate, maps it MAP_SHARED and draws into it. The mapping succeeds
+ * whatever the file's size - mmap does not check - and the first store past the
+ * end of a zero-length file is SIGBUS. weston-simple-shm took nabi itself down
+ * with "Bus error: 10", with nothing in any log, because the fault is a host
+ * memory fault and not a guest one.
+ *
+ * So the reservation is best-effort and the truncate is what is returned on: a
+ * filesystem that cannot preallocate still gets the size right, which is the
+ * part callers depend on. Never shrinks - Linux's fallocate does not - and the
+ * offset is honoured rather than asserted away, since a caller extending a file
+ * from somewhere other than zero is entitled to.
+ */
 DEFINE_SYSCALL(fallocate, int, fd, int, mode, l_off_t, offset, l_off_t, len)
 {
   if (mode != 0) {
-    // FreeBSD's Linuxulator also implements only mode zero
-    warnk("Unsupported fallocate mode\n");
-    return -ENOSYS;
+    /* FreeBSD's Linuxulator also implements only mode zero. EOPNOTSUPP is what
+     * Linux answers for a mode the filesystem will not do - and a *Linux*
+     * errno, which the bare -ENOSYS here was not: that was the host's number,
+     * which means something else on the other side. */
+    warnk("unsupported fallocate mode %d\n", mode);
+    return -LINUX_EOPNOTSUPP;
   }
-  
-  // Emulate posix_fallocate
-  assert(offset == 0);
-  struct fstore store = {F_ALLOCATEALL, F_PEOFPOSMODE, 0, len, 0};
-  return syswrap(fcntl(fd, F_PREALLOCATE, &store));
+  if (offset < 0 || len <= 0)
+    return -LINUX_EINVAL;
+
+  off_t want = (off_t) offset + (off_t) len;
+  struct stat st;
+  if (fstat(fd, &st) < 0)
+    return -darwin_to_linux_errno(errno);
+
+  struct fstore store = {F_ALLOCATEALL, F_PEOFPOSMODE, 0, want, 0};
+  (void) fcntl(fd, F_PREALLOCATE, &store);   /* best effort; the size is below */
+
+  if (st.st_size >= want)
+    return 0;
+  return syswrap(ftruncate(fd, want));
 }
 
 DEFINE_SYSCALL(sync)
