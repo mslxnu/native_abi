@@ -6677,3 +6677,47 @@ One test had encoded the kexts' presence. `devnodetest` expected opening
 the emulation became the automatic fallback, and true only until the kext was
 actually unloaded. It succeeds either way now, by two different routes, which
 is the stronger claim.
+
+### 3.5.122 The tracer was inventing bugs
+
+`init_user0` does not hang. It was the tail of the blocker before it: with the
+embedded-buffer fix in, the boot runs through `post-fs-data` to **330-355
+services**, starts `adbd`, and listens on TCP 5555. What looked like a second
+hang was the last run made before that fix took effect.
+
+What did hang was the investigation, twice, on the same defect in the
+instrument.
+
+`meta_strace_pre` wrote `[pid:tid] name(args` and released the lock; the syscall
+ran; `meta_strace_post` took the lock again and appended `): ret = ...`. Any
+other thread could take the lock in that gap and write its whole line into the
+middle of another. The result reads as an ordinary line and is a splice of two.
+
+It produced two bugs that were not there: `write(fd: 320, size: 0x18): ret =
+0x3e`, a 24-byte write appearing to return 62 - impossible, and ruinous for any
+caller that loops on the count - and `write(fd: 2, size: 0x49): ret = 0x10` in
+the same excerpt, the same impossibility again. The first was chased as far as
+writing a test to reproduce it, and the test passed on the first run: `write` on
+a unix pair and on an accepted TCP socket returns exactly what it was given.
+
+Filtering the trace to one thread does not help. A spliced line *begins* with
+one thread's prefix and ends with another's text, so it survives the filter
+looking exactly like evidence.
+
+The line is assembled per thread in memory now and reaches the sink in a single
+write once the result is known. A call that cannot return - `exit_group`,
+`execve`, `rt_sigreturn` - is emitted at the point of the call instead, because
+a trace ending mid-call is how a guest that stopped inside a syscall says so;
+it gets a newline so the next line does not run into it.
+
+`sockwritetest` is kept and says what it is. It was written to reproduce a bug
+that did not exist, so it has never caught one; it is still the invariant that
+was in doubt, and making `write` over-report by two bytes fails all four checks.
+
+Where the boot stands. `adbd` is up and listening, `nc` opens port 5555, and adb
+connects at the TCP level: `netstat` shows the connection established with 310
+bytes of the CNXN handshake sitting unread in the receive queue. adbd accepts
+the socket, asks `SO_DOMAIN` about it, sets `TCP_NODELAY`, and then never
+registers it with epoll and never reads it, every thread in a futex wait. On
+another run it read the handshake, wrote its own, and dropped the transport as
+"offline". Two shapes of the same last mile.
