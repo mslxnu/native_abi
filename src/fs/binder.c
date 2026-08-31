@@ -1442,13 +1442,42 @@ collect_messages(struct binder_ep *e)
           uint64_t addr = at + bo.buffer;
           bo.buffer = addr;
           memcpy(base + o, &bo, sizeof bo);
-          if ((bo.flags & BUFFER_FLAG_HAS_PARENT) &&
-              bo.parent + sizeof(struct bbuf_obj) <= m->data_size) {
-            struct bbuf_obj par;
-            memcpy(&par, base + bo.parent, sizeof par);
-            uint64_t slot = (par.buffer - at) + bo.parent_offset;
-            if (slot + 8 <= m->total)
-              memcpy(base + slot, &addr, sizeof addr);
+          /*
+           * An embedded buffer: one whose address is stored inside another
+           * buffer, and which the receiver finds by following that pointer.
+           * The driver has to rewrite it, since the copy lives somewhere the
+           * sender never named.
+           *
+           * `parent` is an *index into the offsets array*, not a byte offset
+           * into the data - see struct binder_buffer_object, where it is
+           * documented as "index of parent in offsets array". It was being
+           * used as a byte offset, so the parent was read from whatever
+           * happened to sit at that offset and the pointer was written
+           * somewhere unrelated - or, when the bounds check failed, not at
+           * all.
+           *
+           * libhwbinder checks it and says so: "Buffer in parent 0x... differs
+           * from embedded buffer 0x...". Every hidl call with a nested buffer
+           * failed that check, which is most of them - the interface name in a
+           * hwservicemanager lookup is one. getTransport came back
+           * EX_TRANSACTION_FAILED, so no HAL could register, keymaster aborted,
+           * and vold waited for it forever inside a call init was waiting on.
+           */
+          if ((bo.flags & BUFFER_FLAG_HAS_PARENT) && bo.parent < n) {
+            uint64_t par_at = offs[bo.parent];
+            if (par_at + sizeof(struct bbuf_obj) <= m->data_size) {
+              struct bbuf_obj par;
+              memcpy(&par, base + par_at, sizeof par);
+              /*
+               * The parent's own address has already been rewritten - it comes
+               * earlier in the offsets array, which is the order a parcel is
+               * written in - so subtracting the allocation base recovers where
+               * its bytes sit in this copy.
+               */
+              uint64_t slot = (par.buffer - at) + bo.parent_offset;
+              if (slot + 8 <= m->total)
+                memcpy(base + slot, &addr, sizeof addr);
+            }
           }
           continue;
         }

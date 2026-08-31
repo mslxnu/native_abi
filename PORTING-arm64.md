@@ -6625,3 +6625,55 @@ well as the object's own. Only the object is rewritten here, so the check fails,
 cannot register and aborts, vold retries `getService` forever inside the
 transaction it is answering, and `vdc keymaster earlyBootEnded` never returns to
 the init that is waiting for it.
+
+### 3.5.120 The parent of an embedded buffer is an index, not an offset
+
+hidl passes a buffer inside another buffer: a `binder_buffer_object` with
+`BINDER_BUFFER_FLAG_HAS_PARENT`, naming the parent it lives in and the offset
+within that parent where its address is stored. The driver copies the buffer
+into the receiver and has to rewrite *that stored address* as well as the
+object's own, because the copy is somewhere the sender never named.
+
+`parent` is an **index into the offsets array** - `struct
+binder_buffer_object` documents it as "index of parent in offsets array" - and
+it was being used as a byte offset into the data. So the parent was read from
+whatever happened to sit at that offset, and the rewritten pointer went
+somewhere unrelated, or nowhere when the bounds check caught it.
+
+libhwbinder checks exactly this and says so:
+
+```
+hw-Parcel: Buffer in parent 0xb40000014cde3240 differs from embedded buffer 0x1467e7100
+```
+
+Every hidl call carrying a nested buffer failed that check, which is nearly all
+of them - the interface name in a hwservicemanager lookup is one. So
+`getTransport` came back `EX_TRANSACTION_FAILED: BAD_VALUE`, no HAL could
+register, the keymaster service aborted rather than start, and vold sat in
+`getService` retrying forever *inside* a transaction that `vdc keymaster
+earlyBootEnded` was waiting on, which init was waiting on in turn.
+
+With the index read as an index, `vdc keymaster earlyBootEnded` returns 0 and
+the boot moves on to `vdc --wait cryptfs init_user0`.
+
+### 3.5.121 Two of the three kexts turned out not to be needed
+
+mSL/SysFS and mSL/DevFS were unloaded to find out what actually depends on
+them, since v0.8.0 has to reach an Android shell without any of the sibling
+kexts. The answer for those two is nothing: the boot is unchanged with them
+gone - same service count, same triggers, same blocker - because the emulated
+binder was already in use and `/sys` was contributing only a `/sys/block` that
+mirrors the host's IOKit tree, which no Android process could use anyway.
+
+`/proc` is a different matter and is still installed. Without it nabi serves
+`/proc/self/{exe,cmdline,status,maps}`, `/proc/mounts` and the `/proc/sys`
+files it implements, but there is no `/proc/version`, `cpuinfo`, `meminfo` or
+`uptime`, and **no directory listing at all** - `ls /proc` is empty. Android's
+init does not get past its first stage: it chmods `/proc/cmdline` and aborts
+when that is not there. A real procfs inside nabi is the remaining piece.
+
+One test had encoded the kexts' presence. `devnodetest` expected opening
+`/dev/binder` to fail with ENXIO on a host without mSL/DevFS - written before
+the emulation became the automatic fallback, and true only until the kext was
+actually unloaded. It succeeds either way now, by two different routes, which
+is the stronger claim.

@@ -1560,9 +1560,13 @@ out=$("$NABI" -m "$root" /devnodetest 2>&1)
 rc=$?
 binder=$(printf '%s\n' "$out" | sed -n 's/^binder-open=//p')
 last=$(printf '%s\n' "$out" | tail -1)
-# Whether this host provides binder at all depends on mSL/DevFS being loaded,
-# so the strict check is made only where the device exists to be reached.
-if [ -e /dev/binder ]; then want_binder=1; else want_binder=-6; fi
+# Opening /dev/binder succeeds either way, and the two ways are the point: the
+# kext's device when mSL/DevFS is loaded, nabi's own when it is not - see
+# binder_emulated, which picks the emulation "whenever the host has no binder
+# device to borrow". This used to expect ENXIO on a host without the kext, from
+# before the emulation became the automatic fallback, and only failed once the
+# kext was actually unloaded - which is the whole reason for unloading it.
+want_binder=1
 if [ "$last" = "devnode ok" ] && [ "$binder" = "$want_binder" ]; then
     echo "  ok  devnodetest -> \"$last\", binder=$binder"
 else
