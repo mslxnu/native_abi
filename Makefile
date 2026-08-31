@@ -365,6 +365,27 @@ ARCH_OUTPUTS := $(NABI) $(DECODE_TEST) $(ARM64_TEST) $(MMU_TEST) $(VMMAP_TEST) \
 # make stats the tree afterwards and simply finds the files gone, which no clock
 # granularity can round away.
 $(shell test -f $(ARCH_STAMP) || { mkdir -p $(OUT); rm -f $(OUT)/.built-for-* $(ARCH_OUTPUTS); touch $(ARCH_STAMP); })
+
+# A source edited in the same second the binary was linked, which make cannot
+# see.
+#
+# GNU make 3.81 compares mtimes at one-second granularity and rebuilds only what
+# is strictly *newer*. This builds in a single cc invocation, so editing a file
+# and relinking take well under a second between them - and an edit that lands
+# in the same second as the previous link is equal, not newer, so the rebuild
+# never happens. It never happens *again*, either: neither file moves, so the
+# tree stays stale until something else touches it.
+#
+# That is not a slow build, it is a wrong one. A fix is applied, `make` says
+# nothing, the tests run against the binary from before the fix, and the
+# conclusion drawn is about the wrong code. It cost three confusing test runs
+# before it was recognised, and is the most likely explanation for a smoke test
+# that failed once and never again.
+#
+# Compared here in whole seconds with >=, and the binary removed when any source
+# ties or beats it, for the same reason the ARCH check above runs at parse time:
+# absence is the one signal make cannot round away.
+$(shell test -f $(NABI) && { b=`stat -f %m $(NABI)`; for f in $(SRCS) $(HEADERS); do s=`stat -f %m $$f 2>/dev/null` || continue; [ "$$s" -ge "$$b" ] && { rm -f $(NABI); break; }; done; })
 $(HV_PROBE): test/arch/hv_probe.c $(ARCH_STAMP) | $(OUT)
 	$(CC) $(CFLAGS) -o $@ test/arch/hv_probe.c $(FRAMEWORKS)
 	$(CODESIGN) --force --sign $(SIGNCERT) --entitlements $(ENTITLEMENTS) $@
