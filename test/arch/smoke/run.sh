@@ -743,6 +743,23 @@ else
     fail=1
 fi
 
+# sockwritetest: write(2) on a socket returns what it wrote and never more. A
+# short write is legal and every caller loops on it; a count larger than the
+# buffer walks the caller's pointer past the end - adbd's WriteFdExactly does
+# `len -= r` with the answer. Both a unix pair and an accepted TCP connection,
+# the latter being the shape adbd has. Added while chasing an adb handshake
+# failure that the *tracer* had invented, so it has never caught a real bug -
+# but it is the invariant that was in doubt, and making write over-report by
+# two bytes fails all four checks.
+cp "$here/sockwritetest" "$root/"; chmod +x "$root/sockwritetest"
+out=$("$NABI" -m "$root" /sockwritetest 2>&1 | tail -1)
+if [ "$out" = "sockwrite ok" ]; then
+    echo "  ok  sockwritetest -> \"$out\""
+else
+    echo "  FAIL sockwritetest -> \"$out\""
+    fail=1
+fi
+
 # falloctest: how a Wayland client gets a buffer. fallocate reported success
 # without changing the file's size - macOS's F_PREALLOCATE reserves blocks and
 # leaves st_size alone, which is not what Linux does - so a client sized a
