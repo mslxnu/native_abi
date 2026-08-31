@@ -6571,3 +6571,57 @@ The limit is unchanged and is the whole of what remains. This is software
 rendering. There is no `/dev/dri`, no dmabuf and no GPU surface anywhere in nabi,
 so anything on EGL or GBM does not run - and waydroid's SurfaceFlinger sits
 squarely behind that, a long way past "a Linux window on the screen".
+
+### 3.5.119 Keeping an object alive, and answering the right thread
+
+Two bugs in the emulated binder, both of which stopped Android's boot at the
+same place and neither of which is about the thing it looked like.
+
+**vold died on its first incoming call, every boot.** libbinder does not hold a
+strong reference to a service on its own account: it hands the driver a *weak*
+pointer in the flat object and relies on `BR_INCREFS` and `BR_ACQUIRE` arriving
+to take a strong one. Nothing here sent them, so vold's service object was
+destroyed while the registry still named it, and the next transaction to that
+node had libbinder call `attemptIncStrong` on a `weakref_type` that had been
+freed and its memory handed to something else.
+
+The fault address said so, once it was read as data rather than as an address:
+`0x63697672655365f6` is eight bytes of a string - `..eServic`, out of the middle
+of `NativeService` - which is what the allocator had put in the freed object's
+place. The pair is sent now when a node is first handed out, which is when Linux
+sends it, and the owner is the sender, so it needs none of the cross-process
+machinery.
+
+**Then vold aborted instead**, with "getAndExecuteCommand returned unexpected
+error -2147483648". That is `UNKNOWN_ERROR`, and libbinder produces it from
+`executeCommand`'s default case - a command it does not recognise. The command
+was `BR_REPLY`, which libbinder handles in `waitForResponse` and nowhere else. A
+reply is only ever expected by the thread that made the call; delivered to a
+thread sitting in the pool loop it is simply not a command that belongs there.
+
+The queue was per *endpoint*, so any thread of the process could take it. Linux
+does not have the problem because its driver queues a reply on the calling
+thread. A call now carries the thread that made it, a reply carries the thread it
+is owed to, and `collect_messages` leaves a reply queued for that thread rather
+than handing it to whoever asks first.
+
+Together these move the boot past the place it had been stuck since binder
+handles arrived: `late-fs` and `post-fs-data` now run - they never had - and the
+guest no longer reboots at all, where every previous run ended in
+`reboot,vold-failed`.
+
+What stops it now is one layer further in, and hwservicemanager names it
+exactly:
+
+```
+hw-Parcel: Buffer in parent 0xb4000001... differs from embedded buffer 0x1467e7100
+```
+
+That is libhwbinder checking a hidl scatter-gather buffer. A buffer object
+embedded in a parent carries the offset within the parent where its address is
+written, and the driver has to rewrite *that* pointer to the receiver's copy as
+well as the object's own. Only the object is rewritten here, so the check fails,
+`getTransport` comes back `EX_TRANSACTION_FAILED: BAD_VALUE`, the keymaster HAL
+cannot register and aborts, vold retries `getService` forever inside the
+transaction it is answering, and `vdc keymaster earlyBootEnded` never returns to
+the init that is waiting for it.

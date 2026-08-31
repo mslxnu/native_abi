@@ -77,6 +77,13 @@
 #define BR_NOOP                  0x0000720Cu
 #define BR_CLEAR_DEATH_NOTIFICATION_DONE 0x80087210u
 /*
+ * The driver telling an object's owner that somebody else now holds a
+ * reference. Both carry a binder_ptr_cookie - the weak-ref pointer and the
+ * object - which is why they are sixteen bytes where BR_NOOP is none.
+ */
+#define BR_INCREFS               0x80107207u
+#define BR_ACQUIRE               0x80107208u
+/*
  * Death notification. struct binder_handle_cookie is __packed - a u32 handle
  * followed immediately by a u64 cookie, twelve bytes rather than the sixteen
  * the alignment would otherwise give it - which is also what the ioctl number
@@ -214,6 +221,18 @@ struct bmsg {
    * the call is for, in its own terms - see collect_messages.
    */
   uint32_t target_node;
+  /*
+   * For a reply: the thread, in the process being replied to, that is waiting
+   * for it. Zero means anyone may take it.
+   *
+   * libbinder handles BR_REPLY in waitForResponse and nowhere else. A reply
+   * handed to a thread sitting in the pool loop reaches executeCommand, which
+   * has no case for it, and comes back as "BAD COMMAND" - UNKNOWN_ERROR - which
+   * vold reports as "getAndExecuteCommand returned unexpected error
+   * -2147483648, aborting". Linux does not have the problem because its driver
+   * queues a reply on the calling *thread*, not on the process.
+   */
+  uint64_t reply_tid;
   uint64_t data_size, offsets_size;
   /* Where the parts sit inside `data`, which is the buffer as the receiver
    * will see it: the parcel, the offsets, then the scatter-gather copies. */
@@ -327,7 +346,7 @@ struct binder_ep {
    * a boot attempt and waits; the answer went nowhere, and init waited on the
    * two of them until it declared the service hung.
    */
-  struct { uint64_t tid; uint32_t sender_ep; } calls[BINDER_MAX_CALLS];
+  struct { uint64_t tid; uint32_t sender_ep; uint64_t sender_tid; } calls[BINDER_MAX_CALLS];
 
   /* Commands waiting to be read, as the bytes the guest will be given. */
   unsigned char pending[BINDER_PENDING];
@@ -657,8 +676,9 @@ shm_ep_for_handle(uint32_t handle, const char *ctx)
  * that compares unequal to everyone else's.
  */
 static uint32_t
-shm_node_for(uint32_t owner, uint64_t ptr, uint64_t cookie)
+shm_node_for(uint32_t owner, uint64_t ptr, uint64_t cookie, bool *made)
 {
+  if (made) *made = false;
   for (uint32_t i = 1; i < BINDER_MAX_NODES; i++)
     if (shm->node[i].used && shm->node[i].owner == owner &&
         shm->node[i].ptr == ptr)
@@ -669,6 +689,7 @@ shm_node_for(uint32_t owner, uint64_t ptr, uint64_t cookie)
       shm->node[i].owner = owner;
       shm->node[i].ptr = ptr;
       shm->node[i].cookie = cookie;
+      if (made) *made = true;
       return i;
     }
   return 0;
@@ -960,29 +981,33 @@ call_tid(void)
 
 /* Remember that this thread is answering a call from `sender`. */
 static void
-call_note(struct binder_ep *e, uint32_t sender)
+call_note(struct binder_ep *e, uint32_t sender, uint64_t sender_tid)
 {
   uint64_t me = call_tid();
   for (int i = 0; i < BINDER_MAX_CALLS; i++)
     if (e->calls[i].tid == me || e->calls[i].tid == 0) {
       e->calls[i].tid = me;
       e->calls[i].sender_ep = sender;
+      e->calls[i].sender_tid = sender_tid;
       return;
     }
 }
 
 /* Who this thread owes a reply to, and forget it - a reply is answered once. */
 static uint32_t
-call_take(struct binder_ep *e)
+call_take(struct binder_ep *e, uint64_t *sender_tid)
 {
   uint64_t me = call_tid();
   for (int i = 0; i < BINDER_MAX_CALLS; i++)
     if (e->calls[i].tid == me) {
       uint32_t s = e->calls[i].sender_ep;
+      if (sender_tid) *sender_tid = e->calls[i].sender_tid;
       e->calls[i].tid = 0;
       e->calls[i].sender_ep = 0;
+      e->calls[i].sender_tid = 0;
       return s;
     }
+  if (sender_tid) *sender_tid = 0;
   return 0;
 }
 
@@ -996,6 +1021,7 @@ static int
 do_transaction(struct binder_ep *from, const struct btr *tr, bool reply,
                uint64_t buffers_size)
 {
+  uint64_t back_to_tid = 0;      /* for a reply: the thread it is owed to */
   int slot = reply ? -1 : shm_ep_for_handle((uint32_t) tr->target, from->ctx);
   if (reply) {
     /*
@@ -1005,7 +1031,7 @@ do_transaction(struct binder_ep *from, const struct btr *tr, bool reply,
      * back to this endpoint, which is the one-process case that worked before
      * any of this and still has to.
      */
-    uint32_t to = call_take(from);
+    uint32_t to = call_take(from, &back_to_tid);
     if (to == 0)
       to = from->id;
     slot = -1;
@@ -1073,6 +1099,14 @@ do_transaction(struct binder_ep *from, const struct btr *tr, bool reply,
   m->sender_pid = (uint32_t) getpid();
   m->sender_ep  = from->id;      /* so a reply can find its way back */
   m->target_node = reply ? 0 : (uint32_t) tr->target;
+  /*
+   * A call carries the thread making it, so the answer can find its way back to
+   * that thread and not merely to that process; a reply carries the thread it
+   * is owed to, which call_take just named. A one-way call is owed nothing and
+   * says so with zero.
+   */
+  m->reply_tid = reply ? back_to_tid
+                       : ((tr->flags & TF_ONE_WAY) ? 0 : call_tid());
   m->sender_euid = 0;
   m->data_size = tr->data_size;
   m->offsets_size = tr->offsets_size;
@@ -1130,8 +1164,39 @@ do_transaction(struct binder_ep *from, const struct btr *tr, bool reply,
 
       if (fo.type == LINUX_BINDER_TYPE_BINDER ||
           fo.type == LINUX_BINDER_TYPE_WEAK_BINDER) {
-        uint32_t h = shm_node_for(from->id, fo.binder, fo.cookie);
+        bool made = false;
+        uint32_t h = shm_node_for(from->id, fo.binder, fo.cookie, &made);
         if (h == 0) { err = -LINUX_ENOMEM; break; }
+        if (made) {
+          /*
+           * The owner is told that its object now has a reference outside
+           * itself, which is the thing that keeps the object alive.
+           *
+           * libbinder does not hold a strong reference to a service on its
+           * own account: it hands the driver a *weak* pointer and relies on
+           * BR_INCREFS/BR_ACQUIRE arriving to take a strong one. Without them
+           * nothing here did, so the object was destroyed while the registry
+           * still named it - and the next transaction to that node had
+           * libbinder call attemptIncStrong on a weakref_type that had been
+           * freed and its memory handed to something else.
+           *
+           * That reads as a wild pointer, because it is one: the fault address
+           * was 0x63697672655365f6, which is not an address at all but eight
+           * bytes of the string the allocator had put there. vold died on its
+           * first incoming call, every boot.
+           *
+           * The owner is the sender here - a BINDER object is one the sender
+           * owns - so this goes to the local endpoint and needs none of the
+           * cross-process machinery. The pair is what Linux sends, in this
+           * order, and libbinder answers each with a BC_..._DONE that the
+           * write path already accepts.
+           */
+          uint64_t pc[2] = { fo.binder, fo.cookie };
+          ep_queue_cmd(from, BR_INCREFS);
+          ep_queue(from, pc, sizeof pc);
+          ep_queue_cmd(from, BR_ACQUIRE);
+          ep_queue(from, pc, sizeof pc);
+        }
         fo.type = fo.type == LINUX_BINDER_TYPE_BINDER
                     ? LINUX_BINDER_TYPE_HANDLE : LINUX_BINDER_TYPE_WEAK_HANDLE;
         fo.binder = h;           /* the handle sits in the low half */
@@ -1292,9 +1357,17 @@ collect_messages(struct binder_ep *e)
     shm_unlock();
     return;
   }
+  uint64_t me = call_tid();
   for (int i = 0; i < BSHM_MSG_MAX; i++) {
     struct bmsg *m = &shm->ep[slot].q[i];
     if (!m->used)
+      continue;
+    /*
+     * A reply belongs to the thread that made the call. Left queued for it
+     * rather than handed to whoever asked first - see bmsg::reply_tid for what
+     * happens when the wrong thread gets one.
+     */
+    if (m->is_reply && m->reply_tid != 0 && m->reply_tid != me)
       continue;
     uint64_t total = m->total ? m->total : (m->data_size + m->offsets_size);
     uint64_t at = arena_take(e, total ? total : 8);
@@ -1343,7 +1416,7 @@ collect_messages(struct binder_ep *e)
      * recording either would leave a stale debt for the next real one.
      */
     if (!m->is_reply && !(m->flags & TF_ONE_WAY))
-      call_note(e, m->sender_ep);
+      call_note(e, m->sender_ep, m->reply_tid);
 
     /*
      * The pointers can be made real now, because the arena address is finally
