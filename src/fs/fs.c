@@ -4485,8 +4485,31 @@ darwinfs_mkdirat(struct fs *fs, struct dir *dir, const char *path, int mode)
   if ((r = permit_parent(dir->fd, path, false)) < 0)
     return r;
   r = syswrap(mkdirat(dir->fd, path, mode));
-  if (r >= 0)
-    guest_owner_stamp_new(dir->fd, path);
+  if (r < 0)
+    return r;
+  guest_owner_stamp_new(dir->fd, path);
+
+  /*
+   * A directory the host cannot work with is split the way chmod splits one:
+   * the host gets a mode that can be used and the guest's own mode is recorded
+   * beside it. mkdir passed the guest's mode straight through, so a mode that
+   * denies its owner produced a directory nabi could not touch either.
+   *
+   * chown is where that surfaces, because ownership is recorded in an extended
+   * attribute and writing one needs write permission on the object - while
+   * chown on Linux needs no such thing. dpkg unpacks in exactly this order:
+   * mkdir with mode 0, chown to the package's user, chmod to the real mode. So
+   * `mkdirat("/var/cache/man.dpkg-new", 0)` succeeded, the chown after it came
+   * back EACCES, and man-db failed to unpack - which held back x11-apps,
+   * wayland-utils and weston behind an unmet dependency.
+   *
+   * The mode recorded is the one that actually landed, not the one asked for,
+   * so the umask has already been applied and the guest sees what Linux would
+   * have given it.
+   */
+  struct stat st;
+  if (fstatat(dir->fd, path, &st, 0) == 0 && (st.st_mode & S_IRWXU) != S_IRWXU)
+    guest_mode_record(dir->fd, path, false, (uint32_t)(st.st_mode & 07777));
   return r;
 }
 
