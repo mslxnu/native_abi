@@ -1477,6 +1477,21 @@ else
     fail=1
 fi
 
+# binderwraptest: one buffer the receiver keeps must not close the arena. The
+# mark that goes round tested exactly one range for being free - the one it had
+# just wrapped onto - so a buffer still held at the front of the arena refused
+# every allocation after that, for good. The receiver polls, can never make
+# room, and the sender waits for a reply already written: the Android boot that
+# stopped at the first vdc in about one run in three.
+cp "$here/binderwraptest" "$root/"; chmod +x "$root/binderwraptest"
+out=$(NABI_BINDER=emulated "$NABI" -m "$root" /binderwraptest 2>&1 | tail -1); rc=$?
+if [ "$out" = "binderwrap ok" ]; then
+    echo "  ok  binderwraptest -> \"$out\""
+else
+    echo "  FAIL binderwraptest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 # binderhandletest: an object passed by reference, and called through it. The
 # emulated driver knew one handle - zero, the context manager - which is enough
 # to reach servicemanager and nothing else, while Android is built the other way

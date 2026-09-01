@@ -233,6 +233,12 @@ struct bmsg {
    * queues a reply on the calling *thread*, not on the process.
    */
   uint64_t reply_tid;
+  /*
+   * How many times a thread that is not the one owed this reply has looked at
+   * it and left it alone. Bounded, because the thread it is owed to may never
+   * come back - see collect_messages.
+   */
+  uint32_t passed_over;
   uint64_t data_size, offsets_size;
   /* Where the parts sit inside `data`, which is the buffer as the receiver
    * will see it: the parcel, the offsets, then the scatter-gather copies. */
@@ -695,6 +701,24 @@ shm_node_for(uint32_t owner, uint64_t ptr, uint64_t cookie, bool *made)
   return 0;
 }
 
+/* Is there work still waiting for this endpoint in the shared registry? */
+static bool
+shm_queue_pending(struct binder_ep *e)
+{
+  if (!shm_attach())
+    return false;
+  bool any = false;
+  shm_lock();
+  for (int i = 0; i < BINDER_MAX_EP && !any; i++) {
+    if (!shm->ep[i].used || shm->ep[i].id != e->id)
+      continue;
+    for (int j = 0; j < BSHM_MSG_MAX; j++)
+      if (shm->ep[i].q[j].used) { any = true; break; }
+  }
+  shm_unlock();
+  return any;
+}
+
 /* Wake whoever is waiting on an endpoint, wherever it is. */
 static void
 shm_wake(uint32_t id)
@@ -722,8 +746,46 @@ ep_poke(struct binder_ep *e)
 static void
 ep_queue(struct binder_ep *e, const void *bytes, size_t n)
 {
-  if (e->pending_len + n > sizeof e->pending)
-    return;                      /* dropped rather than overrun; see BR_NOOP */
+  /*
+   * Reclaim what has already been read before deciding there is no room.
+   *
+   * The buffer was only ever reset when it happened to be drained exactly -
+   * pending_off meeting pending_len - and a reader that takes less than the
+   * whole of it leaves the two apart. Every append after that grows
+   * pending_len while pending_off trails behind, so a long-lived endpoint
+   * creeps towards 64KiB of which most has already been delivered, and then
+   * everything is dropped.
+   *
+   * Dropped in silence, which is what made it invisible. A transaction that is
+   * never queued is never delivered and never refused: the sender waits for a
+   * reply that cannot come and the receiver polls for work it will not see,
+   * both of them healthy, neither making progress. Android's boot did that
+   * intermittently - about one run in two would stop at a `vdc` exec with vdc
+   * and vold both sitting in BINDER_WRITE_READ returning zero - and how far it
+   * got depended on how much binder traffic had gone through the endpoint
+   * first, which is why it looked like a race.
+   */
+  if (e->pending_len + n > sizeof e->pending && e->pending_off > 0) {
+    size_t shift = e->pending_off;
+    memmove(e->pending, e->pending + shift, e->pending_len - shift);
+    e->pending_len -= shift;
+    e->pending_off = 0;
+    /* The fixups hold offsets into this buffer, so they move with it. One
+     * pointing into bytes already read has nothing left to point at. */
+    unsigned k = 0;
+    for (unsigned i = 0; i < e->fixup_n; i++)
+      if (e->fixups[i].at >= shift && e->fixups[i].to >= shift) {
+        e->fixups[k].at = e->fixups[i].at - shift;
+        e->fixups[k].to = e->fixups[i].to - shift;
+        k++;
+      }
+    e->fixup_n = k;
+  }
+  if (e->pending_len + n > sizeof e->pending) {
+    /* Said out loud. Silence here is a guest that hangs with nothing wrong. */
+    warnk("binder: endpoint %u is full, dropping %zu bytes of work\n", e->id, n);
+    return;
+  }
   memcpy(e->pending + e->pending_len, bytes, n);
   e->pending_len += n;
   ep_poke(e);
@@ -746,19 +808,28 @@ ep_queue_fixup(struct binder_ep *e, size_t at, size_t to)
   }
 }
 
-/* Does anything still in use sit in [off, off+len) of the arena? */
-static bool
-arena_busy(const struct binder_ep *e, uint64_t off, uint64_t len)
+/*
+ * Where the search has to resume if [off, off+len) is not free, or 0 if it is.
+ *
+ * The end of the furthest live record overlapping the range, rather than the
+ * first one found, so that a caller stepping over blockers is guaranteed to
+ * make progress and to terminate.
+ */
+static uint64_t
+arena_blocked_until(const struct binder_ep *e, uint64_t off, uint64_t len)
 {
   uint64_t base = e->arena_addr;
+  uint64_t past = 0;
   for (int i = 0; i < BINDER_MAX_ALLOCS; i++) {
     if (!e->allocs[i].live)
       continue;
     uint64_t s = e->allocs[i].addr - base;
-    if (s < off + len && off < s + e->allocs[i].size)
-      return true;
+    if (s < off + len && off < s + e->allocs[i].size) {
+      if (s + e->allocs[i].size > past)
+        past = s + e->allocs[i].size;
+    }
   }
-  return false;
+  return past;
 }
 
 /*
@@ -793,18 +864,52 @@ arena_take(struct binder_ep *e, uint64_t size)
   if (want == 0 || want > e->arena_size)
     return 0;
 
-  if (e->arena_brk + want > e->arena_size)
-    e->arena_brk = 0;            /* round again; what is free is at the front */
-  if (arena_busy(e, e->arena_brk, want))
-    return 0;                    /* still in use - the message waits, as before */
+  /*
+   * The mark says where to look first, not where to look only. Wrapping it and
+   * then testing that one range was the whole of the search, so a single live
+   * record sitting across the front of the arena refused every allocation that
+   * followed it - for as long as it lived, which for a buffer the guest is
+   * holding is indefinitely. Nothing recovers from that: the receiver keeps
+   * polling, finds it can make no room, and leaves the message queued, while
+   * the sender waits for a reply that was written and never collected. That is
+   * the boot that stops at the first vdc, and the reason it is the first vdc
+   * and not a later one is only that it takes some traffic to reach the wrap.
+   *
+   * So step over whatever is in the way and look again, from the mark to the
+   * end and then from the front back to the mark. Still first fit, still a
+   * mark that goes round; it just no longer mistakes the first occupied range
+   * for a full arena.
+   */
+  uint64_t start = e->arena_brk;
+  if (start + want > e->arena_size)
+    start = 0;
+
+  uint64_t off = start;
+  bool wrapped = false;
+  for (;;) {
+    if (off + want > e->arena_size) {
+      if (wrapped)
+        return 0;
+      wrapped = true;
+      off = 0;
+      continue;
+    }
+    if (wrapped && off >= start)
+      return 0;                  /* all the way round: the arena really is full */
+
+    uint64_t past = arena_blocked_until(e, off, want);
+    if (past == 0)
+      break;
+    off = past;
+  }
 
   for (int i = 0; i < BINDER_MAX_ALLOCS; i++) {
     if (e->allocs[i].live)
       continue;
-    e->allocs[i].addr = e->arena_addr + e->arena_brk;
+    e->allocs[i].addr = e->arena_addr + off;
     e->allocs[i].size = want;
     e->allocs[i].live = true;
-    e->arena_brk += want;
+    e->arena_brk = off + want;
     return e->allocs[i].addr;
   }
   return 0;
@@ -1363,12 +1468,28 @@ collect_messages(struct binder_ep *e)
     if (!m->used)
       continue;
     /*
-     * A reply belongs to the thread that made the call. Left queued for it
-     * rather than handed to whoever asked first - see bmsg::reply_tid for what
-     * happens when the wrong thread gets one.
+     * A reply belongs to the thread that made the call, and is left for it -
+     * but not for ever.
+     *
+     * libbinder handles BR_REPLY only in waitForResponse, so handing one to a
+     * thread sitting in the pool loop reaches executeCommand, which has no case
+     * for it and answers UNKNOWN_ERROR. That is why the preference exists. What
+     * it must not do is strand the reply when the thread it is owed to never
+     * comes back to collect it: a worker that has since exited, or a caller
+     * whose thread ids changed under it. The message then sits in the queue
+     * with the sender waiting for an answer that has already been written and
+     * the receiver polling an empty pending buffer - which is what stopped
+     * about one Android boot in three, at whichever `vdc` exec came first.
+     *
+     * So the preference is given a bounded number of chances. The thread that
+     * is owed it polls constantly and will take it long before the count runs
+     * out; a thread that is gone never will, and after that anyone may.
      */
-    if (m->is_reply && m->reply_tid != 0 && m->reply_tid != me)
+    if (m->is_reply && m->reply_tid != 0 && m->reply_tid != me &&
+        m->passed_over < 64) {
+      m->passed_over++;
       continue;
+    }
     uint64_t total = m->total ? m->total : (m->data_size + m->offsets_size);
     uint64_t at = arena_take(e, total ? total : 8);
     if (at == 0)
@@ -1748,6 +1869,30 @@ serve_reads(struct binder_ep *e, uint64_t buf, uint64_t size,
   while (read(e->fd, drain, sizeof drain) > 0)
     ;
   fcntl(e->fd, F_SETFL, fl);
+
+  /*
+   * And put one back if there is still work, because the drain cannot tell the
+   * bytes apart.
+   *
+   * A wake byte says "there is something for you" and nothing about what. The
+   * drain empties the fifo on the way out of a read, which is right for the
+   * bytes that stood for what was just handed over and wrong for two others:
+   * one that stood for work this read did not have room for, and one that
+   * arrived from another process while the read was happening. Both are thrown
+   * away, and the endpoint then sits in epoll with a full queue and nothing to
+   * wake it.
+   *
+   * Nobody is at fault in the trace that produces: the sender's write returned
+   * success and the receiver is waiting exactly as it should. Android's boot
+   * stopped this way in roughly one run in three, at whichever `vdc` exec came
+   * first - a ping to servicemanager that servicemanager never collected, both
+   * processes healthy, init waiting on the pair of them for ever.
+   *
+   * Re-arming is cheap and cannot be lost: a byte in the fifo makes the next
+   * poll return at once, and a spurious one only costs an empty read.
+   */
+  if (e->pending_len > e->pending_off || shm_queue_pending(e))
+    ep_poke(e);
   return 0;
 }
 
