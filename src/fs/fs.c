@@ -7854,7 +7854,30 @@ DEFINE_SYSCALL(ftruncate, unsigned int, fd, unsigned long, length)
 DEFINE_SYSCALL(flock, int, fd, int, operation)
 {
   // Linux's and Darwin's operation are compatible
-  return syswrap(flock(fd, operation));
+  int r = syswrap(flock(fd, operation));
+
+  /*
+   * A filesystem that cannot lock at all is not a failure the guest can do
+   * anything with. On Linux flock works on every filesystem, so no caller has a
+   * path for being told otherwise, and the ones that check treat it as the file
+   * being unavailable.
+   *
+   * The Android image is an ext2 volume over FUSE, which answers ENOTSUP, and
+   * iptables-restore exits 4 when it cannot take /system/etc/xtables.lock. That
+   * is netd's persistent child, so netd's next write to it is EPIPE and SIGPIPE
+   * and netd dies; init answers that by restarting zygote, and zygote's
+   * onrestart by killing surfaceflinger, audioserver, cameraserver and media.
+   * The whole boot then spends itself restarting.
+   *
+   * There is nothing to serialise against on a filesystem whose locks do not
+   * exist - no other process can be holding one either - so the lock is granted.
+   * Unlocking likewise. This is weaker than Linux only where two guest
+   * processes contend for a file on such a mount, and the alternative is that
+   * every one of them is refused.
+   */
+  if (r == -LINUX_EOPNOTSUPP)
+    return 0;
+  return r;
 }
 
 /*
