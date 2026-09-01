@@ -1776,6 +1776,23 @@ DEFINE_SYSCALL(listen, int, socket, int, backlog)
  * reopens that window for any other thread that execs in between. The flag
  * would then be doing nothing except in the single-threaded case, where it was
  * never needed.
+ *
+ * The lock that closes that window covers the descriptor's life from existing
+ * to being registered, and nothing before it. It used to be taken first and
+ * held across the accept itself, which is the one call here that waits without
+ * a bound: a server parked waiting for a connection held the process's fd
+ * table against every other thread in it, for as long as nobody connected.
+ *
+ * adbd is built out of exactly that. It has a thread in accept on the tcp
+ * port, and its "server socket" and "jdwp control" threads both start by
+ * calling socket() - so both stopped in socket() before they had done anything
+ * at all, and stayed there. adbd listens, the connection is established by the
+ * host, and the process that should read the handshake has never finished
+ * starting up. Which looks from outside like adbd accepting a connection and
+ * then ignoring it.
+ *
+ * Waiting for a connection needs no lock, because until accept returns there
+ * is no descriptor to protect.
  */
 static int
 do_accept(int sockfd, gaddr_t addr_ptr, gaddr_t addrlen_ptr, int flags)
@@ -1797,11 +1814,10 @@ do_accept(int sockfd, gaddr_t addr_ptr, gaddr_t addrlen_ptr, int flags)
     *socklen_ptr = sizeof(struct sockaddr_storage);
     sock_ptr = alloca(sizeof(struct sockaddr_storage));
   }
-  pthread_rwlock_wrlock(&proc.fileinfo.fdtable_lock);
   int ret = syswrap(accept(sockfd, sock_ptr, socklen_ptr));
-  if (ret < 0) {
-    goto err;
-  }
+  if (ret < 0)
+    return ret;
+  pthread_rwlock_wrlock(&proc.fileinfo.fdtable_lock);
   /*
    * Both flags are set to the asked-for state rather than only turned on,
    * because BSD and Linux disagree about what an accepted socket starts as.

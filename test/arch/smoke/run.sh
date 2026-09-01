@@ -1477,6 +1477,21 @@ else
     fail=1
 fi
 
+# acceptlocktest: a thread waiting in accept must not stop the rest of its
+# process. The fd table's lock was taken before accept and held across it, so a
+# server parked waiting for a connection held it against every other thread -
+# adbd's "server socket" and "jdwp control" threads both stopped in their first
+# socket() call and stayed there, which is why adbd listened on 5555 and never
+# read the handshake.
+cp "$here/acceptlocktest" "$root/"; chmod +x "$root/acceptlocktest"
+out=$("$NABI" -m "$root" /acceptlocktest 2>&1 | tail -1); rc=$?
+if [ "$out" = "acceptlock ok" ]; then
+    echo "  ok  acceptlocktest -> \"$out\""
+else
+    echo "  FAIL acceptlocktest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 # binderwraptest: one buffer the receiver keeps must not close the arena. The
 # mark that goes round tested exactly one range for being free - the one it had
 # just wrapped onto - so a buffer still held at the front of the arena refused
