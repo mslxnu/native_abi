@@ -148,10 +148,45 @@
   FROM_DARWN(_,ENODATA,         ENOATTR)                            \
   FROM_DARWN(_,EPERM,           ENOPOLICY)                          \
   FROM_DARWN(_,EPERM,           EBADRPC)                            \
+  FROM_DARWN(_,EOPNOTSUPP,      ENOTSUP)                            \
 
 DECLARE_CENUM(errno, LINUX_ERRNO);
 DECLARE_CSTR_FUNC(errno, LINUX_ERRNO);
-DECLARE_CMAP_FUNC(darwin_to_linux, errno, LINUX_ERRNO);
+DECLARE_CMAP_FUNC(darwin_to_linux, errno_raw, LINUX_ERRNO);
+
+/*
+ * An errno nabi has no mapping for, turned into one it can return.
+ *
+ * Linux has one "not supported"; Darwin has two, EOPNOTSUPP and ENOTSUP, and
+ * they are different numbers. The list above carries EOPNOTSUPP and declares
+ * ENOTSUP with DECL_ALIAS, which names the Linux-side constant and adds no case
+ * to the darwin-to-linux switch - so ENOTSUP had no mapping at all, and the
+ * FROM_DARWN line now gives it one.
+ *
+ * The generated map answers -1 for anything it does not know, and every caller
+ * negates what it gets - syswrap is written as -darwin_to_linux_errno(errno) -
+ * so an unmapped errno came back as +1. Not an error at all: a positive return,
+ * which the guest reads as the call having succeeded and returned 1.
+ *
+ * Darwin's ENOTSUP was unmapped, and that is what it did. flock on the Android
+ * image answered ENOTSUP, because it is an ext2 volume over FUSE and that
+ * cannot lock, so iptables-restore was told its flock had returned 1. It exits
+ * 4 on that, netd's persistent iptables-restore child dies, netd's next write
+ * to it is EPIPE and SIGPIPE, and netd dies - which init answers by restarting
+ * zygote, and zygote's onrestart by killing surfaceflinger, audioserver,
+ * cameraserver and media. A whole boot spent restarting, out of one errno with
+ * no entry in a table.
+ *
+ * So the mapping is added, and unmapped stops being able to mean success for
+ * whatever is missing next. The raw map still warns, which is how the missing
+ * entry was found.
+ */
+static inline int
+darwin_to_linux_errno(int e)
+{
+  int r = darwin_to_linux_errno_raw(e);
+  return r > 0 ? r : LINUX_EINVAL;
+}
 DECLARE_CMAP_FUNC(linux_to_darwin, errno, LINUX_ERRNO);
 
 #endif

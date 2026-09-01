@@ -330,6 +330,13 @@ $(ARENA_TEST): test/arch/test_arena.c src/mm/arena.c $(HEADERS) $(ARCH_STAMP) | 
 	    -Wall -Wextra -Wno-unused-parameter -Iinclude \
 	    -o $@ test/arch/test_arena.c src/mm/arena.c
 
+ERRNO_TEST := $(OUT)/test_errno
+
+$(ERRNO_TEST): test/arch/test_errno.c $(HEADERS) $(ARCH_STAMP) | $(OUT)
+	$(CC) -arch $(NATIVE_ARCH) -std=gnu11 -O0 -g \
+	    -Wall -Wextra -Wno-unused-parameter -Iinclude \
+	    -o $@ test/arch/test_errno.c
+
 CKPT_TEST := $(OUT)/test_checkpoint
 
 $(CKPT_TEST): test/arch/test_checkpoint.c src/proc/checkpoint.c src/mm/arena.c $(HEADERS) $(ARCH_STAMP) | $(OUT)
@@ -390,14 +397,14 @@ $(HV_PROBE): test/arch/hv_probe.c $(ARCH_STAMP) | $(OUT)
 	$(CC) $(CFLAGS) -o $@ test/arch/hv_probe.c $(FRAMEWORKS)
 	$(CODESIGN) --force --sign $(SIGNCERT) --entitlements $(ENTITLEMENTS) $@
 
-check-arm64: $(CKPT_TEST) $(ARM64_TEST) $(MMU_TEST) $(VMMAP_TEST) $(BOOT_TEST) $(MUNMAP_TEST) $(REENTRY_TEST) $(ARENA_TEST) $(HV_PROBE)
+check-arm64: $(CKPT_TEST) $(ARM64_TEST) $(MMU_TEST) $(VMMAP_TEST) $(BOOT_TEST) $(MUNMAP_TEST) $(REENTRY_TEST) $(ARENA_TEST) $(ERRNO_TEST) $(HV_PROBE)
 	@if [ "$(NATIVE_ARCH)" != "arm64" ]; then \
 		echo "SKIP: the aarch64 backend tests need Apple Silicon to run."; \
 	elif ! $(HV_PROBE); then \
 		echo "SKIP: this host cannot create a VM, so the backend tests cannot run."; \
-		$(ARENA_TEST) && $(CKPT_TEST); \
+		$(ERRNO_TEST) && $(ARENA_TEST) && $(CKPT_TEST); \
 	else \
-		$(ARENA_TEST) && $(CKPT_TEST) && $(ARM64_TEST) && $(MMU_TEST) && $(VMMAP_TEST) && $(BOOT_TEST) && $(MUNMAP_TEST) && $(REENTRY_TEST); \
+		$(ERRNO_TEST) && $(ARENA_TEST) && $(CKPT_TEST) && $(ARM64_TEST) && $(MMU_TEST) && $(VMMAP_TEST) && $(BOOT_TEST) && $(MUNMAP_TEST) && $(REENTRY_TEST); \
 	fi
 
 # End-to-end: run committed aarch64 binaries under a natively-built nabi. Needs
