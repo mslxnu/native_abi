@@ -1477,6 +1477,22 @@ else
     fail=1
 fi
 
+# msynctest: msync on a page that is not the first one of its mapping. The
+# bounds test compared the offset of the address within its region against the
+# length being synced, so a page could only be synced if it lay within the
+# first len bytes of its mapping; and the host wants 16KiB boundaries where a
+# guest page is 4KiB. ART walks its heap a page at a time, so the zygote retried
+# its way through the whole heap - three quarters of a gigabyte of trace for one
+# boot, and enough load to starve everything else.
+cp "$here/msynctest" "$root/"; chmod +x "$root/msynctest"
+out=$("$NABI" -m "$root" /msynctest 2>&1 | tail -1); rc=$?
+if [ "$out" = "msync ok" ]; then
+    echo "  ok  msynctest -> \"$out\""
+else
+    echo "  FAIL msynctest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 # acceptlocktest: a thread waiting in accept must not stop the rest of its
 # process. The fd table's lock was taken before accept and held across it, so a
 # server parked waiting for a connection held it against every other thread -

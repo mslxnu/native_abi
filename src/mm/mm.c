@@ -498,10 +498,31 @@ DEFINE_SYSCALL(get_mempolicy, gaddr_t, policy, gaddr_t, nmask, unsigned long, ma
 DEFINE_SYSCALL(msync, gaddr_t, addr, size_t, len, int, flags)
 {
   struct mm_region *region = find_region(addr, proc.mm);
-  if (!region || addr - region->gaddr >= len || len + addr - region->gaddr > region->size) {
+  if (region == NULL)
     return -LINUX_ENOMEM;
-  }
-  
+
+  /*
+   * The range has to lie inside the mapping it starts in, and that is the whole
+   * of the test. There used to be another clause beside it, "addr -
+   * region->gaddr >= len", which compares the offset of the address within its
+   * region against the number of bytes being synced - two quantities with
+   * nothing to do with each other. What it amounted to was that a page could
+   * only be synced if it lay within the first len bytes of its mapping, so
+   * syncing one page at a time worked at the very start of a region and
+   * returned ENOMEM everywhere after it.
+   *
+   * Which is exactly how ART walks its heap. The zygote syncs page by page, and
+   * every page past the first failed, so it retried its way through the whole
+   * heap one 4KiB call at a time - three quarters of a gigabyte of trace for a
+   * single boot, and enough load to starve everything else on the machine. adb
+   * would go from a working shell to "device offline" while adbd itself sat
+   * idle.
+   */
+  uint64_t off = addr - region->gaddr;
+  if (off > region->size || len > region->size - off)
+    return -LINUX_ENOMEM;
+
+
   if (flags & ~(LINUX_MS_ASYNC | LINUX_MS_SYNC | LINUX_MS_INVALIDATE)) {
     return -LINUX_EINVAL;
   }
@@ -509,6 +530,31 @@ DEFINE_SYSCALL(msync, gaddr_t, addr, size_t, len, int, flags)
   if (flags & LINUX_MS_ASYNC) dflags |= MS_ASYNC;
   if (flags & LINUX_MS_SYNC) dflags |= MS_SYNC;
   if (flags & LINUX_MS_INVALIDATE) dflags |= MS_INVALIDATE;
-  
-  return syswrap(msync(addr - region->gaddr + region->haddr, len, dflags));
+
+  /*
+   * The host wants its own page boundaries, and the guest's are smaller: a
+   * guest page here is 4KiB and the host's is 16KiB, so three guest pages in
+   * every four begin at an address the host will not take and msync answers
+   * EINVAL. Which is not something the guest can do anything about, or should
+   * have to know.
+   *
+   * So the range is widened to the host pages that contain it. msync says when
+   * to write pages back rather than which ones may be written, so flushing the
+   * rest of a host page along with the part that was asked for is allowed - and
+   * the alternative, refusing, is not.
+   */
+  uintptr_t start = (uintptr_t) region->haddr + off;
+  uintptr_t end = start + len;
+  uintptr_t lo = start & ~(uintptr_t)(HOST_BLOCK_GRANULE - 1);
+  uintptr_t hi = (end + HOST_BLOCK_GRANULE - 1) & ~(uintptr_t)(HOST_BLOCK_GRANULE - 1);
+
+  /* Not past the mapping it belongs to, rounded the way the host rounded it. */
+  uintptr_t cap = ((uintptr_t) region->haddr + region->size + HOST_BLOCK_GRANULE - 1)
+                  & ~(uintptr_t)(HOST_BLOCK_GRANULE - 1);
+  if (hi > cap)
+    hi = cap;
+  if (hi <= lo)
+    return 0;
+
+  return syswrap(msync((void *) lo, (size_t)(hi - lo), dflags));
 }
