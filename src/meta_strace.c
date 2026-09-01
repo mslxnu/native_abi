@@ -14,70 +14,40 @@ static FILE *strace_sink;
 pthread_mutex_t strace_sync = PTHREAD_MUTEX_INITIALIZER;
 
 /*
- * One line, built whole before any of it is written.
+ * Who has a line open, and whether one is open at all.
  *
- * A call and its result are printed at two different moments with the syscall
- * in between, and the lock used to be dropped for that. Any other thread could
- * take it and write its own line into the gap, so a multi-threaded guest
- * produced lines spliced out of two calls - a name and arguments from one
- * thread, a "): ret = ..." from another. Nothing marks them, and they read as
- * ordinary lines.
+ * A call and its result are printed at two moments with the syscall in
+ * between, and the lock cannot be held across it - a blocking read would stop
+ * every other thread from tracing. So another thread can arrive mid-line, and
+ * it used to simply write into the middle of one. What came out read as an
+ * ordinary line and was a splice of two: a name and arguments from one thread,
+ * a "): ret = ..." from another, with nothing to mark it.
  *
- * That is the worst way for a tracer to be wrong, because the reader believes
- * it. Twice in one session it produced a bug that was not there: a write of 24
- * bytes appearing to return 62, and a write of 73 appearing to return 16 - both
- * of them another thread's return value, and one of them chased as far as
- * writing a test to reproduce a socket bug that did not exist.
+ * That invented two bugs in one session - a 24-byte write appearing to return
+ * 62, and a 73-byte write appearing to return 16, both of them impossible and
+ * both another thread's number. The first was chased as far as writing a test
+ * to reproduce it, which passed.
  *
- * So the line is assembled in memory, per thread, and reaches the sink in a
- * single write once the result is known.
+ * Buffering the whole line until the result is known fixes the splice and
+ * loses something worth more: a thread blocked *inside* a syscall then prints
+ * nothing at all, so a hung guest shows a thread that has simply stopped making
+ * calls. That is precisely the case worth seeing.
+ *
+ * So: the call is written when it happens, and an interrupted line is closed
+ * with "<unfinished ...>" and picked up later with "<... name resumed>", which
+ * is what strace -f does and for the same reason.
  */
-static _Thread_local FILE  *line_fp;
-static _Thread_local char  *line_buf;
-static _Thread_local size_t line_len;
+static bool     line_open;
+static uint64_t line_tid;
 
-/* Where the formatters print: the pending line, or the sink if none is open. */
-static FILE *
-strace_out(void)
-{
-  return line_fp ? line_fp : strace_sink;
-}
-
-/* Finish the pending line and put it out as one write. */
+/* Close whatever is open, if it is not this thread's. Call with the lock. */
 static void
-line_emit(void)
+line_yield(uint64_t tid)
 {
-  if (line_fp == NULL)
-    return;
-  fclose(line_fp);
-  line_fp = NULL;
-  if (line_buf != NULL) {
-    /* A line emitted without its result - exit_group, execve - has no closing
-     * newline, and the next line would run into it. The truncation is the
-     * point and is kept; the newline is what makes it readable. */
-    bool ends = line_len > 0 && line_buf[line_len - 1] == '\n';
-    pthread_mutex_lock(&strace_sync);
-    fwrite(line_buf, 1, line_len, strace_sink);
-    if (!ends)
-      fputc('\n', strace_sink);
-    fflush(strace_sink);
-    pthread_mutex_unlock(&strace_sync);
-    free(line_buf);
-    line_buf = NULL;
+  if (line_open && line_tid != tid) {
+    fprintf(strace_sink, " <unfinished ...>\n");
+    line_open = false;
   }
-}
-
-/*
- * A call that may never come back, and so would never be emitted. The trace
- * ending mid-call is worth keeping - it is how a guest that stopped inside a
- * syscall says so - and these are the calls that do it.
- */
-static bool
-never_returns(const char *name)
-{
-  return strcmp(name, "exit") == 0 || strcmp(name, "exit_group") == 0 ||
-         strcmp(name, "execve") == 0 || strcmp(name, "execveat") == 0 ||
-         strcmp(name, "rt_sigreturn") == 0;
 }
 
 void
@@ -114,7 +84,7 @@ void
 print_gstr(gstr_t str, int maxlen)
 {
   if (str == 0) {
-    fprintf(strace_out(), "NULL");
+    fprintf(strace_sink, "NULL");
     return;
   }
   if (maxlen < 0)
@@ -125,31 +95,31 @@ print_gstr(gstr_t str, int maxlen)
   char buf[4097];
   if (strncpy_from_user(buf, str, (size_t) maxlen + 1) < 0) {
     /* Not readable: say where it pointed rather than dying of it. */
-    fprintf(strace_out(), "<unreadable %#llx>", (unsigned long long) str);
+    fprintf(strace_sink, "<unreadable %#llx>", (unsigned long long) str);
     return;
   }
   buf[maxlen] = '\0';
 
-  fprintf(strace_out(), "\"");
+  fprintf(strace_sink, "\"");
   for (int i = 0; i < maxlen; i++) {
     char c = buf[i];
     if (c == '\0') {
       break;
     } else if (c == '\n') {
-      fprintf(strace_out(), "\\n");
+      fprintf(strace_sink, "\\n");
     } else if (!isprint((unsigned char) c)) {
-      fprintf(strace_out(), "\\x%02x", (unsigned char) c);
+      fprintf(strace_sink, "\\x%02x", (unsigned char) c);
     } else {
-      fprintf(strace_out(), "%c", c);
+      fprintf(strace_sink, "%c", c);
     }
   }
-  fprintf(strace_out(), "\"");
+  fprintf(strace_sink, "\"");
 }
 
 void
 print_arg(int syscall_num, int arg_idx, const char *arg_name, const char *type_name, uint64_t val)
 {
-    fprintf(strace_out(), "%s: ", arg_name);
+    fprintf(strace_sink, "%s: ", arg_name);
 
     if (strcmp(type_name, "gstr_t") == 0) {
       /*
@@ -164,13 +134,13 @@ print_arg(int syscall_num, int arg_idx, const char *arg_name, const char *type_n
       print_gstr(val, 256);
 
     } else if (strcmp(type_name, "gaddr_t") == 0) {
-      fprintf(strace_out(), "0x%016llx [host: 0x%016llx]", val, (uint64_t)guest_to_host(val));
+      fprintf(strace_sink, "0x%016llx [host: 0x%016llx]", val, (uint64_t)guest_to_host(val));
 
     } else if (strcmp(type_name, "int") == 0) {
-      fprintf(strace_out(), "%lld", val);
+      fprintf(strace_sink, "%lld", val);
 
     } else {
-      fprintf(strace_out(), "0x%llx", val);
+      fprintf(strace_sink, "0x%llx", val);
     }
 }
 
@@ -179,7 +149,7 @@ print_args(int syscall_num, int argc, char *argnames[6], char *typenames[6], uin
 {
   for (int i = 0; i < argc; i++) {
     if (i > 0) {
-      fprintf(strace_out(), ", ");
+      fprintf(strace_sink, ", ");
     }
     print_arg(syscall_num, i, argnames[i], typenames[i], vals[i]);
   }
@@ -188,11 +158,11 @@ print_args(int syscall_num, int argc, char *argnames[6], char *typenames[6], uin
 void
 print_ret(int syscall_num, int argc, char *argnames[6], char *typenames[6], uint64_t vals[6], uint64_t ret)
 {
-  fprintf(strace_out(), "): ret = 0x%llx", ret);
+  fprintf(strace_sink, "): ret = 0x%llx", ret);
   if ((int64_t)ret < 0) {
-    fprintf(strace_out(), "[%s]", linux_errno_str(-ret));
+    fprintf(strace_sink, "[%s]", linux_errno_str(-ret));
   }
-  fprintf(strace_out(), "\n");
+  fprintf(strace_sink, "\n");
 }
 
 void
@@ -214,7 +184,7 @@ do_meta_strace(int syscall_num, char *syscall_name, meta_strace_hook def, meta_s
   }
 
   if (strcmp(syscall_name, "unimplemented") == 0) {
-    fprintf(strace_out(), "<unimplemented systemcall>");
+    fprintf(strace_sink, "<unimplemented systemcall>");
     def(-1, argc, argnames, typenames, vals, ret);
     return;
   }
@@ -235,7 +205,7 @@ meta_strace_info(const char *fmt, ...)
 
   vasprintf(&mes, fmt, ap);
 
-  fprintf(strace_out(), "INFO: %s", mes);
+  fprintf(strace_sink, "INFO: %s", mes);
 
   free(mes);
   va_end(ap);
@@ -260,15 +230,16 @@ meta_strace_pre(int syscall_num, char *syscall_name, ...)
   uint64_t tid;
   pthread_threadid_np(NULL, &tid);
 
-  line_emit();                  /* a previous line with no result; do not lose it */
-  line_fp = open_memstream(&line_buf, &line_len);
-  fprintf(strace_out(), "[%d:%lld] %s(", getpid(), tid, syscall_name);
+  pthread_mutex_lock(&strace_sync);
+  line_yield(tid);
+  fprintf(strace_sink, "[%d:%lld] %s(", getpid(), tid, syscall_name);
 
   do_meta_strace(syscall_num, syscall_name, print_args, strace_pre_hooks, 0, ap);
 
-  /* Emitted now if there will be no result to wait for. */
-  if (never_returns(syscall_name))
-    line_emit();
+  line_open = true;
+  line_tid = tid;
+  fflush(strace_sink);
+  pthread_mutex_unlock(&strace_sync);
 
   va_end(ap);
 }
@@ -285,8 +256,21 @@ meta_strace_post(int syscall_num, char *syscall_name, uint64_t ret, ...)
     return;
   }
 
+  uint64_t tid;
+  pthread_threadid_np(NULL, &tid);
+
+  pthread_mutex_lock(&strace_sync);
+  /* Somebody else's line is open, or this one was closed while the syscall ran:
+   * say which call is being finished rather than appending to a stranger. */
+  line_yield(tid);
+  if (!line_open)
+    fprintf(strace_sink, "[%d:%lld] <... %s resumed", getpid(), tid, syscall_name);
+
   do_meta_strace(syscall_num, syscall_name, print_ret, strace_post_hooks, ret, ap);
-  line_emit();
+
+  line_open = false;
+  fflush(strace_sink);
+  pthread_mutex_unlock(&strace_sync);
 
   va_end(ap);
 }
@@ -301,12 +285,12 @@ meta_strace_sigdeliver(int signum)
   uint64_t tid;
   pthread_threadid_np(NULL, &tid);
 
-  /* The call this thread is inside, first: a signal arriving mid-syscall is
-   * exactly when the pending line matters most. */
-  line_emit();
-
   pthread_mutex_lock(&strace_sync);
+  line_yield(tid);
+  if (line_open) { fprintf(strace_sink, "\n"); line_open = false; }
+
   fprintf(strace_sink, "[%d:%lld] --- %s ---\n", getpid(), tid, linux_signum_str(signum));
+
   fflush(strace_sink);
   pthread_mutex_unlock(&strace_sync);
 }
@@ -323,10 +307,10 @@ trace_read_post(int syscall_num, int argc, char *argnames[6], char *typenames[6]
 {
   for (int i = 0; i < argc; i++) {
     if (i > 0) {
-      fprintf(strace_out(), ", ");
+      fprintf(strace_sink, ", ");
     }
     if (i == 1) {
-      fprintf(strace_out(), "%s: ", argnames[1]);
+      fprintf(strace_sink, "%s: ", argnames[1]);
       print_gstr(vals[1], MIN(STRACE_BUF_MAX, ret)); // Print buf as string
     } else {
       print_arg(syscall_num, i, argnames[i], typenames[i], vals[i]);
@@ -341,10 +325,10 @@ trace_write_pre(int syscall_num, int argc, char *argnames[6], char *typenames[6]
 {
   for (int i = 0; i < argc; i++) {
     if (i > 0) {
-      fprintf(strace_out(), ", ");
+      fprintf(strace_sink, ", ");
     }
     if (i == 1) {
-      fprintf(strace_out(), "%s: ", argnames[1]);
+      fprintf(strace_sink, "%s: ", argnames[1]);
       print_gstr(vals[1], MIN(STRACE_BUF_MAX, vals[2])); // Print buf as string
     } else {
       print_arg(syscall_num, i, argnames[i], typenames[i], vals[i]);
@@ -364,10 +348,10 @@ trace_recvfrom_post(int syscall_num, int argc, char *argnames[6], char *typename
 {
   for (int i = 0; i < argc; i++) {
     if (i > 0) {
-      fprintf(strace_out(), ", ");
+      fprintf(strace_sink, ", ");
     }
     if (i == 1) {
-      fprintf(strace_out(), "%s: ", argnames[1]);
+      fprintf(strace_sink, "%s: ", argnames[1]);
       print_gstr(vals[1], MIN(STRACE_BUF_MAX, ret)); // Print buf as string
     } else {
       print_arg(syscall_num, i, argnames[i], typenames[i], vals[i]);
@@ -382,10 +366,10 @@ trace_sendto_pre(int syscall_num, int argc, char *argnames[6], char *typenames[6
 {
   for (int i = 0; i < argc; i++) {
     if (i > 0) {
-      fprintf(strace_out(), ", ");
+      fprintf(strace_sink, ", ");
     }
     if (i == 1) {
-      fprintf(strace_out(), "%s: ", argnames[1]);
+      fprintf(strace_sink, "%s: ", argnames[1]);
       print_gstr(vals[1], MIN(STRACE_BUF_MAX, vals[2])); // Print buf as string
     } else {
       print_arg(syscall_num, i, argnames[i], typenames[i], vals[i]);
@@ -407,24 +391,24 @@ trace_execve_pre(int syscall_num, int argc, char *argnames[6], char *typenames[6
 
   print_arg(syscall_num, 0, argnames[0], typenames[0], vals[0]); // path
   /* argc */
-  fprintf(strace_out(), ", [");
+  fprintf(strace_sink, ", [");
   for (int i = 0; i < exec_argc; i++) {
-    fprintf(strace_out(), "\"%s\", ", dargv[i]);
+    fprintf(strace_sink, "\"%s\", ", dargv[i]);
   }
-  fprintf(strace_out(), "], ");
+  fprintf(strace_sink, "], ");
   print_arg(syscall_num, 2, argnames[2], typenames[2], vals[2]); // envp
 }
 
 static void
 print_sigset(l_sigset_t *sigset)
 {
-  fprintf(strace_out(), "[");
+  fprintf(strace_sink, "[");
   for (int i = 1; i < LINUX_SIGRTMIN; i++) {
     if (LINUX_SIGISMEMBER(sigset, i)) {
-      fprintf(strace_out(), "%s, ", linux_signum_str(i));
+      fprintf(strace_sink, "%s, ", linux_signum_str(i));
     }
   }
-  fprintf(strace_out(), "]");
+  fprintf(strace_sink, "]");
 }
 
 void
@@ -437,35 +421,35 @@ trace_rt_sigprocmask_post(int syscall_num, int argc, char *argnames[6], char *ty
 {
   for (int i = 0; i < argc; i++) {
     if (i > 0) {
-      fprintf(strace_out(), ", ");
+      fprintf(strace_sink, ", ");
     }
     if (i == 0) {
       // how
-      fprintf(strace_out(), "%s: ", argnames[1]);
+      fprintf(strace_sink, "%s: ", argnames[1]);
       switch  (vals[i]) {
         case LINUX_SIG_BLOCK:
-          fprintf(strace_out(), "BLOCK");
+          fprintf(strace_sink, "BLOCK");
           break;
         case LINUX_SIG_UNBLOCK:
-          fprintf(strace_out(), "UNBLOCK");
+          fprintf(strace_sink, "UNBLOCK");
           break;
         case LINUX_SIG_SETMASK:
-          fprintf(strace_out(), "SETMASK");
+          fprintf(strace_sink, "SETMASK");
           break;
         default:
-          fprintf(strace_out(), "UNKNOWN_HOW");
+          fprintf(strace_sink, "UNKNOWN_HOW");
           break;
       }
     } else if (i == 1 || i == 2) {
       if (vals[i] == 0) {
-        fprintf(strace_out(), "NULL (");
+        fprintf(strace_sink, "NULL (");
         print_sigset(&task.sigmask);
-        fprintf(strace_out(), ")");
+        fprintf(strace_sink, ")");
         continue;
       }
       l_sigset_t lset;
       if (copy_from_user(&lset, vals[i], sizeof(l_sigset_t)))  {
-        fprintf(strace_out(), "FAULT...");
+        fprintf(strace_sink, "FAULT...");
         continue;
       }
       print_sigset(&lset);
