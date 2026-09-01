@@ -1000,6 +1000,7 @@ darwinfs_close(struct file *file)
   eventfd_forget(file->fd);
   binder_forget(file->fd);
   netlink_close(file->fd);
+  netfilter_close(file->fd);
   loop_close(file->fd);
   abstract_close(file->fd);
   seqpacket_close(file->fd);

@@ -48,6 +48,9 @@
  * and Darwin agree on these, but the option names underneath them do not. */
 #define	LINUX_IPPROTO_IP	0
 #define	LINUX_IPPROTO_IPV6	41
+/* Not a level: the protocol iptables asks a raw socket for, so that it can
+ * reach netfilter's tables through it. */
+#define	LINUX_IPPROTO_RAW	255
 #define	LINUX_SOL_IP		0
 #define	LINUX_SOL_IPX		256
 #define	LINUX_SOL_AX25		257

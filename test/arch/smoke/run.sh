@@ -1477,6 +1477,21 @@ else
     fail=1
 fi
 
+# netfiltertest: netfilter's tables, as far as iptables can tell. iptables reads
+# and writes whole tables through four socket options on a raw socket, and
+# libiptc walks the entry blob by the offsets inside it - so the sizes are the
+# thing being checked. Without a table to talk to, iptables-restore exits, netd's
+# next write to that persistent child is EPIPE and SIGPIPE, and init answers a
+# dead netd by restarting zygote and everything zygote's onrestart kills.
+cp "$here/netfiltertest" "$root/"; chmod +x "$root/netfiltertest"
+out=$("$NABI" -m "$root" /netfiltertest 2>&1 | tail -1); rc=$?
+if [ "$out" = "netfilter ok" ]; then
+    echo "  ok  netfiltertest -> \"$out\""
+else
+    echo "  FAIL netfiltertest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 # msynctest: msync on a page that is not the first one of its mapping. The
 # bounds test compared the offset of the address within its region against the
 # length being synced, so a page could only be synced if it lay within the

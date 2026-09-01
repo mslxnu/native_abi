@@ -312,6 +312,15 @@ bool cred_of_host_pid(int32_t pid, uint32_t *uid, uint32_t *gid);
 int  netlink_socket(int type, int protocol, int flags);
 bool netlink_is(int fd);
 void netlink_close(int fd);
+
+/* netfilter's tables, as far as iptables can tell - see src/net/netfilter.c */
+bool netfilter_wants(int family, int type, int protocol);
+void netfilter_note(int fd, int family);
+bool netfilter_is(int fd);
+bool netfilter_level(int fd, int level);
+void netfilter_close(int fd);
+int  netfilter_getsockopt(int fd, int optname, gaddr_t optval_ptr, gaddr_t optlen_ptr);
+int  netfilter_setsockopt(int fd, int optname, gaddr_t optval_ptr, uint32_t opt_len);
 int  netlink_send(int fd, const void *buf, size_t len);
 int  netlink_bind(int fd, const void *addr, size_t addrlen);
 int  netlink_getsockname(int fd, void *addr, size_t *addrlen);

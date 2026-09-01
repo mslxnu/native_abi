@@ -250,11 +250,26 @@ DEFINE_SYSCALL(socket, int, family, int, type, int, protocol)
   int dtype = type & ~(LINUX_SOCK_NONBLOCK | LINUX_SOCK_CLOEXEC);
   int fd = syswrap(socket(linux_to_darwin_sa_family(family),
                           seqpacket_darwin_type(family, dtype, false), protocol));
+  /*
+   * The socket iptables opens to reach netfilter's tables. Darwin refuses a
+   * raw socket to anything unprivileged, and would have nothing behind it if
+   * it did not, so one is stood in for it - a socket that exists to be a
+   * descriptor and to carry the table options, which are answered in
+   * netfilter.c rather than by the host.
+   *
+   * Marked whether or not the real one succeeded, because a raw socket that
+   * did open still has no netfilter under it here.
+   */
+  bool netfilter = netfilter_wants(family, dtype, protocol);
+  if (fd < 0 && netfilter)
+    fd = syswrap(socket(AF_UNIX, SOCK_DGRAM, 0));
   seqpacket_note(fd, family, dtype);
   ret = fd;
   if (fd < 0) {
     goto err;
   }
+  if (netfilter)
+    netfilter_note(fd, family);
 
   int e;
   if (type & LINUX_SOCK_NONBLOCK) {
@@ -738,6 +753,12 @@ sockopt_is_advisory(int level, int name)
 
 DEFINE_SYSCALL(setsockopt, int, fd, int, level, int, optname, gaddr_t, optval_ptr, uint, opt_len)
 {
+  /* Answered before the buffer is copied, because a table replacement is
+   * larger than anything else that arrives here and is read straight out of
+   * the guest. */
+  if (netfilter_is(fd) && netfilter_level(fd, level))
+    return netfilter_setsockopt(fd, optname, optval_ptr, opt_len);
+
   int r;
   char *optval = malloc(opt_len);
   
@@ -904,6 +925,8 @@ DEFINE_SYSCALL(getsockopt, int, fd, int, level, int, optname, gaddr_t, optval_pt
   if (copy_from_user(&l_optlen, optlen_ptr, sizeof l_optlen))
     return -LINUX_EFAULT;
 
+  if (netfilter_is(fd) && netfilter_level(fd, level))
+    return netfilter_getsockopt(fd, optname, optval_ptr, optlen_ptr);
   if (level == LINUX_SOL_SOCKET && optname == LINUX_SO_PEERCRED)
     return peercred_out(fd, optval_ptr, optlen_ptr, l_optlen);
   if (level == LINUX_SOL_SOCKET &&
