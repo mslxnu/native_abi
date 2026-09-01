@@ -18,6 +18,15 @@
  *
  * So this checks the number as well as the behaviour. A test that only
  * exercised read and write would have passed throughout.
+ *
+ * And a third, found later: a dup of an eventfd was not one. The counter was
+ * held per descriptor rather than per eventfd, so the copy was an ordinary
+ * socketpair end again - a write to it moved no counter, made the original
+ * poll no differently, and went to the end nabi keeps. adbd is built on that
+ * exact pair, an eventfd for its epoll and a dup of it to write to, so every
+ * wakeup it sent went nowhere: it completed the connection handshake, read
+ * "OPEN shell,v2,raw:id", wrote to its dup to say so, and the thread in
+ * epoll_pwait was never told. `adb shell` hung with the daemon idle.
  */
 static long sys6(long n,long a,long b,long c,long d,long e,long f){
   register long x8 asm("x8")=n; register long x0 asm("x0")=a; register long x1 asm("x1")=b;
@@ -31,6 +40,8 @@ static long sys6(long n,long a,long b,long c,long d,long e,long f){
 #define SYS_exit 93
 #define SYS_ppoll 73
 #define SYS_eventfd2 19
+#define SYS_fcntl 25
+#define F_DUPFD_CLOEXEC 1030
 #define AT_FDCWD -100
 #define O_RDONLY 0
 #define EFD_CLOEXEC   02000000
@@ -119,6 +130,46 @@ void _start(void)
     fail("ppoll on a ready eventfd", r);
   if (r != 1 || !(pfd.revents & POLLIN))
     fail("a written eventfd did not poll readable; ready count", r);
+
+  /*
+   * A dup is the same eventfd. Everything below is done through the copy and
+   * checked on the original, because that is the way round adbd uses them.
+   */
+  long dup = sys6(SYS_fcntl, fd, F_DUPFD_CLOEXEC, 3, 0,0,0);
+  if (dup < 0)
+    fail("dup the eventfd", dup);
+  if (dup == fd)
+    fail("dup returned the same descriptor", dup);
+
+  /* Drain whatever the poll checks above left behind. */
+  ev_read((int) fd, &v);
+
+  if ((r = ev_write((int) dup, 5)) < 0)
+    fail("write through the dup", r);
+  pfd.fd = (int) fd; pfd.revents = 0;
+  if ((r = sys6(SYS_ppoll, (long) &pfd, 1, (long) &now, 0, 0, 0)) < 0)
+    fail("ppoll after a write through the dup", r);
+  if (r != 1 || !(pfd.revents & POLLIN))
+    fail("a write through the dup did not make the original readable; ready count", r);
+  if ((r = ev_read((int) fd, &v)) < 0)
+    fail("read the original after writing the dup", r);
+  if (v != 5)
+    fail("the dup wrote to a different counter; read back", (long) v);
+
+  /* And the other way, since a dup is symmetric. */
+  if ((r = ev_write((int) fd, 2)) < 0)
+    fail("write to the original", r);
+  if ((r = ev_read((int) dup, &v)) < 0)
+    fail("read through the dup", r);
+  if (v != 2)
+    fail("the original wrote to a different counter; read back through the dup", (long) v);
+
+  /* Closing one of them leaves the other a working eventfd. */
+  sys6(SYS_close, dup, 0,0,0,0,0);
+  if ((r = ev_write((int) fd, 3)) < 0)
+    fail("write after closing the dup", r);
+  if ((r = ev_read((int) fd, &v)) < 0 || v != 3)
+    fail("closing the dup took the eventfd with it; read back", (long) v);
 
   sys6(SYS_close, fd, 0,0,0,0,0);
   put("eventfd ok\n");

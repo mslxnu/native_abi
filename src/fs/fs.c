@@ -335,9 +335,23 @@ struct eventfd_state {
   int      notify_fd;   /* the end NABI keeps; the guest never sees it */
   uint64_t count;
   bool     semaphore;
+  int      refs;        /* descriptors pointing at this, dups included */
 };
 
-KHASH_MAP_INIT_INT(evfd, struct eventfd_state)
+/*
+ * The table is keyed by descriptor and the state is shared, because a dup of an
+ * eventfd is the same eventfd. Keeping the state by value made every entry its
+ * own object, so a dup was an ordinary socketpair end again: the counter did
+ * not move, nothing poked the descriptor, and a write of eight bytes went to
+ * the end NABI holds and stayed there.
+ *
+ * Which is precisely how adbd asks its event loop to look at something. It
+ * keeps the eventfd for epoll and a dup of it to write to, so every wakeup it
+ * sent went nowhere - adbd finished the connection handshake, read "OPEN
+ * shell,v2,raw:id" off the socket, wrote to its dup to say so, and the thread
+ * in epoll_pwait was never told. The shell request simply stopped there.
+ */
+KHASH_MAP_INIT_INT(evfd, struct eventfd_state *)
 static khash_t(evfd) *eventfds;
 
 /* NULL unless `fd` is one of ours, which is also the "is this an eventfd" test
@@ -348,7 +362,26 @@ eventfd_lookup(int fd)
   if (eventfds == NULL)
     return NULL;
   khiter_t k = kh_get(evfd, eventfds, fd);
-  return k == kh_end(eventfds) ? NULL : &kh_value(eventfds, k);
+  return k == kh_end(eventfds) ? NULL : kh_value(eventfds, k);
+}
+
+static void eventfd_forget(int fd);
+
+/*
+ * A second descriptor for the same eventfd. Called from every path that dups
+ * one, so that writing through the copy is writing to the eventfd.
+ */
+void
+eventfd_dup_fd(int oldfd, int newfd)
+{
+  struct eventfd_state *ev = eventfd_lookup(oldfd);
+  if (ev == NULL || oldfd == newfd)
+    return;
+  eventfd_forget(newfd);        /* dup2 onto a live eventfd closes that one */
+  int ret;
+  khiter_t k = kh_put(evfd, eventfds, newfd, &ret);
+  kh_value(eventfds, k) = ev;
+  ev->refs++;
 }
 
 /* Exactly one byte is outstanding whenever the counter is nonzero, so the
@@ -463,8 +496,14 @@ eventfd_forget(int fd)
   khiter_t k = kh_get(evfd, eventfds, fd);
   if (k == kh_end(eventfds))
     return;
-  close(kh_value(eventfds, k).notify_fd);
+  struct eventfd_state *ev = kh_value(eventfds, k);
   kh_del(evfd, eventfds, k);
+  /* The last descriptor for it takes the eventfd with it, which is what
+   * closing the last of a set of dups means. */
+  if (--ev->refs <= 0) {
+    close(ev->notify_fd);
+    free(ev);
+  }
 }
 
 #define LINUX_EFD_SEMAPHORE 1
@@ -507,13 +546,20 @@ DEFINE_SYSCALL(eventfd2, unsigned int, initval, int, flags)
     eventfds = kh_init(evfd);
   int ret;
   khiter_t k = kh_put(evfd, eventfds, sv[0], &ret);
-  kh_value(eventfds, k) = (struct eventfd_state){
+  struct eventfd_state *st = malloc(sizeof *st);
+  if (st == NULL) {
+    kh_del(evfd, eventfds, k);
+    goto fail;
+  }
+  kh_value(eventfds, k) = st;
+  *st = (struct eventfd_state){
+    .refs = 1,
     .notify_fd = sv[1],
     .count = initval,
     .semaphore = (flags & LINUX_EFD_SEMAPHORE) != 0,
   };
   if (initval > 0)
-    eventfd_poke(&kh_value(eventfds, k));
+    eventfd_poke(st);
 
   return sv[0];
 
@@ -2240,6 +2286,7 @@ darwinfs_fcntl(struct file *file, unsigned int cmd, unsigned long arg)
     r = syswrap(fcntl(file->fd, F_DUPFD, arg)); /* FIXME */
     if (r >= 0) {
       procfs_dup_fd(file->fd, r);
+      eventfd_dup_fd(file->fd, r);
       int err = register_fd(r, false);
       if (err < 0) {
         close(r);
@@ -2253,6 +2300,7 @@ darwinfs_fcntl(struct file *file, unsigned int cmd, unsigned long arg)
     r = syswrap(fcntl(file->fd, F_DUPFD_CLOEXEC, arg));
     if (r >= 0) {
       procfs_dup_fd(file->fd, r);
+      eventfd_dup_fd(file->fd, r);
       int err = register_fd(r, true);
       if (err < 0) {
         close(r);
@@ -6951,6 +6999,7 @@ DEFINE_SYSCALL(dup, unsigned int, fd)
   int ret = sys_fcntl(fd, LINUX_F_DUPFD, 0);
   if (ret >= 0) {
     procfs_dup_fd(fd, ret);
+    eventfd_dup_fd(fd, ret);
     int err = register_fd(ret, false);
     if (err < 0) {
       close(ret);
@@ -6970,6 +7019,7 @@ DEFINE_SYSCALL(dup2, unsigned int, fd1, unsigned int, fd2)
   int ret = syswrap(dup2(fd1, fd2));
   if (ret >= 0) {
     procfs_dup_fd(fd1, ret);
+    eventfd_dup_fd(fd1, ret);
     int err = register_fd(ret, false);
     if (err < 0) {
       close(ret);
@@ -6995,6 +7045,7 @@ DEFINE_SYSCALL(dup3, unsigned int, oldfd, unsigned int, newfd, int, flags)
     goto out;
   }
   procfs_dup_fd(oldfd, ret);
+  eventfd_dup_fd(oldfd, ret);
   if (flags & LINUX_O_CLOEXEC) {
     int fcntl_err = syswrap(fcntl(newfd, F_SETFD, FD_CLOEXEC));
     if (fcntl_err < 0) {
