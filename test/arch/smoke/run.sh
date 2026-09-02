@@ -1477,6 +1477,21 @@ else
     fail=1
 fi
 
+# procsystest: the /proc files that describe the machine rather than a process.
+# mSL/ProcFS answered them with the host Mac's - /proc/filesystems listed apfs
+# and devfs, /proc/cmdline was the macOS kernel's boot-args offered to Android's
+# init as the line it parses androidboot.* out of - and its /proc/kmsg reported
+# end of file for ever while poll called the descriptor readable, which is what
+# logd spun on for the life of every boot.
+cp "$here/procsystest" "$root/"; chmod +x "$root/procsystest"
+out=$("$NABI" -m "$root" /procsystest 2>&1 | tail -1); rc=$?
+if [ "$out" = "procsys ok" ]; then
+    echo "  ok  procsystest -> \"$out\""
+else
+    echo "  FAIL procsystest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 # bpftest: bpf(2) is not implemented and will not be - there is no kernel here
 # to load a program into - except for BPF_OBJ_GET, which hands back a
 # descriptor because a descriptor is the whole of what iptables does with one.

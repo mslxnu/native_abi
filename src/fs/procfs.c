@@ -173,7 +173,9 @@ enum procfs_file { PROCFS_NONE, PROCFS_MAPS, PROCFS_CMDLINE, PROCFS_COMM,
                    PROCFS_UID_MAP, PROCFS_GID_MAP, PROCFS_SETGROUPS,
                    PROCFS_MOUNTINFO, PROCFS_STAT, PROCFS_STATUS, PROCFS_CGROUP,
                    PROCFS_ATTR,
-                   PROCFS_NET_DEV };
+                   PROCFS_NET_DEV,
+                   PROCFS_FILESYSTEMS, PROCFS_KCMDLINE, PROCFS_BOOTCONFIG,
+                   PROCFS_KMSG };
 
 /* For PROCFS_FD, the number after /fd/. Meaningless for the others. */
 static enum procfs_file
@@ -188,6 +190,27 @@ own_procfs_file_n(const char *path, int *fd_out)
    * software still opens the short name directly. */
   if (strcmp(rest, "mounts") == 0)
     return PROCFS_MOUNTS;
+
+  /*
+   * The three system-wide files that describe the machine rather than a
+   * process, and the kernel log.
+   *
+   * These were mSL/ProcFS's until now, and what it answered them with was the
+   * host Mac's: /proc/filesystems listed apfs and devfs, and /proc/cmdline was
+   * the *macOS kernel's* boot-args - "-arm64e_preview_abi kext-dev-mode=1
+   * debug=0x144 keepsyms=1" - offered to Android's init as the Linux command
+   * line it parses androidboot.* out of. The same mistake as the sysvipc files
+   * above, and the same shape: the file exists, it parses, and what it says is
+   * about the wrong machine.
+   */
+  if (strcmp(rest, "filesystems") == 0)
+    return PROCFS_FILESYSTEMS;
+  if (strcmp(rest, "cmdline") == 0)      /* the kernel's, not a process's */
+    return PROCFS_KCMDLINE;
+  if (strcmp(rest, "bootconfig") == 0)
+    return PROCFS_BOOTCONFIG;
+  if (strcmp(rest, "kmsg") == 0)
+    return PROCFS_KMSG;
 
   /*
    * The two files under /proc/sys/kernel/random that are read rather than
@@ -878,6 +901,69 @@ build_sysvipc(enum procfs_file which, size_t *len_out)
 }
 
 /*
+ * /proc/filesystems: what can be mounted, which here means what mount.c knows
+ * how to mount. "nodev" is the first field for a filesystem that needs no
+ * block device behind it, and a leading tab for one that does; a caller looking
+ * for a type greps for the name and the prefix is what tells it whether to go
+ * looking for a device.
+ *
+ * The host's answer was its own list - apfs, devfs, procfs, ext2fs - which
+ * names nothing a Linux guest can mount and omits everything it can. Android
+ * looks for ext4 here before it will use a partition.
+ */
+static char *
+build_filesystems(size_t *len)
+{
+  static const char *const nodev[] = {
+    "rootfs", "proc", "sysfs", "devtmpfs", "tmpfs", "devpts",
+    "cgroup", "cgroup2", "mqueue", "securityfs", "debugfs", "binderfs",
+  };
+  static const char *const backed[] = { "ext2", "ext3", "ext4" };
+
+  size_t cap = 512;
+  char *out = malloc(cap);
+  if (out == NULL)
+    return NULL;
+  size_t n = 0;
+  for (size_t i = 0; i < sizeof nodev / sizeof nodev[0]; i++)
+    n += (size_t) snprintf(out + n, cap - n, "nodev\t%s\n", nodev[i]);
+  for (size_t i = 0; i < sizeof backed / sizeof backed[0]; i++)
+    n += (size_t) snprintf(out + n, cap - n, "\t%s\n", backed[i]);
+  *len = n;
+  return out;
+}
+
+/*
+ * /proc/cmdline: empty, because there is no kernel here to have been given
+ * arguments. A line with nothing on it is what a kernel booted without any has,
+ * and it is the honest answer - the alternative on offer was the host's, which
+ * is the arguments *macOS* booted with, and every one of them is meaningless to
+ * the guest reading it.
+ */
+static char *
+build_kcmdline(size_t *len)
+{
+  char *out = malloc(2);
+  if (out == NULL)
+    return NULL;
+  out[0] = '\n';
+  *len = 1;
+  return out;
+}
+
+/* /proc/bootconfig: empty, for the same reason, and empty is what a kernel with
+ * bootconfig support and no bootconfig gives. */
+static char *
+build_bootconfig(size_t *len)
+{
+  char *out = malloc(1);
+  if (out == NULL)
+    return NULL;
+  *len = 0;
+  return out;
+}
+
+/*
  * Linux's NGROUPS_MAX, which is what the kernel would let a process have. The
  * number is Linux's own and has been 65536 since 2.6.4; nothing here enforces
  * it, so reporting anything else would only mislead a caller sizing an array.
@@ -1298,19 +1384,46 @@ procfs_stat(const char *path, bool nofollow, uint32_t *mode, uint64_t *size,
     *size = 0;
     *ino  = 2;
     return true;
+  case PROCFS_FILESYSTEMS:
+  case PROCFS_KCMDLINE:
+  case PROCFS_BOOTCONFIG:
+    /* Readable by anyone and sized zero, which is what /proc says about a file
+     * whose contents are made when they are read. */
+    *mode = 0444 | 0100000;
+    *size = 0;
+    *ino  = 4;
+    return true;
+  case PROCFS_KMSG:
+    /* Root's alone, as Linux has it. */
+    *mode = 0400 | 0100000;
+    *size = 0;
+    *ino  = 5;
+    return true;
   default:
     return false;
   }
 }
 
 int
-procfs_open(const char *path, int *out_fd)
+procfs_open(const char *path, int flags, int *out_fd)
 {
   size_t len = 0;
   char *content = NULL;
   int fdno = -1;
 
   switch (own_procfs_file_n(path, &fdno)) {
+  case PROCFS_KMSG:
+    /*
+     * The same log /dev/kmsg reads, which is nabi's because there is no kernel
+     * here to keep one. Both names have always been the one log on Linux; the
+     * difference is that a read at the end of it waits rather than reporting
+     * end of file, and that difference is the whole of what logd does.
+     *
+     * The host's /proc/kmsg said the opposite: poll reported the descriptor
+     * readable and the read returned zero, over and over, so logd spun on it
+     * for the life of the boot. A core spent saying there is nothing to say.
+     */
+    return kmsg_open(path, flags, out_fd);
   case PROCFS_TASKDIR: {
     /*
      * One entry per guest task, named by its thread id, as directories -
@@ -1561,6 +1674,15 @@ procfs_open(const char *path, int *out_fd)
   case PROCFS_SYSVIPC_SEM:
   case PROCFS_SYSVIPC_MSG:
     content = build_sysvipc(own_procfs_file_n(path, &fdno), &len);
+    break;
+  case PROCFS_FILESYSTEMS:
+    content = build_filesystems(&len);
+    break;
+  case PROCFS_KCMDLINE:
+    content = build_kcmdline(&len);
+    break;
+  case PROCFS_BOOTCONFIG:
+    content = build_bootconfig(&len);
     break;
   default:
     return -1;      /* not ours; the caller does the ordinary lookup */

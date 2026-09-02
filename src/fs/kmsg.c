@@ -289,6 +289,54 @@ kmsg_write(int fd, const char *buf, size_t size, int *ret)
  * one - so a blocking reader looks again on a short interval, and can be
  * interrupted by a signal like any other blocking read.
  */
+/*
+ * Whether a record is waiting for this reader.
+ *
+ * What poll has to be told, rather than what the host says about the file the
+ * log is kept in. The two disagree in both directions and for the same reason -
+ * it is a regular file - so poll calls it readable always and kqueue will not
+ * raise a read event for it at all.
+ *
+ * Left to the host, a reader is told the descriptor is ready, reads, is told
+ * there is nothing there, and asks again. logd does exactly that and spent
+ * every boot doing it.
+ */
+bool
+kmsg_readable(int fd)
+{
+  pthread_mutex_lock(&readers_lock);
+  struct kmsg_reader *r = kmsg_lookup(fd);
+  bool ours = r != NULL;
+  off_t pos = ours ? r->pos : 0;
+  pthread_mutex_unlock(&readers_lock);
+  if (!ours)
+    return false;
+
+  int log = kmsg_log_open();
+  if (log < 0)
+    return false;
+  char rec[KMSG_MAX_RECORD + 128];
+  ssize_t n = pread(log, rec, sizeof rec, pos);
+  /* A whole record, since that is what a read would hand over; half of one is
+   * a record still being written and not yet anybody's to read. */
+  bool have = n > 0 && memchr(rec, '\n', (size_t) n) != NULL;
+  close(log);
+  return have;
+}
+
+/* Whether anything is reading the log at all, so the readiness fix-ups above
+ * cost nothing on a guest that never opens it. */
+bool
+kmsg_any(void)
+{
+  pthread_mutex_lock(&readers_lock);
+  bool any = false;
+  for (size_t i = 0; i < sizeof readers / sizeof readers[0]; i++)
+    if (readers[i].fd >= 0) { any = true; break; }
+  pthread_mutex_unlock(&readers_lock);
+  return any;
+}
+
 bool
 kmsg_read(int fd, char *buf, size_t size, int *ret)
 {

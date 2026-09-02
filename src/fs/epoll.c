@@ -306,7 +306,7 @@ epoll_wait_common(int epfd, gaddr_t events_ptr, int maxevents, int timeout)
    */
   struct epoll_reg pb[64];
   int npb = 0;
-  if (tee_pending() || pidfd_any()) {
+  if (tee_pending() || pidfd_any() || kmsg_any()) {
     pthread_mutex_lock(&epoll_lock);
     epoll_regs_init();
     for (khiter_t k = kh_begin(epoll_regs); k != kh_end(epoll_regs); k++) {
@@ -324,10 +324,11 @@ epoll_wait_common(int epfd, gaddr_t events_ptr, int maxevents, int timeout)
        * pipe, and a pidfd whose process has gone - the latter because kqueue
        * does not raise EVFILT_READ for a regular file at all, which is what a
        * pidfd is here. Without this an event loop waiting on a pidfd would
-       * never learn that the process exited.
+       * never learn that the process exited. The kernel log is a file too, and
+       * is here for the same reason.
        */
       if (npb < (int) (sizeof pb / sizeof pb[0]) &&
-          (tee_readable(rfd) || pidfd_readable(rfd)))
+          (tee_readable(rfd) || pidfd_readable(rfd) || kmsg_readable(rfd)))
         pb[npb++] = reg;
     }
     pthread_mutex_unlock(&epoll_lock);

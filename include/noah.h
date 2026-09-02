@@ -267,6 +267,8 @@ void kmsg_close(int fd);
 bool kmsg_is(int fd);
 bool kmsg_write(int fd, const char *buf, size_t size, int *ret);
 bool kmsg_read(int fd, char *buf, size_t size, int *ret);
+bool kmsg_readable(int fd);
+bool kmsg_any(void);
 bool kmsg_lseek(int fd, off_t offset, int whence, int *ret);
 
 void reinit_process_tables(void);
@@ -363,7 +365,7 @@ void pdeathsig_clear(void);
 bool guest_path_of_fd(int fd, char *out, size_t outsz);
 bool guest_path_of_host(const char *host, char *out, size_t outsz);
 int vkern_open_exec(const char *path);
-int procfs_open(const char *path, int *out_fd);
+int procfs_open(const char *path, int flags, int *out_fd);
 void procfs_close_fd(int fd);
 int procfs_fd_number(const char *path);
 enum ns_type;

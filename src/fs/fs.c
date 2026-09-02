@@ -5588,12 +5588,12 @@ user_openat(int atdirfd, const char *name, int flags, int mode)
     ;
   } else if (loop_open(lookup, &fd) == 0) {
     ;
-  } else if (procfs_open(lookup, &fd) < 0) {
+  } else if (procfs_open(lookup, flags, &fd) < 0) {
     fd = do_openat(atdirfd, name, flags, mode);
     if (fd < 0) {
       char target[LINUX_PATH_MAX];
       if (symlink_into_procfs(atdirfd, name, target, sizeof target))
-        procfs_open(target, &fd);
+        procfs_open(target, flags, &fd);
     }
   }
   /*
@@ -7478,10 +7478,21 @@ poll_common(gaddr_t fds_ptr, int nfds, int timeout)
     goto out;
   }
 
+  /*
+   * The kernel log is kept in a file, so the host calls its descriptor readable
+   * whether or not a record is waiting. Asked about it at all, poll returns at
+   * once and every time - so it is not asked. Readiness for these comes from
+   * kmsg_readable below, and the wait is given a tick to go and look.
+   */
+  bool have_kmsg = false;
+  bool any_kmsg = kmsg_any();
   for (int i = 0; i < nfds; i++) {
     d_fds[i] = l_fds[i];
     if (!in_userfd(l_fds[i].fd)) {
       d_fds[i].fd = -1;
+    } else if (any_kmsg && kmsg_is(l_fds[i].fd)) {
+      d_fds[i].fd = -1;
+      have_kmsg = true;
     }
   }
 
@@ -7515,6 +7526,21 @@ poll_common(gaddr_t fds_ptr, int nfds, int timeout)
   }
 
   /*
+   * How long to leave the kernel log unlooked-at. Only ever reached by a caller
+   * waiting on one, and a log is not a latency-sensitive thing to be woken for.
+   */
+#define KMSG_POLL_TICK_MS 20
+
+  int remaining = timeout;
+  for (;;) {
+  int this_timeout = remaining;
+  if (have_kmsg && !pushed &&
+      (remaining < 0 || remaining > KMSG_POLL_TICK_MS))
+    this_timeout = KMSG_POLL_TICK_MS;
+  struct timespec w0, w1;
+  clock_gettime(CLOCK_MONOTONIC, &w0);
+
+  /*
    * A signal nabi noticed on the guest's behalf is not an interruption the
    * guest asked for. Its host handler runs and returns, the host poll gives up
    * with EINTR, and on Linux nothing would have happened at all: the signal is
@@ -7532,17 +7558,17 @@ poll_common(gaddr_t fds_ptr, int nfds, int timeout)
    */
   for (;;) {
     struct timespec t0, t1;
-    bool timed = timeout > 0;
+    bool timed = this_timeout > 0;
     if (timed)
       clock_gettime(CLOCK_MONOTONIC, &t0);
-    r = syswrap(poll(d_fds, nfds, timeout));
+    r = syswrap(poll(d_fds, nfds, this_timeout));
     if (r != -LINUX_EINTR || !sigrestart_wanted())
       break;
     if (timed) {
       clock_gettime(CLOCK_MONOTONIC, &t1);
       long spent = (t1.tv_sec - t0.tv_sec) * 1000 +
                    (t1.tv_nsec - t0.tv_nsec) / 1000000;
-      timeout = spent >= timeout ? 0 : timeout - (int) spent;
+      this_timeout = spent >= this_timeout ? 0 : this_timeout - (int) spent;
     }
   }
   if (r < 0)
@@ -7557,7 +7583,7 @@ poll_common(gaddr_t fds_ptr, int nfds, int timeout)
     }
   }
 
-  if (pushed || pidfd_any()) {
+  if (pushed || pidfd_any() || kmsg_any()) {
     for (int i = 0; i < nfds; i++) {
       if (!in_userfd(l_fds[i].fd))
         continue;
@@ -7575,6 +7601,20 @@ poll_common(gaddr_t fds_ptr, int nfds, int timeout)
         if (!was && now) r++;
         continue;
       }
+      /*
+       * The kernel log, for the same reason and in the same way: it is kept in
+       * a file, so the host calls it readable whether or not a record is
+       * waiting. Told that, a reader reads, is given nothing, and asks again -
+       * which is what logd did for the whole of every boot.
+       */
+      if (kmsg_is(l_fds[i].fd)) {
+        bool was = (l_fds[i].revents != 0);
+        l_fds[i].revents = kmsg_readable(l_fds[i].fd) ? POLLIN : 0;
+        bool now = (l_fds[i].revents != 0);
+        if (was && !now) r--;
+        if (!was && now) r++;
+        continue;
+      }
       if ((l_fds[i].events & POLLIN) && !(l_fds[i].revents & POLLIN) &&
           tee_readable(l_fds[i].fd)) {
         if (l_fds[i].revents == 0)
@@ -7583,6 +7623,29 @@ poll_common(gaddr_t fds_ptr, int nfds, int timeout)
       }
     }
   }
+
+  /*
+   * Nothing ready yet, and the caller asked to wait. Round again rather than
+   * answering zero, which for a wait with no deadline is an answer that cannot
+   * be true - and which a caller reads as "look again", so it asks immediately
+   * and for ever. logd waits on the kernel log exactly that way.
+   */
+  if (r > 0 || remaining == 0)
+    break;
+  if (!have_kmsg)
+    break;                      /* the host's wait was the whole wait */
+  clock_gettime(CLOCK_MONOTONIC, &w1);
+  if (remaining > 0) {
+    long spent = (w1.tv_sec - w0.tv_sec) * 1000 +
+                 (w1.tv_nsec - w0.tv_nsec) / 1000000;
+    if (spent >= remaining) {
+      r = 0;
+      break;
+    }
+    remaining -= (int) spent;
+  }
+  }
+#undef KMSG_POLL_TICK_MS
 
   if (copy_to_user(fds_ptr, l_fds, nfds * sizeof(struct pollfd))) {
     r = -LINUX_EFAULT;
