@@ -1477,6 +1477,20 @@ else
     fail=1
 fi
 
+# bpftest: bpf(2) is not implemented and will not be - there is no kernel here
+# to load a program into - except for BPF_OBJ_GET, which hands back a
+# descriptor because a descriptor is the whole of what iptables does with one.
+# Told ENOSYS, iptables fails the rule with "bpf: failed to get bpf object",
+# which fails netd's batch and takes netd with it.
+cp "$here/bpftest" "$root/"; chmod +x "$root/bpftest"
+out=$("$NABI" -m "$root" /bpftest 2>&1 | tail -1); rc=$?
+if [ "$out" = "bpf ok" ]; then
+    echo "  ok  bpftest -> \"$out\""
+else
+    echo "  FAIL bpftest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 # netfiltertest: netfilter's tables, as far as iptables can tell. iptables reads
 # and writes whole tables through four socket options on a raw socket, and
 # libiptc walks the entry blob by the offsets inside it - so the sizes are the

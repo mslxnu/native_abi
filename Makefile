@@ -153,6 +153,7 @@ COMMON_SRCS := src/main.c \
                src/fs/binder_broker.c \
                src/fs/epoll.c \
                src/fs/procfs.c \
+               src/sys/bpf.c \
                src/sys/sys.c \
                src/sys/time.c \
                src/mm/mm.c \

@@ -175,16 +175,16 @@ char *sc_name_table[NR_SYSCALLS] = {
  * already knows how to stop at.
  */
 /*
- * bpf: loading programs into the kernel to run at its hook points.
+ * bpf lives in src/sys/bpf.c, and almost all of it is still not implemented for
+ * the reason that used to be written here: there is no kernel to load a program
+ * into. nabi is the Linux system call interface implemented in a userspace
+ * process on macOS - no tracepoints to attach to, no verifier, no maps in
+ * kernel memory, and nothing that could execute a program if one were handed
+ * over. A caller told otherwise would attach a probe that never fires.
  *
- * There is no kernel here to load them into. nabi is the Linux system call
- * interface implemented in a userspace process on macOS; there are no
- * tracepoints to attach to, no verifier, no maps in kernel memory, and nothing
- * that could execute a bpf program if one were handed over. This is not a
- * facility that is missing, it is one the shape of this program has no place
- * for - and a caller told otherwise would attach a probe that never fires.
+ * The single exception is BPF_OBJ_GET, which hands back a descriptor because a
+ * descriptor is the whole of what iptables does with one. See the file.
  */
-DEFINE_NOT_IMPLEMENTED_SYSCALL(bpf)
 
 /*
  * add_key: the kernel keyring.
