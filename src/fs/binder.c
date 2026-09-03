@@ -1212,6 +1212,28 @@ do_transaction(struct binder_ep *from, const struct btr *tr, bool reply,
    */
   m->reply_tid = reply ? back_to_tid
                        : ((tr->flags & TF_ONE_WAY) ? 0 : call_tid());
+  /*
+   * A slot is reused where it lies and nothing clears it between occupants, so
+   * every field a message needs has to be written here. This one was not, and
+   * it is the count of how many threads have declined to take a reply that is
+   * not theirs - so a new reply inherited whatever the last message to use the
+   * slot had reached.
+   *
+   * Inheriting a count that has run out is the whole of the bug. The preference
+   * is then skipped on the message's first look, and the reply goes to whatever
+   * thread asks first: libbinder handles BR_REPLY only in waitForResponse, so a
+   * pool thread that receives one reaches executeCommand, which has no case for
+   * it and answers UNKNOWN_ERROR. The reply is gone, and the thread that made
+   * the call waits for it for ever - which is a boot that stops at whichever
+   * service was unlucky, and stops for good.
+   *
+   * It is intermittent for exactly the reason that it depends on what the slot
+   * held before. Measured over fourteen boots it takes the stall from about one
+   * run in three to about one in seven, so it is a cause and not the only one:
+   * what is left behind it is a reply owed to a thread that is polling a
+   * different endpoint of the same process, which this does not touch.
+   */
+  m->passed_over = 0;
   m->sender_euid = 0;
   m->data_size = tr->data_size;
   m->offsets_size = tr->offsets_size;
