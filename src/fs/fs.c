@@ -6715,7 +6715,16 @@ DEFINE_SYSCALL(mkdirat, int, dirfd, gstr_t, path_ptr, int, mode)
     return r;
   }
   r = path.fs->ops->mkdirat(path.fs, path.dir, path.subpath, mode);
-  if (r >= 0)
+  /*
+   * Also when it was already there. A cgroup's directory is an ordinary host
+   * one and outlives the boot that made it, while the names guests choose do
+   * not - they are built from pids, and pids come round again. So a guest can
+   * make a cgroup, be told it exists, and find nothing in it to read or to
+   * join, which is a state no cgroupfs can be in. Populating is idempotent and
+   * only touches paths inside the hierarchy, so the cheapest way to keep that
+   * true is to do it either way.
+   */
+  if (r >= 0 || r == -LINUX_EEXIST)
     cgroup_after_mkdir(dirfd, name);
   vfs_ungrab_dir(&path);
   return r;
