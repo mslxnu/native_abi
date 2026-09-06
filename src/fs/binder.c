@@ -233,12 +233,6 @@ struct bmsg {
    * queues a reply on the calling *thread*, not on the process.
    */
   uint64_t reply_tid;
-  /*
-   * How many times a thread that is not the one owed this reply has looked at
-   * it and left it alone. Bounded, because the thread it is owed to may never
-   * come back - see collect_messages.
-   */
-  uint32_t passed_over;
   uint64_t data_size, offsets_size;
   /* Where the parts sit inside `data`, which is the buffer as the receiver
    * will see it: the parcel, the offsets, then the scatter-gather copies. */
@@ -1233,7 +1227,6 @@ do_transaction(struct binder_ep *from, const struct btr *tr, bool reply,
    * what is left behind it is a reply owed to a thread that is polling a
    * different endpoint of the same process, which this does not touch.
    */
-  m->passed_over = 0;
   m->sender_euid = 0;
   m->data_size = tr->data_size;
   m->offsets_size = tr->offsets_size;
@@ -1465,6 +1458,7 @@ do_transaction(struct binder_ep *from, const struct btr *tr, bool reply,
   return 0;
 }
 
+
 /*
  * Collect whatever has been left for this endpoint and turn it into the
  * commands the guest will read. This is where a message becomes a pointer into
@@ -1503,15 +1497,19 @@ collect_messages(struct binder_ep *e)
      * the receiver polling an empty pending buffer - which is what stopped
      * about one Android boot in three, at whichever `vdc` exec came first.
      *
-     * So the preference is given a bounded number of chances. The thread that
-     * is owed it polls constantly and will take it long before the count runs
-     * out; a thread that is gone never will, and after that anyone may.
+     * So it is left there, and only there. Linux queues a reply on the todo
+     * list of the thread that made the call and frees it if that thread exits;
+     * no other thread is ever offered it, and neither is one here.
+     *
+     * Giving it to somebody else after a while was tried twice, first after a
+     * count of how many other threads had declined it and then after a
+     * deadline. Both hand a reply to a thread that answers UNKNOWN_ERROR, and
+     * the caller waits for ever either way - so the fallback only chose how
+     * long the boot took to wedge. Nothing is owed to a thread that has gone,
+     * because the caller went with it.
      */
-    if (m->is_reply && m->reply_tid != 0 && m->reply_tid != me &&
-        m->passed_over < 64) {
-      m->passed_over++;
+    if (m->is_reply && m->reply_tid != 0 && m->reply_tid != me)
       continue;
-    }
     uint64_t total = m->total ? m->total : (m->data_size + m->offsets_size);
     uint64_t at = arena_take(e, total ? total : 8);
     if (at == 0)

@@ -1552,6 +1552,20 @@ else
     fail=1
 fi
 
+# binderownreplytest: a reply is for the thread that made the call and for
+# nobody else. nabi used to hand it to somebody else eventually - after a count
+# of how many other threads had declined it, and later after a deadline - and
+# both give a BR_REPLY to a thread that answers UNKNOWN_ERROR, leaving the
+# thread that made the call waiting for ever.
+cp "$here/binderownreplytest" "$root/"; chmod +x "$root/binderownreplytest"
+out=$(NABI_BINDER=emulated "$NABI" -m "$root" /binderownreplytest 2>&1 | tail -1); rc=$?
+if [ "$out" = "binderownreply ok" ]; then
+    echo "  ok  binderownreplytest -> \"$out\""
+else
+    echo "  FAIL binderownreplytest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 # binderwraptest: one buffer the receiver keeps must not close the arena. The
 # mark that goes round tested exactly one range for being free - the one it had
 # just wrapped onto - so a buffer still held at the front of the arena refused
