@@ -162,7 +162,9 @@ static uint64_t balign(uint64_t v) { return (v + 7) & ~(uint64_t) 7; }
 #define BINDER_CTX_NAME 32
 
 /* Calls one endpoint can be answering at once, one per looper thread. */
-#define BINDER_MAX_CALLS 16
+/* Calls in flight on one endpoint, across all of its threads - not per thread,
+ * because a reentrant thread is inside several at once and each takes a slot. */
+#define BINDER_MAX_CALLS 64
 
 #define BINDER_MAX_FIXUPS 4
 #define BINDER_PENDING    (64 * 1024)
@@ -345,8 +347,14 @@ struct binder_ep {
    * which is to say a process could only answer itself. vdc asks vold to mark
    * a boot attempt and waits; the answer went nowhere, and init waited on the
    * two of them until it declared the service hung.
+   *
+   * A thread can be inside more than one of them at once, so each is pushed
+   * with the order it arrived in and the innermost is the one answered next.
    */
-  struct { uint64_t tid; uint32_t sender_ep; uint64_t sender_tid; } calls[BINDER_MAX_CALLS];
+  struct {
+    uint64_t tid; uint32_t sender_ep; uint64_t sender_tid; uint64_t depth;
+  } calls[BINDER_MAX_CALLS];
+  uint64_t call_seq;             /* rising, so `depth` orders the nesting */
 
   /* Commands waiting to be read, as the bytes the guest will be given. */
   unsigned char pending[BINDER_PENDING];
@@ -1078,34 +1086,59 @@ call_tid(void)
   return (uint64_t) pthread_mach_thread_np(pthread_self());
 }
 
-/* Remember that this thread is answering a call from `sender`. */
+/*
+ * Remember that this thread is answering a call from `sender`.
+ *
+ * Pushed, not assigned: a thread can be inside more than one call at a time.
+ * libbinder answers incoming transactions while it waits for the reply to one
+ * of its own - that is what makes binder reentrant - so a thread part way
+ * through answering A can be handed B, and it then owes two replies. Linux
+ * keeps exactly this, per thread, as the transaction stack.
+ *
+ * Keeping one slot per thread and overwriting it lost the outer call the
+ * instant a nested one arrived. The reply to B took the slot; the reply to A
+ * then found nothing, fell back to this endpoint, and the caller of A was never
+ * answered at all - a boot that stops with a reply owed and never collected.
+ */
 static void
 call_note(struct binder_ep *e, uint32_t sender, uint64_t sender_tid)
 {
   uint64_t me = call_tid();
   for (int i = 0; i < BINDER_MAX_CALLS; i++)
-    if (e->calls[i].tid == me || e->calls[i].tid == 0) {
+    if (e->calls[i].tid == 0) {
       e->calls[i].tid = me;
       e->calls[i].sender_ep = sender;
       e->calls[i].sender_tid = sender_tid;
+      e->calls[i].depth = ++e->call_seq;
       return;
     }
 }
 
-/* Who this thread owes a reply to, and forget it - a reply is answered once. */
+/*
+ * Who this thread owes a reply to, and forget it - a reply is answered once.
+ *
+ * The innermost call this thread is inside, because calls nest and their
+ * replies come back in the reverse order: the reply being written now is for
+ * the most recent call handed to this thread, not the first one.
+ */
 static uint32_t
 call_take(struct binder_ep *e, uint64_t *sender_tid)
 {
   uint64_t me = call_tid();
+  int best = -1;
   for (int i = 0; i < BINDER_MAX_CALLS; i++)
-    if (e->calls[i].tid == me) {
-      uint32_t s = e->calls[i].sender_ep;
-      if (sender_tid) *sender_tid = e->calls[i].sender_tid;
-      e->calls[i].tid = 0;
-      e->calls[i].sender_ep = 0;
-      e->calls[i].sender_tid = 0;
-      return s;
-    }
+    if (e->calls[i].tid == me &&
+        (best < 0 || e->calls[i].depth > e->calls[best].depth))
+      best = i;
+  if (best >= 0) {
+    uint32_t s = e->calls[best].sender_ep;
+    if (sender_tid) *sender_tid = e->calls[best].sender_tid;
+    e->calls[best].tid = 0;
+    e->calls[best].sender_ep = 0;
+    e->calls[best].sender_tid = 0;
+    e->calls[best].depth = 0;
+    return s;
+  }
   if (sender_tid) *sender_tid = 0;
   return 0;
 }

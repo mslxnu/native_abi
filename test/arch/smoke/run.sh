@@ -1566,6 +1566,22 @@ else
     fail=1
 fi
 
+# bindernesttest: a thread answering two calls at once owes both of the callers
+# a reply. Binder is reentrant - libbinder answers incoming transactions while
+# it waits for the reply to a call of its own - so a thread part way through
+# answering A is routinely handed B, and owes two replies innermost first. nabi
+# kept one slot per thread and overwrote it, so the nested call erased the outer
+# one: B's caller was answered, and A's waited for a reply that had gone back to
+# the replying endpoint instead.
+cp "$here/bindernesttest" "$root/"; chmod +x "$root/bindernesttest"
+out=$(NABI_BINDER=emulated "$NABI" -m "$root" /bindernesttest 2>&1 | tail -1); rc=$?
+if [ "$out" = "bindernest ok" ]; then
+    echo "  ok  bindernesttest -> \"$out\""
+else
+    echo "  FAIL bindernesttest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 # binderwraptest: one buffer the receiver keeps must not close the arena. The
 # mark that goes round tested exactly one range for being free - the one it had
 # just wrapped onto - so a buffer still held at the front of the arena refused
