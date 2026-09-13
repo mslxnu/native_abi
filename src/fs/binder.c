@@ -1144,6 +1144,53 @@ call_take(struct binder_ep *e, uint64_t *sender_tid)
 }
 
 /*
+ * Why a pass left a message queued, and what was queued in the first place.
+ *
+ * Set NABI_BINDER_TALLY to turn it on; it prints through printk, so it needs
+ * -o as well and costs nothing in a normal run. The pair is the point: a
+ * "queued" line names the endpoint a call was put in front of, and a "left"
+ * line says why a pass over that queue walked past it. A stall with a queued
+ * line and no delivery is a message nobody would take; a stall with no queued
+ * line at all never got sent, which is a different bug in a different place.
+ *
+ * collect_messages runs on every binder read and a polling pool runs it
+ * thousands of times a second, so printing every pass would bury the run in its
+ * own log. Only a change in what is being said gets printed, plus one line
+ * every TALLY_REPEAT repeats so that a stall which never changes still keeps
+ * saying it is there.
+ */
+#define TALLY_REPEAT 4096
+
+static void
+tally(struct binder_ep *e, const char *what, uint32_t to_ep,
+      const struct bmsg *m)
+{
+  static int on = -1;
+  if (on < 0)
+    on = getenv("NABI_BINDER_TALLY") != NULL;
+  if (!on)
+    return;
+
+  static __thread uint64_t last, n;
+  uint64_t key = (uint64_t)(uintptr_t) what ^ ((uint64_t) m->code << 8) ^
+                 ((uint64_t) m->sender_ep << 24) ^ (m->reply_tid << 1) ^
+                 ((uint64_t) to_ep << 40) ^ ((uint64_t) m->is_reply << 63);
+  if (key == last) {
+    if (++n % TALLY_REPEAT != 0)
+      return;
+  } else {
+    last = key;
+    n = 0;
+  }
+
+  printk("binder tally: %s to_ep=%u %s code=%u from_ep=%u reply_tid=%llu "
+         "poller=%llu arena=%llu/%llu\n",
+         what, to_ep, m->is_reply ? "reply" : "call", m->code, m->sender_ep,
+         (unsigned long long) m->reply_tid, (unsigned long long) call_tid(),
+         (unsigned long long) e->arena_brk, (unsigned long long) e->arena_size);
+}
+
+/*
  * One BC_TRANSACTION or BC_REPLY: allocate in the *receiver's* arena, copy the
  * payload there, and hand the receiver a pointer into its own memory. That
  * copy is what binder is: the sender's buffer is never shared, so neither side
@@ -1480,6 +1527,7 @@ do_transaction(struct binder_ep *from, const struct btr *tr, bool reply,
   }
 
   m->used = 1;
+  tally(from, "queued", dst->id, m);
   uint32_t wake_id = dst->id;
   shm_unlock();
 
@@ -1541,15 +1589,21 @@ collect_messages(struct binder_ep *e)
      * long the boot took to wedge. Nothing is owed to a thread that has gone,
      * because the caller went with it.
      */
-    if (m->is_reply && m->reply_tid != 0 && m->reply_tid != me)
+    if (m->is_reply && m->reply_tid != 0 && m->reply_tid != me) {
+      tally(e, "left: reply owed to another thread", e->id, m);
       continue;
+    }
     uint64_t total = m->total ? m->total : (m->data_size + m->offsets_size);
     uint64_t at = arena_take(e, total ? total : 8);
-    if (at == 0)
+    if (at == 0) {
+      tally(e, "left: no arena room", e->id, m);
       break;                     /* no room yet; it stays queued */
+    }
     void *dst = guest_to_host(at);
-    if (dst == NULL)
+    if (dst == NULL) {
+      tally(e, "left: no host mapping", e->id, m);
       break;
+    }
     memcpy(dst, m->data, total);
 
     struct btr out;
@@ -1720,6 +1774,7 @@ collect_messages(struct binder_ep *e)
       ep_queue(e, &out, sizeof out);
     }
     m->used = 0;
+    tally(e, "delivered", e->id, m);
   }
   shm_unlock();
 }
