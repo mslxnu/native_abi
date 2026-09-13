@@ -1229,6 +1229,50 @@ tally(struct binder_ep *e, const char *what, uint32_t to_ep,
 }
 
 /*
+ * Every pass over an endpoint's queue, and how much was sitting in it.
+ *
+ * This answers the one question the rest of the tally cannot: whether the
+ * receiver is ever asked to look. A message that is queued, never delivered and
+ * never refused has not been walked past - nothing walked at all. So if no line
+ * appears for an endpoint after work arrives for it, the wake did not wake
+ * anybody, and the fault is in what makes the descriptor readable rather than
+ * in the collecting; and if the lines do appear while the message stays put,
+ * the fault is here instead.
+ *
+ * The counting happens after the switch, not before it, so an endpoint that
+ * nobody is measuring does not pay for a walk of every slot on every read.
+ */
+static void
+look(struct binder_ep *e, int slot)
+{
+  static int on = -1;
+  if (on < 0)
+    on = getenv("NABI_BINDER_TALLY") != NULL;
+  if (!on)
+    return;
+
+  int used = 0;
+  for (int i = 0; i < BSHM_MSG_MAX; i++)
+    if (shm->ep[slot].q[i].used)
+      used++;
+
+  static __thread uint32_t last_ep;
+  static __thread int last_used = -1;
+  static __thread uint64_t n;
+  if (e->id == last_ep && used == last_used) {
+    if (++n % TALLY_REPEAT != 0)
+      return;
+  } else {
+    last_ep = e->id;
+    last_used = used;
+    n = 0;
+  }
+
+  printk("binder tally: look ep=%u waiting=%d poller=%llu\n",
+         e->id, used, (unsigned long long) call_tid());
+}
+
+/*
  * One BC_TRANSACTION or BC_REPLY: allocate in the *receiver's* arena, copy the
  * payload there, and hand the receiver a pointer into its own memory. That
  * copy is what binder is: the sender's buffer is never shared, so neither side
@@ -1627,6 +1671,8 @@ collect_messages(struct binder_ep *e)
     shm_unlock();
     return;
   }
+  look(e, slot);
+
   uint64_t me = call_tid();
   for (int i = 0; i < BSHM_MSG_MAX; i++) {
     struct bmsg *m = &shm->ep[slot].q[i];
