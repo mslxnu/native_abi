@@ -1582,6 +1582,21 @@ else
     fail=1
 fi
 
+# binderdeadtest: a transaction to an endpoint whose owner was killed is
+# answered rather than swallowed. The dead process never closed its descriptor,
+# so the slot and the wake fifo outlive it - and the fifo, having a name but no
+# reader, answers ENXIO. nabi discarded that and left the message in the corpse's
+# queue, where nothing would ever collect it, with the sender waiting on a reply
+# that could not come. BR_DEAD_REPLY now says so, the way Linux does.
+cp "$here/binderdeadtest" "$root/"; chmod +x "$root/binderdeadtest"
+out=$(NABI_BINDER=emulated "$NABI" -m "$root" /binderdeadtest 2>&1 | tail -1); rc=$?
+if [ "$out" = "binderdead ok" ]; then
+    echo "  ok  binderdeadtest -> \"$out\""
+else
+    echo "  FAIL binderdeadtest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 # binderwraptest: one buffer the receiver keeps must not close the arena. The
 # mark that goes round tested exactly one range for being free - the one it had
 # just wrapped onto - so a buffer still held at the front of the arena refused

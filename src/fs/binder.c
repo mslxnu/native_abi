@@ -73,6 +73,9 @@
 /* flat_binder_object.flags: this node wants the sec-ctx form. */
 #define FLAT_BINDER_FLAG_TXN_SECURITY_CTX 0x1000u
 #define BR_REPLY                 0x80407203u
+/* The target is gone. libbinder turns this into DEAD_OBJECT, which is an answer
+ * the caller can act on, rather than a wait that never ends. */
+#define BR_DEAD_REPLY            0x00007205u
 #define BR_TRANSACTION_COMPLETE  0x00007206u
 #define BR_NOOP                  0x0000720Cu
 #define BR_CLEAR_DEATH_NOTIFICATION_DONE 0x80087210u
@@ -743,28 +746,31 @@ wake_lost(uint32_t id, const char *how, ssize_t w)
          id, how, w, errno);
 }
 
-/* Wake whoever is waiting on an endpoint, wherever it is. */
-static void
+/*
+ * Wake whoever is waiting on an endpoint, wherever it is. True if a byte
+ * actually reached the fifo.
+ *
+ * The answer matters to a sender. A fifo that still has its name but no reader
+ * answers ENXIO, and that means the endpoint is gone - so the caller can tell
+ * "delivered" from "there is nobody there any more" instead of assuming the
+ * first and waiting for ever.
+ */
+static bool
 shm_wake(uint32_t id)
 {
   char path[PATH_MAX];
   wake_path(id, path, sizeof path);
   int fd = open(path, O_WRONLY | O_NONBLOCK);
   if (fd < 0) {
-    /*
-     * Both ways out of here lose a wakeup in silence, which is why they are
-     * said out loud under the tally. The message stays in the queue and the
-     * only thing that would have told anyone about it has gone: the receiver
-     * sits in epoll with work waiting and no reason to look.
-     */
     wake_lost(id, "open", -1);
-    return;                      /* nobody listening; the queue still has it */
+    return false;                /* nobody listening; the queue still has it */
   }
   char one = 1;
   ssize_t w = write(fd, &one, 1);
   if (w != 1)
     wake_lost(id, "write", w);   /* a full fifo answers EAGAIN and is dropped */
   close(fd);
+  return w == 1;
 }
 
 /* Readable when something is waiting, the way signalfd and eventfd do it. */
@@ -1561,9 +1567,39 @@ do_transaction(struct binder_ep *from, const struct btr *tr, bool reply,
   m->used = 1;
   tally(from, "queued", dst->id, m);
   uint32_t wake_id = dst->id;
+  int32_t  wake_pid = dst->pid;
   shm_unlock();
 
-  shm_wake(wake_id);
+  /*
+   * A wake that finds no reader means the endpoint is gone, and leaving the
+   * message where it is means leaving it there for ever: collect_messages only
+   * ever runs from a read on that same endpoint, and there is nobody left to
+   * read it. The sender would then wait for an answer that cannot come, which
+   * is an Android boot stopping at whichever service asked a dead one for
+   * something - both processes healthy, neither at fault, nothing said.
+   *
+   * So the message comes back out and the sender is told, which is what Linux
+   * does with BR_DEAD_REPLY; libbinder turns it into DEAD_OBJECT. The write
+   * itself still succeeds - returning an error here would abort the rest of
+   * the sender's write buffer, which is a larger failure than one dead target.
+   *
+   * The slot goes too if the owner really has gone, so the next send fails at
+   * once rather than repeating all of this. That is only a shortcut: the same
+   * check at open time is what actually reclaims slots, and a wake can fail
+   * for a live process whose descriptor is merely closed, which is why the
+   * message is withdrawn either way.
+   */
+  if (!shm_wake(wake_id)) {
+    shm_lock();
+    if (shm->ep[slot].used && shm->ep[slot].id == wake_id) {
+      m->used = 0;
+      if (wake_pid > 0 && kill((pid_t) wake_pid, 0) != 0 && errno == ESRCH)
+        shm->ep[slot].used = 0;
+    }
+    shm_unlock();
+    ep_queue_cmd(from, BR_DEAD_REPLY);
+    return 0;
+  }
 
   /* The sender is told its transaction was handed over. For a one-way call
    * that is the whole of the answer it gets. */
