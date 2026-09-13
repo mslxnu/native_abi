@@ -13,19 +13,19 @@ macOS processes.
 <img width="609" height="459" alt="nabi" src="https://github.com/mslxnu/native_abi/blob/master/.uploads/nabi.png" />
 </p>
 
-This is the main module of **mSL/XNU**, a modular macOS Subsystem for Linux.
+This is the main module of **mSL/XNU**, a macOS Subsystem for Linux.
 
 ## The larger project
 
 mSL/XNU — *macOS Subsystem for Linux / X is Now UNIX* — is a set of compatibility
-layers and utilities for macOS that aim at improving system compatibility with
+layers and utilities for macOS that aim to improve system compatibility with
 ported Linux, BSD and other Unix-like code.
 
 It also aims at **native, seamless execution of Linux ELF binaries on macOS**:
 not in a container and not in a virtual machine, but as ordinary processes on
 the running system.
 
-Reaching that needs several independent pieces, which is why the project is modular
+For this we have several independent pieces, which is why the project is modular
 rather than one monolith. Each is useful on its own, and each can be installed,
 replaced or omitted:
 
@@ -34,10 +34,6 @@ replaced or omitted:
 | **Syscall translation** | Linux system calls onto Darwin's, over `Hypervisor.framework` | **this repository** |
 | **Filesystem Hierarchy Standard** | Native Linux-style filesystem layout | [mSL/FHS](https://github.com/mslxnu/fhs) |
 | **procfs** | `/proc`, as a native pseudo-filesystem | [mSL/ProcFS](https://github.com/mslxnu/procfs) |
-| **sysfs** | `/sys`, as a native pseudo-filesystem | [mSL/SysFS](https://github.com/mslxnu/sysfs) |
-| **devfs** | `/dev` driver add-ons for macOS | [mSL/DevFS](https://github.com/mslxnu/devfs) |
-
-**This repository is the ABI piece.** The rest of this document describes it.
 
 ## What is mSL/NABI?
 
