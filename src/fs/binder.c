@@ -1256,11 +1256,33 @@ look(struct binder_ep *e, int slot)
     if (shm->ep[slot].q[i].used)
       used++;
 
+  /*
+   * How many slots answer to this endpoint's id, not just which one was taken.
+   *
+   * collect_messages takes the first match and stops; a sender arrives by a
+   * different road, through shm_ep_for_handle. If two slots ever carry one id
+   * those roads can end in different places, and the result looks exactly like
+   * what the stall looks like: the sender queues into one slot, the receiver
+   * scans the other for ever, and the message is neither delivered nor refused
+   * because nothing that walks the queue can see it.
+   */
+  int slots = 0;
+  for (int i = 0; i < BINDER_MAX_EP; i++)
+    if (shm->ep[i].used && shm->ep[i].id == e->id)
+      slots++;
+
+  /*
+   * Repeated far more often than the rest of the tally, because here the
+   * repetition *is* the finding: a receiver polling an empty queue over and
+   * over says one thing, and a receiver that has stopped polling says the
+   * opposite, and at one line every few thousand passes the two are
+   * indistinguishable. They have to be told apart.
+   */
   static __thread uint32_t last_ep;
   static __thread int last_used = -1;
   static __thread uint64_t n;
   if (e->id == last_ep && used == last_used) {
-    if (++n % TALLY_REPEAT != 0)
+    if (++n % 64 != 0)
       return;
   } else {
     last_ep = e->id;
@@ -1268,8 +1290,8 @@ look(struct binder_ep *e, int slot)
     n = 0;
   }
 
-  printk("binder tally: look ep=%u waiting=%d poller=%llu\n",
-         e->id, used, (unsigned long long) call_tid());
+  printk("binder tally: look ep=%u slot=%d slots=%d waiting=%d poller=%llu\n",
+         e->id, slot, slots, used, (unsigned long long) call_tid());
 }
 
 /*
