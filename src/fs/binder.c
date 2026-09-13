@@ -721,6 +721,28 @@ shm_queue_pending(struct binder_ep *e)
   return any;
 }
 
+/*
+ * A wakeup that was not delivered.
+ *
+ * This is the one thing on the path that fails in silence: shm_wake throws
+ * away both the open error and the write result, so a poke can vanish while
+ * the message it stood for stays in the queue, and the receiver then sits in
+ * epoll with work waiting and no reason to look. Off unless NABI_BINDER_TALLY
+ * is set, and rare by construction - no rate limit, because if these lines
+ * appear at all they are the answer rather than the noise.
+ */
+static void
+wake_lost(uint32_t id, const char *how, ssize_t w)
+{
+  static int on = -1;
+  if (on < 0)
+    on = getenv("NABI_BINDER_TALLY") != NULL;
+  if (!on)
+    return;
+  printk("binder tally: wake LOST ep=%u at %s ret=%zd errno=%d\n",
+         id, how, w, errno);
+}
+
 /* Wake whoever is waiting on an endpoint, wherever it is. */
 static void
 shm_wake(uint32_t id)
@@ -728,10 +750,20 @@ shm_wake(uint32_t id)
   char path[PATH_MAX];
   wake_path(id, path, sizeof path);
   int fd = open(path, O_WRONLY | O_NONBLOCK);
-  if (fd < 0)
+  if (fd < 0) {
+    /*
+     * Both ways out of here lose a wakeup in silence, which is why they are
+     * said out loud under the tally. The message stays in the queue and the
+     * only thing that would have told anyone about it has gone: the receiver
+     * sits in epoll with work waiting and no reason to look.
+     */
+    wake_lost(id, "open", -1);
     return;                      /* nobody listening; the queue still has it */
+  }
   char one = 1;
-  (void) write(fd, &one, 1);
+  ssize_t w = write(fd, &one, 1);
+  if (w != 1)
+    wake_lost(id, "write", w);   /* a full fifo answers EAGAIN and is dropped */
   close(fd);
 }
 
