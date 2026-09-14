@@ -27,6 +27,7 @@
 
 #include <errno.h>
 #include <limits.h>
+#include <poll.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -60,6 +61,18 @@ struct epoll_reg {
 KHASH_MAP_INIT_INT64(epoll, struct epoll_reg)
 static khash_t(epoll) *epoll_regs;
 static pthread_mutex_t epoll_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* The same switch the binder tally uses, because this is the other half of the
+ * same question and a second variable would only have to be carried through
+ * `env -i` alongside it. */
+static bool
+tally_on(void)
+{
+  static int on = -1;
+  if (on < 0)
+    on = getenv("NABI_BINDER_TALLY") != NULL;
+  return on != 0;
+}
 
 /*
  * Everything registered on an epoll instance goes when its descriptor does.
@@ -337,6 +350,40 @@ epoll_wait_common(int epfd, gaddr_t events_ptr, int maxevents, int timeout)
       ts.tv_nsec = 0;
       tsp = &ts;
     }
+  }
+
+  /*
+   * About to block: say so if anything in this set is already readable.
+   *
+   * That pair of facts is the whole question behind a boot stall that is still
+   * open. A sender writes a byte into the fifo behind a descriptor, checks that
+   * the byte is there to be read, and the receiver sitting in this call never
+   * comes out of it. Every step on the binder side of that has been measured
+   * and is correct - right queue, right file, byte present - so what is left is
+   * whether this wait returns when one of the descriptors it is watching has
+   * something waiting on it.
+   *
+   * Asked before the wait rather than after, because "it returned nothing" is
+   * already known; what is not known is whether it should have returned at all.
+   */
+  if (tally_on() && (tsp == NULL || tsp->tv_sec != 0 || tsp->tv_nsec != 0)) {
+    pthread_mutex_lock(&epoll_lock);
+    epoll_regs_init();
+    for (khiter_t k = kh_begin(epoll_regs); k != kh_end(epoll_regs); k++) {
+      if (!kh_exist(epoll_regs, k))
+        continue;
+      uint64_t key = kh_key(epoll_regs, k);
+      if ((int) (key >> 32) != epfd)
+        continue;
+      if (!(kh_value(epoll_regs, k).events & LINUX_EPOLLIN))
+        continue;
+      int rfd = (int) (uint32_t) key;
+      struct pollfd pfd = { .fd = rfd, .events = POLLIN };
+      if (poll(&pfd, 1, 0) > 0 && (pfd.revents & POLLIN))
+        printk("epoll tally: blocking with fd=%d already readable (epfd=%d)\n",
+               rfd, epfd);
+    }
+    pthread_mutex_unlock(&epoll_lock);
   }
 
   /*
