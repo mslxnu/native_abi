@@ -788,6 +788,56 @@ fifo_ino(const char *what, uint32_t id, int fd)
 }
 
 /*
+ * Whether the byte that was just written is actually there to be seen.
+ *
+ * Everything left of the stall rests on one thing nobody has measured. The
+ * write returns success, so the byte is *assumed* to be sitting in the fifo
+ * waiting for the receiver's poll to notice it - and from that assumption
+ * follows the whole conclusion that the fault must be in what makes a
+ * descriptor readable. Assumed, never looked at.
+ *
+ * A second open of the same path, read-only and non-blocking, asks it directly:
+ * poll for POLLIN and read nothing at all, which neither consumes what is there
+ * nor disturbs the reader that is waiting for it. Opening a fifo read-only with
+ * O_NONBLOCK succeeds whether or not anyone holds the other end, so this cannot
+ * block, and POLLIN on the read end is the very condition the receiver's own
+ * epoll is parked on.
+ *
+ * A stall that says "visible" means the byte was there and nothing woke on it.
+ * A stall that says "NOT VISIBLE" means something takes it away, and the proof
+ * that nothing could has a hole in it.
+ */
+static void
+wake_seen(uint32_t id)
+{
+  static int on = -1;
+  if (on < 0)
+    on = getenv("NABI_BINDER_TALLY") != NULL;
+  if (!on)
+    return;
+
+  char path[PATH_MAX];
+  wake_path(id, path, sizeof path);
+  int fd = open(path, O_RDONLY | O_NONBLOCK);
+  if (fd < 0)
+    return;
+  struct pollfd pfd = { .fd = fd, .events = POLLIN };
+  int r = poll(&pfd, 1, 0);
+  bool visible = r > 0 && (pfd.revents & POLLIN) != 0;
+  close(fd);
+
+  static __thread uint32_t last_id;
+  static __thread int last_vis = -1;
+  if (id == last_id && (int) visible == last_vis)
+    return;
+  last_id = id;
+  last_vis = (int) visible;
+
+  printk("binder tally: wake %s ep=%u\n",
+         visible ? "visible" : "NOT VISIBLE", id);
+}
+
+/*
  * Wake whoever is waiting on an endpoint, wherever it is. True if a byte
  * actually reached the fifo.
  *
@@ -812,6 +862,8 @@ shm_wake(uint32_t id)
   if (w != 1)
     wake_lost(id, "write", w);   /* a full fifo answers EAGAIN and is dropped */
   close(fd);
+  if (w == 1)
+    wake_seen(id);
   return w == 1;
 }
 
