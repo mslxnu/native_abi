@@ -206,11 +206,22 @@ static uint64_t balign(uint64_t v) { return (v + 7) & ~(uint64_t) 7; }
  */
 #define BSHM_MSG_MAX 32
 #define BSHM_PAYLOAD  8192
-#define BSHM_MAGIC    0x42494e44u
+/* Bumped when the shared layout changed to carry a message sequence: an old
+ * file left behind by an earlier build still answers to the old magic, and
+ * would be read at the new offsets. */
+#define BSHM_MAGIC    0x42494e45u
 
 struct bmsg {
   uint32_t used;
   uint32_t is_reply;
+  /*
+   * What this message is called, for as long as it is in the queue. Both ends
+   * report it, so a delivery can be matched to the send that made it instead of
+   * being guessed at by comparing the fields they happen to share - which two
+   * messages can easily have in common, and which is how an earlier detector
+   * came to report messages as never delivered when they had been.
+   */
+  uint64_t seq;
   uint64_t cookie;
   uint32_t code, flags;
   uint32_t sender_pid, sender_euid;
@@ -309,6 +320,12 @@ struct bnode_shared {
 struct bshm {
   uint32_t magic;
   uint32_t next_id;
+  /*
+   * Names every message, across every process attached to this instance, so
+   * that the two ends of one delivery can be matched exactly. Allocated under
+   * the same lock the queue is written under, which is what makes it unique.
+   */
+  uint64_t next_seq;
   struct bep_shared ep[BINDER_MAX_EP];
   struct bnode_shared node[BINDER_MAX_NODES];
 };
@@ -485,6 +502,7 @@ shm_attach(void)
       memset(shm, 0, sizeof *shm);
     shm->magic = BSHM_MAGIC;
     shm->next_id = 1;
+    shm->next_seq = 1;
   }
   flock(fd, LOCK_UN);
   return true;
@@ -1305,9 +1323,26 @@ tally(struct binder_ep *e, const char *what, uint32_t to_ep,
   if (!on)
     return;
 
+  /*
+   * The message's own name is in the key, which means every message is distinct
+   * and nothing here collapses: one line for the send and one for the delivery,
+   * every time, so the two can be joined on seq.
+   *
+   * That is the whole point. The previous key was made of the fields two
+   * messages can share - code, endpoints, the thread owed the reply - and the
+   * two ends are printed by different processes, each deduplicating on its own.
+   * A receiver could therefore suppress its delivery line as a repeat while the
+   * sender's queued line printed, and comparing the two sets reported messages
+   * as never delivered when they had been. It did that in every healthy boot,
+   * dozens of times, and a whole line of investigation was spent on the
+   * phantom it produced. Set membership survives deduplication only inside one
+   * dedupe domain, never across two.
+   *
+   * A refusal now always prints too, for the same reason and deliberately:
+   * losing a rare one to a repeat count is the kind of blindness this is for.
+   */
   static __thread uint64_t last, n;
-  uint64_t key = (uint64_t)(uintptr_t) what ^ ((uint64_t) m->code << 8) ^
-                 ((uint64_t) m->sender_ep << 24) ^ (m->reply_tid << 1) ^
+  uint64_t key = (uint64_t)(uintptr_t) what ^ m->seq ^
                  ((uint64_t) to_ep << 40) ^ ((uint64_t) m->is_reply << 63);
   if (key == last) {
     if (++n % TALLY_REPEAT != 0)
@@ -1317,9 +1352,10 @@ tally(struct binder_ep *e, const char *what, uint32_t to_ep,
     n = 0;
   }
 
-  printk("binder tally: %s to_ep=%u %s code=%u from_ep=%u reply_tid=%llu "
-         "poller=%llu arena=%llu/%llu\n",
-         what, to_ep, m->is_reply ? "reply" : "call", m->code, m->sender_ep,
+  printk("binder tally: %s seq=%llu to_ep=%u %s code=%u from_ep=%u "
+         "reply_tid=%llu poller=%llu arena=%llu/%llu\n",
+         what, (unsigned long long) m->seq, to_ep,
+         m->is_reply ? "reply" : "call", m->code, m->sender_ep,
          (unsigned long long) m->reply_tid, (unsigned long long) call_tid(),
          (unsigned long long) e->arena_brk, (unsigned long long) e->arena_size);
 }
@@ -1726,6 +1762,7 @@ do_transaction(struct binder_ep *from, const struct btr *tr, bool reply,
     }
   }
 
+  m->seq = shm->next_seq++;      /* under shm_lock, so it is nobody else's */
   m->used = 1;
   tally(from, "queued", dst->id, m);
   uint32_t wake_id = dst->id;
