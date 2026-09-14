@@ -747,6 +747,47 @@ wake_lost(uint32_t id, const char *how, ssize_t w)
 }
 
 /*
+ * Which fifo, by inode, rather than by name.
+ *
+ * A sender reaches an endpoint's fifo by opening its path; the receiver has
+ * been holding a descriptor on it since the endpoint was made. Those are the
+ * same file only as long as nothing has replaced it - and the path is unlinked
+ * and remade when an endpoint is created, and unlinked again when the last
+ * descriptor on one goes away. Should a name ever come to mean a different file
+ * than the one the receiver is reading, every wake after that writes a byte
+ * into a fifo nobody is watching: the open succeeds, the write succeeds,
+ * nothing is reported lost, and the reader is never woken again.
+ *
+ * So both ends say which inode they have, once each, and the two numbers either
+ * match or they do not.
+ */
+static void
+fifo_ino(const char *what, uint32_t id, int fd)
+{
+  static int on = -1;
+  if (on < 0)
+    on = getenv("NABI_BINDER_TALLY") != NULL;
+  if (!on)
+    return;
+
+  struct stat st;
+  if (fstat(fd, &st) != 0)
+    return;
+
+  /* Once per endpoint per side: a wake happens constantly and the answer does
+   * not change, so only a change is worth a line. */
+  static __thread uint32_t last_id;
+  static __thread unsigned long long last_ino;
+  if (id == last_id && (unsigned long long) st.st_ino == last_ino)
+    return;
+  last_id = id;
+  last_ino = (unsigned long long) st.st_ino;
+
+  printk("binder tally: fifo %s ep=%u ino=%llu\n",
+         what, id, (unsigned long long) st.st_ino);
+}
+
+/*
  * Wake whoever is waiting on an endpoint, wherever it is. True if a byte
  * actually reached the fifo.
  *
@@ -765,6 +806,7 @@ shm_wake(uint32_t id)
     wake_lost(id, "open", -1);
     return false;                /* nobody listening; the queue still has it */
   }
+  fifo_ino("written", id, fd);   /* the file a sender actually reaches */
   char one = 1;
   ssize_t w = write(fd, &one, 1);
   if (w != 1)
@@ -1046,6 +1088,8 @@ binder_emul_open(const char *ctx, int flags, int *out_fd)
     shm_lock(); shm->ep[slot].used = 0; shm_unlock();
     return -1;
   }
+  fifo_ino("held", id, fd);      /* the file the receiver will read, for as
+                                  * long as this endpoint exists */
   if (flags & LINUX_O_CLOEXEC)
     fcntl(fd, F_SETFD, FD_CLOEXEC);
   if (!(flags & LINUX_O_NONBLOCK))
