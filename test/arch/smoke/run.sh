@@ -231,7 +231,14 @@ fi
 for t in procfstest mapstest identtest; do
     out=$(NABI_IGNORE_HOST_FS=1 "$NABI" -m "$root" /$t); rc=$?
     case "$t:$out" in
-        procfstest:"procfs skipped") ok=yes ;;
+        # "procfs ok" is now also correct here. procfstest probes /proc/version,
+        # and NABI answers that itself since the machine-description files moved
+        # out of mSL/ProcFS - so the probe succeeds with the passthrough
+        # pretended absent and the test runs for real instead of skipping. That
+        # is this block's stated requirement: what NABI answers from its own
+        # state does not go away. It does mean procfstest's probe no longer
+        # distinguishes a passthrough from NABI's own answer.
+        procfstest:"procfs ok"|procfstest:"procfs skipped") ok=yes ;;
         mapstest:"maps ok")          ok=yes ;;
         identtest:"ident ok")        ok=yes ;;
         *)                           ok=no  ;;
@@ -1623,6 +1630,19 @@ if [ "$out" = "ptypeer ok" ]; then
     echo "  ok  ptypeertest -> \"$out\""
 else
     echo "  FAIL ptypeertest -> \"$out\", exit $rc"
+    fail=1
+fi
+
+# procmachinetest: the six /proc files that describe the machine, answered by
+# nabi rather than by mSL/ProcFS - which answered them with the host Mac's, so
+# `free` reported the Mac's memory. Run kext-free, which is the case that has to
+# work for the v0.8.0 requirement.
+cp "$here/procmachinetest" "$root/"; chmod +x "$root/procmachinetest"
+out=$(NABI_IGNORE_HOST_FS=1 "$NABI" -m "$root" /procmachinetest 2>&1 | tail -1); rc=$?
+if [ "$out" = "procmachine ok" ]; then
+    echo "  ok  procmachinetest -> \"$out\""
+else
+    echo "  FAIL procmachinetest -> \"$out\", exit $rc"
     fail=1
 fi
 

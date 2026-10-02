@@ -41,6 +41,7 @@
  * collides with the inline of the same name in util/misc.h. One prototype is
  * cheaper than an include-order rule nobody will remember. */
 int sysctlbyname(const char *, void *, size_t *, void *, size_t);
+#include <sys/time.h>
 #include <unistd.h>
 
 #include "common.h"
@@ -175,6 +176,9 @@ enum procfs_file { PROCFS_NONE, PROCFS_MAPS, PROCFS_CMDLINE, PROCFS_COMM,
                    PROCFS_ATTR,
                    PROCFS_NET_DEV,
                    PROCFS_FILESYSTEMS, PROCFS_KCMDLINE, PROCFS_BOOTCONFIG,
+                   /* PROCFS_STAT above is a process's; this one is the machine's. */
+                   PROCFS_CPUINFO, PROCFS_MEMINFO, PROCFS_KSTAT,
+                   PROCFS_UPTIME, PROCFS_LOADAVG, PROCFS_VERSION,
                    PROCFS_KMSG };
 
 /* For PROCFS_FD, the number after /fd/. Meaningless for the others. */
@@ -211,6 +215,28 @@ own_procfs_file_n(const char *path, int *fd_out)
     return PROCFS_BOOTCONFIG;
   if (strcmp(rest, "kmsg") == 0)
     return PROCFS_KMSG;
+
+  /*
+   * The rest of what describes the machine. mSL/ProcFS answered these with the
+   * host's too: `free` in a guest reported the Mac's RAM and `ps aux` listed the
+   * Mac's processes. Unlike /proc/cmdline, though, some of them are the same
+   * number for both - a guest here runs on the host's cores and allocates out of
+   * the host's memory, so hw.memsize really is the memory it has. What must not
+   * come from the host is anything about elapsed time, which is why build_uptime
+   * computes rather than copies.
+   */
+  if (strcmp(rest, "cpuinfo") == 0)
+    return PROCFS_CPUINFO;
+  if (strcmp(rest, "meminfo") == 0)
+    return PROCFS_MEMINFO;
+  if (strcmp(rest, "stat") == 0)       /* the machine's, not a process's */
+    return PROCFS_KSTAT;
+  if (strcmp(rest, "uptime") == 0)
+    return PROCFS_UPTIME;
+  if (strcmp(rest, "loadavg") == 0)
+    return PROCFS_LOADAVG;
+  if (strcmp(rest, "version") == 0)
+    return PROCFS_VERSION;
 
   /*
    * The two files under /proc/sys/kernel/random that are read rather than
@@ -901,6 +927,177 @@ build_sysvipc(enum procfs_file which, size_t *len_out)
 }
 
 /*
+ * The host's own numbers, where the host's number is also the guest's.
+ *
+ * A guest here is a host process: scheduled on the host's cores, allocating out
+ * of the host's memory. So hw.logicalcpu and hw.memsize are not the wrong
+ * machine's answer the way /proc/cmdline was - they are the only true one. What
+ * would be wrong is dressing them up: fields that cannot be known are left at
+ * zero rather than invented.
+ */
+static long
+host_long(const char *name, long fallback)
+{
+  int64_t v = 0;
+  size_t len = sizeof v;
+  if (sysctlbyname(name, &v, &len, NULL, 0) < 0)
+    return fallback;
+  return (long) v;
+}
+
+/* Seconds since the host booted. Note the difference from sysinfo(2) in sys.c,
+ * which assigns kern.boottime's seconds straight into info.uptime and so reports
+ * a Unix timestamp where an elapsed count belongs. */
+static double
+host_uptime_seconds(void)
+{
+  struct timeval boot;
+  size_t len = sizeof boot;
+  if (sysctlbyname("kern.boottime", &boot, &len, NULL, 0) < 0)
+    return 0.0;
+  struct timeval now;
+  gettimeofday(&now, NULL);
+  double up = (double)(now.tv_sec - boot.tv_sec) +
+              (double)(now.tv_usec - boot.tv_usec) / 1000000.0;
+  return up > 0.0 ? up : 0.0;
+}
+
+/*
+ * /proc/cpuinfo. The shape matters more than the detail: a caller either counts
+ * "processor" lines or greps one field, and the format is per-architecture, so
+ * these are emitted in the aarch64 spelling the guests here use. The feature
+ * list is deliberately short - naming an extension the host may not have is
+ * worse than naming none.
+ */
+static char *
+build_cpuinfo(size_t *len)
+{
+  long ncpu = host_long("hw.logicalcpu", 1);
+  if (ncpu < 1)
+    ncpu = 1;
+  size_t cap = (size_t) ncpu * 256 + 256;
+  char *out = malloc(cap);
+  if (out == NULL)
+    return NULL;
+  size_t n = 0;
+  for (long i = 0; i < ncpu && n < cap; i++)
+    n += (size_t) snprintf(out + n, cap - n,
+                           "processor\t: %ld\n"
+                           "BogoMIPS\t: 100.00\n"
+                           "Features\t: fp asimd\n"
+                           "CPU implementer\t: 0x61\n"
+                           "CPU architecture: 8\n"
+                           "CPU variant\t: 0x0\n"
+                           "CPU part\t: 0x000\n"
+                           "CPU revision\t: 0\n\n", i);
+  *len = n;
+  return out;
+}
+
+/*
+ * /proc/meminfo. free(1) wants MemTotal, MemFree, MemAvailable, Buffers, Cached
+ * and the swap pair, and prints nonsense rather than complaining if one is
+ * missing. Buffers and Cached are zero because Darwin's page accounting does not
+ * split that way, and a guessed split would be read as fact.
+ */
+static char *
+build_meminfo(size_t *len)
+{
+  long pagesize = host_long("hw.pagesize", 4096);
+  long total_kb = host_long("hw.memsize", 0) / 1024;
+  long free_kb  = host_long("vm.page_free_count", 0) * pagesize / 1024;
+  size_t cap = 512;
+  char *out = malloc(cap);
+  if (out == NULL)
+    return NULL;
+  *len = (size_t) snprintf(out, cap,
+      "MemTotal:       %8ld kB\n"
+      "MemFree:        %8ld kB\n"
+      "MemAvailable:   %8ld kB\n"
+      "Buffers:        %8d kB\n"
+      "Cached:         %8d kB\n"
+      "SwapTotal:      %8d kB\n"
+      "SwapFree:       %8d kB\n",
+      total_kb, free_kb, free_kb, 0, 0, 0, 0);
+  return out;
+}
+
+/*
+ * /proc/stat, the machine's. The cpu rows are zeroed: nabi does not account the
+ * guest's time in jiffies and has nothing to derive it from, so a reader sees an
+ * idle machine rather than a fabricated one. btime is real, and is usually what
+ * the caller came for.
+ */
+static char *
+build_kstat(size_t *len)
+{
+  long ncpu = host_long("hw.logicalcpu", 1);
+  if (ncpu < 1)
+    ncpu = 1;
+  struct timeval boot;
+  size_t blen = sizeof boot;
+  long btime = sysctlbyname("kern.boottime", &boot, &blen, NULL, 0) == 0
+                 ? (long) boot.tv_sec : 0;
+  size_t cap = (size_t) ncpu * 96 + 256;
+  char *out = malloc(cap);
+  if (out == NULL)
+    return NULL;
+  size_t n = (size_t) snprintf(out, cap, "cpu  0 0 0 0 0 0 0 0 0 0\n");
+  for (long i = 0; i < ncpu && n < cap; i++)
+    n += (size_t) snprintf(out + n, cap - n, "cpu%ld 0 0 0 0 0 0 0 0 0 0\n", i);
+  n += (size_t) snprintf(out + n, cap - n,
+                         "intr 0\nctxt 0\nbtime %ld\nprocesses 1\n"
+                         "procs_running 1\nprocs_blocked 0\n", btime);
+  *len = n;
+  return out;
+}
+
+/* /proc/uptime: elapsed, then idle. Idle is zero for the same reason the cpu
+ * rows in /proc/stat are. */
+static char *
+build_uptime(size_t *len)
+{
+  char *out = malloc(64);
+  if (out == NULL)
+    return NULL;
+  *len = (size_t) snprintf(out, 64, "%.2f 0.00\n", host_uptime_seconds());
+  return out;
+}
+
+/*
+ * /proc/loadavg. The host's averages, which count everything else on the Mac as
+ * well as this guest - but a guest's processes *are* host processes, so there is
+ * no separate number to report, and sysinfo(2) already answers from getloadavg.
+ * Disagreeing with it would be worse than sharing its approximation.
+ */
+static char *
+build_loadavg(size_t *len)
+{
+  double la[3] = { 0.0, 0.0, 0.0 };
+  (void) getloadavg(la, 3);
+  char *out = malloc(96);
+  if (out == NULL)
+    return NULL;
+  *len = (size_t) snprintf(out, 96, "%.2f %.2f %.2f 1/1 %d\n",
+                           la[0], la[1], la[2], (int) getpid());
+  return out;
+}
+
+/* /proc/version has to agree with uname(2), or a guest that cross-checks the two
+ * concludes it is being lied to - which it would be. LINUX_RELEASE is the one
+ * source for both. */
+static char *
+build_version(size_t *len)
+{
+  char *out = malloc(256);
+  if (out == NULL)
+    return NULL;
+  *len = (size_t) snprintf(out, 256,
+      "Linux version " LINUX_RELEASE " (nabi@darwin) #1 SMP PREEMPT\n");
+  return out;
+}
+
+/*
  * /proc/filesystems: what can be mounted, which here means what mount.c knows
  * how to mount. "nodev" is the first field for a filesystem that needs no
  * block device behind it, and a leading tab for one that does; a caller looking
@@ -1387,6 +1584,12 @@ procfs_stat(const char *path, bool nofollow, uint32_t *mode, uint64_t *size,
   case PROCFS_FILESYSTEMS:
   case PROCFS_KCMDLINE:
   case PROCFS_BOOTCONFIG:
+  case PROCFS_CPUINFO:
+  case PROCFS_MEMINFO:
+  case PROCFS_KSTAT:
+  case PROCFS_UPTIME:
+  case PROCFS_LOADAVG:
+  case PROCFS_VERSION:
     /* Readable by anyone and sized zero, which is what /proc says about a file
      * whose contents are made when they are read. */
     *mode = 0444 | 0100000;
@@ -1683,6 +1886,24 @@ procfs_open(const char *path, int flags, int *out_fd)
     break;
   case PROCFS_BOOTCONFIG:
     content = build_bootconfig(&len);
+    break;
+  case PROCFS_CPUINFO:
+    content = build_cpuinfo(&len);
+    break;
+  case PROCFS_MEMINFO:
+    content = build_meminfo(&len);
+    break;
+  case PROCFS_KSTAT:
+    content = build_kstat(&len);
+    break;
+  case PROCFS_UPTIME:
+    content = build_uptime(&len);
+    break;
+  case PROCFS_LOADAVG:
+    content = build_loadavg(&len);
+    break;
+  case PROCFS_VERSION:
+    content = build_version(&len);
     break;
   default:
     return -1;      /* not ours; the caller does the ordinary lookup */
