@@ -672,6 +672,23 @@ backing_for_type(const char *type, const char *source, unsigned long flags,
      * The one hierarchy, wherever it is asked for. cgroups are not per-mount:
      * mounting cgroup2 twice shows the same tree, which is what the mount is
      * for - a place to see it from.
+     *
+     * That is true of cgroup2 and false of the first version, where each
+     * controller is a hierarchy of its own, and the difference is not only
+     * cosmetic. Android mounts five - cpuset, cpuctl, memcg, blkio, stune - and
+     * libprocessgroup chmods a directory it has created recursively, every file
+     * in it. Aimed at one controller's tree that is its own business; landing on
+     * the single tree here it rewrites the others' files too, 2,420 of them in a
+     * boot. /dev/cpuset/cpus ends up 0775 that way, having been created 0644 and
+     * never chmod'd by name, and init then refuses to read its own input:
+     * "Skipping insecure file", because ReadFile declines anything its group can
+     * write. Four `copy` commands in init.rc fail on a file that is there and
+     * perfectly readable.
+     *
+     * Giving each v1 controller its own directory is the fix and is a change of
+     * its own: cgroup_hierarchy, cgroup_move, cgroup_current and
+     * /proc/<pid>/cgroup all assume there is one. Recorded here because the
+     * symptom shows up a long way from this decision.
      */
     char host[PATH_MAX];
     int cr = cgroup_hierarchy(host, sizeof host);
