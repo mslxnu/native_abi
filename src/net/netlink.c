@@ -246,27 +246,65 @@ if_mtu(const char *name)
   return mtu;
 }
 
-/* One RTM_NEWLINK per interface, which is what a GETLINK dump is made of. */
-static void
-dump_links(struct nlbuf *b, uint32_t seq, uint32_t portid)
+/*
+ * The interfaces, as Linux would describe them.
+ *
+ * Lifted out of the link dump below so that /sys/class/net can be built from the
+ * same walk and the same conversions. The two describe one thing, and a guest
+ * that enumerates interfaces through /sys and then asks netlink about one of them
+ * - which is the ordinary shape, Java's NetworkInterface does exactly that - must
+ * not be told two different stories. Sharing the enumeration is the only way to
+ * promise that; agreeing by inspection is how the two halves of /proc came to
+ * disagree.
+ *
+ * getifaddrs reports an interface once per address; this wants it once. The
+ * link-level entry is the one carrying the hardware address, so that is the one
+ * taken.
+ */
+size_t
+net_iface_list(struct net_iface *out, size_t max)
 {
   struct ifaddrs *ifa0;
   if (getifaddrs(&ifa0) < 0)
-    return;
+    return 0;
 
-  /* getifaddrs reports an interface once per address; a link dump wants it
-   * once. The link-level entry is the one carrying the hardware address, so
-   * that is the one taken, and an interface without one is taken on its first
-   * appearance instead. */
-  for (struct ifaddrs *ifa = ifa0; ifa; ifa = ifa->ifa_next) {
+  size_t n = 0;
+  for (struct ifaddrs *ifa = ifa0; ifa && n < max; ifa = ifa->ifa_next) {
     if (ifa->ifa_addr == NULL || ifa->ifa_addr->sa_family != AF_LINK)
       continue;
-
     struct sockaddr_dl *dl = (struct sockaddr_dl *) ifa->ifa_addr;
     unsigned idx = if_nametoindex(ifa->ifa_name);
     if (idx == 0)
       continue;
 
+    struct net_iface *ni = &out[n++];
+    memset(ni, 0, sizeof *ni);
+    strlcpy(ni->name, ifa->ifa_name, sizeof ni->name);
+    ni->index = idx;
+    ni->flags = if_flags_to_linux(ifa->ifa_flags);
+    ni->type  = (ifa->ifa_flags & IFF_LOOPBACK) ? LINUX_ARPHRD_LOOPBACK
+              : dl->sdl_alen == 6               ? LINUX_ARPHRD_ETHER
+              :                                   LINUX_ARPHRD_NONE;
+    ni->mtu = (uint32_t) if_mtu(ifa->ifa_name);
+    ni->addr_len = dl->sdl_alen > sizeof ni->addr ? (uint8_t) sizeof ni->addr
+                                                  : (uint8_t) dl->sdl_alen;
+    if (ni->addr_len > 0)
+      memcpy(ni->addr, LLADDR(dl), ni->addr_len);
+    ni->oper_up = (ifa->ifa_flags & IFF_RUNNING) != 0;
+  }
+  freeifaddrs(ifa0);
+  return n;
+}
+
+/* One RTM_NEWLINK per interface, which is what a GETLINK dump is made of. */
+static void
+dump_links(struct nlbuf *b, uint32_t seq, uint32_t portid)
+{
+  struct net_iface ifs[64];
+  size_t nifs = net_iface_list(ifs, sizeof ifs / sizeof ifs[0]);
+
+  for (size_t i = 0; i < nifs; i++) {
+    const struct net_iface *ni = &ifs[i];
     size_t off = b->len;
     struct l_ifinfomsg *ii =
       (struct l_ifinfomsg *) ((uint8_t *)
@@ -275,26 +313,22 @@ dump_links(struct nlbuf *b, uint32_t seq, uint32_t portid)
     if (ii == NULL)
       break;
     ii->ifi_family = 0;         /* AF_UNSPEC, as the kernel sends */
-    ii->ifi_type = (ifa->ifa_flags & IFF_LOOPBACK) ? LINUX_ARPHRD_LOOPBACK
-                 : dl->sdl_alen == 6               ? LINUX_ARPHRD_ETHER
-                 :                                   LINUX_ARPHRD_NONE;
-    ii->ifi_index = (int32_t) idx;
-    ii->ifi_flags = if_flags_to_linux(ifa->ifa_flags);
+    ii->ifi_type = ni->type;
+    ii->ifi_index = (int32_t) ni->index;
+    ii->ifi_flags = ni->flags;
     ii->ifi_change = 0;
 
-    nla_put_str(b, LINUX_IFLA_IFNAME, ifa->ifa_name);
-    nla_put_u32(b, LINUX_IFLA_MTU, (uint32_t) if_mtu(ifa->ifa_name));
-    if (dl->sdl_alen > 0)
-      nla_put(b, LINUX_IFLA_ADDRESS, LLADDR(dl), dl->sdl_alen);
+    nla_put_str(b, LINUX_IFLA_IFNAME, ni->name);
+    nla_put_u32(b, LINUX_IFLA_MTU, ni->mtu);
+    if (ni->addr_len > 0)
+      nla_put(b, LINUX_IFLA_ADDRESS, ni->addr, ni->addr_len);
     nla_put_u32(b, LINUX_IFLA_TXQLEN, 1000);
     nla_put_u8(b, LINUX_IFLA_OPERSTATE,
-               (ifa->ifa_flags & IFF_RUNNING) ? LINUX_IF_OPER_UP
-                                              : LINUX_IF_OPER_DOWN);
+               ni->oper_up ? LINUX_IF_OPER_UP : LINUX_IF_OPER_DOWN);
     nla_put_u8(b, LINUX_IFLA_LINKMODE, 0);
     nla_put_u32(b, LINUX_IFLA_GROUP, 0);
     nlmsg_end(b, off);
   }
-  freeifaddrs(ifa0);
 }
 
 /* How many leading one-bits a netmask has, which is what Linux reports instead

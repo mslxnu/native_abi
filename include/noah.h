@@ -321,6 +321,23 @@ int    seccomp_mode_get(void);
 void   caps_snapshot(uint64_t *inh, uint64_t *prm, uint64_t *eff, uint64_t *bnd,
                      uint64_t *amb);
 bool   host_proc_live(void);
+
+/*
+ * One interface, as Linux describes it. Filled by net_iface_list from the host's
+ * own, with the Darwin-to-Linux conversions already applied, so that netlink's
+ * link dump and /sys/class/net are built from one answer rather than two.
+ */
+struct net_iface {
+  char     name[16];            /* IFNAMSIZ */
+  uint32_t index;
+  uint32_t flags;               /* Linux IFF_* */
+  uint16_t type;                /* Linux ARPHRD_* */
+  uint32_t mtu;
+  uint8_t  addr[8];
+  uint8_t  addr_len;
+  bool     oper_up;
+};
+size_t net_iface_list(struct net_iface *out, size_t max);
 int    seccomp_no_new_privs_get(void);
 int    seccomp_no_new_privs_set(void);
 size_t seccomp_snapshot_size(void);

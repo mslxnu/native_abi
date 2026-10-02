@@ -27,6 +27,11 @@ static long sys6(long n,long a,long b,long c,long d,long e,long f){
 #define AT_FDCWD (-100)
 #define O_RDONLY 0
 #define O_WRONLY 1
+#define SYS_socket 198
+#define SYS_ioctl 29
+#define AF_INET 2
+#define SOCK_DGRAM 2
+#define SIOCGIFINDEX 0x8933
 #define O_DIRECTORY 0200000
 #define S_IFMT  0170000
 #define S_IFDIR 0040000
@@ -199,6 +204,102 @@ void _start(void)
     bad("/sys/fs", "does not list cgroup");
   if (listing("/sys/fs/cgroup", "cgroup.procs") == -2)
     bad("/sys/fs/cgroup", "is the empty placeholder rather than the real hierarchy");
+
+  /*
+   * /sys/class/net: one directory per interface, and the same set netlink reports.
+   *
+   * Asked 40 times a boot as a directory and never as a file, because the list of
+   * names is what a caller wants from it first. An empty directory would have been
+   * worse than an absent one - it would say the machine has no interfaces while
+   * netlink lists them - so what is checked is that the names are there and that
+   * each one's ifindex is the number the rest of nabi gives for that name.
+   */
+  must_be_dir("/sys/class/net");
+  {
+    static char nbuf[8192];
+    int nifs = 0;
+    long dfd = sys6(SYS_openat, AT_FDCWD, (long) "/sys/class/net",
+                    O_RDONLY | O_DIRECTORY, 0, 0, 0);
+    if (dfd < 0) {
+      bad("/sys/class/net", "will not list");
+    } else {
+      long sock = sys6(SYS_socket, AF_INET, SOCK_DGRAM, 0, 0, 0, 0);
+      for (;;) {
+        long n = sys6(SYS_getdents64, dfd, (long) nbuf, sizeof nbuf, 0, 0, 0);
+        if (n <= 0) break;
+        for (long off = 0; off < n; ) {
+          struct linux_dirent64 *de = (struct linux_dirent64 *)(nbuf + off);
+          off += de->d_reclen;
+          if (de->d_name[0] == '.') continue;
+          nifs++;
+
+          /* Every attribute Linux puts there has to be readable; a caller that
+           * enumerates and then reads one must not meet an ENOENT. */
+          static const char *const want[] = { "address", "addr_len", "ifindex",
+                                              "mtu", "flags", "type",
+                                              "operstate", "carrier" };
+          char p2[160], val[64];
+          long ifindex = -1;
+          for (int k = 0; k < 8; k++) {
+            int i2 = 0;
+            const char *pre = "/sys/class/net/";
+            for (int j = 0; pre[j]; j++) p2[i2++] = pre[j];
+            for (int j = 0; de->d_name[j]; j++) p2[i2++] = de->d_name[j];
+            p2[i2++] = '/';
+            for (int j = 0; want[k][j]; j++) p2[i2++] = want[k][j];
+            p2[i2] = 0;
+            long r2 = slurp(p2, val, sizeof val);
+            if (r2 <= 0) { bad(p2, "will not read"); continue; }
+            if (k == 2) {
+              ifindex = 0;
+              for (int j = 0; val[j] >= '0' && val[j] <= '9'; j++)
+                ifindex = ifindex * 10 + (val[j] - '0');
+            }
+          }
+
+          /*
+           * And the index agrees with what an ioctl says for the same name. This is
+           * the invariant the whole arrangement rests on: /sys/class/net is built
+           * from the same walk netlink's link dump uses, so a guest that enumerates
+           * here and then asks about one of them - which is what Java's
+           * NetworkInterface does - cannot be told two different stories.
+           */
+          if (sock >= 0 && ifindex > 0) {
+            char ifr[40];
+            for (int j = 0; j < 40; j++) ifr[j] = 0;
+            for (int j = 0; de->d_name[j] && j < 15; j++) ifr[j] = de->d_name[j];
+            if (sys6(SYS_ioctl, sock, SIOCGIFINDEX, (long) ifr, 0, 0, 0) == 0) {
+              long got = *(int *)(ifr + 16);
+              if (got != ifindex)
+                bad(de->d_name, "its ifindex here is not the one the ioctl gives");
+            }
+          }
+        }
+      }
+      if (sock >= 0) sys6(SYS_close, sock, 0,0,0,0,0);
+      sys6(SYS_close, dfd, 0,0,0,0,0);
+      /* There is always a loopback, so an empty listing means the walk failed
+       * rather than that the machine has no interfaces. */
+      if (nifs == 0)
+        bad("/sys/class/net", "lists no interface at all");
+    }
+  }
+
+  /*
+   * And nothing in /sys may be created, which a real host directory would
+   * otherwise allow. Android made /sys/power/state and
+   * /sys/kernel/tracing/tracing_on inside this tree, where they persisted and
+   * changed what /sys said from one boot to the next - the state file this
+   * deliberately does not serve existed by the second run.
+   */
+  {
+    long fd = sys6(SYS_openat, AT_FDCWD, (long) "/sys/power/state",
+                   O_WRONLY | 0100 /* O_CREAT */, 0644, 0, 0);
+    if (fd >= 0) {
+      sys6(SYS_close, fd, 0,0,0,0,0);
+      bad("/sys/power/state", "could be created, so the tree is not read-only");
+    }
+  }
 
   put(fails == 0 ? "sysfs ok\n" : "sysfs failed\n");
   sys6(SYS_exit_group, fails ? 1 : 0, 0,0,0,0,0);

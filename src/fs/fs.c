@@ -2973,6 +2973,15 @@ static const struct {
 } sysfs_tree[] = {
   { "/class", NULL },
   /*
+   * One directory per interface, filled below from the same walk netlink's link
+   * dump uses. Asked 40 times a boot as a directory and never as a file, because
+   * what a caller wants from it first is the list of interface names - Java's
+   * NetworkInterface, Android's netd and anything calling if_nameindex all start
+   * there. Serving it empty would have been worse than absent: it would have said
+   * the machine has no interfaces while netlink listed them.
+   */
+  { "/class/net", NULL },
+  /*
    * /sys itself, so a listing of it shows what is in it. Without this the
    * directories below existed and `ls /sys` was empty - a directory a guest can
    * enter and cannot see, which is the same disagreement between one answer and
@@ -3037,6 +3046,227 @@ static const struct {
  * contents of /sys. A directory that is not ours is not used, and nothing is
  * served rather than something forged.
  */
+/*
+ * Remove anything in the tree that the table does not put there.
+ *
+ * The belt to the rdonly braces above: a tree left behind by an earlier nabi -
+ * one built before creation was refused, which is what every /tmp on a machine
+ * that ran this already holds - would otherwise go on being served. It also
+ * sweeps the `.new.<pid>` leftovers of a rewrite that was interrupted.
+ *
+ * One level inside each of the table's own directories, which is where a guest
+ * creating a file lands, rather than a walk of the whole tree on every
+ * resolution.
+ */
+static void sysfs_rmtree(const char *path);
+
+/*
+ * /sys/class/net/<if>/, one directory per interface with the attributes Linux
+ * puts there.
+ *
+ * Every value comes from net_iface_list, which is the same walk and the same
+ * Darwin-to-Linux conversions netlink's RTM_GETLINK dump is built from. That is
+ * the point of having lifted it out: a guest that enumerates interfaces here and
+ * then asks netlink about one of them is the ordinary shape, and two sources
+ * agreeing by inspection is how the two halves of /proc came to disagree.
+ *
+ * Directories rather than the symlinks into /sys/devices Linux has. The symlink is
+ * what `ls -l` shows and what a caller following it to the device reaches; nothing
+ * here has a device tree to point into, and a symlink to a path nabi does not
+ * serve would be worse than a directory holding the attributes themselves.
+ *
+ * Interfaces that have gone are removed, so the listing is the current set rather
+ * than every interface this machine has ever had.
+ */
+static void
+sysfs_build_net(const char *root)
+{
+  char netdir[PATH_MAX];
+  if ((size_t) snprintf(netdir, sizeof netdir, "%s/class/net", root) >=
+      sizeof netdir)
+    return;
+
+  struct net_iface ifs[64];
+  size_t nifs = net_iface_list(ifs, sizeof ifs / sizeof ifs[0]);
+
+  /* Gone since the last look. Done first so a name reused by a different
+   * interface is rebuilt rather than half-updated. */
+  DIR *d = opendir(netdir);
+  if (d != NULL) {
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+      if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0)
+        continue;
+      bool still = false;
+      for (size_t i = 0; i < nifs && !still; i++)
+        still = strcmp(ifs[i].name, e->d_name) == 0;
+      if (still)
+        continue;
+      char sub[PATH_MAX];
+      if ((size_t) snprintf(sub, sizeof sub, "%s/%s", netdir, e->d_name) <
+          sizeof sub)
+        sysfs_rmtree(sub);
+    }
+    closedir(d);
+  }
+
+  for (size_t i = 0; i < nifs; i++) {
+    const struct net_iface *ni = &ifs[i];
+    char ifdir[PATH_MAX];
+    if ((size_t) snprintf(ifdir, sizeof ifdir, "%s/%s", netdir, ni->name) >=
+        sizeof ifdir)
+      continue;
+    if (mkdir(ifdir, 0755) != 0 && errno != EEXIST)
+      continue;
+    (void) chmod(ifdir, 0755);
+
+    /*
+     * The hardware address, lower case and colon-separated, which is the form
+     * every parser of this file expects. An interface without one reads as all
+     * zeroes rather than empty, because that is what Linux shows for a loopback -
+     * and `addr_len` is six there too.
+     */
+    char addr[64];
+    size_t al = 0;
+    unsigned n = ni->addr_len ? ni->addr_len : 6;
+    if (n > sizeof ni->addr)
+      n = sizeof ni->addr;
+    for (unsigned k = 0; k < n && al + 4 < sizeof addr; k++)
+      al += (size_t) snprintf(addr + al, sizeof addr - al, "%s%02x",
+                              k ? ":" : "", ni->addr_len ? ni->addr[k] : 0);
+    al += (size_t) snprintf(addr + al, sizeof addr - al, "\n");
+
+    struct { const char *name; char text[64]; } attr[] = {
+      { "address",   { 0 } },
+      { "addr_len",  { 0 } },
+      { "ifindex",   { 0 } },
+      { "mtu",       { 0 } },
+      /* Linux prints this as a hex word of its own IFF_* bits, which is what
+       * net_iface_list has already converted them to. */
+      { "flags",     { 0 } },
+      { "type",      { 0 } },
+      { "operstate", { 0 } },
+      /* Whether the link has a carrier. Taken from the same running bit operstate
+       * is, so the two cannot contradict each other. */
+      { "carrier",   { 0 } },
+    };
+    snprintf(attr[0].text, sizeof attr[0].text, "%s", addr);
+    snprintf(attr[1].text, sizeof attr[1].text, "%u\n", n);
+    snprintf(attr[2].text, sizeof attr[2].text, "%u\n", ni->index);
+    snprintf(attr[3].text, sizeof attr[3].text, "%u\n", ni->mtu);
+    snprintf(attr[4].text, sizeof attr[4].text, "0x%x\n", ni->flags);
+    snprintf(attr[5].text, sizeof attr[5].text, "%u\n", ni->type);
+    snprintf(attr[6].text, sizeof attr[6].text, "%s\n",
+             ni->oper_up ? "up" : "down");
+    snprintf(attr[7].text, sizeof attr[7].text, "%d\n", ni->oper_up ? 1 : 0);
+
+    for (size_t k = 0; k < sizeof attr / sizeof attr[0]; k++) {
+      char fpath[PATH_MAX];
+      if ((size_t) snprintf(fpath, sizeof fpath, "%s/%s", ifdir,
+                            attr[k].name) >= sizeof fpath)
+        continue;
+      size_t want = strlen(attr[k].text);
+      /* Compared before writing, as the static files above are: an interface's
+       * attributes change rarely and this path is resolved constantly. */
+      struct stat st;
+      char have[64];
+      if (stat(fpath, &st) == 0 && (size_t) st.st_size == want &&
+          want < sizeof have) {
+        int rfd = open(fpath, O_RDONLY);
+        if (rfd >= 0) {
+          bool same = read(rfd, have, want) == (ssize_t) want &&
+                      memcmp(have, attr[k].text, want) == 0;
+          close(rfd);
+          if (same)
+            continue;
+        }
+      }
+      char tmp[PATH_MAX];
+      if ((size_t) snprintf(tmp, sizeof tmp, "%s.new.%d", fpath,
+                            (int) getpid()) >= sizeof tmp)
+        continue;
+      int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+      if (fd < 0)
+        continue;
+      bool ok = write(fd, attr[k].text, want) == (ssize_t) want;
+      close(fd);
+      if (!ok || rename(tmp, fpath) != 0)
+        (void) unlink(tmp);
+      else
+        (void) chmod(fpath, 0644);
+    }
+  }
+}
+
+static bool
+sysfs_known_child(const char *dir_rel, const char *child)
+{
+  char rel[PATH_MAX];
+  if ((size_t) snprintf(rel, sizeof rel, "%s/%s", dir_rel, child) >= sizeof rel)
+    return false;
+  for (size_t i = 0; i < NR_SYSFS_TREE; i++)
+    if (strcmp(sysfs_tree[i].path, rel) == 0)
+      return true;
+  return false;
+}
+
+static void
+sysfs_rmtree(const char *path)
+{
+  DIR *d = opendir(path);
+  if (d != NULL) {
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+      if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0)
+        continue;
+      char sub[PATH_MAX];
+      if ((size_t) snprintf(sub, sizeof sub, "%s/%s", path, e->d_name) <
+          sizeof sub)
+        sysfs_rmtree(sub);
+    }
+    closedir(d);
+  }
+  if (rmdir(path) != 0)
+    (void) unlink(path);
+}
+
+static void
+sysfs_prune(const char *root)
+{
+  for (size_t i = 0; i < NR_SYSFS_TREE; i++) {
+    if (sysfs_tree[i].content != NULL)
+      continue;                   /* a file has no children to sweep */
+    char dir[PATH_MAX];
+    if ((size_t) snprintf(dir, sizeof dir, "%s%s", root, sysfs_tree[i].path) >=
+        sizeof dir)
+      continue;
+    /* The cgroup hierarchy's placeholder is empty by construction and the
+     * hierarchy itself is reached another way; nothing to sweep, and sweeping
+     * would be the one place this could do damage. */
+    if (strcmp(sysfs_tree[i].path, "/fs/cgroup") == 0)
+      continue;
+    /* Nor /class/net, whose children are interface names rather than table
+     * entries; sysfs_build_net removes the ones that have gone. */
+    if (strcmp(sysfs_tree[i].path, "/class/net") == 0)
+      continue;
+    DIR *d = opendir(dir);
+    if (d == NULL)
+      continue;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+      if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0)
+        continue;
+      if (sysfs_known_child(sysfs_tree[i].path, e->d_name))
+        continue;
+      char sub[PATH_MAX];
+      if ((size_t) snprintf(sub, sizeof sub, "%s/%s", dir, e->d_name) <
+          sizeof sub)
+        sysfs_rmtree(sub);
+    }
+    closedir(d);
+  }
+}
+
 static bool
 sysfs_root(char *out, size_t outsz)
 {
@@ -3065,26 +3295,42 @@ sysfs_root(char *out, size_t outsz)
       continue;
     }
     /*
-     * Rewritten rather than left alone; see the note above on why a guest's write
-     * cannot be refused here and must instead not persist.
+     * Written when it is missing or wrong, and otherwise left alone.
      *
-     * Through a temporary name and a rename, which is atomic: resolving this path
-     * is what rewrites it, so two processes reaching it at once would otherwise
-     * have one truncating the file the other is about to read. A reader holding
-     * the old file keeps reading the old bytes, which are these bytes.
+     * It cannot be wrong through anything a guest did - the whole tree resolves
+     * read-only, so nothing in it can be created, removed or written - but a tree
+     * left by an older nabi that did allow writes can be, and such a tree is
+     * sitting in /tmp on any machine that ran one. Comparing costs a read where
+     * rewriting cost a write and a rename on every one of the eleven thousand /sys
+     * lookups a boot makes.
      *
-     * Left at 0644, which is the mode Linux gives it. Making it read-only locked
-     * nabi out of its own file - the rewrite below opens it for writing, so the
-     * second resolution failed with EACCES and took the whole translation with
-     * it - and would not have kept a root guest out anyway.
+     * The rewrite goes through a temporary name and a rename, which is atomic, so
+     * a reader cannot catch a half-written file. The name carries the pid because
+     * every guest process is its own nabi and they all resolve this path; one
+     * shared name had them renaming each other's work away.
+     *
+     * Left at 0644, the mode Linux gives it. Making it read-only locked nabi out
+     * of its own file, and would not have kept a root guest out anyway - root
+     * ignores the mode as it does on Linux, and guest_mode_adopt exists to defeat
+     * a file that denies its owner. The read-only namespace is what holds.
      */
-    /*
-     * The temporary name carries the pid, because every guest process is its own
-     * nabi and they all resolve this path. One shared name had them renaming each
-     * other's file away: the loser's rename found nothing, the translation failed,
-     * and the guest was told the file did not exist - 114 times out of 221 in an
-     * Android boot, which is how this was found.
-     */
+    size_t clen = strlen(sysfs_tree[i].content);
+    {
+      struct stat cst;
+      char have[256];
+      if (stat(path, &cst) == 0 && (size_t) cst.st_size == clen &&
+          clen < sizeof have) {
+        int rfd = open(path, O_RDONLY);
+        if (rfd >= 0) {
+          bool same = read(rfd, have, clen) == (ssize_t) clen &&
+                      memcmp(have, sysfs_tree[i].content, clen) == 0;
+          close(rfd);
+          if (same)
+            continue;
+        }
+      }
+    }
+
     char tmp[PATH_MAX];
     if ((size_t) snprintf(tmp, sizeof tmp, "%s.new.%d", path, (int) getpid()) >=
         sizeof tmp)
@@ -3092,8 +3338,7 @@ sysfs_root(char *out, size_t outsz)
     int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd < 0)
       return false;
-    size_t len = strlen(sysfs_tree[i].content);
-    bool ok = write(fd, sysfs_tree[i].content, len) == (ssize_t) len;
+    bool ok = write(fd, sysfs_tree[i].content, clen) == (ssize_t) clen;
     close(fd);
     if (!ok || rename(tmp, path) != 0) {
       (void) unlink(tmp);
@@ -3101,6 +3346,8 @@ sysfs_root(char *out, size_t outsz)
     }
     (void) chmod(path, 0644);     /* and here */
   }
+  sysfs_prune(out);
+  sysfs_build_net(out);
   return true;
 }
 
@@ -3131,8 +3378,20 @@ sysfs_to_host(const char *name, char *out, size_t outsz)
   bool known = false;
   for (size_t i = 0; i < NR_SYSFS_TREE && !known; i++) {
     size_t tn = strlen(sysfs_tree[i].path);
-    /* The entry itself, or anything under a directory of ours - a readdir of
-     * /sys/class/udc reaches it by name and so does a stat of what it found. */
+    /*
+     * The entry itself, or anything under a directory of ours - a readdir of
+     * /sys/class/udc reaches it by name and so does a stat of what it found.
+     *
+     * The root entry is the exception and matches only /sys exactly. As a prefix
+     * it is the empty string, which matched everything: nabi claimed the whole of
+     * /sys, answered for names it serves nothing at - /sys/fs/selinux among them -
+     * and would shadow whatever a rootfs image had under there.
+     */
+    if (tn == 0) {
+      if (rest[0] == '\0')
+        known = true;
+      continue;
+    }
     if (strncmp(rest, sysfs_tree[i].path, tn) == 0 &&
         (rest[tn] == '\0' || (rest[tn] == '/' && sysfs_tree[i].content == NULL)))
       known = true;
@@ -5194,6 +5453,18 @@ resolve_path(const struct dir *parent, const char *name, int flags, struct path 
     return -LINUX_ELOOP;
 
   path->rdonly = false;
+  /*
+   * Set when the name turns out to be one of nabi's /sys entries, and reapplied at
+   * every exit below.
+   *
+   * It cannot simply be left in path->rdonly, because resolving continues after
+   * the rewrite and resolve_path clears the flag each time it is entered: /tmp is
+   * a symlink to /private/tmp on macOS, so the host path this produces is followed
+   * one more step and the recursive call reset it. The flag was set and gone by
+   * the time vfs_grab_dir_w looked, which is why a guest could still make files in
+   * /sys.
+   */
+  bool sysfs_rdonly = false;
   struct dir dir = *parent;
   /* Both outlive the branch below, since `name` may be made to point at one. */
   char ptsname[32];
@@ -5267,6 +5538,21 @@ resolve_path(const struct dir *parent, const char *name, int flags, struct path 
       name = cgpath;              /* the hierarchy, wherever /sys comes from */
     } else if (sysfs_to_host(name, cgpath, sizeof cgpath)) {
       name = cgpath;              /* and the rest of /sys that is nabi's */
+      /*
+       * Nothing may be *created* in it. A real host directory accepts new files
+       * where sysfs has no way to make one, and Android duly made
+       * /sys/power/state and /sys/power/wake_lock and
+       * /sys/kernel/tracing/tracing_on inside this tree - which then persisted in
+       * /tmp and changed what /sys reported from one boot to the next. The
+       * /sys/power/state this deliberately does not serve existed by the second
+       * run, and a write to it would have been reported as a success.
+       *
+       * Writes to the files that are here still work, as they do on Linux, and do
+       * not persist because the contents are rewritten. It is only the namespace
+       * that is closed - which is what every mutating operation routes through
+       * vfs_grab_dir_w to discover.
+       */
+      sysfs_rdonly = true;
     } else if (!is_host_passthrough(name)) {
       dir.fd = proc.fileinfo.rootfd;
       name++;
@@ -5381,7 +5667,12 @@ resolve_path(const struct dir *parent, const char *name, int flags, struct path 
       if ((n = fs->ops->readlinkat(fs, &dir, path->subpath, buf, sizeof buf)) > 0) {
         strcpy(buf + n, c);
         if (buf[0] == '/') {
-          return resolve_path(&dir, buf, flags, path, loop + 1);
+          {
+            int rr = resolve_path(&dir, buf, flags, path, loop + 1);
+            if (rr == 0 && sysfs_rdonly)
+              path->rdonly = true;
+            return rr;
+          }
         } else {
           /* remove the last component */
           while (sp >= path->subpath && *--sp != '/')
@@ -5390,7 +5681,12 @@ resolve_path(const struct dir *parent, const char *name, int flags, struct path 
           char buf2[LINUX_PATH_MAX];
           strcpy(buf2, path->subpath);
           strcat(buf2, buf);
-          return resolve_path(&dir, buf2, flags, path, loop + 1);
+          {
+            int rr = resolve_path(&dir, buf2, flags, path, loop + 1);
+            if (rr == 0 && sysfs_rdonly)
+              path->rdonly = true;
+            return rr;
+          }
         }
       }
     }
@@ -5441,6 +5737,8 @@ resolve_path(const struct dir *parent, const char *name, int flags, struct path 
   path->fs = fs;
   path->dir = malloc(sizeof(struct dir));
   path->dir->fd = dir.fd;
+  if (sysfs_rdonly)
+    path->rdonly = true;
   return 0;
 }
 
