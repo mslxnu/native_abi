@@ -101,6 +101,24 @@ struct task {
   struct list_head head;
   gaddr_t set_child_tid, clear_child_tid;
   uint64_t tid;
+  /*
+   * The Mach port naming the host thread this task runs on, which is the handle on
+   * what Darwin knows about one thread rather than the whole process: thread_info
+   * with THREAD_EXTENDED_INFO gives its cpu time, its run state and its name.
+   *
+   * A port rather than pthread_threadid_np's number, which looks like the obvious
+   * choice and is not: proc_pidinfo(PROC_PIDTHREADINFO) wants the handle
+   * PROC_PIDLISTTHREADS hands out - a kernel thread address - and returns nothing
+   * at all for a thread id, with no API to get from one to the other.
+   *
+   * Kept beside tid rather than derived from it, because Linux gives the main
+   * thread a tid equal to the pid, so tid names no host thread there. Taken in the
+   * thread itself, where pthread_self() is the answer; the port stays valid to
+   * read from any thread of the process. Not carried in the checkpoint - the far
+   * side is a fresh process whose threads are its own - so it is set wherever tid
+   * is.
+   */
+  uint32_t mach_thread;
   gaddr_t robust_list;
   l_sigset_t sigmask;
   atomic_sigbits_t sigpending;

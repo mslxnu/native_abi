@@ -30,6 +30,7 @@ init_task(unsigned long clone_flags, gaddr_t child_tid, gaddr_t tls)
 
   if (clone_flags & LINUX_CLONE_THREAD) {
     pthread_threadid_np(NULL, &task.tid);
+    task.mach_thread = pthread_mach_thread_np(pthread_self());
     /*
      * And into the pid namespace, because Linux numbers threads and processes
      * out of the same range - a tid *is* a pid, which is why tgkill takes one
@@ -45,6 +46,7 @@ init_task(unsigned long clone_flags, gaddr_t child_tid, gaddr_t tls)
       (void) pidns_add_child((int32_t) task.tid);
   } else {
     task.tid = getpid();
+    task.mach_thread = pthread_mach_thread_np(pthread_self());
   }
 
   task.set_child_tid = task.clear_child_tid = 0;
@@ -241,6 +243,7 @@ void
 resume_apply_clone(unsigned long clone_flags, gaddr_t child_tid, gaddr_t tls)
 {
   task.tid = getpid();
+  task.mach_thread = pthread_mach_thread_np(pthread_self());
 
   task.set_child_tid = task.clear_child_tid = 0;
   if (clone_flags & LINUX_CLONE_CHILD_SETTID)

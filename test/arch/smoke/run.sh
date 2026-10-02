@@ -1668,6 +1668,20 @@ else
     fail=1
 fi
 
+# threadstattest: per-thread accounting in /proc/<pid>/task/<tid>/stat. The
+# per-thread files used to be the process's under another name - the path was
+# rewritten and the tid thrown away - so every row of `ps -L` carried the same id,
+# state and cpu time, which is the one column that listing exists to show. Three
+# threads with deliberately unequal work; invisible in a single-threaded guest.
+cp "$here/threadstattest" "$root/"; chmod +x "$root/threadstattest"
+out=$(NABI_IGNORE_HOST_FS=1 "$NABI" -m "$root" /threadstattest 2>&1 | tail -1); rc=$?
+if [ "$out" = "threadstat ok" ]; then
+    echo "  ok  threadstattest -> \"$out\""
+else
+    echo "  FAIL threadstattest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 # oomadjtest: /proc/<pid>/oom_score_adj, which did not exist - so Android's init
 # said "Unable to write -1000 to /proc/1/oom_score_adj: open() failed" on every
 # boot, and every service it started got the same. No OOM killer here to bias, so

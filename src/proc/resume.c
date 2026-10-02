@@ -203,6 +203,8 @@ checkpoint_restore(int ckpt_fd, int arena_fd)
   pthread_mutex_init(&proc.futex_mutex, NULL);
 
   task.tid             = hdr.tid;
+
+  task.mach_thread = pthread_mach_thread_np(pthread_self());
   task.set_child_tid   = hdr.set_child_tid;
   task.clear_child_tid = hdr.clear_child_tid;
   task.robust_list     = hdr.robust_list;

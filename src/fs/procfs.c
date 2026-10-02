@@ -65,6 +65,11 @@ int sysctlbyname(const char *, void *, size_t *, void *, size_t);
  * inline of that name in util/misc.h if it gets there first - the same reason
  * sysctlbyname is declared by hand above. */
 #include <libproc.h>
+/* For a single thread's times, state and name, which libproc cannot reach: its
+ * PROC_PIDTHREADINFO wants the handle PROC_PIDLISTTHREADS hands out and there is
+ * no way from a pthread to that. thread_info takes a port, which is recordable. */
+#include <mach/mach.h>
+#include <mach/thread_act.h>
 
 /*
  * Record what this process is running, at exec.
@@ -179,6 +184,9 @@ enum procfs_file { PROCFS_NONE, PROCFS_MAPS, PROCFS_CMDLINE, PROCFS_COMM,
                    PROCFS_UID_MAP, PROCFS_GID_MAP, PROCFS_SETGROUPS,
                    PROCFS_MOUNTINFO, PROCFS_STAT, PROCFS_STATUS, PROCFS_CGROUP,
                    PROCFS_ATTR, PROCFS_OOM_SCORE_ADJ,
+                   /* The per-thread spellings of three of the above; see the
+                    * /task/<tid>/ rewrite in the classifier. */
+                   PROCFS_THREAD_STAT, PROCFS_THREAD_STATUS, PROCFS_THREAD_COMM,
                    PROCFS_NET_DEV,
                    PROCFS_FILESYSTEMS, PROCFS_KCMDLINE, PROCFS_BOOTCONFIG,
                    /* PROCFS_STAT above is a process's; this one is the machine's. */
@@ -392,11 +400,13 @@ procfs_classify(const char *path, int *fd_out, int depth)
       numbuf[tn] = '\0';
       int32_t want = (int32_t) atoi(numbuf);
       bool ours = false;
+      int32_t matched_tid = 0;
       struct list_head *tp;
       list_for_each (tp, &proc.tasks) {
         struct task *t = list_entry(tp, struct task, head);
         if (want == (int32_t) t->tid || want == pidns_to_ns((int32_t) t->tid)) {
           ours = true;
+          matched_tid = (int32_t) t->tid;      /* the host number, always */
           break;
         }
       }
@@ -407,6 +417,23 @@ procfs_classify(const char *path, int *fd_out, int depth)
           if (fd_out) *fd_out = (int) getpid();
           return PROCFS_PIDDIR;
         }
+        /*
+         * stat, status and comm are the three with an answer of their own, so
+         * they keep the tid rather than being rewritten into the process's. It
+         * is what `ps -L` and `top -H` read, and a thread reporting the whole
+         * process's cpu time makes every row of that listing identical - which
+         * is not a cosmetic complaint, it is the one column the command exists
+         * to show.
+         */
+        if (strcmp(tail, "/stat") == 0 || strcmp(tail, "/status") == 0 ||
+            strcmp(tail, "/comm") == 0) {
+          if (fd_out) *fd_out = (int) matched_tid;
+          return strcmp(tail, "/stat") == 0   ? PROCFS_THREAD_STAT
+               : strcmp(tail, "/status") == 0 ? PROCFS_THREAD_STATUS
+                                             : PROCFS_THREAD_COMM;
+        }
+        /* Everything else has no per-thread answer to get wrong, so it is the
+         * process's file under another name. */
         char rewritten[PATH_MAX];
         snprintf(rewritten, sizeof rewritten, "/proc/self%s", tail);
         return procfs_classify(rewritten, fd_out, depth + 1);
@@ -875,6 +902,22 @@ darwin_state_letter(uint32_t st)
   }
 }
 
+/* When the process started, in the clock ticks since boot that stat field 22
+ * counts - not the epoch seconds Darwin keeps, which would say the machine had
+ * been up since 1970. */
+static unsigned long long
+process_start_ticks(const struct proc_taskallinfo *ti)
+{
+  struct timeval boottime;
+  size_t sz = sizeof boottime;
+  if (sysctlbyname("kern.boottime", &boottime, &sz, NULL, 0) != 0)
+    return 0;
+  if ((uint64_t) ti->pbsd.pbi_start_tvsec <= (uint64_t) boottime.tv_sec)
+    return 0;
+  return ((unsigned long long) ti->pbsd.pbi_start_tvsec -
+          (unsigned long long) boottime.tv_sec) * 100ULL;
+}
+
 /* Nanoseconds to the clock ticks /proc counts in. 100 a second, which is what
  * AT_CLKTCK tells the guest and therefore what its libc divides by. */
 static unsigned long long
@@ -905,6 +948,225 @@ proc_comm_paren(int host_pid, const struct proc_taskallinfo *ti, char *out,
     name = ti->pbsd.pbi_comm;
   }
   snprintf(out, cap, "(%.15s)", name ? name : "nabi");
+}
+
+/* Defined below; the per-thread status is this one with four lines replaced. */
+static char *build_status(int host_pid, size_t *len_out);
+
+/*
+ * What Darwin knows about one thread of this process: its cpu time in
+ * nanoseconds, its run state and its name, all from one call.
+ *
+ * Found by the Mach port struct task recorded, not by the Linux tid, which for
+ * the main thread is the pid and names no host thread at all. Returns false for a
+ * thread that has gone since the directory was read, which is the ordinary race
+ * of reading /proc and is answered as Linux answers it - the file is simply not
+ * there any more.
+ */
+static bool
+darwin_thread_info(int32_t linux_tid, struct thread_extended_info *pth)
+{
+  mach_port_t port = MACH_PORT_NULL;
+  struct list_head *tp;
+  list_for_each (tp, &proc.tasks) {
+    struct task *t = list_entry(tp, struct task, head);
+    if ((int32_t) t->tid == linux_tid) {
+      port = (mach_port_t) t->mach_thread;
+      break;
+    }
+  }
+  if (port == MACH_PORT_NULL)
+    return false;
+  memset(pth, 0, sizeof *pth);
+  mach_msg_type_number_t count = THREAD_EXTENDED_INFO_COUNT;
+  return thread_info(port, THREAD_EXTENDED_INFO, (thread_info_t) pth, &count) ==
+         KERN_SUCCESS;
+}
+
+/* A Mach thread's run state as the letter Linux's stat carries. D is the one that
+ * earns its own letter rather than collapsing into S: a caller looking for a
+ * thread stuck in the kernel is looking for exactly that. */
+static char
+thread_state_letter(int32_t run_state)
+{
+  switch (run_state) {
+  case 1:  return 'R';   /* TH_STATE_RUNNING */
+  case 2:  return 'T';   /* TH_STATE_STOPPED */
+  case 3:  return 'S';   /* TH_STATE_WAITING */
+  case 4:  return 'D';   /* TH_STATE_UNINTERRUPTIBLE */
+  case 5:  return 'S';   /* TH_STATE_HALTED, which Linux has no letter for */
+  default: return 'S';
+  }
+}
+
+/*
+ * The thread's name, which is its comm.
+ *
+ * prctl(PR_SET_NAME) already goes to pthread_setname_np, so Darwin is holding
+ * the guest's own answer here and there is nothing to keep in parallel. A thread
+ * that never named itself has none, and the process's comm is what Linux shows
+ * for that - a thread inherits the name it was forked with.
+ */
+static void
+thread_comm(const struct thread_extended_info *pth, char *out, size_t cap)
+{
+  if (pth->pth_name[0]) {
+    snprintf(out, cap, "%.15s", pth->pth_name);
+    return;
+  }
+  const char *exe = proc.ident.exe;
+  const char *base = exe ? strrchr(exe, '/') : NULL;
+  snprintf(out, cap, "%.15s", exe ? (base ? base + 1 : exe) : "nabi");
+}
+
+/*
+ * /proc/<pid>/task/<tid>/stat.
+ *
+ * The same fifty-two fields in the same order, because the same parser reads it,
+ * but the ones that describe a thread describe this thread: its id, its state and
+ * its cpu time. The process-wide ones - the sizes, the thread count, the parent -
+ * stay the process's, which is what Linux does too; a thread has no address space
+ * or parent of its own.
+ */
+static char *
+build_thread_stat(int32_t linux_tid, size_t *len_out)
+{
+  struct thread_extended_info pth;
+  if (!darwin_thread_info(linux_tid, &pth))
+    return NULL;
+  struct proc_taskallinfo ti;
+  if (!darwin_task_info((int) getpid(), &ti))
+    return NULL;
+
+  char comm[32];
+  char name[32];
+  thread_comm(&pth, name, sizeof name);
+  snprintf(comm, sizeof comm, "(%s)", name);
+
+  int nthreads = 0;
+  struct list_head *tp;
+  list_for_each (tp, &proc.tasks)
+    nthreads++;
+
+  char *out = malloc(1024);
+  if (!out)
+    return NULL;
+  int n = snprintf(
+      out, 1024,
+      "%d %s %c %d %d %d "
+      "0 -1 0 "
+      "%llu 0 %llu 0 "
+      "%llu %llu 0 0 "
+      /* 18 priority  19 nice  20 num_threads  21 itrealvalue  22 starttime */
+      "%d 0 %d 0 %llu "
+      "%llu %llu 18446744073709551615 "
+      "0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
+      (int) pidns_to_ns(linux_tid), comm,
+      thread_state_letter(pth.pth_run_state),
+      (int) pidns_to_ns((int32_t) ti.pbsd.pbi_ppid),
+      (int) pidns_to_ns((int32_t) ti.pbsd.pbi_pgid),
+      (int) pidns_to_ns((int32_t) ti.pbsd.pbi_pgid),
+      (unsigned long long) ti.ptinfo.pti_faults,
+      (unsigned long long) ti.ptinfo.pti_pageins,
+      ns_to_ticks(pth.pth_user_time),
+      ns_to_ticks(pth.pth_system_time),
+      /* Darwin counts priority upwards and Linux's nice counts the other way;
+       * there is no honest conversion, so the default is reported rather than a
+       * number derived from a different scale. */
+      20, nthreads > 0 ? nthreads : 1,
+      /* The process's start, because Darwin reports no per-thread one. Linux's is
+       * the thread's, so this is an approximation rather than a copy - but zero
+       * would say the thread has existed since boot, which `ps -L` renders as a
+       * START column from the wrong decade. */
+      process_start_ticks(&ti),
+      (unsigned long long) ti.ptinfo.pti_virtual_size,
+      (unsigned long long) (ti.ptinfo.pti_resident_size / 4096));
+  if (n < 0) {
+    free(out);
+    return NULL;
+  }
+  *len_out = (size_t) n;
+  return out;
+}
+
+/*
+ * /proc/<pid>/task/<tid>/status: the process's, with the four lines that are the
+ * thread's replaced.
+ *
+ * Built by rewriting rather than by a second generator, so the two files cannot
+ * drift apart - the twenty-odd lines they share are written once.
+ */
+static char *
+build_thread_status(int32_t linux_tid, size_t *len_out)
+{
+  struct thread_extended_info pth;
+  if (!darwin_thread_info(linux_tid, &pth))
+    return NULL;
+
+  size_t plen;
+  char *proc_status = build_status((int) getpid(), &plen);
+  if (!proc_status)
+    return NULL;
+
+  char name[32];
+  thread_comm(&pth, name, sizeof name);
+  char letter = thread_state_letter(pth.pth_run_state);
+
+  size_t cap = plen + 256;
+  char *out = malloc(cap);
+  if (!out) {
+    free(proc_status);
+    return NULL;
+  }
+  size_t len = 0;
+  char *line = proc_status;
+  while (*line) {
+    char *nl = strchr(line, '\n');
+    size_t llen = nl ? (size_t) (nl - line) : strlen(line);
+
+    int w = -1;
+    if (strncmp(line, "Name:", 5) == 0)
+      w = snprintf(out + len, cap - len, "Name:\t%s\n", name);
+    else if (strncmp(line, "State:", 6) == 0)
+      w = snprintf(out + len, cap - len, "State:\t%c (%s)\n", letter,
+                   letter == 'R' ? "running" : letter == 'T' ? "stopped"
+                   : letter == 'D' ? "disk sleep" : "sleeping");
+    /* Pid is the thread's; Tgid stays the process's, which is the whole of how
+     * the two are told apart. */
+    else if (strncmp(line, "Pid:", 4) == 0)
+      w = snprintf(out + len, cap - len, "Pid:\t%d\n",
+                   (int) pidns_to_ns(linux_tid));
+    if (w < 0) {
+      if (len + llen + 2 > cap)
+        break;
+      memcpy(out + len, line, llen);
+      len += llen;
+      out[len++] = '\n';
+    } else {
+      len += (size_t) w;
+    }
+    if (!nl)
+      break;
+    line = nl + 1;
+  }
+  free(proc_status);
+  *len_out = len;
+  return out;
+}
+
+static char *
+build_thread_comm(int32_t linux_tid, size_t *len_out)
+{
+  struct thread_extended_info pth;
+  if (!darwin_thread_info(linux_tid, &pth))
+    return NULL;
+  char name[32];
+  thread_comm(&pth, name, sizeof name);
+  char *out = malloc(32);
+  if (!out)
+    return NULL;
+  *len_out = (size_t) snprintf(out, 32, "%s\n", name);
+  return out;
 }
 
 /*
@@ -938,17 +1200,7 @@ build_stat_darwin(int host_pid, size_t *len_out)
       nthreads = n;
   }
 
-  /* starttime is counted from boot, not from the epoch. */
-  unsigned long long start_ticks = 0;
-  {
-    struct timeval boottime;
-    size_t sz = sizeof boottime;
-    if (sysctlbyname("kern.boottime", &boottime, &sz, NULL, 0) == 0 &&
-        (uint64_t) ti.pbsd.pbi_start_tvsec > (uint64_t) boottime.tv_sec)
-      start_ticks =
-          ((unsigned long long) ti.pbsd.pbi_start_tvsec -
-           (unsigned long long) boottime.tv_sec) * 100ULL;
-  }
+  unsigned long long start_ticks = process_start_ticks(&ti);
 
   char *out = malloc(1024);
   if (!out)
@@ -2170,6 +2422,9 @@ procfs_stat(const char *path, bool nofollow, uint32_t *mode, uint64_t *size,
    * normal shape and is unaffected; one that trusts st_size as the length would
    * be wrong about real Linux too.
    */
+  case PROCFS_THREAD_STAT:
+  case PROCFS_THREAD_STATUS:
+  case PROCFS_THREAD_COMM:
   case PROCFS_MAPS:
   case PROCFS_CMDLINE:
   case PROCFS_COMM:
@@ -2596,6 +2851,17 @@ procfs_open(const char *path, int flags, int *out_fd)
     break;
   case PROCFS_STAT:
     content = build_stat(fdno, &len);
+    break;
+  /* fdno is a tid here rather than a pid; the classifier keeps it for exactly
+   * these three. */
+  case PROCFS_THREAD_STAT:
+    content = build_thread_stat((int32_t) fdno, &len);
+    break;
+  case PROCFS_THREAD_STATUS:
+    content = build_thread_status((int32_t) fdno, &len);
+    break;
+  case PROCFS_THREAD_COMM:
+    content = build_thread_comm((int32_t) fdno, &len);
     break;
   case PROCFS_STATUS:
     content = build_status(fdno, &len);

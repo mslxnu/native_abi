@@ -385,6 +385,8 @@ init_first_proc(const char *root)
     cap_start_unprivileged();
 
   task.tid = getpid();
+
+  task.mach_thread = pthread_mach_thread_np(pthread_self());
 }
 
 static void
