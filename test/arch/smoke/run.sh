@@ -1646,6 +1646,20 @@ else
     fail=1
 fi
 
+# sysinfotest: sysinfo(2) reports an uptime rather than the instant of boot, and
+# free memory read from a sysctl of the right width. It assigned kern.boottime's
+# seconds straight across - a Unix timestamp where elapsed seconds belong - and
+# read a four-byte page count into an uninitialised eight-byte variable, so free
+# memory came out larger than total.
+cp "$here/sysinfotest" "$root/"; chmod +x "$root/sysinfotest"
+out=$("$NABI" -m "$root" /sysinfotest 2>&1 | tail -1); rc=$?
+if [ "$out" = "sysinfo ok" ]; then
+    echo "  ok  sysinfotest -> \"$out\""
+else
+    echo "  FAIL sysinfotest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 # binderwraptest: one buffer the receiver keeps must not close the arena. The
 # mark that goes round tested exactly one range for being free - the one it had
 # just wrapped onto - so a buffer still held at the front of the arena refused

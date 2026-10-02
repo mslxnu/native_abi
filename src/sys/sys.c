@@ -23,10 +23,19 @@ DEFINE_SYSCALL(sysinfo, gaddr_t, info_ptr)
   struct l_sysinfo info;
   size_t len;
 
-  struct timeval boottime;
+  /*
+   * Elapsed, not the instant it happened. kern.boottime is *when* the machine
+   * booted, so assigning its seconds straight across reported a Unix timestamp
+   * as an uptime - about 1.79e9 where a few thousand belonged, which anything
+   * dividing by it or formatting it as a duration reads as a machine up for
+   * fifty-odd years. /proc/uptime computes it the same way, and the two have to
+   * agree.
+   */
+  struct timeval boottime, now;
   len = sizeof boottime;
   if (sysctlbyname("kern.boottime", &boottime, &len, NULL, 0) < 0) exit(1);
-  info.uptime = boottime.tv_sec;
+  gettimeofday(&now, NULL);
+  info.uptime = now.tv_sec > boottime.tv_sec ? now.tv_sec - boottime.tv_sec : 0;
 
   double loadavg[3];
   if (getloadavg(loadavg, sizeof loadavg / sizeof loadavg[0]) < 0) {
@@ -45,13 +54,36 @@ DEFINE_SYSCALL(sysinfo, gaddr_t, info_ptr)
   }
   info.totalram = memsize;
 
-  int64_t freepages;
+  /*
+   * Pages times the page size, and the page size has to be asked for. It was
+   * hardcoded to 0x1000, which is right on x86 and wrong on every Apple Silicon
+   * machine - those use 16K pages, so free memory came out at a quarter of what
+   * was actually free. A number that is wrong by a constant factor is worse than
+   * a missing one: it looks plausible, and a guest deciding whether it has room
+   * to allocate believes it.
+   */
+  /*
+   * Each sysctl read into a variable of its own width.
+   *
+   * vm.page_free_count is four bytes and this read it into an uninitialised
+   * int64_t with len=8. sysctlbyname fills the value's own size and leaves the
+   * rest of the buffer alone, so the top half stayed whatever was on the stack
+   * and free memory came out astronomically wrong - larger than total memory,
+   * which is how it was noticed. hw.pagesize is eight bytes, hw.memsize above is
+   * eight; the widths are not guessable and have to match.
+   */
+  int64_t pagesize = 0x1000;
+  len = sizeof pagesize;
+  if (sysctlbyname("hw.pagesize", &pagesize, &len, NULL, 0) < 0 || pagesize <= 0)
+    pagesize = 0x1000;
+
+  unsigned int freepages = 0;
   len = sizeof freepages;
   if (sysctlbyname("vm.page_free_count", &freepages, &len, NULL, 0) < 0){
     perror("sysinfo:");
     exit(1);
   }
-  info.freeram = freepages * 0x1000;
+  info.freeram = (unsigned long) freepages * (unsigned long) pagesize;
 
   /*
    * sysctlbyname() changed in macos 15. Any older os will leave swapinfo[4] as 0.

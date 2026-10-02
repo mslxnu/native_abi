@@ -938,6 +938,16 @@ build_sysvipc(enum procfs_file which, size_t *len_out)
 static long
 host_long(const char *name, long fallback)
 {
+  /*
+   * Zero first, and that is load-bearing rather than tidiness. These sysctls are
+   * not all the same width - hw.memsize and hw.pagesize are eight bytes,
+   * hw.logicalcpu and vm.page_free_count are four - and sysctlbyname fills the
+   * value's own size and leaves the rest of the buffer untouched. Reading a
+   * four-byte value into eight uninitialised bytes leaves the top half as
+   * whatever was on the stack; zeroed first, the little-endian low half is the
+   * whole answer. sysinfo(2) in sys.c had exactly that bug and reported more free
+   * memory than the machine has.
+   */
   int64_t v = 0;
   size_t len = sizeof v;
   if (sysctlbyname(name, &v, &len, NULL, 0) < 0)
