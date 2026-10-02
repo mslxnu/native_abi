@@ -399,9 +399,29 @@ timerfd_read(int fd, char *out, size_t size, int *ret)
     pthread_mutex_unlock(&t->lock);
 
     if (n != 0) {
+      /*
+       * Non-blocking for the drain, because the descriptor itself need not be.
+       *
+       * A timerfd created without TFD_NONBLOCK is a blocking descriptor, and a
+       * drain that empties the pipe then waits for ever on the read after the
+       * last byte - inside a loop that never gets back to handing the caller
+       * its count. Every later expiry only feeds that stuck read: the timer
+       * goes on firing, the count goes on climbing, and read(2) never returns.
+       * Android's servicemanager arms a five second interval and reads it
+       * blocking, so it hung there for the rest of the boot and every service
+       * waiting on it hung behind it - which is a stall that looked like binder
+       * losing a wakeup for a long time.
+       *
+       * binder's wake drain already avoids this the same way.
+       */
       char drain[64];
+      int fl = fcntl(t->rd, F_GETFL);
+      if (fl >= 0 && !(fl & O_NONBLOCK))
+        fcntl(t->rd, F_SETFL, fl | O_NONBLOCK);
       while (read(t->rd, drain, sizeof drain) > 0)
         ;
+      if (fl >= 0 && !(fl & O_NONBLOCK))
+        fcntl(t->rd, F_SETFL, fl);
       memcpy(out, &n, sizeof n);
       *ret = (int) sizeof n;
       return true;

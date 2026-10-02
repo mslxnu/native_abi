@@ -1597,6 +1597,21 @@ else
     fail=1
 fi
 
+# timerfddraintest: reading a *blocking* timerfd returns rather than wedging.
+# timerfd_read drains the pipe after taking the expiry count, and that drain has
+# to be non-blocking: without TFD_NONBLOCK the read after the last byte waits for
+# ever, inside a loop that never hands the caller its count. Android's
+# servicemanager arms a 5s interval and reads it blocking, so it hung there for
+# the rest of the boot - which looked like binder losing a wakeup for a long time.
+cp "$here/timerfddraintest" "$root/"; chmod +x "$root/timerfddraintest"
+out=$(NABI_BINDER=emulated "$NABI" -m "$root" /timerfddraintest 2>&1 | tail -1); rc=$?
+if [ "$out" = "timerfddrain ok" ]; then
+    echo "  ok  timerfddraintest -> \"$out\""
+else
+    echo "  FAIL timerfddraintest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 # binderwraptest: one buffer the receiver keeps must not close the arena. The
 # mark that goes round tested exactly one range for being free - the one it had
 # just wrapped onto - so a buffer still held at the front of the arena refused

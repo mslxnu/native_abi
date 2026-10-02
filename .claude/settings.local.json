@@ -1,0 +1,25 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(rtk grep *)",
+      "Bash(rtk ls *)",
+      "Bash(rtk read *)",
+      "Bash(clang -print-targets)",
+      "Bash(make ARCH=arm64 build)",
+      "Bash(rm -f bindernesttest.o bindernesttest)",
+      "Bash(clang -target aarch64-linux-gnu -ffreestanding -fno-stack-protector -O2 -c bindernesttest.c -o bindernesttest.o)",
+      "Bash(ld.lld -static -e _start bindernesttest.o -o bindernesttest)",
+      "Bash(echo \"rc=$?\")",
+      "Bash(cd /Users/sunneva/Development/msl/nabi/test/arch/smoke *)",
+      "Bash(export DYLD_FALLBACK_LIBRARY_PATH=/opt/homebrew/Cellar/z3/4.16.0/lib)",
+      "Bash(zig build-exe *)",
+      "Bash(zig cc *)",
+      "Bash(make check-smoke *)",
+      "Bash(grep -n \"^- \\\\`binder\" test/arch/smoke/README.md)",
+      "Read(//Users/sunneva/Development/msl/android-harness/**)",
+      "Bash(IMG_DIR=/Users/sunneva/Development/msl/waydroid-images ./mount-images.sh)",
+      "Read(//tmp/**)",
+      "Bash(cd /Users/sunneva/Development/msl/nabi *)"
+    ]
+  }
+}
