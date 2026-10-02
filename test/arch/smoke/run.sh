@@ -1668,6 +1668,21 @@ else
     fail=1
 fi
 
+# oomadjtest: /proc/<pid>/oom_score_adj, which did not exist - so Android's init
+# said "Unable to write -1000 to /proc/1/oom_score_adj: open() failed" on every
+# boot, and every service it started got the same. No OOM killer here to bias, so
+# what is checked is that the file behaves: it round-trips, it refuses what Linux
+# refuses, and a child inherits it - which on arm64 means travelling in the
+# checkpoint, since a fork here is fork plus execve.
+cp "$here/oomadjtest" "$root/"; chmod +x "$root/oomadjtest"
+out=$(NABI_IGNORE_HOST_FS=1 "$NABI" -m "$root" /oomadjtest 2>&1 | tail -1); rc=$?
+if [ "$out" = "oomadj ok" ]; then
+    echo "  ok  oomadjtest -> \"$out\""
+else
+    echo "  FAIL oomadjtest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 # sysinfotest: sysinfo(2) reports an uptime rather than the instant of boot, and
 # free memory read from a sysctl of the right width. It assigned kern.boottime's
 # seconds straight across - a Unix timestamp where elapsed seconds belong - and

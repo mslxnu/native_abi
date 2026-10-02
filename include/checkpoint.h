@@ -26,7 +26,7 @@
 #include "linux/signal.h"
 
 #define CHECKPOINT_MAGIC   0x4E414249434B5031ULL  /* "NABICKP1" */
-#define CHECKPOINT_VERSION 9
+#define CHECKPOINT_VERSION 10
 
 /* One guest memory region, as src/mm/mmap.c tracks it, with the host address
  * replaced by the arena offset that names the same bytes elsewhere. */
@@ -184,6 +184,14 @@ struct checkpoint_header {
    */
   uint32_t exe_len;
   uint32_t cmdline_len;
+
+  /*
+   * The OOM bias, as of version 10. Linux inherits it across fork and keeps it
+   * across execve, and a fork here is fork plus execve, so without this a child
+   * read back zero from a value its parent had set.
+   */
+  int32_t  oom_score_adj;
+  uint32_t _pad5;
   uint32_t _pad2;
 };
 

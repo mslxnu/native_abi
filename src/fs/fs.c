@@ -3926,7 +3926,7 @@ DEFINE_SYSCALL(write, int, fd, gaddr_t, buf_ptr, size_t, size)
     free(buf);
     return r;
   }
-  if (procfs_write_timens(fd, buf, size, &r))
+  if (procfs_write_divert(fd, buf, size, &r))
     goto out;
 
   /*

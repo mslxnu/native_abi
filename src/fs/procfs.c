@@ -173,7 +173,7 @@ enum procfs_file { PROCFS_NONE, PROCFS_MAPS, PROCFS_CMDLINE, PROCFS_COMM,
                    PROCFS_NS_FORCHILDREN, PROCFS_TIMENS_OFFSETS,
                    PROCFS_UID_MAP, PROCFS_GID_MAP, PROCFS_SETGROUPS,
                    PROCFS_MOUNTINFO, PROCFS_STAT, PROCFS_STATUS, PROCFS_CGROUP,
-                   PROCFS_ATTR,
+                   PROCFS_ATTR, PROCFS_OOM_SCORE_ADJ,
                    PROCFS_NET_DEV,
                    PROCFS_FILESYSTEMS, PROCFS_KCMDLINE, PROCFS_BOOTCONFIG,
                    /* PROCFS_STAT above is a process's; this one is the machine's. */
@@ -387,6 +387,37 @@ own_procfs_file_n(const char *path, int *fd_out)
    * somebody else: LXC reads /proc/1/cgroup to learn the layout before it will
    * start a container, and got ENOENT because pid 1 is not us.
    */
+  /*
+   * oom_score_adj, for any pid rather than only our own, because the callers
+   * that matter are writing somebody else's: Android's init writes
+   * /proc/<pid>/oom_score_adj for each service it starts, and lmkd writes the
+   * processes it is biasing. ENOENT for those is what made init say "Unable to
+   * write -1000 to /proc/1/oom_score_adj: open() failed" on every boot.
+   *
+   * fd_out carries the host pid when it is somebody we know about, and -1 when
+   * it is not; a write for anyone but ourselves is accepted and dropped. There
+   * is no OOM killer here for the number to bias, so the only question a guest
+   * can really ask is what it set, and that it gets back.
+   */
+  if (strcmp(slash, "/oom_score_adj") == 0) {
+    if (fd_out) {
+      *fd_out = -1;
+      if (mine) {
+        *fd_out = (int) getpid();
+      } else if (n > 0 && rest[0] >= '0' && rest[0] <= '9') {
+        char numbuf[16];
+        if (n < sizeof numbuf) {
+          memcpy(numbuf, rest, n);
+          numbuf[n] = '\0';
+          int32_t host = pidns_to_host(atoi(numbuf));
+          if (host == (int32_t) getpid())
+            *fd_out = (int) host;
+        }
+      }
+    }
+    return PROCFS_OOM_SCORE_ADJ;
+  }
+
   if (strcmp(slash, "/cgroup") == 0) {
     if (fd_out) {
       int32_t ns;
@@ -594,6 +625,24 @@ own_procfs_file_n(const char *path, int *fd_out)
  * lands somewhere the rootfs does not - and something sizing a download into
  * /tmp should not be told it shares the root's free space.
  */
+/*
+ * The bias itself, as text with a newline, which is the form Linux has and the
+ * form `cat` of it shows. Zero for anyone but ourselves: nabi has no table of
+ * other processes' settings, and inventing a number would be worse than the
+ * default they would have had anyway.
+ */
+static char *
+build_oom_score_adj(int fdno, size_t *len)
+{
+  char text[16];
+  int n = snprintf(text, sizeof text, "%d\n",
+                   fdno == (int) getpid() ? proc.oom_score_adj : 0);
+  if (n < 0)
+    return NULL;
+  *len = (size_t) n;
+  return strdup(text);
+}
+
 static char *
 build_mounts(size_t *len_out)
 {
@@ -1421,37 +1470,71 @@ procfs_ns_of_fd(int fd, enum ns_type *type, uint64_t *ino)
 }
 
 /*
- * Descriptors on /proc/<pid>/timens_offsets, which is the one file here a guest
- * writes rather than reads.
+ * Descriptors on the entries here a guest writes rather than reads:
+ * timens_offsets, the user namespace's maps, and oom_score_adj.
  *
- * The file it was handed is a temporary stand-in holding the current text, so a
- * write that landed in it would be recorded nowhere and reported as a success -
- * the guest would set an offset, read it back from its own copy, and find the
+ * The file each was handed is a temporary stand-in holding the current text, so
+ * a write that landed in it would be recorded nowhere and reported as a success
+ * - the guest would set an offset, read it back from its own copy, and find the
  * clocks unmoved. The descriptor is noted instead and write(2) is diverted to
- * the namespace itself.
+ * whatever really holds the value.
  */
-KHASH_MAP_INIT_INT(timensfd, int)
-static khash_t(timensfd) *timens_fds;
+KHASH_MAP_INIT_INT(divertfd, int)
+static khash_t(divertfd) *divert_fds;
 
 static void
 procfs_remember_writable(int fd, enum procfs_file which)
 {
   int ret;
-  if (timens_fds == NULL)
-    timens_fds = kh_init(timensfd);
-  khiter_t k = kh_put(timensfd, timens_fds, fd, &ret);
-  kh_value(timens_fds, k) = (int) which;
+  if (divert_fds == NULL)
+    divert_fds = kh_init(divertfd);
+  khiter_t k = kh_put(divertfd, divert_fds, fd, &ret);
+  kh_value(divert_fds, k) = (int) which;
 }
 
-/* Whether a write to this descriptor is really a write to a time namespace,
- * and if so what came of it. */
-bool
-procfs_write_timens(int fd, const char *buf, size_t size, int *out)
+/*
+ * A write of /proc/<pid>/oom_score_adj.
+ *
+ * Range-checked, because Linux range-checks it and because the caller reads the
+ * refusal: Android's init prints "oom_score_adjust value must be in range" from
+ * the EINVAL rather than guessing. Reached only for our own pid - a write for
+ * anyone else is never diverted here at all, and lands in the stand-in file
+ * instead, there being no OOM killer here to bias and no table of other
+ * processes to keep the number in.
+ */
+#define OOM_SCORE_ADJ_MIN (-1000)
+#define OOM_SCORE_ADJ_MAX 1000
+
+static int
+oom_score_adj_write(const char *text)
 {
-  if (timens_fds == NULL)
+  char *end = NULL;
+  errno = 0;
+  long v = strtol(text, &end, 10);
+  if (end == text || errno == ERANGE)
+    return -LINUX_EINVAL;
+  /* Trailing space or a newline is how everything writes this; anything else is
+   * not a number and Linux says so. */
+  while (*end == ' ' || *end == '\t' || *end == '\n' || *end == '\r')
+    end++;
+  if (*end != '\0')
+    return -LINUX_EINVAL;
+  if (v < OOM_SCORE_ADJ_MIN || v > OOM_SCORE_ADJ_MAX)
+    return -LINUX_EINVAL;
+
+  proc.oom_score_adj = (int) v;
+  return 0;
+}
+
+/* Whether a write to this descriptor is one of those, and if so what came of
+ * it. */
+bool
+procfs_write_divert(int fd, const char *buf, size_t size, int *out)
+{
+  if (divert_fds == NULL)
     return false;
-  khiter_t k = kh_get(timensfd, timens_fds, fd);
-  if (k == kh_end(timens_fds))
+  khiter_t k = kh_get(divertfd, divert_fds, fd);
+  if (k == kh_end(divert_fds))
     return false;
 
   char text[512];
@@ -1460,10 +1543,11 @@ procfs_write_timens(int fd, const char *buf, size_t size, int *out)
   text[n] = '\0';
 
   int r;
-  switch ((enum procfs_file) kh_value(timens_fds, k)) {
+  switch ((enum procfs_file) kh_value(divert_fds, k)) {
   case PROCFS_UID_MAP:    r = userns_map_write(false, text); break;
   case PROCFS_GID_MAP:    r = userns_map_write(true, text);  break;
   case PROCFS_SETGROUPS:  r = userns_setgroups_write(text);  break;
+  case PROCFS_OOM_SCORE_ADJ: r = oom_score_adj_write(text);  break;
   default:                r = timens_offsets_write(text);    break;
   }
   *out = r < 0 ? r : (int) size;
@@ -1507,15 +1591,15 @@ procfs_dup_fd(int oldfd, int newfd)
       kh_value(nsfd_notes, n) = note;
     }
   }
-  if (timens_fds != NULL) {
-    khiter_t k = kh_get(timensfd, timens_fds, oldfd);
-    if (k != kh_end(timens_fds)) {
+  if (divert_fds != NULL) {
+    khiter_t k = kh_get(divertfd, divert_fds, oldfd);
+    if (k != kh_end(divert_fds)) {
       /* The value as well as the key: it says *which* file this is, and a copy
        * that carried only the key had every map write arriving at the time
        * namespace's parser instead, which refused it. */
-      int which = kh_value(timens_fds, k);
-      khiter_t n = kh_put(timensfd, timens_fds, newfd, &ret);
-      kh_value(timens_fds, n) = which;
+      int which = kh_value(divert_fds, k);
+      khiter_t n = kh_put(divertfd, divert_fds, newfd, &ret);
+      kh_value(divert_fds, n) = which;
     }
   }
 }
@@ -1535,10 +1619,10 @@ procfs_remember_tmpdir(int fd, const char *dir)
 void
 procfs_close_fd(int fd)
 {
-  if (timens_fds != NULL) {
-    khiter_t tk = kh_get(timensfd, timens_fds, fd);
-    if (tk != kh_end(timens_fds))
-      kh_del(timensfd, timens_fds, tk);
+  if (divert_fds != NULL) {
+    khiter_t tk = kh_get(divertfd, divert_fds, fd);
+    if (tk != kh_end(divert_fds))
+      kh_del(divertfd, divert_fds, tk);
   }
   if (nsfd_notes != NULL) {
     khiter_t nk = kh_get(nsfd, nsfd_notes, fd);
@@ -1695,6 +1779,9 @@ procfs_stat(const char *path, bool nofollow, uint32_t *mode, uint64_t *size,
    * set, not just inspected - so a read-only mode here would have a caller
    * decline to try. */
   case PROCFS_ATTR:
+  /* Written far more often than it is read, so a read-only mode here would have
+   * the caller that matters decline to try. */
+  case PROCFS_OOM_SCORE_ADJ:
     *mode = 0644 | 0100000;
     *size = 0;
     *ino  = 6;
@@ -2077,6 +2164,9 @@ procfs_open(const char *path, int flags, int *out_fd)
     content = strdup("");
     len = 0;
     break;
+  case PROCFS_OOM_SCORE_ADJ:
+    content = build_oom_score_adj(fdno, &len);
+    break;
   case PROCFS_MOUNTS:
     content = build_mounts(&len);
     break;
@@ -2171,6 +2261,16 @@ procfs_open(const char *path, int flags, int *out_fd)
     enum procfs_file w = own_procfs_file_n(path, &fdno);
     if (w == PROCFS_TIMENS_OFFSETS || w == PROCFS_UID_MAP ||
         w == PROCFS_GID_MAP || w == PROCFS_SETGROUPS)
+      procfs_remember_writable(fd, w);
+    /*
+     * oom_score_adj only when the pid is our own. The note says what to do with
+     * a write but not who it was for, so a diverted write for somebody else's
+     * pid would be recorded against this process - a guest biasing a child would
+     * silently bias itself. Left unnoted, the write lands in the stand-in file
+     * and is reported as the success it has to be, which is all that can be done
+     * for a process nabi keeps nothing about.
+     */
+    if (w == PROCFS_OOM_SCORE_ADJ && fdno == (int) getpid())
       procfs_remember_writable(fd, w);
   }
 

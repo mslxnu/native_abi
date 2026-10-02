@@ -235,6 +235,14 @@ struct proc {
     char  *cmdline;      /* argv flattened, each entry NUL-terminated */
     size_t cmdline_len;
   } ident;
+
+  /*
+   * What this process wrote to /proc/self/oom_score_adj. Kept so that a read
+   * back agrees with the write, which is all nabi can honestly offer: there is
+   * no OOM killer here to bias. Inherited across fork like Linux's, so it
+   * travels in the checkpoint. See src/fs/procfs.c.
+   */
+  int oom_score_adj;
 };
 
 extern struct proc proc;
@@ -370,7 +378,7 @@ void procfs_close_fd(int fd);
 int procfs_fd_number(const char *path);
 enum ns_type;
 bool procfs_ns_of_fd(int fd, enum ns_type *type, uint64_t *ino);
-bool procfs_write_timens(int fd, const char *buf, size_t size, int *out);
+bool procfs_write_divert(int fd, const char *buf, size_t size, int *out);
 void procfs_dup_fd(int oldfd, int newfd);
 
 /* inotify (src/fs/inotify.c). The opens and closes are the guest's own: kqueue

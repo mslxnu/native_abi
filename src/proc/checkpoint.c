@@ -184,6 +184,7 @@ checkpoint_write(int fd)
   hdr.seccomp_bytes = (uint32_t) seccomp_bytes;
   hdr.exe_len       = proc.ident.exe ? (uint32_t)(strlen(proc.ident.exe) + 1) : 0;
   hdr.cmdline_len   = (uint32_t) proc.ident.cmdline_len;
+  hdr.oom_score_adj = (int32_t) proc.oom_score_adj;
 
   int rc = -1;
   if (write_all(fd, &hdr, sizeof hdr) == 0 &&
@@ -304,6 +305,8 @@ checkpoint_read(int fd, struct checkpoint_header *hdr,
     nsproxy_restore(hdr->ns_ino, &uts);
     cgroup_set_current(hdr->cgroup);
   }
+
+  proc.oom_score_adj = (int) hdr->oom_score_adj;
 
   *regions_out = regions;
   *s2_out = s2;
