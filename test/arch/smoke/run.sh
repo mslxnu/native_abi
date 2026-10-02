@@ -1646,6 +1646,28 @@ else
     fail=1
 fi
 
+# procdirtest: a path nabi will open is a path nabi admits exists. procfs
+# answered open for far more of /proc than it answered stat for, deliberately,
+# because mSL/ProcFS stat'd the rest - so without the kext the two halves
+# contradicted each other and `ps aux` died with "fatal library error, lookup
+# self" while every file it wanted could be read by name. Run both ways: the
+# agreement has to hold whether or not the kext is there.
+cp "$here/procdirtest" "$root/"; chmod +x "$root/procdirtest"
+out=$(NABI_IGNORE_HOST_FS=1 "$NABI" -m "$root" /procdirtest 2>&1 | tail -1); rc=$?
+if [ "$out" = "procdir ok" ]; then
+    echo "  ok  procdirtest (kext-free) -> \"$out\""
+else
+    echo "  FAIL procdirtest (kext-free) -> \"$out\", exit $rc"
+    fail=1
+fi
+out=$("$NABI" -m "$root" /procdirtest 2>&1 | tail -1); rc=$?
+if [ "$out" = "procdir ok" ]; then
+    echo "  ok  procdirtest -> \"$out\""
+else
+    echo "  FAIL procdirtest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 # sysinfotest: sysinfo(2) reports an uptime rather than the instant of boot, and
 # free memory read from a sysctl of the right width. It assigned kern.boottime's
 # seconds straight across - a Unix timestamp where elapsed seconds belong - and

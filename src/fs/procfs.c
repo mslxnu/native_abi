@@ -179,12 +179,25 @@ enum procfs_file { PROCFS_NONE, PROCFS_MAPS, PROCFS_CMDLINE, PROCFS_COMM,
                    /* PROCFS_STAT above is a process's; this one is the machine's. */
                    PROCFS_CPUINFO, PROCFS_MEMINFO, PROCFS_KSTAT,
                    PROCFS_UPTIME, PROCFS_LOADAVG, PROCFS_VERSION,
-                   PROCFS_KMSG };
+                   PROCFS_KMSG,
+                   /* The two directories: /proc itself, and /proc/<pid>. */
+                   PROCFS_PROCDIR, PROCFS_PIDDIR };
 
 /* For PROCFS_FD, the number after /fd/. Meaningless for the others. */
 static enum procfs_file
 own_procfs_file_n(const char *path, int *fd_out)
 {
+  /*
+   * /proc itself. Claimed before the prefix test below, which wants the slash.
+   *
+   * Without this the guest's /proc was whatever the rootfs had at that name -
+   * an empty directory - so anything enumerating processes found none. `ps` and
+   * `top` listed nothing at all and `pgrep` never matched.
+   */
+  if (strcmp(path, "/proc") == 0 || strcmp(path, "/proc/") == 0 ||
+      strcmp(path, "/proc/.") == 0)
+    return PROCFS_PROCDIR;
+
   if (strncmp(path, "/proc/", 6) != 0)
     return PROCFS_NONE;
   const char *rest = path + 6;
@@ -294,9 +307,38 @@ own_procfs_file_n(const char *path, int *fd_out)
   if (strcmp(rest, "sys/kernel/random/boot_id") == 0)
     return PROCFS_RANDOM_BOOT_ID;
 
+  /*
+   * /proc/<pid> as a directory, for self, thread-self, our own pid and any
+   * member of the pid namespace - the same set the entries below are served
+   * for, because a file nabi answers has to sit inside a directory nabi admits
+   * to having.
+   *
+   * It did not, and open and stat disagreed about the same process:
+   * /proc/2/status opened and read, while a stat of /proc/2 was ENOENT. procps
+   * stats the directory before it reads anything in it, which is why `ps aux`
+   * died with "fatal library error, lookup self" even once every file it wanted
+   * could be opened by name.
+   */
   const char *slash = strchr(rest, '/');
-  if (!slash)
+  if (!slash) {
+    if (strcmp(rest, "self") == 0 || strcmp(rest, "thread-self") == 0) {
+      if (fd_out) *fd_out = (int) getpid();
+      return PROCFS_PIDDIR;
+    }
+    if (rest[0] >= '0' && rest[0] <= '9') {
+      int32_t want = (int32_t) atoi(rest);
+      if (want == (int32_t) getpid() || want == pidns_to_ns((int32_t) getpid())) {
+        if (fd_out) *fd_out = (int) getpid();
+        return PROCFS_PIDDIR;
+      }
+      int32_t host = pidns_to_host(want);
+      if (host >= 0) {
+        if (fd_out) *fd_out = (int) host;
+        return PROCFS_PIDDIR;
+      }
+    }
     return PROCFS_NONE;
+  }
 
   size_t n = (size_t) (slash - rest);
   bool mine = (n == 4 && strncmp(rest, "self", 4) == 0) ||
@@ -1612,6 +1654,91 @@ procfs_stat(const char *path, bool nofollow, uint32_t *mode, uint64_t *size,
     *size = 0;
     *ino  = 5;
     return true;
+  /*
+   * Everything else nabi can open, it can now also stat.
+   *
+   * This function used to answer only the entries with no host counterpart,
+   * because "most of /proc is the host's" and mSL/ProcFS stat'd the rest. That
+   * made open and stat disagree about the same path, which is invisible while the
+   * kext is installed and fatal without it: a file that reads perfectly does not
+   * exist as far as access(2) or stat(2) is concerned. procps stats /proc/self
+   * before it reads anything and died with "fatal library error, lookup self",
+   * and `[ -e /proc/self/status ]` was false while `cat` of it worked.
+   *
+   * Sized zero, which is what /proc says about a file whose contents are made
+   * when they are read - the same answer the system-wide files above give. A
+   * caller that sizes a buffer from st_size and then reads until EOF is the
+   * normal shape and is unaffected; one that trusts st_size as the length would
+   * be wrong about real Linux too.
+   */
+  case PROCFS_MAPS:
+  case PROCFS_CMDLINE:
+  case PROCFS_COMM:
+  case PROCFS_MOUNTS:
+  case PROCFS_MOUNTINFO:
+  case PROCFS_STAT:
+  case PROCFS_STATUS:
+  case PROCFS_CGROUP:
+  case PROCFS_NET_DEV:
+  case PROCFS_SYSVIPC_SHM:
+  case PROCFS_SYSVIPC_SEM:
+  case PROCFS_SYSVIPC_MSG:
+  case PROCFS_RANDOM_UUID:
+  case PROCFS_RANDOM_BOOT_ID:
+  case PROCFS_NGROUPS_MAX:
+    *mode = 0444 | 0100000;
+    *size = 0;
+    *ino  = 5;
+    return true;
+
+  /* The label files are read *and* written - /proc/thread-self/attr/fscreate is
+   * set, not just inspected - so a read-only mode here would have a caller
+   * decline to try. */
+  case PROCFS_ATTR:
+    *mode = 0644 | 0100000;
+    *size = 0;
+    *ino  = 6;
+    return true;
+
+  /*
+   * Two directories. Linux has /proc/<pid>/fd as dr-x------ because what is in it
+   * is nobody else's business, and task as dr-xr-xr-x; copied rather than
+   * invented, since a tool that checks the mode before walking in is checking
+   * against Linux's answer.
+   */
+  /* dr-xr-xr-x, as Linux has both of them. */
+  case PROCFS_PROCDIR:
+  case PROCFS_PIDDIR:
+    *mode = 0555 | 0040000;
+    *size = 0;
+    *ino  = 10;
+    return true;
+
+  case PROCFS_FDDIR:
+    *mode = 0500 | 0040000;
+    *size = 0;
+    *ino  = 7;
+    return true;
+  case PROCFS_TASKDIR:
+    *mode = 0555 | 0040000;
+    *size = 0;
+    *ino  = 8;
+    return true;
+
+  /*
+   * /proc/<pid>/fd/<n> is a symlink, and its size is the length of what it
+   * resolves to - which is what anything sizing a readlink buffer asks for. Read
+   * back through procfs_readlink rather than guessed, so the two cannot disagree.
+   */
+  case PROCFS_FD: {
+    char target[PATH_MAX];
+    int n = procfs_readlink(path, target, sizeof target);
+    *mode = 0777 | 0120000;                 /* lrwxrwxrwx */
+    *size = n > 0 ? (uint64_t) n : 0;
+    *ino  = 9;
+    return true;
+  }
+
   default:
     return false;
   }
@@ -1664,6 +1791,108 @@ procfs_open(const char *path, int flags, int *out_fd)
       procfs_rmtree(dirtpl);
       return -1;
     }
+    procfs_remember_tmpdir(dfd, dirtpl);
+    *out_fd = dfd;
+    return 0;
+  }
+
+  /*
+   * The two process directories, built the way /proc/self/fd and /proc/self/ns
+   * are: a real temporary directory holding one entry per thing nabi serves,
+   * opened and swept when the guest closes it.
+   *
+   * The entries are empty placeholders, which is enough for the readdir this
+   * exists for and no more. Reading one *through* the returned descriptor would
+   * get nothing; it is the absolute path that carries content, answered by the
+   * cases in this same switch. That is the arrangement /proc/self/task has had
+   * since it was added, and the callers that matter use absolute paths - procps
+   * walks /proc for names and then opens /proc/<pid>/stat by name.
+   */
+  case PROCFS_PROCDIR: {
+    char dirtpl[PATH_MAX];
+    const char *tmpd = getenv("TMPDIR");
+    snprintf(dirtpl, sizeof dirtpl, "%s/nabi-procdir-XXXXXX",
+             tmpd && *tmpd ? tmpd : "/tmp");
+    if (mkdtemp(dirtpl) == NULL)
+      return -1;
+
+    char name[PATH_MAX];
+
+    /*
+     * One directory per process, named as this namespace numbers it. Outside a
+     * namespace there is only one process to name, because nabi has no table of
+     * the others: a guest process is a host process and they do not know about
+     * each other. So `ps` in a plain guest lists itself, and in a namespace
+     * lists the namespace - which is the case containers care about.
+     */
+    int32_t hosts[256];
+    size_t nh = pidns_hosts(hosts, sizeof hosts / sizeof hosts[0]);
+    if (nh == 0) {
+      hosts[0] = (int32_t) getpid();
+      nh = 1;
+    }
+    for (size_t i = 0; i < nh; i++) {
+      snprintf(name, sizeof name, "%s/%d", dirtpl, (int) pidns_to_ns(hosts[i]));
+      (void) mkdir(name, 0555);
+    }
+
+    static const char *const links[] = { "self", "thread-self" };
+    for (size_t i = 0; i < sizeof links / sizeof links[0]; i++) {
+      char target[16];
+      snprintf(name, sizeof name, "%s/%s", dirtpl, links[i]);
+      snprintf(target, sizeof target, "%d",
+               (int) pidns_to_ns((int32_t) getpid()));
+      (void) symlink(target, name);
+    }
+
+    /* The system-wide files, so that something listing /proc to find out what
+     * this kernel offers finds the ones that are really there. */
+    static const char *const files[] = {
+      "cpuinfo", "meminfo", "stat", "uptime", "loadavg", "version",
+      "filesystems", "cmdline", "bootconfig", "mounts", "kmsg"
+    };
+    for (size_t i = 0; i < sizeof files / sizeof files[0]; i++) {
+      snprintf(name, sizeof name, "%s/%s", dirtpl, files[i]);
+      int tfd = open(name, O_WRONLY | O_CREAT | O_TRUNC, 0444);
+      if (tfd >= 0) close(tfd);
+    }
+
+    int dfd = open(dirtpl, O_RDONLY | O_DIRECTORY);
+    if (dfd < 0) { procfs_rmtree(dirtpl); return -1; }
+    procfs_remember_tmpdir(dfd, dirtpl);
+    *out_fd = dfd;
+    return 0;
+  }
+
+  case PROCFS_PIDDIR: {
+    char dirtpl[PATH_MAX];
+    const char *tmpd = getenv("TMPDIR");
+    snprintf(dirtpl, sizeof dirtpl, "%s/nabi-piddir-XXXXXX",
+             tmpd && *tmpd ? tmpd : "/tmp");
+    if (mkdtemp(dirtpl) == NULL)
+      return -1;
+
+    char name[PATH_MAX];
+    static const char *const files[] = {
+      "stat", "status", "cmdline", "comm", "maps", "mounts", "mountinfo",
+      "cgroup"
+    };
+    for (size_t i = 0; i < sizeof files / sizeof files[0]; i++) {
+      snprintf(name, sizeof name, "%s/%s", dirtpl, files[i]);
+      int tfd = open(name, O_WRONLY | O_CREAT | O_TRUNC, 0444);
+      if (tfd >= 0) close(tfd);
+    }
+    static const char *const dirs[] = { "fd", "task", "ns", "attr" };
+    for (size_t i = 0; i < sizeof dirs / sizeof dirs[0]; i++) {
+      snprintf(name, sizeof name, "%s/%s", dirtpl, dirs[i]);
+      (void) mkdir(name, 0555);
+    }
+    /* exe is a symlink everywhere else, and `ls -l` of the directory asks. */
+    snprintf(name, sizeof name, "%s/exe", dirtpl);
+    (void) symlink(proc.ident.exe ? proc.ident.exe : "/", name);
+
+    int dfd = open(dirtpl, O_RDONLY | O_DIRECTORY);
+    if (dfd < 0) { procfs_rmtree(dirtpl); return -1; }
     procfs_remember_tmpdir(dfd, dirtpl);
     *out_fd = dfd;
     return 0;
