@@ -27,12 +27,14 @@ static long sys6(long n,long a,long b,long c,long d,long e,long f){
 #define SYS_read 63
 #define SYS_close 57
 #define SYS_openat 56
+#define SYS_mount 40
 #define SYS_mkdirat 34
 #define SYS_getpid 172
 #define SYS_exit_group 94
 #define AT_FDCWD (-100)
 #define O_RDONLY 0
 #define EEXIST 17
+#define EINVAL 22
 
 static void put(const char*m){int i=0;while(m[i])i++;sys6(SYS_write,1,(long)m,i,0,0,0);}
 static void putd(long v){char b[24];int i=23;b[i--]=0;int g=v<0;if(g)v=-v;
@@ -101,6 +103,90 @@ void _start(void)
       sys6(SYS_close, f, 0,0,0,0,0);
       buf[n > 0 ? n : 0] = '\0';
       want("/proc/mounts names it", has(buf, "/sys/fs/cgroup"), 1);
+    }
+  }
+
+  /*
+   * `tasks` is the first cgroup version's name for cgroup.procs, and the name
+   * Android uses: libprocessgroup places a process by writing its pid to
+   * /dev/cpuset/<group>/tasks. Only the cgroup.procs spelling existed, so the
+   * mount succeeded, init made the group directories, and every write into one was
+   * ENOENT - 282 refused lookups and 176 "failed to set task profiles" a boot.
+   */
+  {
+    char mine_tasks[80];
+    int i = 0; while (mine[i]) { mine_tasks[i] = mine[i]; i++; }
+    const char *t = "/tasks";
+    int j = 0; while (t[j]) { mine_tasks[i + j] = t[j]; j++; }
+    mine_tasks[i + j] = '\0';
+
+    want("the hierarchy root has tasks", can_open("/sys/fs/cgroup/tasks"), 1);
+    want("and so does a cgroup in it", can_open(mine_tasks), 1);
+
+    /*
+     * And writing a pid to it really moves the process, rather than landing in a
+     * file that happens to exist. /proc/self/cgroup is where the move shows, so
+     * the two have to agree - a tasks file that accepted the write and changed
+     * nothing would pass every check but this one.
+     */
+    long fd = sys6(SYS_openat, AT_FDCWD, (long) mine_tasks, 1 /* O_WRONLY */, 0,0,0);
+    want("open tasks for writing", fd >= 0, 1);
+    if (fd >= 0) {
+      char pidtext[16];
+      long pid = sys6(SYS_getpid, 0,0,0,0,0,0);
+      int k = 0; char tmp[16]; int ti = 0;
+      if (pid == 0) tmp[ti++] = '0';
+      while (pid > 0) { tmp[ti++] = (char)('0' + pid % 10); pid /= 10; }
+      while (ti > 0) pidtext[k++] = tmp[--ti];
+      pidtext[k++] = '\n';
+      want("write our pid to tasks",
+           sys6(SYS_write, fd, (long) pidtext, k, 0,0,0) == k, 1);
+      sys6(SYS_close, fd, 0,0,0,0,0);
+
+      char buf[256];
+      long f2 = sys6(SYS_openat, AT_FDCWD, (long) "/proc/self/cgroup", 0, 0,0,0);
+      want("open /proc/self/cgroup", f2 >= 0, 1);
+      if (f2 >= 0) {
+        long n = sys6(SYS_read, f2, (long) buf, sizeof buf - 1, 0,0,0);
+        sys6(SYS_close, f2, 0,0,0,0,0);
+        buf[n > 0 ? n : 0] = '\0';
+        /* mine is "/sys/fs/cgroup/tNNN"; the group's own name is what cgroup
+         * reports, so compare against the part after the hierarchy. */
+        want("the move shows in /proc/self/cgroup",
+             has(buf, mine + sizeof "/sys/fs/cgroup" - 1), 1);
+      }
+    }
+
+    /* Not a number is not a pid, and Linux says so rather than ignoring it. */
+    long bad_fd = sys6(SYS_openat, AT_FDCWD, (long) mine_tasks, 1, 0,0,0);
+    if (bad_fd >= 0) {
+      want("tasks refuses what is not a pid",
+           sys6(SYS_write, bad_fd, (long) "notapid\n", 8, 0,0,0), -EINVAL);
+      sys6(SYS_close, bad_fd, 0,0,0,0,0);
+    }
+  }
+
+  /*
+   * cpuset is a filesystem type of its own, not an option on cgroup: Android's
+   * init runs `mount cpuset none /dev/cpuset`. Refusing it answered ENODEV and
+   * nothing under /dev/cpuset existed for the rest of the boot.
+   */
+  {
+    want("mkdir a mount point",
+         sys6(SYS_mkdirat, AT_FDCWD, (long) "/cstest", 0755, 0,0,0) == 0 ||
+         sys6(SYS_mkdirat, AT_FDCWD, (long) "/cstest", 0755, 0,0,0) == -EEXIST, 1);
+    want("mount -t cpuset is accepted",
+         sys6(SYS_mount, (long) "none", (long) "/cstest", (long) "cpuset", 0, 0, 0), 0);
+    want("and it is a cgroup hierarchy", can_open("/cstest/tasks"), 1);
+    /* The type in /proc/mounts is how libprocessgroup finds a controller, so a
+     * cpuset mount described as cgroup2 is one it would walk past. */
+    char buf[4096];
+    long f = sys6(SYS_openat, AT_FDCWD, (long) "/proc/mounts", 0, 0,0,0);
+    if (f >= 0) {
+      long n = sys6(SYS_read, f, (long) buf, sizeof buf - 1, 0,0,0);
+      sys6(SYS_close, f, 0,0,0,0,0);
+      buf[n > 0 ? n : 0] = '\0';
+      want("/proc/mounts calls it cpuset", has(buf, "cpuset"), 1);
     }
   }
 

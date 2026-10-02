@@ -93,12 +93,20 @@ cgroup_set_current(const char *path)
 }
 
 /*
- * The three files every cgroup has, and only those three.
+ * The files every cgroup has, and only those.
  *
  * cgroup.controllers is empty and is the honest part: it is how a caller asks
  * what this hierarchy can do, and the answer is "organise processes". Anything
  * that would go on to write memory.max reads this first and finds nothing to
  * enable.
+ *
+ * `tasks` is the first version's name for cgroup.procs and is the name Android
+ * uses: libprocessgroup places a process by writing its pid to
+ * /dev/cpuset/<group>/tasks or /dev/stune/<group>/tasks, and those are v1
+ * hierarchies however they are mounted here. Without it the mount succeeded, init
+ * made the group directories, and every write into one of them was ENOENT - which
+ * reads in the log as a missing cgroup rather than a missing file. A write to it
+ * is the same move cgroup.procs performs; the two names are one file on Linux too.
  */
 void
 cgroup_populate(const char *dir)
@@ -108,6 +116,24 @@ cgroup_populate(const char *dir)
     { "cgroup.subtree_control", "" },
     { "cgroup.procs",           "" },
     { "cgroup.type",            "domain\n" },
+    { "tasks",                  "" },
+    /*
+     * The cpuset masks. Android's init writes a group's allowed cpus and memory
+     * nodes through these, and reads the root's first to learn what there is to
+     * divide: both were ENOENT, twelve times a boot.
+     *
+     * One cpu and one memory node, which is the answer nabi gives everywhere else
+     * - sched_getaffinity reports one, Cpus_allowed in /proc/<pid>/status says
+     * one, and /proc/cpuinfo lists one. A cpuset promising more than the scheduler
+     * will give is the kind of disagreement between two interfaces that is worse
+     * than either answer alone.
+     *
+     * Present in every cgroup rather than only in a cpuset hierarchy, because
+     * there is one hierarchy here however it is mounted; see the note on that in
+     * mount_add. Harmless where nothing reads them.
+     */
+    { "cpus",                   "0\n" },
+    { "mems",                   "0\n" },
   };
   char path[PATH_MAX];
   for (size_t i = 0; i < sizeof files / sizeof files[0]; i++) {
@@ -443,8 +469,10 @@ cgroup_write_procs(int fd, const char *buf, size_t size, int *out)
   if (!cgroup_is_hierarchy_path(path))
     return false;
 
+  /* Either name: see cgroup_populate on why `tasks` is here. */
   char *base = strrchr(path, '/');
-  if (!base || strcmp(base, "/cgroup.procs") != 0)
+  if (!base || (strcmp(base, "/cgroup.procs") != 0 &&
+                strcmp(base, "/tasks") != 0))
     return false;
 
   cgroup_root_dir(root, sizeof root);

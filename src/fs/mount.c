@@ -657,7 +657,17 @@ backing_for_type(const char *type, const char *source, unsigned long flags,
     snprintf(e->type, sizeof e->type, "tmpfs");
     return 0;
   }
-  if (type_is(type, "cgroup2") || type_is(type, "cgroup")) {
+  /*
+   * cpuset is the third spelling of a cgroup mount, and it is a filesystem type
+   * of its own rather than an option: Android's init mounts /dev/cpuset with
+   * `mount cpuset none /dev/cpuset`, not with cgroup and -o cpuset. Refusing it
+   * answered ENODEV, libprocessgroup said "Failed to mount cpuset cgroup: No such
+   * device", and nothing under /dev/cpuset existed for the rest of the boot -
+   * which is 282 refused lookups and 176 "failed to set task profiles", every one
+   * of them this one mount.
+   */
+  if (type_is(type, "cgroup2") || type_is(type, "cgroup") ||
+      type_is(type, "cpuset")) {
     /*
      * The one hierarchy, wherever it is asked for. cgroups are not per-mount:
      * mounting cgroup2 twice shows the same tree, which is what the mount is
@@ -667,9 +677,17 @@ backing_for_type(const char *type, const char *source, unsigned long flags,
     int cr = cgroup_hierarchy(host, sizeof host);
     if (cr < 0)
       return cr;
-    snprintf(e->source, sizeof e->source, "cgroup2");
+    /*
+     * Reported back as what was asked for when it was cpuset, rather than as
+     * cgroup2. The type in /proc/mounts is how libprocessgroup finds out where a
+     * controller lives, and a cpuset mount described as cgroup2 is one it would
+     * walk past. cgroup and cgroup2 keep saying cgroup2, which is what they have
+     * always said and what the single hierarchy really is.
+     */
+    const char *as = type_is(type, "cpuset") ? "cpuset" : "cgroup2";
+    snprintf(e->source, sizeof e->source, "%s", as);
     snprintf(e->hostdir, sizeof e->hostdir, "%s", host);
-    snprintf(e->type, sizeof e->type, "cgroup2");
+    snprintf(e->type, sizeof e->type, "%s", as);
     return 0;
   }
   if (type_is(type, "devtmpfs")) {
