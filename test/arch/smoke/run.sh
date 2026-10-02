@@ -1612,6 +1612,20 @@ else
     fail=1
 fi
 
+# ptypeertest: TIOCGPTPEER hands back the slave. glibc has reached for it first
+# since 2.24 and only falls back to ptsname()+open("/dev/pts/<n>") if it fails -
+# and that fallback is checked against the guest's credentials, while a Darwin
+# slave is granted to the host user. So an unimplemented ioctl broke every
+# terminal emulator for any guest not running as the host uid.
+cp "$here/ptypeertest" "$root/"; chmod +x "$root/ptypeertest"
+out=$(NABI_BINDER=emulated "$NABI" -m "$root" /ptypeertest 2>&1 | tail -1); rc=$?
+if [ "$out" = "ptypeer ok" ]; then
+    echo "  ok  ptypeertest -> \"$out\""
+else
+    echo "  FAIL ptypeertest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 # binderwraptest: one buffer the receiver keeps must not close the arena. The
 # mark that goes round tested exactly one range for being free - the one it had
 # just wrapped onto - so a buffer still held at the front of the arena refused

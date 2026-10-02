@@ -2059,6 +2059,46 @@ darwinfs_ioctl(struct file *file, int cmd, uint64_t val0)
     }
     return 0;
   }
+  /*
+   * The slave, opened by the master rather than looked up by name.
+   *
+   * glibc has reached for this first since 2.24 and only falls back to
+   * ptsname() plus open() if it fails, which is why an unimplemented
+   * TIOCGPTPEER is not merely slower: the fallback opens /dev/pts/<n>, and that
+   * path is subject to the guest's own credentials. A Darwin slave is granted to
+   * the *host* user, so a guest running as anyone else - `--user 1000`, which is
+   * what a desktop session wants - is refused by its own permission check on a
+   * device this process already owns. weston-terminal reported only "failed to
+   * fork and create pty (Permission denied)" for it.
+   *
+   * Darwin has no equivalent ioctl, but it does not need one: the name is
+   * already reachable through TIOCPTYGNAME, and opening it here is done with the
+   * host's credentials, which is the whole point of the call. The flags are the
+   * argument rather than a pointer - O_RDWR|O_NOCTTY in practice.
+   *
+   * Granted again defensively: unlockpt is what normally grants, and a caller
+   * that goes straight here without it would otherwise get an ungranted slave.
+   * TIOCPTYGRANT on an already-granted master is harmless.
+   */
+  case LINUX_TIOCGPTPEER: {
+    char name[PATH_MAX];
+    if ((r = RETRY_ON_RESTARTABLE_EINTR(ioctl(fd, TIOCPTYGNAME, name))) < 0) {
+      return r;
+    }
+    (void) RETRY_ON_RESTARTABLE_EINTR(ioctl(fd, TIOCPTYGRANT));
+    int sfd = open(name, linux_to_darwin_o_flags((int) val0));
+    if (sfd < 0) {
+      return -darwin_to_linux_errno(errno);
+    }
+    /* register_fd answers 0 or -errno, not a descriptor - the number the guest
+     * gets is the host's own, as with eventfd and socketpair above. */
+    int err = register_fd(sfd, (val0 & LINUX_O_CLOEXEC) != 0);
+    if (err < 0) {
+      close(sfd);
+      return err;
+    }
+    return sfd;
+  }
   /* Both take no argument on either side; only the numbers differ. */
   case LINUX_TIOCSCTTY:
     return RETRY_ON_RESTARTABLE_EINTR(ioctl(fd, TIOCSCTTY));

@@ -412,6 +412,7 @@
  */
 #define LINUX_TIOCGPTN		0x80045430	/* _IOR('T', 0x30, unsigned int) */
 #define LINUX_TIOCSPTLCK	0x40045431	/* _IOW('T', 0x31, int) */
+#define LINUX_TIOCGPTPEER	0x5441		/* _IO('T', 0x41) - open the slave directly */
 
 #define	LINUX_FIONCLEX		0x5450
 #define	LINUX_FIOCLEX		0x5451
