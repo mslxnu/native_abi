@@ -1668,6 +1668,33 @@ else
     fail=1
 fi
 
+# sysfstest: the parts of /sys nabi answers for itself. /sys was whatever the
+# rootfs image had at that name, so every question was ENOENT - and Android's init
+# opens /sys/class/udc 1,721 times a boot waiting for a USB device controller,
+# which is a core spent on an answer that cannot change. Checks both halves: the
+# entries served, and that trace_marker and /sys/power/state are still absent,
+# since either would have Android believe in a capability it does not have.
+cp "$here/sysfstest" "$root/"; chmod +x "$root/sysfstest"
+out=$(NABI_IGNORE_HOST_FS=1 "$NABI" -m "$root" /sysfstest 2>&1 | tail -1); rc=$?
+if [ "$out" = "sysfs ok" ]; then
+    echo "  ok  sysfstest -> \"$out\""
+else
+    echo "  FAIL sysfstest -> \"$out\", exit $rc"
+    fail=1
+fi
+# And as somebody other than root, which is the case that found where the tree
+# may live: a translated path is walked by the guest, so every component is
+# checked against its credentials, and a per-user TMPDIR is 0700. Android's
+# services run as system and audioserver, and all of them were refused three
+# directories above the file they wanted.
+out=$(NABI_IGNORE_HOST_FS=1 "$NABI" -u 1000:1000 -m "$root" /sysfstest 2>&1 | tail -1); rc=$?
+if [ "$out" = "sysfs ok" ]; then
+    echo "  ok  sysfstest (uid 1000) -> \"$out\""
+else
+    echo "  FAIL sysfstest (uid 1000) -> \"$out\", exit $rc"
+    fail=1
+fi
+
 # threadstattest: per-thread accounting in /proc/<pid>/task/<tid>/stat. The
 # per-thread files used to be the process's under another name - the path was
 # rewritten and the tid thrown away - so every row of `ps -L` carried the same id,

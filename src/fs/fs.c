@@ -2930,6 +2930,222 @@ cgroupfs_to_host(const char *name, char *out, size_t outsz)
   return (size_t) snprintf(out, outsz, "%s%s", root, name + n) < outsz;
 }
 
+/*
+ * The parts of /sys nabi answers for itself.
+ *
+ * mSL/SysFS is on its way out and on this machine was never in: /sys was whatever
+ * the rootfs image had at that name, which is an empty read-only directory, so
+ * every question about it was ENOENT. One Android boot asks 30,080 of them and is
+ * refused 5,167 times, and the refusals are not all equal. Android's init opens
+ * /sys/class/udc 1,721 times from one thread, waiting for a USB device controller
+ * to appear before it will set up the gadget - a core spent on a question whose
+ * answer cannot change, which is the same shape as logd's old spin on
+ * /proc/kmsg. The directory existing and being empty ends it, and empty is the
+ * truth: there is no USB device controller here.
+ *
+ * Served by translating the name onto a real tree under TMPDIR rather than by
+ * generating content the way /proc's entries are. These answers are static -
+ * nothing about them depends on the process asking - and a real directory makes
+ * stat, open and readdir agree by construction, which is the half of /proc that
+ * had to be repaired after the fact.
+ *
+ * The file's contents are rewritten every time the tree is reached rather than
+ * only when it is missing, which is not belt-and-braces. A guest cannot be kept
+ * out of it by the host mode: a 0444 file denies its own owner, which is exactly
+ * what guest_mode_adopt exists to work around, and the guest is root besides -
+ * root ignores the mode here as it does on Linux. So a root guest's write lands.
+ * (A read-only mode does not even cost nothing: it locked nabi out of rewriting
+ * its own file, and the second resolution of the path failed outright.)
+ * Rewriting means it does not persist: the next read says what is true rather
+ * than what the file was last told, and a guest that writes this learns its write
+ * did not take, which is the useful half of the refusal it cannot be given. The
+ * honest refusal is Linux's EINVAL for a value the kernel will not accept, and
+ * that needs the write diverted the way /proc's writable entries are.
+ *
+ * The directories are made idempotently and left in place, because a directory
+ * that survives a run is a directory that is already correct. That also avoids
+ * the trap the cgroup hierarchy has, where a leftover makes the next mkdir fail
+ * on something unrelated-looking.
+ */
+static const struct {
+  const char *path;         /* under /sys */
+  const char *content;      /* NULL for a directory */
+} sysfs_tree[] = {
+  { "/class", NULL },
+  /*
+   * /sys itself, so a listing of it shows what is in it. Without this the
+   * directories below existed and `ls /sys` was empty - a directory a guest can
+   * enter and cannot see, which is the same disagreement between one answer and
+   * another that /proc's stat and open had.
+   *
+   * /fs is here only to be listed; anything inside it is the cgroup hierarchy's,
+   * which resolves on its own and is declined below so the order of the two
+   * cannot quietly decide it.
+   */
+  { "", NULL },
+  { "/fs", NULL },
+  { "/fs/cgroup", NULL },
+  /* The spin. Empty, which is what a machine with no device controller shows. */
+  { "/class/udc", NULL },
+  { "/kernel", NULL },
+  { "/kernel/mm", NULL },
+  { "/kernel/mm/transparent_hugepage", NULL },
+  /*
+   * Asked 221 times a boot. The brackets mark the setting in force, and never is
+   * in force: there are no huge pages here to collapse into. Saying "always"
+   * would have a guest expect its madvise(MADV_HUGEPAGE) to mean something.
+   */
+  { "/kernel/mm/transparent_hugepage/enabled", "always madvise [never]\n" },
+  /*
+   * The two spellings of the ftrace directory, which atrace probes before it will
+   * trace anything. They exist and hold no trace_marker, which is how a kernel
+   * built without ftrace looks - and is why trace_marker is deliberately absent
+   * rather than served as a sink. A writable marker would turn Android's tracing
+   * on, to write into something that traces nothing.
+   */
+  { "/kernel/tracing", NULL },
+  { "/kernel/debug", NULL },
+  { "/kernel/debug/tracing", NULL },
+  /*
+   * /sys/power exists; /sys/power/state does not, and that is deliberate. Android
+   * suspends by writing "mem" to it, and a write here would land in a real file
+   * and be reported as a success - after which SystemSuspend believes the device
+   * slept when it did not. Refusing the write needs the name to be diverted the
+   * way /proc's writable entries are, and until it is, absent is the honest
+   * answer and the one Android already copes with.
+   */
+  { "/power", NULL },
+};
+#define NR_SYSFS_TREE (sizeof sysfs_tree / sizeof sysfs_tree[0])
+
+/*
+ * Where the tree lives.
+ *
+ * Under /tmp rather than TMPDIR, which is the opposite of what the rest of nabi
+ * does and is forced by what the guest has to be able to do with it. A
+ * translated path is walked by the guest, so every component of it is checked
+ * against the guest's own credentials - and a per-user TMPDIR on macOS is 0700,
+ * which a guest that is not root cannot search. Android's services run as
+ * system, audioserver and the rest, and every one of them got EACCES on the way
+ * through /var/folders/.../T: 127 refusals of transparent_hugepage in a boot,
+ * which read as the file being unreadable and were really the directory three
+ * levels above it. /tmp is 1777 and traversable by anyone, which is what a path
+ * the guest walks needs to be.
+ *
+ * Named per uid and checked for ownership, because /tmp is shared: another
+ * account could otherwise leave a tree here and have nabi serve its files as the
+ * contents of /sys. A directory that is not ours is not used, and nothing is
+ * served rather than something forged.
+ */
+static bool
+sysfs_root(char *out, size_t outsz)
+{
+  if ((size_t) snprintf(out, outsz, "/tmp/nabi-sysfs-%u",
+                        (unsigned) geteuid()) >= outsz)
+    return false;
+  if (mkdir(out, 0755) != 0 && errno != EEXIST)
+    return false;
+  struct stat rst;
+  if (stat(out, &rst) != 0 || !S_ISDIR(rst.st_mode) || rst.st_uid != geteuid())
+    return false;
+  /* mkdir honours the umask, and a guest that set a restrictive one - Android's
+   * init sets 077 - would otherwise make the tree unsearchable for everything
+   * that came after it. */
+  (void) chmod(out, 0755);
+
+  char path[PATH_MAX];
+  for (size_t i = 0; i < NR_SYSFS_TREE; i++) {
+    if ((size_t) snprintf(path, sizeof path, "%s%s", out, sysfs_tree[i].path) >=
+        sizeof path)
+      return false;
+    if (sysfs_tree[i].content == NULL) {
+      if (mkdir(path, 0755) != 0 && errno != EEXIST)
+        return false;
+      (void) chmod(path, 0755);   /* see the umask note above */
+      continue;
+    }
+    /*
+     * Rewritten rather than left alone; see the note above on why a guest's write
+     * cannot be refused here and must instead not persist.
+     *
+     * Through a temporary name and a rename, which is atomic: resolving this path
+     * is what rewrites it, so two processes reaching it at once would otherwise
+     * have one truncating the file the other is about to read. A reader holding
+     * the old file keeps reading the old bytes, which are these bytes.
+     *
+     * Left at 0644, which is the mode Linux gives it. Making it read-only locked
+     * nabi out of its own file - the rewrite below opens it for writing, so the
+     * second resolution failed with EACCES and took the whole translation with
+     * it - and would not have kept a root guest out anyway.
+     */
+    /*
+     * The temporary name carries the pid, because every guest process is its own
+     * nabi and they all resolve this path. One shared name had them renaming each
+     * other's file away: the loser's rename found nothing, the translation failed,
+     * and the guest was told the file did not exist - 114 times out of 221 in an
+     * Android boot, which is how this was found.
+     */
+    char tmp[PATH_MAX];
+    if ((size_t) snprintf(tmp, sizeof tmp, "%s.new.%d", path, (int) getpid()) >=
+        sizeof tmp)
+      return false;
+    int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd < 0)
+      return false;
+    size_t len = strlen(sysfs_tree[i].content);
+    bool ok = write(fd, sysfs_tree[i].content, len) == (ssize_t) len;
+    close(fd);
+    if (!ok || rename(tmp, path) != 0) {
+      (void) unlink(tmp);
+      return false;
+    }
+    (void) chmod(path, 0644);     /* and here */
+  }
+  return true;
+}
+
+/*
+ * Whether this name is one of them, and where it lives if so.
+ *
+ * Only the names in the table and the directories above them, so /sys as a whole
+ * is not claimed: everything else there still resolves as it did, and a guest
+ * that mounts its own sysfs still gets what it mounted. Asked in the same place
+ * cgroupfs_to_host is, and for the same reason - after a mount, before the
+ * passthrough.
+ */
+static bool
+sysfs_to_host(const char *name, char *out, size_t outsz)
+{
+  static const char pre[] = "/sys";
+  size_t n = sizeof pre - 1;
+  if (strncmp(name, pre, n) != 0 || (name[n] != '\0' && name[n] != '/'))
+    return false;
+  const char *rest = name + n;
+
+  /* The hierarchy answers for itself, wherever /sys comes from. Declined here as
+   * well as being asked first, so neither order can serve an empty placeholder
+   * in place of a guest's actual cgroups. */
+  if (strncmp(rest, "/fs/cgroup/", 11) == 0 || strcmp(rest, "/fs/cgroup") == 0)
+    return false;
+
+  bool known = false;
+  for (size_t i = 0; i < NR_SYSFS_TREE && !known; i++) {
+    size_t tn = strlen(sysfs_tree[i].path);
+    /* The entry itself, or anything under a directory of ours - a readdir of
+     * /sys/class/udc reaches it by name and so does a stat of what it found. */
+    if (strncmp(rest, sysfs_tree[i].path, tn) == 0 &&
+        (rest[tn] == '\0' || (rest[tn] == '/' && sysfs_tree[i].content == NULL)))
+      known = true;
+  }
+  if (!known)
+    return false;
+
+  char root[PATH_MAX];
+  if (!sysfs_root(root, sizeof root))
+    return false;
+  return (size_t) snprintf(out, outsz, "%s%s", root, rest) < outsz;
+}
+
 static int
 binder_dev_open(const char *guest_path, int flags, int *out_fd)
 {
@@ -5049,6 +5265,8 @@ resolve_path(const struct dir *parent, const char *name, int flags, struct path 
         name = ptsname;
     } else if (cgroupfs_to_host(name, cgpath, sizeof cgpath)) {
       name = cgpath;              /* the hierarchy, wherever /sys comes from */
+    } else if (sysfs_to_host(name, cgpath, sizeof cgpath)) {
+      name = cgpath;              /* and the rest of /sys that is nabi's */
     } else if (!is_host_passthrough(name)) {
       dir.fd = proc.fileinfo.rootfd;
       name++;
@@ -5464,6 +5682,11 @@ guest_to_host_path(const char *name, char *out, size_t outsz)
      * new directory is a cgroup, and a directory that resolves one way and is
      * classified the other is a cgroup with none of a cgroup's files. */
     if (cgroupfs_to_host(name, mnt, sizeof mnt)) {
+      if (strlcpy(out, mnt, outsz) >= outsz)
+        return -LINUX_ENAMETOOLONG;
+      return 0;
+    }
+    if (sysfs_to_host(name, mnt, sizeof mnt)) {
       if (strlcpy(out, mnt, outsz) >= outsz)
         return -LINUX_ENAMETOOLONG;
       return 0;
