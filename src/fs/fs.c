@@ -4842,6 +4842,20 @@ init_host_passthrough(void)
 }
 
 /*
+ * Whether the host really has a /proc to read.
+ *
+ * procfs's stat and status generators used to read the host's /proc directly,
+ * with a plain open that this probe never saw - so NABI_IGNORE_HOST_FS did not
+ * reach them and the two files kept working on a machine pretending not to have
+ * the kext. Every claim that they worked without it was therefore untested.
+ */
+bool
+host_proc_live(void)
+{
+  return optional_live[0];      /* "/proc", the first entry of the table above */
+}
+
+/*
  * Say what the probe decided.
  *
  * Separate from the probe itself because that has to run before any path is

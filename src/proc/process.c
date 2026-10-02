@@ -1020,6 +1020,21 @@ static uint64_t cap_bounding    = ~0ULL;
 static uint64_t cap_ambient     = 0;
 static pthread_mutex_t cap_lock = PTHREAD_MUTEX_INITIALIZER;
 
+/* The five sets at once, for /proc/<pid>/status to report. Taken under the lock
+ * so the lines of one file cannot straddle a change. */
+void
+caps_snapshot(uint64_t *inh, uint64_t *prm, uint64_t *eff, uint64_t *bnd,
+              uint64_t *amb)
+{
+  pthread_mutex_lock(&cap_lock);
+  *inh = cap_inheritable;
+  *prm = cap_permitted;
+  *eff = cap_effective;
+  *bnd = cap_bounding;
+  *amb = cap_ambient;
+  pthread_mutex_unlock(&cap_lock);
+}
+
 /*
  * PR_SET_KEEPCAPS, which says whether the permitted set survives a transition
  * to all-non-zero uids.

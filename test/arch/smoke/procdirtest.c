@@ -24,6 +24,8 @@ static long sys6(long n,long a,long b,long c,long d,long e,long f){
 #define SYS_exit_group 94
 #define AT_FDCWD (-100)
 #define O_RDONLY 0
+#define O_WRONLY 1
+#define SYS_read 63
 #define O_DIRECTORY 0200000
 #define S_IFMT   0170000
 #define S_IFDIR  0040000
@@ -53,6 +55,10 @@ static void bad(const char *what, const char *why)
 { fails++; put("  FAIL "); put(what); put(": "); put(why); put("\n"); }
 static int eq(const char*a,const char*b)
 { int i=0; for(;a[i]&&b[i];i++) if(a[i]!=b[i]) return 0; return a[i]==b[i]; }
+static int eqn(const char*a,const char*b,int n)
+{ for(int i=0;i<n;i++) if(a[i]!=b[i]) return 0; return 1; }
+static int find(const char*h,int hn,const char*nd,int nn)
+{ for(int i=0;i+nn<=hn;i++) if(eqn(h+i,nd,nn)) return 1; return 0; }
 
 /* The whole point: whatever opens must also stat. */
 static void agree(const char *path, int wantdir)
@@ -73,6 +79,69 @@ static void agree(const char *path, int wantdir)
     bad(path, "stats as something other than a directory");
   if (!wantdir && isdir)
     bad(path, "stats as a directory");
+}
+
+/* The first real entry of a directory, copied into `out`. The tid under
+ * /proc/self/task cannot be known ahead of time and cannot be borrowed from
+ * another process - every guest process here has its own task list, so a tid read
+ * in one and used in another is correctly refused. */
+static int first_entry(const char *dir, char *out, int cap)
+{
+  static char buf[8192];
+  long fd = sys6(SYS_openat, AT_FDCWD, (long) dir, O_RDONLY | O_DIRECTORY, 0,0,0);
+  if (fd < 0) return 0;
+  int got = 0;
+  for (;;) {
+    long n = sys6(SYS_getdents64, fd, (long) buf, sizeof buf, 0, 0, 0);
+    if (n <= 0) break;
+    for (long off = 0; off < n && !got; ) {
+      struct linux_dirent64 *de = (struct linux_dirent64 *)(buf + off);
+      if (de->d_name[0] != '.') {
+        int i = 0;
+        for (; de->d_name[i] && i < cap - 1; i++) out[i] = de->d_name[i];
+        out[i] = 0;
+        got = 1;
+      }
+      off += de->d_reclen;
+    }
+    if (got) break;
+  }
+  sys6(SYS_close, fd, 0,0,0,0,0);
+  return got;
+}
+
+/* Joins "/proc/self/task/<tid>" and `leaf` into `out`. */
+static void tpath(const char *tid, const char *leaf, char *out, int cap)
+{
+  const char *pre = "/proc/self/task/";
+  int i = 0;
+  for (int j = 0; pre[j] && i < cap - 1; j++) out[i++] = pre[j];
+  for (int j = 0; tid[j] && i < cap - 1; j++) out[i++] = tid[j];
+  for (int j = 0; leaf[j] && i < cap - 1; j++) out[i++] = leaf[j];
+  out[i] = 0;
+}
+
+/*
+ * Stronger than agree(): this path must be there. agree() deliberately says
+ * nothing about a path that does not open at all, so a file that is absent from
+ * both halves of procfs slips past it - which is exactly the shape of the
+ * /task/<tid> gap and of stat and status having no answer without the kext.
+ * `must` has to appear in what it reads, so a generator that returns nothing is
+ * caught too.
+ */
+static void require(const char *path, const char *must, int mustn)
+{
+  static char rbuf[8192];
+  long fd = sys6(SYS_openat, AT_FDCWD, (long) path, O_RDONLY, 0, 0, 0);
+  if (fd < 0) { bad(path, "does not open"); return; }
+  long n = sys6(SYS_read, fd, (long) rbuf, sizeof rbuf - 1, 0, 0, 0);
+  sys6(SYS_close, fd, 0,0,0,0,0);
+  if (n <= 0) { bad(path, "reads empty"); return; }
+  rbuf[n] = 0;
+  if (!find(rbuf, (int) n, must, mustn)) bad(path, "is missing what it must say");
+  struct lstat rst;
+  if (sys6(SYS_newfstatat, AT_FDCWD, (long) path, (long) &rst, 0, 0, 0) != 0)
+    bad(path, "reads but does not stat");
 }
 
 static int lists(const char *dir, const char *name)
@@ -107,6 +176,19 @@ void _start(void)
   agree("/proc/self/task", 1);
   agree("/proc/self/ns", 1);
 
+  /*
+   * stat and status must be there, not merely agree. Both were built by rewriting
+   * the pid fields of the *host's* /proc, read with a plain open that the
+   * passthrough probe never saw - so they quietly went on working on a machine
+   * pretending to have no kext, and on one that really had none they were absent
+   * while stat claimed they existed. Required here, with a field of each that a
+   * caller actually parses, so the Darwin-backed answer cannot regress to nothing.
+   */
+  require("/proc/self/status", "Name:", 5);
+  require("/proc/self/status", "VmRSS:", 6);
+  require("/proc/self/status", "Threads:", 8);
+  require("/proc/self/stat", ")", 1);
+
   /* The files. Every one of these could be read before and none of them could
    * be stat'd, which is the bug this test exists for. */
   agree("/proc/self/status", 0);
@@ -129,6 +211,55 @@ void _start(void)
    * under it. */
   if (!lists("/proc", "self"))
     bad("/proc", "its own listing has no self");
+
+  /*
+   * /proc/<pid>/task/<tid>/<file>, the per-thread view. Only the bare /task was
+   * classified, so everything inside it fell through - and libselinux's fallback
+   * for setting a creation context is exactly
+   * /proc/self/task/<tid>/attr/fscreate, so a guest whose first spelling failed
+   * had no second one.
+   *
+   * The tid has to be read from the directory rather than assumed: it is not the
+   * pid in a threaded guest, and a tid taken from another process is correctly
+   * refused, since each guest process here keeps its own task list.
+   */
+  char tid[32], path[128];
+  struct lstat tst;
+  if (!first_entry("/proc/self/task", tid, sizeof tid)) {
+    bad("/proc/self/task", "lists no thread at all");
+  } else {
+    tpath(tid, "", path, sizeof path);
+    agree(path, 1);                       /* the thread's own directory */
+    if (sys6(SYS_newfstatat, AT_FDCWD, (long) path, (long) &tst, 0, 0, 0) != 0)
+      bad(path, "the thread's own directory is not there");
+    tpath(tid, "/fd", path, sizeof path);     agree(path, 1);
+    tpath(tid, "/ns", path, sizeof path);     agree(path, 1);
+    tpath(tid, "/status", path, sizeof path); agree(path, 0);
+    tpath(tid, "/stat", path, sizeof path);   agree(path, 0);
+    tpath(tid, "/comm", path, sizeof path);   agree(path, 0);
+    tpath(tid, "/maps", path, sizeof path);   agree(path, 0);
+    tpath(tid, "/cmdline", path, sizeof path); agree(path, 0);
+    tpath(tid, "/cgroup", path, sizeof path); agree(path, 0);
+    tpath(tid, "/attr/current", path, sizeof path); agree(path, 0);
+
+    /* The one that sent libselinux away empty-handed, and it has to be writable
+     * rather than merely present. */
+    tpath(tid, "/attr/fscreate", path, sizeof path);
+    long fd = sys6(SYS_openat, AT_FDCWD, (long) path, O_WRONLY, 0, 0, 0);
+    if (fd < 0) bad(path, "cannot be opened for writing");
+    else sys6(SYS_close, fd, 0,0,0,0,0);
+
+    /* And they really read, rather than merely opening: these are generated on
+     * open, so an empty answer means the generator declined. */
+    tpath(tid, "/status", path, sizeof path);  require(path, "Name:", 5);
+    tpath(tid, "/stat", path, sizeof path);    require(path, ")", 1);
+    tpath(tid, "/comm", path, sizeof path);    require(path, "", 0);
+  }
+
+  /* A tid that is not one of ours is not ours to answer for. */
+  if (sys6(SYS_newfstatat, AT_FDCWD, (long) "/proc/self/task/999999/status",
+           (long) &tst, 0, 0, 0) == 0)
+    bad("/proc/self/task/999999/status", "answered for a thread we do not have");
 
   put(fails == 0 ? "procdir ok\n" : "procdir failed\n");
   sys6(SYS_exit_group, fails ? 1 : 0, 0,0,0,0,0);

@@ -300,6 +300,9 @@ bool mount_pivot(const char *new_root, const char *put_old_after,
 bool   seccomp_check(uint64_t nr, const uint64_t *args, uint64_t *ret);
 int    seccomp_prctl_set(unsigned long mode, gaddr_t prog);
 int    seccomp_mode_get(void);
+void   caps_snapshot(uint64_t *inh, uint64_t *prm, uint64_t *eff, uint64_t *bnd,
+                     uint64_t *amb);
+bool   host_proc_live(void);
 int    seccomp_no_new_privs_get(void);
 int    seccomp_no_new_privs_set(void);
 size_t seccomp_snapshot_size(void);

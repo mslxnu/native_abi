@@ -61,6 +61,11 @@ int sysctlbyname(const char *, void *, size_t *, void *, size_t);
 #include "linux/fs.h"
 #include "linux/mman.h"
 
+/* Last on purpose: libproc.h reaches sys/param.h, whose roundup() macro eats the
+ * inline of that name in util/misc.h if it gets there first - the same reason
+ * sysctlbyname is declared by hand above. */
+#include <libproc.h>
+
 /*
  * Record what this process is running, at exec.
  *
@@ -184,8 +189,23 @@ enum procfs_file { PROCFS_NONE, PROCFS_MAPS, PROCFS_CMDLINE, PROCFS_COMM,
                    PROCFS_PROCDIR, PROCFS_PIDDIR };
 
 /* For PROCFS_FD, the number after /fd/. Meaningless for the others. */
+static enum procfs_file procfs_classify(const char *path, int *fd_out, int depth);
+
+/*
+ * Which of /proc's entries this path is, if it is one of nabi's.
+ *
+ * The depth argument exists only for the /task/<tid>/ rewrite below, which hands
+ * the remainder back here once; one is the ceiling, so a path spelling /task/
+ * twice cannot walk in circles.
+ */
 static enum procfs_file
 own_procfs_file_n(const char *path, int *fd_out)
+{
+  return procfs_classify(path, fd_out, 0);
+}
+
+static enum procfs_file
+procfs_classify(const char *path, int *fd_out, int depth)
 {
   /*
    * /proc itself. Claimed before the prefix test below, which wants the slash.
@@ -340,6 +360,60 @@ own_procfs_file_n(const char *path, int *fd_out)
     return PROCFS_NONE;
   }
 
+  /*
+   * /proc/<pid>/task/<tid>/<anything>: the per-thread view, which is the same
+   * set of files one directory up.
+   *
+   * Only the bare /task was classified, so everything inside it fell through.
+   * libselinux sets the context new files are created with by writing
+   * /proc/thread-self/attr/fscreate and *falling back* to
+   * /proc/self/task/<tid>/attr/fscreate - the fallback path reached nothing, so
+   * a guest whose first spelling failed had no second one. The same hole swallows
+   * /proc/self/task/<tid>/status, which is how anything enumerating threads reads
+   * them after walking the directory it was already given.
+   *
+   * Answered by handing the remainder back to this function as the process's own
+   * file, once the tid is confirmed to be one of our tasks. That is a real
+   * limitation and not a rewrite of convenience: the per-thread files report the
+   * process's numbers, so a thread's stat carries the process's cpu time and its
+   * status the process's pid. For every file but stat, status and comm there is
+   * no per-thread answer to get wrong, and those three need thread-level
+   * accounting Darwin reports separately - worth doing when something reads
+   * `ps -L` and not before. The files existing is the difference between a caller
+   * proceeding and a caller giving up.
+   */
+  if (strncmp(slash, "/task/", 6) == 0 && slash[6] != '\0' && depth == 0) {
+    const char *tid = slash + 6;
+    const char *tail = strchr(tid, '/');
+    size_t tn = tail ? (size_t) (tail - tid) : strlen(tid);
+    char numbuf[16];
+    if (tn > 0 && tn < sizeof numbuf && tid[0] >= '0' && tid[0] <= '9') {
+      memcpy(numbuf, tid, tn);
+      numbuf[tn] = '\0';
+      int32_t want = (int32_t) atoi(numbuf);
+      bool ours = false;
+      struct list_head *tp;
+      list_for_each (tp, &proc.tasks) {
+        struct task *t = list_entry(tp, struct task, head);
+        if (want == (int32_t) t->tid || want == pidns_to_ns((int32_t) t->tid)) {
+          ours = true;
+          break;
+        }
+      }
+      if (ours) {
+        /* No tail is the thread's own directory, which is a directory like the
+         * process's. */
+        if (!tail || strcmp(tail, "/") == 0 || strcmp(tail, "/.") == 0) {
+          if (fd_out) *fd_out = (int) getpid();
+          return PROCFS_PIDDIR;
+        }
+        char rewritten[PATH_MAX];
+        snprintf(rewritten, sizeof rewritten, "/proc/self%s", tail);
+        return procfs_classify(rewritten, fd_out, depth + 1);
+      }
+    }
+  }
+
   size_t n = (size_t) (slash - rest);
   bool mine = (n == 4 && strncmp(rest, "self", 4) == 0) ||
               (n == 11 && strncmp(rest, "thread-self", 11) == 0);
@@ -447,7 +521,18 @@ own_procfs_file_n(const char *path, int *fd_out)
    * inconsistency a renumbering has to avoid to be worth having. Outside a pid
    * namespace these are not ours and the host answers them as before.
    */
-  if (pidns_active() && strcmp(slash, "/stat") == 0) {
+  /*
+   * stat is ours whether or not a pid namespace is active, as status already was.
+   *
+   * It used to be claimed only inside one, on the grounds that outside a namespace
+   * the host's answer is already right - pidns_to_ns is the identity there, so the
+   * rewriting this generator exists for changes nothing. True about the content
+   * and wrong about existence: the host answering it at all depends on
+   * mSL/ProcFS, so without the kext and without a namespace /proc/self/stat was
+   * simply absent, and `ps` had nothing to read. It also broke the per-thread
+   * path, which resolves through this one.
+   */
+  if (strcmp(slash, "/stat") == 0) {
     if (fd_out) *fd_out = (int) getpid();
     return PROCFS_STAT;
   }
@@ -696,6 +781,16 @@ ns_link_ino(enum procfs_file kind, enum ns_type t)
 static char *
 slurp_host_proc(int host_pid, const char *leaf, size_t *len_out)
 {
+  /*
+   * Only if the host really has a /proc. This is a plain open of a host path,
+   * which the passthrough probe never sees, so without this test
+   * NABI_IGNORE_HOST_FS did not reach the two generators below and they went on
+   * reading mSL/ProcFS on a machine that was pretending not to have it. Every
+   * claim that stat and status worked kext-free was made against the kext.
+   */
+  if (!host_proc_live())
+    return NULL;
+
   char path[PATH_MAX];
   snprintf(path, sizeof path, "/proc/%d/%s", host_pid, leaf);
   int fd = open(path, O_RDONLY);
@@ -736,13 +831,333 @@ slurp_host_proc(int host_pid, const char *leaf, size_t *len_out)
  * starts after the last ')' - which is how everything that reads this file
  * does it, and for the same reason.
  */
+/*
+ * What Darwin knows about a process, which is what /proc/<pid>/stat and
+ * /proc/<pid>/status are built from when there is no host /proc to copy.
+ *
+ * Fill what Darwin knows and zero the rest, which is the same rule the
+ * machine-wide files follow: a field nabi cannot know reads as the zero Linux
+ * itself shows for "nothing to report", and no caller is told a number that was
+ * invented. Everything here comes from one proc_pidinfo call so the lines of one
+ * file describe one instant.
+ */
+static bool
+darwin_task_info(int host_pid, struct proc_taskallinfo *ti)
+{
+  memset(ti, 0, sizeof *ti);
+  return proc_pidinfo(host_pid, PROC_PIDTASKALLINFO, 0, ti, sizeof *ti) ==
+         (int) sizeof *ti;
+}
+
+/* Darwin's process states, as the single letter Linux uses. Z and T are the two
+ * a caller acts on - `ps` marks them and a reaper waits for Z - so they are
+ * distinguished rather than all collapsed into S.
+ *
+ * The five p_stat values spelled out rather than taken from <sys/proc.h>, which
+ * this file cannot include: it is the header the roundup() collision above comes
+ * from. They have had these numbers since 4.4BSD. */
+#define DARWIN_SIDL   1
+#define DARWIN_SRUN   2
+#define DARWIN_SSLEEP 3
+#define DARWIN_SSTOP  4
+#define DARWIN_SZOMB  5
+
+static char
+darwin_state_letter(uint32_t st)
+{
+  switch (st) {
+  case DARWIN_SIDL:   return 'I';
+  case DARWIN_SRUN:   return 'R';
+  case DARWIN_SSLEEP: return 'S';
+  case DARWIN_SSTOP:  return 'T';
+  case DARWIN_SZOMB:  return 'Z';
+  default:            return 'S';
+  }
+}
+
+/* Nanoseconds to the clock ticks /proc counts in. 100 a second, which is what
+ * AT_CLKTCK tells the guest and therefore what its libc divides by. */
+static unsigned long long
+ns_to_ticks(uint64_t ns)
+{
+  return (unsigned long long) (ns / 10000000ULL);
+}
+
+/*
+ * The comm of a process, parenthesised as field 2 of stat has it.
+ *
+ * Ours comes from the identity nabi recorded at exec, because Darwin's answer
+ * for this process is "nabi" - the emulator, not the guest. Somebody else's can
+ * only be Darwin's, and for another guest that is "nabi" too; it is the truth
+ * about the host process and the only name available.
+ */
+static void
+proc_comm_paren(int host_pid, const struct proc_taskallinfo *ti, char *out,
+                size_t cap)
+{
+  const char *name = NULL;
+  if (host_pid == (int) getpid() && proc.ident.exe) {
+    const char *base = strrchr(proc.ident.exe, '/');
+    name = base ? base + 1 : proc.ident.exe;
+  } else if (ti->pbsd.pbi_name[0]) {
+    name = ti->pbsd.pbi_name;
+  } else if (ti->pbsd.pbi_comm[0]) {
+    name = ti->pbsd.pbi_comm;
+  }
+  snprintf(out, cap, "(%.15s)", name ? name : "nabi");
+}
+
+/*
+ * /proc/<pid>/stat from Darwin alone.
+ *
+ * The field order is Linux's and the count is Linux's, because this is parsed
+ * positionally - procps counts spaces from the last close parenthesis and would
+ * read the wrong field from a short line rather than notice. So every field is
+ * present and the ones with no answer here are zero.
+ */
+static char *
+build_stat_darwin(int host_pid, size_t *len_out)
+{
+  struct proc_taskallinfo ti;
+  if (!darwin_task_info(host_pid, &ti))
+    return NULL;
+
+  char comm[32];
+  proc_comm_paren(host_pid, &ti, comm, sizeof comm);
+
+  int nthreads = (int) ti.ptinfo.pti_threadnum;
+  if (host_pid == (int) getpid()) {
+    /* Our own count is the guest's threads, not nabi's - the same mismatch
+     * /proc/<pid>/task carries, and built from the same list so the two files
+     * cannot disagree. */
+    int n = 0;
+    struct list_head *tp;
+    list_for_each (tp, &proc.tasks)
+      n++;
+    if (n > 0)
+      nthreads = n;
+  }
+
+  /* starttime is counted from boot, not from the epoch. */
+  unsigned long long start_ticks = 0;
+  {
+    struct timeval boottime;
+    size_t sz = sizeof boottime;
+    if (sysctlbyname("kern.boottime", &boottime, &sz, NULL, 0) == 0 &&
+        (uint64_t) ti.pbsd.pbi_start_tvsec > (uint64_t) boottime.tv_sec)
+      start_ticks =
+          ((unsigned long long) ti.pbsd.pbi_start_tvsec -
+           (unsigned long long) boottime.tv_sec) * 100ULL;
+  }
+
+  char *out = malloc(1024);
+  if (!out)
+    return NULL;
+  int n = snprintf(
+      out, 1024,
+      /*  1 pid   2 comm  3 state  4 ppid  5 pgrp  6 session */
+      "%d %s %c %d %d %d "
+      /*  7 tty_nr  8 tpgid  9 flags */
+      "0 -1 0 "
+      /* 10 minflt  11 cminflt  12 majflt  13 cmajflt */
+      "%llu 0 %llu 0 "
+      /* 14 utime  15 stime  16 cutime  17 cstime */
+      "%llu %llu 0 0 "
+      /* 18 priority  19 nice  20 num_threads  21 itrealvalue  22 starttime */
+      "20 %d %d 0 %llu "
+      /* 23 vsize  24 rss (in pages)  25 rsslim */
+      "%llu %llu 18446744073709551615 "
+      /* 26-52: the addresses of the segments, the signal masks, the exit
+       * signal, the processor, the rt priorities, the delayacct and the fault
+       * addresses. None of them is knowable from Darwin and every one of them
+       * is zero rather than absent, so the field count stays right. */
+      "0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
+      (int) pidns_to_ns(host_pid), comm,
+      darwin_state_letter(ti.pbsd.pbi_status),
+      (int) pidns_to_ns((int32_t) ti.pbsd.pbi_ppid),
+      (int) pidns_to_ns((int32_t) ti.pbsd.pbi_pgid),
+      (int) pidns_to_ns((int32_t) ti.pbsd.pbi_pgid),
+      (unsigned long long) ti.ptinfo.pti_faults,
+      (unsigned long long) ti.ptinfo.pti_pageins,
+      ns_to_ticks(ti.ptinfo.pti_total_user),
+      ns_to_ticks(ti.ptinfo.pti_total_system),
+      (int) ti.pbsd.pbi_nice, nthreads, start_ticks,
+      (unsigned long long) ti.ptinfo.pti_virtual_size,
+      (unsigned long long) (ti.ptinfo.pti_resident_size / 4096));
+  if (n < 0) {
+    free(out);
+    return NULL;
+  }
+  *len_out = (size_t) n;
+  return out;
+}
+
+/*
+ * /proc/<pid>/status from Darwin and from nabi's own books.
+ *
+ * Read by name rather than by position, so a line nabi cannot fill could be
+ * left out - but the whole standard set is emitted anyway, because a caller that
+ * finds no VmRSS line cannot tell "zero" from "this kernel does not say", and
+ * the former is the truth here for the fields Darwin has no answer for.
+ *
+ * The credential, signal and capability lines are better than Darwin's for our
+ * own process: nabi keeps the guest's, and Darwin's would be the emulator's.
+ * For anybody else only Darwin's ids are available and the rest is zero, which
+ * is honest - nabi knows nothing about another process's masks.
+ */
+static char *
+build_status_darwin(int host_pid, size_t *len_out)
+{
+  struct proc_taskallinfo ti;
+  if (!darwin_task_info(host_pid, &ti))
+    return NULL;
+
+  bool self = host_pid == (int) getpid();
+  char comm[32];
+  proc_comm_paren(host_pid, &ti, comm, sizeof comm);
+  /* Without the parentheses here; status spells it plainly. */
+  size_t clen = strlen(comm);
+  if (clen >= 2) {
+    memmove(comm, comm + 1, clen - 2);
+    comm[clen - 2] = '\0';
+  }
+
+  int nthreads = (int) ti.ptinfo.pti_threadnum;
+  if (self) {
+    int n = 0;
+    struct list_head *tp;
+    list_for_each (tp, &proc.tasks)
+      n++;
+    if (n > 0)
+      nthreads = n;
+  }
+
+  l_uid_t uid, euid, suid, fsuid;
+  l_gid_t gid, egid, sgid, fsgid;
+  if (self) {
+    uid = proc.cred.uid; euid = proc.cred.euid;
+    suid = proc.cred.suid; fsuid = proc.cred.fsuid;
+    gid = proc.cred.gid;  egid = proc.cred.egid;
+    sgid = proc.cred.sgid; fsgid = proc.cred.fsgid;
+  } else {
+    uid = euid = suid = fsuid = (l_uid_t) ti.pbsd.pbi_uid;
+    gid = egid = sgid = fsgid = (l_gid_t) ti.pbsd.pbi_gid;
+  }
+
+  uint64_t inh = 0, prm = 0, eff = 0, bnd = 0, amb = 0;
+  uint64_t blocked = 0, ignored = 0, caught = 0;
+  if (self) {
+    caps_snapshot(&inh, &prm, &eff, &bnd, &amb);
+    blocked = task.sigmask.__mask;
+    for (int sig = 1; sig < LINUX_NSIG; sig++) {
+      uint64_t bit = 1ULL << (sig - 1);
+      l_handler_t h = proc.sigaction[sig].lsa_handler;
+      if (h == (l_handler_t) LINUX_SIG_IGN)
+        ignored |= bit;
+      else if (h != (l_handler_t) LINUX_SIG_DFL)
+        caught |= bit;
+    }
+  }
+
+  size_t cap = 2048;
+  char *out = malloc(cap);
+  if (!out)
+    return NULL;
+  size_t len = 0;
+#define EMIT(...)                                                              \
+  do {                                                                         \
+    int w = snprintf(out + len, cap - len, __VA_ARGS__);                        \
+    if (w < 0 || (size_t) w >= cap - len) {                                     \
+      free(out);                                                               \
+      return NULL;                                                             \
+    }                                                                          \
+    len += (size_t) w;                                                          \
+  } while (0)
+
+  EMIT("Name:\t%s\n", comm);
+  EMIT("Umask:\t0022\n");
+  EMIT("State:\t%c (%s)\n", darwin_state_letter(ti.pbsd.pbi_status),
+       darwin_state_letter(ti.pbsd.pbi_status) == 'R' ? "running" :
+       darwin_state_letter(ti.pbsd.pbi_status) == 'Z' ? "zombie" :
+       darwin_state_letter(ti.pbsd.pbi_status) == 'T' ? "stopped" : "sleeping");
+  EMIT("Tgid:\t%d\n", (int) pidns_to_ns(host_pid));
+  EMIT("Ngid:\t0\n");
+  EMIT("Pid:\t%d\n", (int) pidns_to_ns(host_pid));
+  /* A parent outside the namespace has no pid in it, and 0 is what Linux shows
+   * for that. */
+  EMIT("PPid:\t%d\n", (int) pidns_to_ns((int32_t) ti.pbsd.pbi_ppid));
+  EMIT("TracerPid:\t0\n");
+  EMIT("Uid:\t%d\t%d\t%d\t%d\n", (int) uid, (int) euid, (int) suid, (int) fsuid);
+  EMIT("Gid:\t%d\t%d\t%d\t%d\n", (int) gid, (int) egid, (int) sgid, (int) fsgid);
+  EMIT("FDSize:\t256\n");
+  EMIT("Groups:\t");
+  if (self) {
+    int ng = guest_groups_get(NULL);
+    if (ng > 0) {
+      l_gid_t *g = malloc((size_t) ng * sizeof *g);
+      if (g) {
+        ng = guest_groups_get(g);
+        for (int i = 0; i < ng; i++)
+          EMIT("%d ", (int) g[i]);
+        free(g);
+      }
+    }
+  }
+  EMIT("\n");
+  /* Darwin reports the whole task's footprint, which is the guest's arena and
+   * nabi's own together. It is the number the host would charge for this
+   * process and the only one there is. */
+  EMIT("VmPeak:\t%llu kB\n", (unsigned long long) (ti.ptinfo.pti_virtual_size / 1024));
+  EMIT("VmSize:\t%llu kB\n", (unsigned long long) (ti.ptinfo.pti_virtual_size / 1024));
+  EMIT("VmLck:\t0 kB\n");
+  EMIT("VmPin:\t0 kB\n");
+  EMIT("VmHWM:\t%llu kB\n", (unsigned long long) (ti.ptinfo.pti_resident_size / 1024));
+  EMIT("VmRSS:\t%llu kB\n", (unsigned long long) (ti.ptinfo.pti_resident_size / 1024));
+  EMIT("VmData:\t0 kB\n");
+  EMIT("VmStk:\t0 kB\n");
+  EMIT("VmExe:\t0 kB\n");
+  EMIT("VmLib:\t0 kB\n");
+  EMIT("VmPTE:\t0 kB\n");
+  EMIT("VmSwap:\t0 kB\n");
+  EMIT("Threads:\t%d\n", nthreads > 0 ? nthreads : 1);
+  EMIT("SigQ:\t0/0\n");
+  EMIT("SigPnd:\t%016llx\n", 0ULL);
+  EMIT("ShdPnd:\t%016llx\n", 0ULL);
+  EMIT("SigBlk:\t%016llx\n", (unsigned long long) blocked);
+  EMIT("SigIgn:\t%016llx\n", (unsigned long long) ignored);
+  EMIT("SigCgt:\t%016llx\n", (unsigned long long) caught);
+  EMIT("CapInh:\t%016llx\n", (unsigned long long) inh);
+  EMIT("CapPrm:\t%016llx\n", (unsigned long long) prm);
+  EMIT("CapEff:\t%016llx\n", (unsigned long long) eff);
+  EMIT("CapBnd:\t%016llx\n", (unsigned long long) bnd);
+  EMIT("CapAmb:\t%016llx\n", (unsigned long long) amb);
+  EMIT("NoNewPrivs:\t0\n");
+  EMIT("Seccomp:\t%d\n", self ? seccomp_mode_get() : 0);
+  /* One CPU, deliberately and consistently: sched_getaffinity reports one here
+   * too, and the two disagreeing is worse than either answer. */
+  EMIT("Cpus_allowed:\t1\n");
+  EMIT("Cpus_allowed_list:\t0\n");
+  EMIT("Mems_allowed:\t1\n");
+  EMIT("Mems_allowed_list:\t0\n");
+  EMIT("voluntary_ctxt_switches:\t0\n");
+  EMIT("nonvoluntary_ctxt_switches:\t0\n");
+#undef EMIT
+
+  *len_out = len;
+  return out;
+}
+
 static char *
 build_stat(int host_pid, size_t *len_out)
 {
   size_t hlen;
   char *host = slurp_host_proc(host_pid, "stat", &hlen);
+  /* No host /proc to rewrite, so build it from Darwin instead. Preferred when
+   * mSL/ProcFS is there because its answer carries the twenty-odd fields Darwin
+   * has no equivalent of, but not required for the file to exist - which it was,
+   * and which is why stat said /proc/self/stat was there and the open failed. */
   if (!host)
-    return NULL;
+    return build_stat_darwin(host_pid, len_out);
 
   char *rp = strrchr(host, ')');
   if (!rp) {
@@ -804,7 +1219,7 @@ build_status(int host_pid, size_t *len_out)
   size_t hlen;
   char *host = slurp_host_proc(host_pid, "status", &hlen);
   if (!host)
-    return NULL;
+    return build_status_darwin(host_pid, len_out);
 
   size_t cap = hlen + 256;
   char *out = malloc(cap);
