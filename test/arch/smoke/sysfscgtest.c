@@ -190,6 +190,69 @@ void _start(void)
     }
   }
 
+  /*
+   * Each v1 controller is a hierarchy of its own.
+   *
+   * They were one directory, on the grounds that mounting cgroup2 twice shows the
+   * same tree - right about version two, wrong about version one. A cgroup made
+   * under one controller appeared under all of them, so a process placed in
+   * /dev/cpuset/foreground was in /dev/stune/foreground too; and
+   * libprocessgroup's recursive chmod of a directory it had made rewrote the other
+   * controllers' files, which is how /dev/cpuset/cpus became group-writable and
+   * init came to refuse its own input file.
+   */
+  {
+    want("mkdir /csa",
+         sys6(SYS_mkdirat, AT_FDCWD, (long) "/csa", 0755, 0,0,0) == 0 ||
+         sys6(SYS_mkdirat, AT_FDCWD, (long) "/csa", 0755, 0,0,0) == -EEXIST, 1);
+    want("mkdir /stb",
+         sys6(SYS_mkdirat, AT_FDCWD, (long) "/stb", 0755, 0,0,0) == 0 ||
+         sys6(SYS_mkdirat, AT_FDCWD, (long) "/stb", 0755, 0,0,0) == -EEXIST, 1);
+    /* cpuset names its controller as the type; everything else passes it as the
+     * mount data, which is how libprocessgroup mounts them. */
+    want("mount cpuset",
+         sys6(SYS_mount, (long) "none", (long) "/csa", (long) "cpuset", 0, 0, 0), 0);
+    want("mount cgroup -o schedtune",
+         sys6(SYS_mount, (long) "none", (long) "/stb", (long) "cgroup", 0,
+              (long) "schedtune", 0), 0);
+
+    /* A group made in one is not a group in the other. */
+    want("mkdir a group under cpuset",
+         sys6(SYS_mkdirat, AT_FDCWD, (long) "/csa/grp", 0755, 0,0,0), 0);
+    want("schedtune does not have it", can_open("/stb/grp/tasks") < 0, 1);
+    want("and cpuset does", can_open("/csa/grp/tasks"), 1);
+
+    /*
+     * And a move happens in one hierarchy only. This is the assertion that would
+     * have caught the old behaviour: with one shared tree both lines moved
+     * together, which is a process in two cgroups of two hierarchies at once by
+     * accident rather than by being placed there.
+     */
+    long fd = sys6(SYS_openat, AT_FDCWD, (long) "/csa/grp/tasks", 1 /* O_WRONLY */, 0,0,0);
+    want("open the group's tasks", fd >= 0, 1);
+    if (fd >= 0) {
+      want("write 0 to join it",
+           sys6(SYS_write, fd, (long) "0\n", 2, 0,0,0), 2);
+      sys6(SYS_close, fd, 0,0,0,0,0);
+
+      char buf[512];
+      long f2 = sys6(SYS_openat, AT_FDCWD, (long) "/proc/self/cgroup", 0, 0,0,0);
+      want("open /proc/self/cgroup", f2 >= 0, 1);
+      if (f2 >= 0) {
+        long n2 = sys6(SYS_read, f2, (long) buf, sizeof buf - 1, 0,0,0);
+        sys6(SYS_close, f2, 0,0,0,0,0);
+        buf[n2 > 0 ? n2 : 0] = '\0';
+        /* One line per mounted controller, plus version two's. */
+        want("cpuset has a line", has(buf, "cpuset:"), 1);
+        want("schedtune has a line", has(buf, "schedtune:"), 1);
+        want("and version two still does", has(buf, "0::"), 1);
+        /* The move shows against cpuset and nowhere else. */
+        want("the move is in cpuset", has(buf, "cpuset:/grp"), 1);
+        want("schedtune is untouched", has(buf, "schedtune:/grp"), 0);
+      }
+    }
+  }
+
   put(fails == 0 ? "sysfscg ok\n" : "sysfscg failed\n");
   sys6(SYS_exit_group, fails ? 1 : 0, 0,0,0,0,0);
 }

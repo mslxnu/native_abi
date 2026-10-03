@@ -236,6 +236,8 @@ bool mount_is_rdonly(const char *guest_path);
 
 /* /proc/mounts and /proc/self/mountinfo, from the table rather than a fixed
  * string that could only ever describe the day it was written. */
+/* The cgroup v1 controllers this namespace has mounted. See src/fs/mount.c. */
+size_t mount_cgroup_controllers(char names[][32], size_t max);
 int  mount_build_mounts(char *out, size_t n);
 int  mount_build_mountinfo(char *out, size_t n);
 

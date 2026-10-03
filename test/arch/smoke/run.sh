@@ -10,6 +10,22 @@ NABI="${1:?usage: run.sh <path-to-nabi>}"
 here=$(cd "$(dirname "$0")" && pwd)
 
 root=$(mktemp -d)
+
+# Start on a clean machine.
+#
+# nabi's mount table, cgroup hierarchies and tmpfs backings live under TMPDIR
+# keyed by the boot tag, and the tag does not change between runs - which is what
+# lets a forked child, a separate nabi process, see its parent's mounts. The
+# consequence is that they also outlive the guest that made them, so a filesystem
+# one test mounts is still mounted for the next one. That was invisible while
+# /proc/<pid>/cgroup had a single line to print; now that it lists one line per
+# mounted controller, a cpuset left behind by an earlier test appears in the
+# /proc/self/cgroup of a process that never heard of it, and nstest rightly
+# objects. The suite already assumes it owns the machine - it kills every nabi
+# process at the end - so it starts by clearing what earlier runs left.
+for d in "${TMPDIR:-/tmp}" /tmp; do
+    rm -rf "$d"/nabi-mnt-* "$d"/nabi-cgroup-* "$d"/nabi-tmpfs-* 2>/dev/null
+done
 trap 'rm -rf "$root"' EXIT
 cp "$here/exit42" "$here/hello" "$root/"
 chmod +x "$root/exit42" "$root/hello"

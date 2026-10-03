@@ -46,6 +46,7 @@
 #include "noah.h"
 #include "namespace.h"
 #include "cgroup.h"
+#include "mount.h"
 
 #include "linux/common.h"
 #include "linux/errno.h"
@@ -63,7 +64,7 @@ static char current_cgroup[CGROUP_PATH_MAX] = "/";
  * cgroup wrote the pid into an ordinary file and moved no one.
  */
 void
-cgroup_root_dir(char *out, size_t n)
+cgroup_base_dir(char *out, size_t n)
 {
   static char base[PATH_MAX];
   if (base[0] == '\0') {
@@ -77,6 +78,90 @@ cgroup_root_dir(char *out, size_t n)
       base[--bl] = '\0';
   }
   snprintf(out, n, "%s/nabi-cgroup-%s", base, nabi_boot_tag());
+}
+
+/*
+ * The host directory a named hierarchy lives in.
+ *
+ * The first cgroup version gives each controller a hierarchy of its own, and so
+ * does this: the unnamed one is version two's, at the directory it has always
+ * been at, and a named one sits beside it with the controller's name appended.
+ *
+ * They were one directory until now, on the grounds that mounting cgroup2 twice
+ * shows the same tree. That is right about version two and wrong about version
+ * one, and the wrongness was not academic. Android mounts five - cpuset, cpu,
+ * memory, blkio, schedtune - and libprocessgroup chmods a directory it has made
+ * recursively, every file in it. Aimed at one controller's tree that is its own
+ * business; landing on a shared tree it rewrote the others' files, 2,420 of them
+ * in a boot, and /dev/cpuset/cpus ended up group-writable without anything having
+ * chmod'd it by name. init then refused to read its own input file. The other
+ * half of the same mistake is quieter: /dev/stune/foreground and
+ * /dev/cpuset/foreground were one cgroup, so a process placed in one was in both.
+ */
+void
+cgroup_root_dir(const char *name, char *out, size_t n)
+{
+  char base[PATH_MAX];
+  cgroup_base_dir(base, sizeof base);
+  if (name != NULL && *name != '\0')
+    snprintf(out, n, "%s-%s", base, name);
+  else
+    snprintf(out, n, "%s", base);
+}
+
+/*
+ * Which hierarchy a host path is in, if any: its root and the controller's name,
+ * the name being empty for version two's.
+ *
+ * Every caller that used to strip the one root off a path asks this instead, so a
+ * path decides which tree it belongs to rather than the answer being assumed.
+ */
+bool
+cgroup_hierarchy_of(const char *hostpath, char *root, size_t rn,
+                    char *name, size_t nn)
+{
+  char base[PATH_MAX];
+  cgroup_base_dir(base, sizeof base);
+  size_t bl = strlen(base);
+  if (strncmp(hostpath, base, bl) != 0)
+    return false;
+
+  const char *p = hostpath + bl;
+  if (*p == '\0' || *p == '/') {              /* version two's, the unnamed one */
+    if (name != NULL && nn > 0)
+      name[0] = '\0';
+    if (root != NULL && rn > 0)
+      snprintf(root, rn, "%s", base);
+    return true;
+  }
+  /* A name follows, or this is some other directory that merely starts the same
+   * way and is none of ours. */
+  if (*p != '-')
+    return false;
+  const char *s = p + 1;
+  const char *end = strchr(s, '/');
+  size_t ln = end != NULL ? (size_t) (end - s) : strlen(s);
+  if (ln == 0)
+    return false;
+  if (name != NULL && nn > 0) {
+    size_t k = ln < nn - 1 ? ln : nn - 1;
+    memcpy(name, s, k);
+    name[k] = '\0';
+  }
+  if (root != NULL && rn > 0)
+    snprintf(root, rn, "%.*s", (int) (bl + 1 + ln), hostpath);
+  return true;
+}
+
+/*
+ * Every hierarchy that exists, which is every v1 controller this namespace has
+ * mounted. The mount table is the record, not the directories: see
+ * mount_cgroup_controllers.
+ */
+size_t
+cgroup_hierarchy_names(char names[][32], size_t max)
+{
+  return mount_cgroup_controllers(names, max);
 }
 
 const char *
@@ -150,9 +235,9 @@ cgroup_populate(const char *dir)
 
 /* Make the hierarchy if it is not there, and return its host directory. */
 int
-cgroup_hierarchy(char *out, size_t n)
+cgroup_hierarchy(const char *name, char *out, size_t n)
 {
-  cgroup_root_dir(out, n);
+  cgroup_root_dir(name, out, n);
   if (mkdir(out, 0755) < 0 && errno != EEXIST)
     return -darwin_to_linux_errno(errno);
   cgroup_populate(out);
@@ -164,11 +249,7 @@ cgroup_hierarchy(char *out, size_t n)
 bool
 cgroup_is_hierarchy_path(const char *hostpath)
 {
-  char root[PATH_MAX];
-  cgroup_root_dir(root, sizeof root);
-  size_t n = strlen(root);
-  return strncmp(hostpath, root, n) == 0 &&
-         (hostpath[n] == '\0' || hostpath[n] == '/');
+  return cgroup_hierarchy_of(hostpath, NULL, 0, NULL, 0);
 }
 
 /*
@@ -182,6 +263,7 @@ cgroup_is_hierarchy_path(const char *hostpath)
  */
 static bool find_in_tree(const char *dir, const char *rel, int32_t nspid,
                          char *out, size_t n);
+static int cgroup_proc_text_at(int32_t nspid, bool self, char *out, size_t n);
 
 int
 cgroup_proc_text(char *out, size_t n)
@@ -196,26 +278,73 @@ cgroup_proc_text(char *out, size_t n)
    * is for a process that has never been written into a procs file at all: a
    * forked child, which is in its parent's cgroup by inheritance.
    */
-  char found[CGROUP_PATH_MAX];
-  char hroot[PATH_MAX];
-  cgroup_root_dir(hroot, sizeof hroot);
-  const char *mine = current_cgroup;
-  if (find_in_tree(hroot, "", pidns_to_ns((int32_t) getpid()),
-                   found, sizeof found))
+  return cgroup_proc_text_at(pidns_to_ns((int32_t) getpid()), true, out, n);
+}
+
+/*
+ * A cgroup path as the namespace sees it.
+ *
+ * Rebasing is the entire function of a cgroup namespace: a process whose cgroup is
+ * /foo/bar, in a namespace rooted at /foo, is in /bar - and one whose cgroup has
+ * escaped the namespace root, which cannot happen by moving but can by the root
+ * being removed, falls back to "/" as it does on Linux.
+ */
+static const char *
+cgroup_shown(const char *path, const char *nsroot)
+{
+  size_t rl = strlen(nsroot);
+  if (rl <= 1)
+    return path;
+  if (strncmp(path, nsroot, rl) == 0 && (path[rl] == '\0' || path[rl] == '/'))
+    return path[rl] == '\0' ? "/" : path + rl;
+  return "/";
+}
+
+/*
+ * One line per hierarchy, which is the shape this file has on Linux: a numbered
+ * line naming the controller for each of the first version's, and `0::` for the
+ * second. It had one line because there was one tree.
+ *
+ * `self` says whether current_cgroup may stand in for the unnamed hierarchy when
+ * the files have nothing to say, which is only true of the process doing the
+ * asking - a forked child is in its parent's cgroup by inheritance and has never
+ * been written into any procs file.
+ */
+static int
+cgroup_proc_text_at(int32_t nspid, bool self, char *out, size_t n)
+{
+  const char *nsroot = cgroup_ns_root();
+  size_t len = 0;
+
+  /*
+   * The named ones first and the unnamed one last, which is the order Linux
+   * prints and the order anything reading the last line expects.
+   */
+  char names[16][32];
+  size_t cnt = cgroup_hierarchy_names(names, sizeof names / sizeof names[0]);
+  for (size_t i = 0; i < cnt && len < n; i++) {
+    char root[PATH_MAX], found[CGROUP_PATH_MAX] = "/";
+    cgroup_root_dir(names[i], root, sizeof root);
+    (void) find_in_tree(root, "", nspid, found, sizeof found);
+    int w = snprintf(out + len, n - len, "%zu:%s:%s\n", cnt - i, names[i],
+                     cgroup_shown(found, nsroot));
+    if (w < 0)
+      return w;
+    len += (size_t) w;
+  }
+
+  char root[PATH_MAX], found[CGROUP_PATH_MAX];
+  cgroup_root_dir(NULL, root, sizeof root);
+  const char *mine = self ? current_cgroup : "/";
+  if (find_in_tree(root, "", nspid, found, sizeof found))
     mine = found;
-
-  const char *root = cgroup_ns_root();
-
-  const char *shown = mine;
-  size_t rlen = strlen(root);
-  if (rlen > 1 && strncmp(mine, root, rlen) == 0 &&
-      (mine[rlen] == '\0' || mine[rlen] == '/'))
-    shown = mine[rlen] == '\0' ? "/" : mine + rlen;
-  else if (rlen > 1)
-    shown = "/";
-
-  /* One line, hierarchy id 0 and no controller name: the cgroup v2 form. */
-  return snprintf(out, n, "0::%s\n", shown);
+  if (len < n) {
+    int w = snprintf(out + len, n - len, "0::%s\n", cgroup_shown(mine, nsroot));
+    if (w < 0)
+      return w;
+    len += (size_t) w;
+  }
+  return (int) len;
 }
 
 /*
@@ -281,26 +410,11 @@ find_in_tree(const char *dir, const char *rel, int32_t nspid,
 int
 cgroup_proc_text_for(int32_t nspid, char *out, size_t n)
 {
-  if (nspid == pidns_to_ns((int32_t) getpid()))
-    return cgroup_proc_text(out, n);
-
-  char root[PATH_MAX];
-  cgroup_root_dir(root, sizeof root);
-
-  char path[CGROUP_PATH_MAX] = "/";
-  (void) find_in_tree(root, "", nspid, path, sizeof path);
-
-  /* Reported the same way as our own: relative to the namespace's root. */
-  const char *nsroot = cgroup_ns_root();
-  const char *shown = path;
-  size_t rlen = strlen(nsroot);
-  if (rlen > 1 && strncmp(path, nsroot, rlen) == 0 &&
-      (path[rlen] == '\0' || path[rlen] == '/'))
-    shown = path[rlen] == '\0' ? "/" : path + rlen;
-  else if (rlen > 1)
-    shown = "/";
-
-  return snprintf(out, n, "0::%s\n", shown);
+  /* The same walk, only without this process's shortcut standing in for an empty
+   * answer: another process's cgroup is whatever the files say, and a pid found
+   * nowhere is at the root, which is where one that has never been moved is. */
+  bool self = nspid == pidns_to_ns((int32_t) getpid());
+  return cgroup_proc_text_at(nspid, self, out, n);
 }
 
 /*
@@ -322,10 +436,10 @@ cgroup_proc_text_for(int32_t nspid, char *out, size_t n)
  * what joining it did. The file is the record; current_cgroup is the shortcut
  * this process keeps for itself. */
 static void
-procs_file_update(const char *cgroup_path, int32_t nspid, bool add)
+procs_file_update(const char *root, const char *cgroup_path, int32_t nspid,
+                  bool add)
 {
-  char root[PATH_MAX], path[PATH_MAX];
-  cgroup_root_dir(root, sizeof root);
+  char path[PATH_MAX];
   snprintf(path, sizeof path, "%s%s/cgroup.procs", root,
            strcmp(cgroup_path, "/") == 0 ? "" : cgroup_path);
 
@@ -466,7 +580,10 @@ cgroup_write_procs(int fd, const char *buf, size_t size, int *out)
   char path[PATH_MAX], root[PATH_MAX];
   if (fcntl(fd, F_GETPATH, path) < 0)
     return false;
-  if (!cgroup_is_hierarchy_path(path))
+  /* Which hierarchy, rather than the hierarchy: the move has to happen in the
+   * controller's own tree, and writing /dev/cpuset/foreground/tasks must not place
+   * the process in /dev/stune/foreground as well. */
+  if (!cgroup_hierarchy_of(path, root, sizeof root, NULL, 0))
     return false;
 
   /* Either name: see cgroup_populate on why `tasks` is here. */
@@ -475,7 +592,6 @@ cgroup_write_procs(int fd, const char *buf, size_t size, int *out)
                 strcmp(base, "/tasks") != 0))
     return false;
 
-  cgroup_root_dir(root, sizeof root);
   *base = '\0';                 /* the directory is the cgroup */
   const char *rel = path + strlen(root);
   if (*rel == '\0')
@@ -493,7 +609,7 @@ cgroup_write_procs(int fd, const char *buf, size_t size, int *out)
     return true;
   }
 
-  int r = cgroup_move(rel, (int32_t) pid);
+  int r = cgroup_move(root, rel, (int32_t) pid);
   *out = r < 0 ? r : (int) size;
   return true;
 }
@@ -528,10 +644,9 @@ cgroup_write_control(int fd, const char *buf, size_t size, int *out)
 }
 
 int
-cgroup_move(const char *cgroup_path, int32_t nspid)
+cgroup_move(const char *root, const char *cgroup_path, int32_t nspid)
 {
-  char host[PATH_MAX], root[PATH_MAX];
-  cgroup_root_dir(root, sizeof root);
+  char host[PATH_MAX];
   snprintf(host, sizeof host, "%s%s", root,
            strcmp(cgroup_path, "/") == 0 ? "" : cgroup_path);
 
@@ -564,15 +679,26 @@ cgroup_move(const char *cgroup_path, int32_t nspid)
    * is known without looking; another process's is found in the files, since
    * that is where it is written down.
    */
+  /*
+   * current_cgroup is the shortcut this process keeps for itself, and it keeps one
+   * - so it can only stand for one hierarchy. It stands for version two's, which
+   * is the one the checkpoint carries and the one a forked child inherits. In a
+   * named hierarchy the files are the only record, so where the process is now is
+   * found by walking that tree, exactly as another process's is.
+   */
+  char base[PATH_MAX];
+  cgroup_root_dir(NULL, base, sizeof base);
+  bool unnamed = strcmp(root, base) == 0;
+
   char from[CGROUP_PATH_MAX] = "/";
-  if (who == self)
+  if (who == self && unnamed)
     snprintf(from, sizeof from, "%s", current_cgroup);
   else
     (void) find_in_tree(root, "", who, from, sizeof from);
 
-  procs_file_update(from, who, false);
-  if (who == self)
+  procs_file_update(root, from, who, false);
+  if (who == self && unnamed)
     cgroup_set_current(cgroup_path);
-  procs_file_update(cgroup_path, who, true);
+  procs_file_update(root, cgroup_path, who, true);
   return 0;
 }

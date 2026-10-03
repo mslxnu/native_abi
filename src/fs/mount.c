@@ -526,6 +526,42 @@ static const struct { const char *src, *tgt, *type, *opts; } base[] = {
   { "cgroup2",   "/sys/fs/cgroup", "cgroup2", "rw,nosuid,nodev,noexec,relatime" },
 };
 
+/*
+ * The controllers that have a hierarchy mounted, which is what /proc/<pid>/cgroup
+ * lists a line for.
+ *
+ * Taken from this namespace's mount table and not from the directories on disk.
+ * The directories outlive the guest that made them - they carry the boot tag, and
+ * the tag does not change between runs - so a controller one guest mounted would
+ * otherwise appear in the next guest's /proc/self/cgroup, which is how nstest
+ * caught this: a plain process reported a cpuset hierarchy it had never heard of
+ * because an earlier test had mounted one. A hierarchy exists when it is mounted,
+ * on Linux and here.
+ */
+size_t
+mount_cgroup_controllers(char names[][32], size_t max)
+{
+  struct mount_table t;
+  if (!current_table(&t))
+    return 0;
+  size_t cnt = 0;
+  for (uint32_t i = 0; i < t.n && cnt < max; i++) {
+    if (t.m[i].hostdir[0] == '\0')
+      continue;
+    char name[32];
+    if (!cgroup_hierarchy_of(t.m[i].hostdir, NULL, 0, name, sizeof name))
+      continue;
+    if (name[0] == '\0')
+      continue;                 /* version two's, reported as its own line */
+    bool seen = false;
+    for (size_t k = 0; k < cnt && !seen; k++)
+      seen = strcmp(names[k], name) == 0;
+    if (!seen)
+      snprintf(names[cnt++], 32, "%s", name);
+  }
+  return cnt;
+}
+
 int
 mount_build_mounts(char *out, size_t n)
 {
@@ -631,9 +667,30 @@ tmpfs_mode(const char *data)
   return 0777 & ~um;
 }
 
+/*
+ * Whether a string could be a controller's name: one token of the characters a
+ * name is made of, so that a mount option cannot name a directory of its own.
+ */
+static bool
+cgroup_ctrl_name_ok(const char *s)
+{
+  if (s == NULL || *s == '\0')
+    return false;
+  for (size_t i = 0; s[i] != '\0'; i++) {
+    char c = s[i];
+    if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+          (c >= '0' && c <= '9') || c == '_'))
+      return false;
+    if (i >= 31)
+      return false;
+  }
+  return true;
+}
+
 static int
-backing_for_type(const char *type, const char *source, unsigned long flags,
-                 const char *data, bool probe_only, struct mount_entry *e)
+backing_for_type(const char *type, const char *source, const char *target,
+                 const char *ctrl_hint, unsigned long flags, const char *data,
+                 bool probe_only, struct mount_entry *e)
 {
   if (type_is(type, "tmpfs")) {
     char dirtpl[PATH_MAX];
@@ -690,8 +747,50 @@ backing_for_type(const char *type, const char *source, unsigned long flags,
      * /proc/<pid>/cgroup all assume there is one. Recorded here because the
      * symptom shows up a long way from this decision.
      */
+    /*
+     * Which controller, so that each gets its own tree. libprocessgroup reads
+     * cgroups.json and mounts each one with its name as the mount data - "blkio"
+     * on /dev/blkio, "cpu" on /dev/cpuctl, "memory" on /dev/memcg - and the
+     * cpuset mount names it as the type instead, which is the older spelling.
+     *
+     * A v1 mount that names no controller falls back to the mount point's own
+     * last component, which is distinct per mount and is the property that
+     * matters; two mounts of the same controller still share a tree, because they
+     * share the name.
+     */
+    char ctrl[32] = "";
+    if (!type_is(type, "cgroup2")) {
+      /* The type names it for a cpuset mount, which is the older spelling; for
+       * `cgroup` it is the mount data, which is how libprocessgroup passes it -
+       * cgroups.json's "Controller", one per mount. */
+      const char *from = type_is(type, "cpuset") ? "cpuset" : data;
+      if (from != NULL) {
+        size_t k = 0;
+        while (from[k] != '\0' && k < sizeof ctrl - 1 &&
+               from[k] != ',' && from[k] != '\0')
+          k++;
+        if (k > 0 && k < sizeof ctrl) {
+          memcpy(ctrl, from, k);
+          ctrl[k] = '\0';
+          if (!cgroup_ctrl_name_ok(ctrl))
+            ctrl[0] = '\0';
+        }
+      }
+      /* Nothing named it, so the mount point does. Distinct per mount, which is
+       * the property that matters, and two mounts of one controller still share a
+       * tree because they share the name. */
+      if (ctrl[0] == '\0' && ctrl_hint != NULL && cgroup_ctrl_name_ok(ctrl_hint))
+        snprintf(ctrl, sizeof ctrl, "%s", ctrl_hint);
+      if (ctrl[0] == '\0' && target != NULL) {
+        const char *slash = strrchr(target, '/');
+        const char *b = slash != NULL ? slash + 1 : target;
+        if (cgroup_ctrl_name_ok(b))
+          snprintf(ctrl, sizeof ctrl, "%s", b);
+      }
+    }
+
     char host[PATH_MAX];
-    int cr = cgroup_hierarchy(host, sizeof host);
+    int cr = cgroup_hierarchy(ctrl[0] != '\0' ? ctrl : NULL, host, sizeof host);
     if (cr < 0)
       return cr;
     /*
@@ -701,7 +800,12 @@ backing_for_type(const char *type, const char *source, unsigned long flags,
      * walk past. cgroup and cgroup2 keep saying cgroup2, which is what they have
      * always said and what the single hierarchy really is.
      */
-    const char *as = type_is(type, "cpuset") ? "cpuset" : "cgroup2";
+    /* Reported as what was asked for. The type in /proc/mounts is how
+     * libprocessgroup finds where a controller lives, and it walks past one that
+     * is described as something else. */
+    const char *as = type_is(type, "cgroup2") ? "cgroup2"
+                   : type_is(type, "cpuset")  ? "cpuset"
+                                              : "cgroup";
     snprintf(e->source, sizeof e->source, "%s", as);
     snprintf(e->hostdir, sizeof e->hostdir, "%s", host);
     snprintf(e->type, sizeof e->type, "%s", as);
@@ -1018,7 +1122,7 @@ DEFINE_SYSCALL(mount, gstr_t, source_ptr, gstr_t, target_ptr, gstr_t, type_ptr,
     /* Everything a filesystem *type* can be here, which is also everything
      * fsopen can name - so the two ask the same function rather than growing
      * two answers that could disagree. */
-    int br = backing_for_type(type, source, flags, data, false, &e);
+    int br = backing_for_type(type, source, target, NULL, flags, data, false, &e);
     if (br < 0)
       return br;
   }
@@ -1325,6 +1429,14 @@ struct fsctx_hdr {
   uint32_t created;             /* FSCONFIG_CMD_CREATE has been issued */
   char     type[16];
   char     source[MOUNT_PATH_MAX];
+  /*
+   * The controller a cgroup v1 mount is for, when it was given as an option
+   * rather than as the type. `mount -t cgroup -o schedtune` arrives here as a
+   * flag with no value, which is the only place that name appears: the target
+   * comes later with move_mount, and by then the backing directory has been
+   * chosen. Empty for every other filesystem.
+   */
+  char     ctrl[32];
 };
 
 struct detached_hdr {
@@ -1417,7 +1529,7 @@ DEFINE_SYSCALL(fsopen, gstr_t, fsname_ptr, unsigned int, flags)
   struct mount_entry probe;
   memset(&probe, 0, sizeof probe);
   /* A type check, with nothing yet named to mount. */
-  int r = backing_for_type(type, type, 0, NULL, true, &probe);
+  int r = backing_for_type(type, type, NULL, NULL, 0, NULL, true, &probe);
   if (r < 0)
     return r;
   /* Nothing is allocated yet - that probe may have made a tmpfs directory, and
@@ -1471,6 +1583,15 @@ DEFINE_SYSCALL(fsconfig, int, fd, unsigned int, cmd, gstr_t, key_ptr,
     if (strcmp(key, "source") == 0 && value != 0) {
       if (strncpy_from_user(h.source, value, sizeof h.source) < 0)
         return -LINUX_EFAULT;
+      if (pwrite(fd, &h, sizeof h, 0) != (ssize_t) sizeof h)
+        return -LINUX_EIO;
+    } else if (cmd == LINUX_FSCONFIG_SET_FLAG && h.ctrl[0] == '\0' &&
+               type_is(h.type, "cgroup") && cgroup_ctrl_name_ok(key)) {
+      /* The first option that could be a controller's name is taken as one. A
+       * cgroup v1 mount is for whichever controllers it names, and nabi can give
+       * a tree to the first of them; the rest would be co-mounted with it, which
+       * is a tree they would share here anyway. */
+      snprintf(h.ctrl, sizeof h.ctrl, "%s", key);
       if (pwrite(fd, &h, sizeof h, 0) != (ssize_t) sizeof h)
         return -LINUX_EIO;
     }
@@ -1537,7 +1658,7 @@ DEFINE_SYSCALL(fsmount, int, fsfd, unsigned int, flags, unsigned int, attr_flags
   memset(&e, 0, sizeof e);
   /* fsmount carries read-only as a mount attribute rather than a mount flag;
    * the two mean the same thing to anything that has to honour it. */
-  if ((r = backing_for_type(h.type, h.source,
+  if ((r = backing_for_type(h.type, h.source, NULL, h.ctrl,
                             (attr_flags & LINUX_MOUNT_ATTR_RDONLY)
                               ? LINUX_MS_RDONLY : 0, NULL, false, &e)) < 0)
     return r;

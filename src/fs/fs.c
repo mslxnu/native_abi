@@ -2925,7 +2925,10 @@ cgroupfs_to_host(const char *name, char *out, size_t outsz)
     return false;
 
   char root[PATH_MAX];
-  if (cgroup_hierarchy(root, sizeof root) < 0)
+  /* /sys/fs/cgroup with nothing mounted on it is version two's, which is the
+   * unnamed hierarchy. A guest that mounts a v1 controller there instead gets what
+   * it mounted, because the mount table is asked first. */
+  if (cgroup_hierarchy(NULL, root, sizeof root) < 0)
     return false;
   return (size_t) snprintf(out, outsz, "%s%s", root, name + n) < outsz;
 }
