@@ -951,20 +951,54 @@ DEFINE_SYSCALL(kill, l_pid_t, pid, int, sig)
     if (h < 0)
       return -LINUX_ESRCH;
     pid = h;
+  } else if (pid < -1 && pidns_active()) {
+    /*
+     * A process group, delivered one member at a time rather than by handing the
+     * host a group number.
+     *
+     * Translating the group as a pid and signalling the host's group of that
+     * number is what this did, and it is wrong in both directions. The number a
+     * translation produces is a host *pid*, and a host process group of that
+     * number is a different thing that may well exist and belong to somebody
+     * else: a group nabi does not own answers EPERM, which is what Android's
+     * libprocessgroup met 376 times a boot - "kill(-512, 9) failed: Operation not
+     * permitted" - while a group that does not exist answers ESRCH. The quiet half
+     * is worse than the noisy one. On a machine where that number happened to be
+     * a group of this account's own processes the signal would have been delivered,
+     * to the user's shell or whatever else they were running, and a pid namespace
+     * that lets a signal out by arithmetic is not containing anything.
+     *
+     * So the namespace is asked instead. Every member whose own process group is
+     * the one named gets the signal, which is what Linux delivers, and nothing
+     * outside the namespace can be named at all. The caller is included if it is
+     * in the group: Linux excludes it from the -1 broadcast below and does not
+     * exclude it from a group.
+     */
+    int32_t want = (int32_t) -pid;
+    int32_t hosts[PIDNS_MAX];
+    size_t n = pidns_hosts(hosts, sizeof hosts / sizeof hosts[0]);
+    if (n > sizeof hosts / sizeof hosts[0])
+      n = sizeof hosts / sizeof hosts[0];
+    int sent = 0, last = -LINUX_ESRCH;
+    for (size_t i = 0; i < n; i++) {
+      pid_t hpg = getpgid((pid_t) hosts[i]);
+      if (hpg < 0)
+        continue;                 /* gone between the listing and the question */
+      if (pidns_to_ns((int32_t) hpg) != want)
+        continue;
+      int r = send_signal((pid_t) hosts[i], sig);
+      if (r == 0)
+        sent++;
+      else
+        last = r;
+    }
+    return sent > 0 ? 0 : last;
   } else if (pid < -1) {
     /*
-     * A process group, which is a pid and has to be translated like one. It was
-     * not, so the number went to the host's group of that name - somebody
-     * else's, or nobody's.
-     *
-     * Android's libprocessgroup kills a service by its group on every restart
-     * and every shutdown, so "kill(-146, 9) failed: Operation not permitted"
-     * followed by "Failed to kill process cgroup ... 1 processes remain"
-     * appeared for each one, and init sat in a restart loop waiting for
-     * processes that were never signalled. setpgid already translates both of
-     * its arguments, so the group a guest names does exist here - it is the
-     * host pid of whichever process made the group - and this is the same
-     * lookup in the other direction.
+     * Outside a pid namespace the guest's pids are the host's, so the group it
+     * names is the host's group of that number and there is no containment being
+     * claimed to break. The translation is the identity here; it is kept so the
+     * two paths read the same way.
      */
     pid_t h = pidns_to_host(-pid);
     if (h < 0)

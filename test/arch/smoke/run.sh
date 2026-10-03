@@ -1684,6 +1684,23 @@ else
     fail=1
 fi
 
+# pgkilltest: a signal to a process group reaches every member of it, and a group
+# outlives its leader. This is a guard rather than a discriminator and is registered
+# knowing that: it passes against the code it was written for, because that code was
+# right whenever the guest's leader was a genuine host group leader, which is the
+# ordinary case. What it could not get right was a number that named an unrelated
+# host group - Android met that 376 times a boot as EPERM - and that depends on what
+# else the machine is running, so it cannot be reproduced from inside a guest. The
+# evidence for the fix is the boot; this keeps the semantics from slipping.
+cp "$here/pgkilltest" "$root/"; chmod +x "$root/pgkilltest"
+out=$(NABI_IGNORE_HOST_FS=1 "$NABI" --pid1 -m "$root" /pgkilltest 2>&1 | tail -1); rc=$?
+if [ "$out" = "pgkill ok" ]; then
+    echo "  ok  pgkilltest -> \"$out\""
+else
+    echo "  FAIL pgkilltest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 # sysfstest: the parts of /sys nabi answers for itself. /sys was whatever the
 # rootfs image had at that name, so every question was ENOENT - and Android's init
 # opens /sys/class/udc 1,721 times a boot waiting for a USB device controller,
