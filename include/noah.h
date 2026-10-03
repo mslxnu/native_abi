@@ -321,6 +321,11 @@ int    seccomp_mode_get(void);
 void   caps_snapshot(uint64_t *inh, uint64_t *prm, uint64_t *eff, uint64_t *bnd,
                      uint64_t *amb);
 bool   host_proc_live(void);
+/*
+ * Whether the guest may raise a priority: root, or CAP_SYS_NICE. Linux asks the
+ * same question of nice and of I/O priority, so both ask this.
+ */
+bool   guest_may_renice(void);
 
 /*
  * One interface, as Linux describes it. Filled by net_iface_list from the host's

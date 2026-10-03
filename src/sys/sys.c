@@ -1,5 +1,6 @@
 #include "common.h"
 #include "noah.h"
+#include "namespace.h"
 
 #include "linux/common.h"
 #include "linux/misc.h"
@@ -326,8 +327,47 @@ DEFINE_SYSCALL(ioprio_set, int, which, int, who, int, ioprio)
 {
   if (which < LINUX_IOPRIO_WHO_PROCESS || which > LINUX_IOPRIO_WHO_USER)
     return -LINUX_EINVAL;
-  if (!ioprio_is_self(which, who))
-    return -LINUX_EPERM;        /* the host cannot name another process here */
+
+  /*
+   * Somebody else's, which is what Android's init asks for 91 times a boot - it
+   * lowers the disk priority of each service it starts, and the service is not
+   * the caller. "init: failed to set pid 23 ioprio=2,2: Operation not permitted"
+   * for every one.
+   *
+   * Darwin has no way to name another process here: setiopolicy_np adjusts the
+   * caller and takes no pid. So this is accepted and applied to nothing, with the
+   * checks Linux makes still made - the pid has to exist, and the caller needs the
+   * privilege Linux wants for it, which is CAP_SYS_NICE or root. An unprivileged
+   * guest is refused exactly as it would be on Linux; a privileged one is told yes
+   * about a policy that is not there.
+   *
+   * Accepting a request that does nothing is the lesser of the two wrongs
+   * available, and it is the choice /proc/<pid>/attr already makes for the same
+   * reason: refusing fails the callers this exists for, and there is no I/O policy
+   * for another process to be had. Nothing reads it back - ioprio_get is never
+   * called in a boot - so the pretence is not compounded by an answer that
+   * contradicts it; ioprio_get still declines to describe a process nabi keeps
+   * nothing about, which is a refusal to answer rather than an invented number.
+   */
+  if (!ioprio_is_self(which, who)) {
+    if (which != LINUX_IOPRIO_WHO_PROCESS)
+      return -LINUX_EPERM;      /* a group or a user, which is more than one */
+    /*
+     * What was asked for is checked before who is asking, which is the order
+     * Linux checks in: a caller probing the range should not have EPERM hide an
+     * EINVAL. sched_setscheduler makes the same point about the same thing.
+     */
+    int oclass = ioprio >> LINUX_IOPRIO_CLASS_SHIFT;
+    int olevel = ioprio & LINUX_IOPRIO_PRIO_MASK;
+    if (olevel > 7 || oclass < LINUX_IOPRIO_CLASS_NONE ||
+        oclass > LINUX_IOPRIO_CLASS_IDLE)
+      return -LINUX_EINVAL;
+    if (pidns_to_host(who) < 0)
+      return -LINUX_ESRCH;
+    if (!guest_may_renice())
+      return -LINUX_EPERM;
+    return 0;
+  }
 
   int class = ioprio >> LINUX_IOPRIO_CLASS_SHIFT;
   int level = ioprio & LINUX_IOPRIO_PRIO_MASK;

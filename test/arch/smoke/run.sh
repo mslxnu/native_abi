@@ -1684,6 +1684,21 @@ else
     fail=1
 fi
 
+# iopriotest: ioprio_set for a process that is not the caller, which is what
+# Android's init asks for on every service it starts - and was refused 91 times a
+# boot. Darwin cannot name another process here, so the request is accepted and
+# applied to nothing, with the checks Linux makes still made: the pid must exist,
+# the class and level must exist, and the caller needs the privilege. The order is
+# checked too, because EPERM must not hide an EINVAL from a caller probing the range.
+cp "$here/iopriotest" "$root/"; chmod +x "$root/iopriotest"
+out=$(NABI_IGNORE_HOST_FS=1 "$NABI" --pid1 -m "$root" /iopriotest 2>&1 | tail -1); rc=$?
+if [ "$out" = "ioprio ok" ]; then
+    echo "  ok  iopriotest -> \"$out\""
+else
+    echo "  FAIL iopriotest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 # pgkilltest: a signal to a process group reaches every member of it, and a group
 # outlives its leader. This is a guard rather than a discriminator and is registered
 # knowing that: it passes against the code it was written for, because that code was

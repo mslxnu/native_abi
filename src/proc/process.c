@@ -2250,8 +2250,8 @@ DEFINE_SYSCALL(getpriority, int, which, int, who)
  * runs as does not, so the host refuses a request the guest was entitled to
  * make. Asked here with the guest's own credentials, as file access is.
  */
-static bool
-may_renice(void)
+bool
+guest_may_renice(void)
 {
   bool root;
   pthread_rwlock_rdlock(&proc.cred.lock);
@@ -2294,7 +2294,7 @@ DEFINE_SYSCALL(setpriority, int, which, int, who, int, niceval)
     return 0;
   }
   int e = errno;
-  if ((e == EPERM || e == EACCES) && may_renice()) {
+  if ((e == EPERM || e == EACCES) && guest_may_renice()) {
     if (which == PRIO_PROCESS && (who == 0 || who == getpid())) {
       nice_wanted = niceval;
       nice_pretended = true;
