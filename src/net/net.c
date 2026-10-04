@@ -870,9 +870,35 @@ peer_ucred(int fd, struct l_ucred *out)
 static int
 peercred_out(int fd, gaddr_t optval_ptr, gaddr_t optlen_ptr, l_socklen_t want)
 {
+  /*
+   * A descriptor that is not a socket at all, which is ENOTSOCK and nothing else.
+   *
+   * Darwin says so too, and said so here - but the answer that reached the guest
+   * was EPERM, because every failure of the peer lookup below was handed to the
+   * caller as it stood and Darwin's ENOTSOCK is 38 where Linux's is 88. Android
+   * asks this of descriptors that are not sockets - a /proc/kmsg one among them,
+   * 46 times a boot - and "operation not permitted" about a pipe is a different
+   * problem from the one it has. SO_TYPE is the question "is this a socket",
+   * asked of the host, which is the only party that knows.
+   */
+  int stype;
+  socklen_t stypelen = sizeof stype;
+  if (getsockopt(fd, SOL_SOCKET, SO_TYPE, &stype, &stypelen) < 0)
+    return -LINUX_ENOTSOCK;
+
   struct l_ucred uc;
-  if (!peer_ucred(fd, &uc))
-    return syswrap(-1);
+  if (!peer_ucred(fd, &uc)) {
+    /*
+     * A socket with no peer to describe. Linux answers this rather than failing:
+     * the credentials it keeps are simply unset, so it reports no process and the
+     * overflow ids, which are its way of saying a value it has no answer for. A
+     * caller that asks before connecting gets a reading, not an error, and the
+     * reading says nobody.
+     */
+    uc.pid = 0;
+    uc.uid = USERNS_OVERFLOW;
+    uc.gid = USERNS_OVERFLOW;
+  }
 
   /* Linux truncates to the caller's buffer and reports how much it wrote. */
   l_socklen_t n = want < (l_socklen_t) sizeof uc ? want : (l_socklen_t) sizeof uc;

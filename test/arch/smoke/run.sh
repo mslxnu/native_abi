@@ -1684,6 +1684,21 @@ else
     fail=1
 fi
 
+# peercredtest: SO_PEERCRED, including on descriptors that are not sockets. Every
+# failure of the peer lookup used to reach the guest as the host left it, and Darwin's
+# ENOTSOCK is 38 where Linux's is 88 - so a pipe or a /proc/kmsg descriptor came back
+# as EPERM, 46 times a boot. A socket with nobody on the other end is answered rather
+# than refused, as Linux answers it. A connected one must still name the peer, which
+# is what dbus-daemon's EXTERNAL authentication is decided on.
+cp "$here/peercredtest" "$root/"; chmod +x "$root/peercredtest"
+out=$(NABI_IGNORE_HOST_FS=1 "$NABI" --pid1 -m "$root" /peercredtest 2>&1 | tail -1); rc=$?
+if [ "$out" = "peercred ok" ]; then
+    echo "  ok  peercredtest -> \"$out\""
+else
+    echo "  FAIL peercredtest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 # iopriotest: ioprio_set for a process that is not the caller, which is what
 # Android's init asks for on every service it starts - and was refused 91 times a
 # boot. Darwin cannot name another process here, so the request is accepted and
