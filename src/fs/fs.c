@@ -5797,8 +5797,37 @@ vfs_grab_dir_w(int dirfd, const char *name, int flags, struct path *path)
   if (r < 0)
     return r;
   if (path->rdonly) {
+    /*
+     * Read-only, but only if the thing being asked about could have existed.
+     * Otherwise there is a truer answer: the directory that would hold it is not
+     * there.
+     *
+     * Linux says ENOENT about a name whose parent is missing and reaches the
+     * question of whether the filesystem is writable only afterwards. It matters
+     * here because Android probes for hardware by writing to it - every
+     * /sys/class/leds/<colour>/brightness and every android_usb entry under
+     * /sys/class in init.rc is a guess at a device this machine does not have. Since /sys is
+     * nabi's and resolves read-only, all of those were answered "read-only file
+     * system", which says the kernel refuses where the truth is that there is no
+     * such device. One is a thing to work around and the other is a thing to give
+     * up on, and a caller can only tell them apart from the errno.
+     *
+     * The test is on the directory, not the name: a name that is simply absent
+     * from a directory that is there is a creation, and refusing that is what
+     * read-only means.
+     */
+    int dfd = path->dir != NULL ? path->dir->fd : AT_FDCWD;
+    char parent[LINUX_PATH_MAX];
+    snprintf(parent, sizeof parent, "%s", path->subpath);
+    char *slash = strrchr(parent, '/');
+    bool parent_gone = false;
+    if (slash != NULL && slash != parent) {
+      *slash = '\0';
+      struct stat pst;
+      parent_gone = fstatat(dfd, parent, &pst, 0) < 0 && errno == ENOENT;
+    }
     vfs_ungrab_dir(path);
-    return -LINUX_EROFS;
+    return parent_gone ? -LINUX_ENOENT : -LINUX_EROFS;
   }
   return 0;
 }

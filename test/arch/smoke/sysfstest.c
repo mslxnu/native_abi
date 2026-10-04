@@ -301,6 +301,41 @@ void _start(void)
     }
   }
 
+  /*
+   * Read-only is the answer about a thing that could have existed. About a thing
+   * whose directory is not there, the truer answer is that it is not there.
+   *
+   * Android probes for hardware by writing to it: every
+   * /sys/class/leds/<colour>/brightness in init.rc is a guess at a device this
+   * machine does not have. Since /sys is nabi's and resolves read-only, all of
+   * those were answered "read-only file system", which says the kernel refuses
+   * where the truth is that there is no such device. One is a thing to work
+   * around and the other is a thing to give up on, and the errno is all a caller
+   * has to tell them apart.
+   */
+  {
+    long fd = sys6(SYS_openat, AT_FDCWD,
+                   (long) "/sys/class/leds/red/brightness",
+                   O_WRONLY | 0100 /* O_CREAT */, 0644, 0, 0);
+    if (fd >= 0) {
+      sys6(SYS_close, fd, 0,0,0,0,0);
+      bad("/sys/class/leds/red/brightness", "could be created");
+    } else if (fd != -2 /* ENOENT */) {
+      bad("/sys/class/leds/red/brightness",
+          "a device that is not there should be ENOENT, not a refusal");
+    }
+    /* And a name beside one that does exist is still a creation, which read-only
+     * refuses - the distinction is the directory, not the name. */
+    fd = sys6(SYS_openat, AT_FDCWD, (long) "/sys/power/newthing",
+              O_WRONLY | 0100, 0644, 0, 0);
+    if (fd >= 0) {
+      sys6(SYS_close, fd, 0,0,0,0,0);
+      bad("/sys/power/newthing", "could be created in a read-only tree");
+    } else if (fd != -30 /* EROFS */) {
+      bad("/sys/power/newthing", "creating in a read-only tree should be EROFS");
+    }
+  }
+
   put(fails == 0 ? "sysfs ok\n" : "sysfs failed\n");
   sys6(SYS_exit_group, fails ? 1 : 0, 0,0,0,0,0);
 }
