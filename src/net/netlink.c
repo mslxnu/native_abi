@@ -37,6 +37,19 @@
  *     Silence is a truthful answer there: nothing publishes, so nothing
  *     arrives, and that is what a machine with no events looks like.
  *
+ *   - Connection tracking, which netd subscribes to and which has nothing to
+ *     publish: there is no connection tracking here, so no event is ever sent.
+ *     This is the same shape as the kernel-event multicast above - a subscriber
+ *     binds and waits - and netd does exactly that, two setsockopts and a bind and
+ *     nothing further. Refusing it at socket() cost more than silence does:
+ *     netd took the refusal as fatal and exited, init answered a dead netd by
+ *     restarting zygote, and zygote's onrestart killed surfaceflinger,
+ *     audioserver, cameraserver, media and wificond. Thirty-two netd starts a
+ *     boot, and the hundred and fifty "service not found" lines underneath them
+ *     were all that cascade rather than a hundred and fifty problems. A dump
+ *     request on it is answered empty rather than refused, so admitting it does
+ *     not reintroduce the mistake below.
+ *
  *   - Every other protocol is refused at socket(), with the error a kernel
  *     built without that subsystem gives. This was not the first answer: they
  *     opened and answered requests with EOPNOTSUPP, on the reasoning that a
@@ -539,6 +552,18 @@ netlink_send(int fd, const void *buf, size_t len)
 
     if (nl->protocol == LINUX_NETLINK_ROUTE) {
       handle_route(nl, h, payload, paylen, &out);
+    } else if (nl->protocol == LINUX_NETLINK_NETFILTER &&
+               (h->nlmsg_flags & LINUX_NLM_F_DUMP) == LINUX_NLM_F_DUMP) {
+      /*
+       * A dump of the connections being tracked, which is none of them. An empty
+       * dump is the complete and truthful answer - the same answer a kernel with
+       * the subsystem and nothing in its table gives - and it is one the caller is
+       * written to handle, where a refusal is not. This is what keeps admitting
+       * the protocol from repeating the mistake described at the top of this file:
+       * a socket that opens and then refuses what is asked of it is worse than one
+       * that will not open, so nothing here refuses.
+       */
+      put_done(&out, h->nlmsg_seq, nl->portid);
     } else if (h->nlmsg_flags & LINUX_NLM_F_ACK) {
       /* Nothing here speaks the other protocols, and a request on one is
        * acknowledged as refused rather than left to time out. */
@@ -635,7 +660,8 @@ netlink_socket(int type, int protocol, int flags)
    * the one that stopped su from running.
    */
   if (protocol != LINUX_NETLINK_ROUTE &&
-      protocol != LINUX_NETLINK_KOBJECT_UEVENT)
+      protocol != LINUX_NETLINK_KOBJECT_UEVENT &&
+      protocol != LINUX_NETLINK_NETFILTER)
     return -LINUX_EPROTONOSUPPORT;
 
   int sv[2];

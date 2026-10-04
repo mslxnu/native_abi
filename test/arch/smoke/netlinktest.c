@@ -39,7 +39,9 @@ static long sys6(long n, long a, long b, long c, long d, long e, long f){
 
 #define AF_NETLINK       16
 #define SOCK_RAW          3
+#define SOCK_DGRAM      2
 #define NETLINK_ROUTE     0
+#define NETLINK_NETFILTER 12
 #define NETLINK_AUDIT     9
 #define NETLINK_UEVENT   15
 #define EPROTONOSUPPORT  93
@@ -120,6 +122,55 @@ void _start(void)
   { long ue = sys6(SYS_socket, AF_NETLINK, SOCK_RAW, NETLINK_UEVENT, 0, 0, 0);
     if (ue < 0)
       fail("socket(NETLINK_KOBJECT_UEVENT)", ue, 0); }
+
+  /*
+   * Connection tracking opens too, for the same reason the event multicast does:
+   * netd subscribes to it and nothing here publishes, so nothing arrives. It binds
+   * and sets a receive buffer and asks nothing further - which is why refusing it
+   * cost so much. netd took the refusal as fatal and exited, init answered a dead
+   * netd by restarting zygote, and zygote's onrestart killed surfaceflinger,
+   * audioserver, cameraserver, media and wificond: thirty-two netd starts a boot,
+   * with a hundred and fifty "service not found" lines underneath that were all one
+   * cascade.
+   */
+  { long ct = sys6(SYS_socket, AF_NETLINK, SOCK_DGRAM, NETLINK_NETFILTER, 0, 0, 0);
+    if (ct < 0) {
+      fail("socket(NETLINK_NETFILTER)", ct, 0);
+    } else {
+      /* Bound and sized, which is all netd does to it. */
+      struct sockaddr_nl a;
+      for (unsigned i = 0; i < sizeof a; i++) ((char *) &a)[i] = 0;
+      a.family = AF_NETLINK;
+      long r2 = sys6(SYS_bind, ct, (long) &a, sizeof a, 0, 0, 0);
+      if (r2 != 0) fail("bind(NETLINK_NETFILTER)", r2, 0);
+
+      /*
+       * And a dump of what is being tracked is answered empty rather than refused.
+       * That is what keeps admitting this protocol from repeating the libaudit
+       * mistake above: nothing it is asked returns an error it has no path for.
+       */
+      struct nlmsghdr *dh = (struct nlmsghdr *) req;
+      for (unsigned i = 0; i < sizeof *dh; i++) req[i] = 0;
+      dh->len = sizeof *dh;
+      dh->type = 0x101;          /* IPCTNL_MSG_CT_GET, in the conntrack subsystem */
+      dh->flags = NLM_F_REQUEST | NLM_F_DUMP;
+      dh->seq = 99;
+      long sent = sys6(SYS_sendto, ct, (long) req, dh->len, 0, 0, 0);
+      if (sent != (long) dh->len) {
+        fail("sendto(NETLINK_NETFILTER dump)", sent, (long) dh->len);
+      } else {
+        long got = sys6(SYS_recvfrom, ct, (long) reply, sizeof reply, 0, 0, 0);
+        if (got < (long) sizeof(struct nlmsghdr)) {
+          fail("a dump answered nothing at all", got, (long) sizeof(struct nlmsghdr));
+        } else {
+          struct nlmsghdr *rh = (struct nlmsghdr *) reply;
+          /* NLMSG_DONE is 3; an error would be NLMSG_ERROR, which is 2. */
+          if (rh->type != 3)
+            fail("a dump of an empty table should be NLMSG_DONE", rh->type, 3);
+        }
+      }
+    }
+  }
 
   /* Ask for every link. */
   struct nlmsghdr *h = (struct nlmsghdr *) req;

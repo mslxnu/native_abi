@@ -20,6 +20,7 @@
 #define LINUX_NETLINK_USERSOCK        2
 #define LINUX_NETLINK_SOCK_DIAG       4
 #define LINUX_NETLINK_KOBJECT_UEVENT 15
+#define LINUX_NETLINK_NETFILTER      12
 #define LINUX_NETLINK_AUDIT           9
 
 /* struct l_sockaddr_nl lives in linux/socket.h, beside the other families. */
