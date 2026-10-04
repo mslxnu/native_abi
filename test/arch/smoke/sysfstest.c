@@ -23,6 +23,8 @@ static long sys6(long n,long a,long b,long c,long d,long e,long f){
 #define SYS_openat 56
 #define SYS_getdents64 61
 #define SYS_newfstatat 79
+#define SYS_fchownat 54
+#define SYS_fchmodat 53
 #define SYS_exit_group 94
 #define AT_FDCWD (-100)
 #define O_RDONLY 0
@@ -324,6 +326,23 @@ void _start(void)
       bad("/sys/class/leds/red/brightness",
           "a device that is not there should be ENOENT, not a refusal");
     }
+    /*
+     * And an operation that needs the name itself, rather than making it, says so
+     * about a name that is not there: a chown or a chmod of one is ENOENT, which is
+     * what Linux answers because it resolves the path before it asks whether the
+     * filesystem may be written. /sys/power/state and /sys/fs/pstore are both names
+     * this deliberately does not serve, and init chowns both.
+     */
+    if (sys6(SYS_fchownat, AT_FDCWD, (long) "/sys/power/state", 0, 0, 0, 0) != -2)
+      bad("chown /sys/power/state",
+          "a name that is not there should be ENOENT, not a refusal");
+    if (sys6(SYS_fchmodat, AT_FDCWD, (long) "/sys/power/state", 0644, 0, 0, 0) != -2)
+      bad("chmod /sys/power/state",
+          "a name that is not there should be ENOENT, not a refusal");
+    /* But one that *is* there is refused, because that is what read-only means. */
+    if (sys6(SYS_fchmodat, AT_FDCWD, (long) THP, 0644, 0, 0, 0) != -30)
+      bad("chmod " THP, "a name that is there should be EROFS");
+
     /* And a name beside one that does exist is still a creation, which read-only
      * refuses - the distinction is the directory, not the name. */
     fd = sys6(SYS_openat, AT_FDCWD, (long) "/sys/power/newthing",

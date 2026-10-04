@@ -5791,43 +5791,51 @@ void vfs_ungrab_dir(struct path *path);
  * this, and one that forgot would be a read-only mount that was not.
  */
 static int
-vfs_grab_dir_w(int dirfd, const char *name, int flags, struct path *path)
+vfs_grab_dir_w(int dirfd, const char *name, int flags, bool creating,
+               struct path *path)
 {
   int r = vfs_grab_dir(dirfd, name, flags, path);
   if (r < 0)
     return r;
   if (path->rdonly) {
     /*
-     * Read-only, but only if the thing being asked about could have existed.
-     * Otherwise there is a truer answer: the directory that would hold it is not
-     * there.
+     * Read-only, but only about something that could have been there. Otherwise
+     * there is a truer answer: it is not there.
      *
-     * Linux says ENOENT about a name whose parent is missing and reaches the
-     * question of whether the filesystem is writable only afterwards. It matters
-     * here because Android probes for hardware by writing to it - every
+     * Linux resolves the path before it asks whether the filesystem may be
+     * written, so ENOENT wins over EROFS whenever the name the operation needs is
+     * missing. Which name that is depends on the operation, which is what
+     * `creating` says: a mkdir, or an open with O_CREAT, needs the *directory* to
+     * be there and expects the name itself not to be, while a chown or an unlink
+     * needs the *name*. Only the caller knows which it means, so only the caller
+     * can say - and the parameter has no default for that reason.
+     *
+     * It matters because Android probes for hardware by writing to it: every
      * /sys/class/leds/<colour>/brightness and every android_usb entry under
-     * /sys/class in init.rc is a guess at a device this machine does not have. Since /sys is
-     * nabi's and resolves read-only, all of those were answered "read-only file
-     * system", which says the kernel refuses where the truth is that there is no
-     * such device. One is a thing to work around and the other is a thing to give
-     * up on, and a caller can only tell them apart from the errno.
-     *
-     * The test is on the directory, not the name: a name that is simply absent
-     * from a directory that is there is a creation, and refusing that is what
-     * read-only means.
+     * /sys/class in init.rc is a guess at a device this machine does not have.
+     * Since /sys is nabi's and resolves read-only, all of those were answered
+     * "read-only file system", which says the kernel refuses where the truth is
+     * that there is no such device. One is a thing to work around and the other a
+     * thing to give up on, and the errno is all a caller has to tell them apart.
      */
     int dfd = path->dir != NULL ? path->dir->fd : AT_FDCWD;
-    char parent[LINUX_PATH_MAX];
-    snprintf(parent, sizeof parent, "%s", path->subpath);
-    char *slash = strrchr(parent, '/');
-    bool parent_gone = false;
-    if (slash != NULL && slash != parent) {
-      *slash = '\0';
-      struct stat pst;
-      parent_gone = fstatat(dfd, parent, &pst, 0) < 0 && errno == ENOENT;
+    struct stat st;
+    bool missing;
+    if (creating) {
+      char parent[LINUX_PATH_MAX];
+      snprintf(parent, sizeof parent, "%s", path->subpath);
+      char *slash = strrchr(parent, '/');
+      missing = false;
+      if (slash != NULL && slash != parent) {
+        *slash = '\0';
+        missing = fstatat(dfd, parent, &st, 0) < 0 && errno == ENOENT;
+      }
+    } else {
+      missing = fstatat(dfd, path->subpath, &st, AT_SYMLINK_NOFOLLOW) < 0 &&
+                errno == ENOENT;
     }
     vfs_ungrab_dir(path);
-    return parent_gone ? -LINUX_ENOENT : -LINUX_EROFS;
+    return missing ? -LINUX_ENOENT : -LINUX_EROFS;
   }
   return 0;
 }
@@ -5855,7 +5863,7 @@ do_openat(int dirfd, const char *name, int flags, int mode)
                 (flags & (LINUX_O_CREAT | LINUX_O_TRUNC));
 
   struct path path;
-  int r = writes ? vfs_grab_dir_w(dirfd, name, lkflag, &path)
+  int r = writes ? vfs_grab_dir_w(dirfd, name, lkflag, (flags & LINUX_O_CREAT) != 0, &path)
                  : vfs_grab_dir(dirfd, name, lkflag, &path);
   if (r < 0) {
     return r;
@@ -6613,7 +6621,7 @@ DEFINE_SYSCALL(symlinkat, gstr_t, path1_ptr, int, dirfd, gstr_t, path2_ptr)
   strncpy_from_user(path2, path2_ptr, sizeof path2);
 
   struct path path;
-  int r = vfs_grab_dir_w(dirfd, path2, 0, &path);
+  int r = vfs_grab_dir_w(dirfd, path2, 0, true, &path);
   if (r < 0) {
     return r;
   }
@@ -6887,7 +6895,7 @@ DEFINE_SYSCALL(fchownat, int, dirfd, gstr_t, path_ptr, l_uid_t, user, l_gid_t, g
 
   int grab_flags = flags & LINUX_AT_SYMLINK_NOFOLLOW ? LOOKUP_NOFOLLOW : 0;
   struct path path;
-  int r = vfs_grab_dir_w(dirfd, pathname, grab_flags, &path);
+  int r = vfs_grab_dir_w(dirfd, pathname, grab_flags, false, &path);
   if (r < 0) {
     return r;
   }
@@ -6911,7 +6919,7 @@ static int
 do_fchmodat(int dirfd, const char *pathname, l_mode_t mode)
 {
   struct path path;
-  int r = vfs_grab_dir_w(dirfd, pathname, 0, &path);
+  int r = vfs_grab_dir_w(dirfd, pathname, 0, false, &path);
   if (r < 0) {
     return r;
   }
@@ -7116,9 +7124,9 @@ DEFINE_SYSCALL(renameat2, int, oldfd, gstr_t, oldpath_ptr, int, newfd,
 
   struct path oldpath, newpath;
   int r;
-  if ((r = vfs_grab_dir_w(oldfd, oldname, LOOKUP_NOFOLLOW, &oldpath)) < 0)
+  if ((r = vfs_grab_dir_w(oldfd, oldname, LOOKUP_NOFOLLOW, false, &oldpath)) < 0)
     return r;
-  if ((r = vfs_grab_dir_w(newfd, newname, LOOKUP_NOFOLLOW, &newpath)) < 0)
+  if ((r = vfs_grab_dir_w(newfd, newname, LOOKUP_NOFOLLOW, true, &newpath)) < 0)
     goto out;
   if (oldpath.fs != newpath.fs) {
     r = -LINUX_EXDEV;
@@ -7153,10 +7161,10 @@ DEFINE_SYSCALL(renameat, int, oldfd, gstr_t, oldpath_ptr, int, newfd, gstr_t, ne
 
   struct path oldpath, newpath;
   int r;
-  if ((r = vfs_grab_dir_w(oldfd, oldname, LOOKUP_NOFOLLOW, &oldpath)) < 0) {
+  if ((r = vfs_grab_dir_w(oldfd, oldname, LOOKUP_NOFOLLOW, false, &oldpath)) < 0) {
     goto out1;
   }
-  if ((r = vfs_grab_dir_w(newfd, newname, LOOKUP_NOFOLLOW, &newpath)) < 0) {
+  if ((r = vfs_grab_dir_w(newfd, newname, LOOKUP_NOFOLLOW, true, &newpath)) < 0) {
     goto out2;
   }
   if (oldpath.fs != newpath.fs) {
@@ -7183,7 +7191,7 @@ DEFINE_SYSCALL(unlinkat, int, dirfd, gstr_t, path_ptr, int, flags)
 
   struct path path;
   int r;
-  if ((r = vfs_grab_dir_w(dirfd, name, LOOKUP_NOFOLLOW, &path)) < 0) {
+  if ((r = vfs_grab_dir_w(dirfd, name, LOOKUP_NOFOLLOW, false, &path)) < 0) {
     return r;
   }
   r = path.fs->ops->unlinkat(path.fs, path.dir, path.subpath, flags);
@@ -7223,10 +7231,10 @@ DEFINE_SYSCALL(linkat, int, oldfd, gstr_t, oldpath_ptr, int, newfd, gstr_t, newp
   int lkflag = flags & LINUX_AT_SYMLINK_FOLLOW ? 0 : LOOKUP_NOFOLLOW;
   struct path oldpath, newpath;
   int r;
-  if ((r = vfs_grab_dir_w(oldfd, oldname, lkflag, &oldpath)) < 0) {
+  if ((r = vfs_grab_dir_w(oldfd, oldname, lkflag, false, &oldpath)) < 0) {
     goto out1;
   }
-  if ((r = vfs_grab_dir_w(newfd, newname, 0, &newpath)) < 0) {
+  if ((r = vfs_grab_dir_w(newfd, newname, 0, true, &newpath)) < 0) {
     goto out2;
   }
   if (oldpath.fs != newpath.fs) {
@@ -7318,7 +7326,7 @@ DEFINE_SYSCALL(mkdirat, int, dirfd, gstr_t, path_ptr, int, mode)
 
   struct path path;
   int r;
-  if ((r = vfs_grab_dir_w(dirfd, name, 0, &path)) < 0) {
+  if ((r = vfs_grab_dir_w(dirfd, name, 0, true, &path)) < 0) {
     return r;
   }
   r = path.fs->ops->mkdirat(path.fs, path.dir, path.subpath, mode);
@@ -7471,7 +7479,7 @@ DEFINE_SYSCALL(mknodat, int, dirfd, gaddr_t, path_ptr, l_mode_t, mode, l_dev_t, 
   int r = 0;
   switch(mode & S_IFMT) {
   case S_IFIFO: {
-    if ((r = vfs_grab_dir_w(dirfd, name, 0, &path)) < 0) {
+    if ((r = vfs_grab_dir_w(dirfd, name, 0, true, &path)) < 0) {
       goto out;
     }
     r = syswrap(mkfifo(path.subpath, mode));
@@ -7487,7 +7495,7 @@ DEFINE_SYSCALL(mknodat, int, dirfd, gaddr_t, path_ptr, l_mode_t, mode, l_dev_t, 
      * case when the container's /dev is backed by the host's, is EEXIST as
      * Linux would answer.
      */
-    if ((r = vfs_grab_dir_w(dirfd, name, 0, &path)) < 0) {
+    if ((r = vfs_grab_dir_w(dirfd, name, 0, true, &path)) < 0) {
       goto out;
     }
     mode_t host = host_mode_for((uint32_t) mode, false);
@@ -8904,7 +8912,7 @@ DEFINE_SYSCALL(fchmodat2, int, dirfd, gstr_t, path_ptr, l_mode_t, mode,
    */
   char abs[PATH_MAX];
   struct path path;
-  int r = vfs_grab_dir_w(dirfd, pathname, LOOKUP_NOFOLLOW, &path);
+  int r = vfs_grab_dir_w(dirfd, pathname, LOOKUP_NOFOLLOW, false, &path);
   if (r < 0)
     return r;
   bool ok = abs_path_at(path.dir->fd, path.subpath, abs, sizeof abs);
