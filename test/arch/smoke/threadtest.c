@@ -29,6 +29,12 @@ static long sys6(long n,long a,long b,long c,long d,long e,long f){
 #define SYS_clone 220
 #define SYS_mmap 222
 #define SYS_wait4 260
+#define SYS_gettid 178
+#define SYS_newfstatat 79
+#define SYS_sched_setparam 118
+#define SYS_sched_setscheduler 119
+#define SYS_sched_getscheduler 120
+#define SYS_sched_getparam 121
 #define FUTEX_WAIT 0
 #define FUTEX_WAKE 1
 #define CLONE_VM 0x100
@@ -67,6 +73,30 @@ void _start(void){
                   sp, 0, TLSVAL, (long)&ctid, 0);
   if (tid < 0) { put("clone FAIL\n"); sys6(SYS_exit_group,2,0,0,0,0,0); }
   if (tid == 0) {
+    /* Scheduling calls must accept this thread's nonzero guest TID. */
+    long self = sys6(SYS_gettid, 0,0,0,0,0,0);
+    /* The same live thread must also have a /proc/<tid> directory. */
+    static char path[64] = "/proc/", digits[16];
+    static unsigned char st[256];
+    long id = self;
+    int n = 0, end = 6;
+    do { digits[n++] = '0' + id % 10; id /= 10; } while (id);
+    while (n) path[end++] = digits[--n];
+    path[end] = 0;
+    if (sys6(SYS_newfstatat, -100, (long)path, (long)st, 0,0,0) != 0) {
+      put("thread proc directory FAIL\n");
+      sys6(SYS_exit_group, 8, 0,0,0,0,0);
+    }
+    int priority = -1;
+    if (self <= 0 ||
+        sys6(SYS_sched_getscheduler, self, 0,0,0,0,0) != 0 ||
+        sys6(SYS_sched_getparam, self, (long)&priority, 0,0,0,0) != 0 ||
+        priority != 0 ||
+        sys6(SYS_sched_setparam, self, (long)&priority, 0,0,0,0) != 0 ||
+        sys6(SYS_sched_setscheduler, self, 0, (long)&priority, 0,0,0) != 0) {
+      put("thread scheduling FAIL\n");
+      sys6(SYS_exit_group, 7, 0,0,0,0,0);
+    }
     long t; asm volatile("mrs %0, tpidr_el0" : "=r"(t));
     tls_seen = t;
     sys6(SYS_exit, 0, 0,0,0,0,0);        /* the thread, not the process */

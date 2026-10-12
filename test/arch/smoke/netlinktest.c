@@ -36,6 +36,15 @@ static long sys6(long n, long a, long b, long c, long d, long e, long f){
 #define SYS_getsockname 204
 #define SYS_sendto      206
 #define SYS_recvfrom    207
+#define SYS_ioctl        29
+#define SYS_openat       56
+#define SYS_close        57
+#define SYS_read         63
+#define SYS_unshare      97
+#define SIOCGIFHWADDR 0x8927
+#define IFLA_ADDRESS      1
+#define ENODEV           19
+#define EFAULT           14
 
 #define AF_NETLINK       16
 #define SOCK_RAW          3
@@ -80,6 +89,51 @@ static void fail(const char *w, long got, long want)
 
 static char reply[65536];
 static char req[128];
+static char netdev[65536];
+struct ifreq { char name[16]; unsigned short family; unsigned char data[22]; };
+
+/* Read the built-in procfs to EOF, including on hosts without mSL/ProcFS. */
+static void read_netdev(void)
+{
+  long fd = sys6(SYS_openat, -100, (long) "/proc/net/dev", 0, 0, 0, 0);
+  if (fd < 0) fail("open /proc/net/dev", fd, 0);
+  long used = 0, n;
+  while ((n = sys6(SYS_read, fd, (long) (netdev + used),
+                   sizeof netdev - 1 - used, 0, 0, 0)) > 0) {
+    used += n;
+    if (used == sizeof netdev - 1) fail("net/dev exceeds test buffer", used, 0);
+  }
+  if (n < 0) fail("read /proc/net/dev", n, 0);
+  netdev[used] = 0;
+  sys6(SYS_close, fd, 0,0,0,0,0);
+}
+
+/* Find a named row and check that a caller can read all 16 Linux counters. */
+static void counters(const char *name, int zero)
+{
+  for (const char *p = netdev; *p; ) {
+    while (*p == ' ') p++;
+    int i = 0;
+    while (name[i] && p[i] == name[i]) i++;
+    if (!name[i] && p[i] == ':') {
+      p += i + 1;
+      for (int field = 0; field < 16; field++) {
+        while (*p == ' ') p++;
+        if (*p < '0' || *p > '9') fail("missing net/dev counter", field, 16);
+        while (*p >= '0' && *p <= '9') {
+          if (zero && *p != '0') fail("namespace traffic counter", *p - '0', 0);
+          p++;
+        }
+      }
+      while (*p == ' ') p++;
+      if (*p != '\n') fail("extra net/dev counter", *p, '\n');
+      return;
+    }
+    while (*p && *p != '\n') p++;
+    if (*p) p++;
+  }
+  fail("netlink interface missing from net/dev", 0, 1);
+}
 
 void _start(void)
 {
@@ -194,6 +248,10 @@ void _start(void)
   if (got != peeked) fail("the peeked size against what was read", peeked, got);
 
   /* Walk it: at least one named link, and a DONE at the end. */
+  read_netdev();
+  long inet = sys6(SYS_socket, 2 /* AF_INET */, SOCK_DGRAM, 0, 0, 0, 0);
+  if (inet < 0) fail("socket for interface ioctl", inet, 0);
+  struct ifreq first = {0};
   int links = 0, named = 0, done = 0;
   unsigned off = 0;
   while (off + sizeof(struct nlmsghdr) <= (unsigned) got) {
@@ -205,15 +263,42 @@ void _start(void)
       if (!(m->flags & NLM_F_MULTI))
         fail("a dump message without NLM_F_MULTI", m->flags, NLM_F_MULTI);
       unsigned ao = sizeof *m + sizeof(struct ifinfomsg);
+      const char *name = 0;
+      const unsigned char *address = 0;
+      unsigned addrlen = 0;
       while (ao + sizeof(struct rtattr) <= m->len) {
         struct rtattr *a = (struct rtattr *) (reply + off + ao);
         if (a->len < sizeof *a || ao + a->len > m->len) break;
         if (a->type == IFLA_IFNAME &&
             a->len > sizeof *a &&
-            *((char *) a + sizeof *a) != '\0')
+            *((char *) a + sizeof *a) != '\0') {
           named++;
+          name = (char *) a + sizeof *a;
+        }
+        if (a->type == IFLA_ADDRESS) {
+          address = (unsigned char *) a + sizeof *a;
+          addrlen = a->len - sizeof *a;
+        }
         ao += ALIGN4(a->len);
       }
+      if (!name) fail("link without a name", 0, 1);
+      struct ifreq hw = {0};
+      unsigned ni = 0;
+      while (ni < sizeof hw.name - 1 && name[ni]) {
+        hw.name[ni] = name[ni]; ni++;
+      }
+      if (links == 1) first = hw;
+      if ((r = sys6(SYS_ioctl, inet, SIOCGIFHWADDR, (long) &hw, 0,0,0)) != 0)
+        fail("SIOCGIFHWADDR for a netlink interface", r, 0);
+      struct ifinfomsg *info = (struct ifinfomsg *) (m + 1);
+      if (hw.family != info->type)
+        fail("hardware type agrees with netlink", hw.family, info->type);
+      for (unsigned i = 0; i < 14; i++) {
+        unsigned char expected = i < addrlen ? address[i] : 0;
+        if (hw.data[i] != expected)
+          fail("hardware address agrees with netlink", hw.data[i], expected);
+      }
+      counters(hw.name, 0);
     }
     off += ALIGN4(m->len);
   }
@@ -237,6 +322,32 @@ void _start(void)
   struct nlmsgerr *e = (struct nlmsgerr *) (reply + sizeof *m);
   if (e->error != -EPERM) fail("the error creating a link", e->error, -EPERM);
   if (e->msg.seq != 2) fail("the sequence echoed in the error", e->msg.seq, 2);
+
+  if ((r = sys6(SYS_ioctl, inet, SIOCGIFHWADDR, 0, 0,0,0)) != -EFAULT)
+    fail("hardware address with invalid buffer", r, -EFAULT);
+  struct ifreq missing = { .name = "nabi-missing" };
+  if ((r = sys6(SYS_ioctl, inet, SIOCGIFHWADDR, (long) &missing, 0,0,0)) != -ENODEV)
+    fail("hardware address for missing interface", r, -ENODEV);
+  sys6(SYS_close, inet, 0,0,0,0,0);
+
+  /* The namespace must keep its isolated, zero-traffic loopback view. */
+  if ((r = sys6(SYS_unshare, 0x40000000 /* CLONE_NEWNET */, 0,0,0,0,0)) != 0)
+    fail("unshare network namespace", r, 0);
+  inet = sys6(SYS_socket, 2 /* AF_INET */, SOCK_DGRAM, 0, 0, 0, 0);
+  if (inet < 0) fail("socket in network namespace", inet, 0);
+  read_netdev();
+  counters("lo", 1);
+  int rows = 0;
+  for (const char *p = netdev; *p; p++) if (*p == ':') rows++;
+  if (rows != 1) fail("namespace interface count", rows, 1);
+  struct ifreq loopback = { .name = "lo" };
+  if ((r = sys6(SYS_ioctl, inet, SIOCGIFHWADDR, (long) &loopback, 0,0,0)) != 0)
+    fail("namespace loopback hardware address", r, 0);
+  if (loopback.family != 772) fail("namespace loopback type", loopback.family, 772);
+  for (unsigned i = 0; i < 14; i++)
+    if (loopback.data[i]) fail("namespace loopback address", loopback.data[i], 0);
+  if ((r = sys6(SYS_ioctl, inet, SIOCGIFHWADDR, (long) &first, 0,0,0)) != -ENODEV)
+    fail("host interface hidden in namespace", r, -ENODEV);
 
   put("netlink ok\n");
   sys6(SYS_exit, 0, 0,0,0,0,0);

@@ -2327,16 +2327,34 @@ DEFINE_SYSCALL(setpriority, int, which, int, who, int, niceval)
  * maximum should get the number it would get anywhere else.
  */
 
-/* The task exists, or ESRCH. pid 0 is the caller, which always does. Guest pids
- * are host pids, so this is a real question with a real answer. */
+/* Guest threads live in this process: Darwin's kill(tid, 0) cannot find them.
+ * The caller translates a guest PID through pidns_to_host first. */
+bool
+host_task_exists(int32_t host_id)
+{
+  if (host_id <= 0)
+    return false;
+  bool found = false;
+  struct list_head *entry;
+  pthread_rwlock_rdlock(&proc.lock);
+  list_for_each (entry, &proc.tasks) {
+    const struct task *candidate = list_entry(entry, struct task, head);
+    if (candidate->tid == (uint64_t) host_id) {
+      found = true;
+      break;
+    }
+  }
+  pthread_rwlock_unlock(&proc.lock);
+  return found || kill(host_id, 0) == 0 || errno == EPERM;
+}
+
+/* Linux scheduling calls accept thread IDs. pid 0 means the caller. */
 static int
 sched_check_pid(l_pid_t pid)
 {
   if (pid < 0)
     return -LINUX_EINVAL;
-  if (pid == 0)
-    return 0;
-  return syswrap(kill(pid, 0)) < 0 ? -LINUX_ESRCH : 0;
+  return pid == 0 || host_task_exists(pidns_to_host(pid)) ? 0 : -LINUX_ESRCH;
 }
 
 /* Whether a policy exists at all, with the flag bit already stripped. */
