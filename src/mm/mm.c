@@ -154,6 +154,99 @@ split_region(struct mm *mm, struct mm_region *region, gaddr_t gaddr)
   RB_INSERT(mm_region_tree, &mm->mm_region_tree, tail);
 }
 
+/*
+ * True if `b` is `a`'s immediate neighbour and the two are indistinguishable in
+ * everything a guest can observe, so that Linux would be holding them as one
+ * vm_area rather than two.
+ *
+ * Both address spaces have to be contiguous, not just the guest's: a merged
+ * region is described by one haddr and one length, so a pair that happens to
+ * adjoin in the guest while living apart on the host cannot become one record.
+ * split_region only ever hands out halves of a single allocation, so the pairs
+ * this is asked about do adjoin in both - but mmap can place two separate
+ * mappings next to each other in the guest, and those must stay separate.
+ *
+ * Anonymous only. A file mapping would also have to agree about its offset, and
+ * split_region gives each half its own duplicated descriptor, so joining two of
+ * them means deciding which one to close. Neither question has come up, and
+ * leaving such a pair unmerged costs only the refusal the caller already gets.
+ */
+static bool
+regions_adjoin(const struct mm_region *a, const struct mm_region *b)
+{
+  if (a->gaddr + a->size != b->gaddr)
+    return false;
+  if ((char *) a->haddr + a->size != (char *) b->haddr)
+    return false;
+  if (a->prot != b->prot || a->mm_flags != b->mm_flags)
+    return false;
+  if (a->sealed != b->sealed || a->reserved != b->reserved)
+    return false;
+  if (a->shm_id != b->shm_id || a->is_global != b->is_global)
+    return false;
+  if (a->mm_fd >= 0 || b->mm_fd >= 0)
+    return false;
+  if (!(a->mm_flags & LINUX_MAP_ANONYMOUS))
+    return false;
+  /* One arena allocation carved in two, or neither in the arena at all. */
+  if ((a->arena_off < 0) != (b->arena_off < 0))
+    return false;
+  if (a->arena_off >= 0 && a->arena_off + (off_t) a->size != b->arena_off)
+    return false;
+  return true;
+}
+
+/*
+ * Put back together what mprotect took apart.
+ *
+ * Splitting had no inverse. A guest that takes a page's write permission away
+ * and then gives it back is left with two regions that agree about everything,
+ * for good, and nothing in the mapping's own behaviour says so - the halves have
+ * the same permissions and the same contents, and a read or a write cannot tell.
+ *
+ * What tells is the next question asked about the whole mapping. mremap requires
+ * old_size to fit inside the region at old_addr, the way Linux requires it to
+ * fit inside the vm_area, so growing a buffer whose first page was protected
+ * once is EFAULT here and succeeds there. Android's CFI shadow does exactly
+ * that: it flips one page between read-only and read-write hundreds of times
+ * and then grows the shadow. The count is the other half of the cost - every
+ * flip adds a region that is never reclaimed, so the table grows without bound
+ * while the guest's actual mappings do not.
+ *
+ * Backwards first, because a merge into the predecessor consumes the region this
+ * was called about, and the survivor is what carries on. The tree entry has to
+ * be removed before the survivor grows over its range: region_compare treats
+ * any overlap as equality, so a node whose address has just been absorbed is no
+ * longer findable by its own key.
+ */
+void
+merge_region(struct mm *mm, struct mm_region *region)
+{
+  while (region->list.prev != &mm->mm_regions) {
+    struct mm_region *prev =
+        list_entry(region->list.prev, struct mm_region, list);
+    if (!regions_adjoin(prev, region))
+      break;
+    size_t grew = region->size;
+    list_del(&region->list);
+    RB_REMOVE(mm_region_tree, &mm->mm_region_tree, region);
+    free(region);
+    prev->size += grew;
+    region = prev;
+  }
+  while (region->list.next != &mm->mm_regions) {
+    struct mm_region *next =
+        list_entry(region->list.next, struct mm_region, list);
+    if (!regions_adjoin(region, next))
+      break;
+    size_t grew = next->size;
+    list_del(&next->list);
+    RB_REMOVE(mm_region_tree, &mm->mm_region_tree, next);
+    free(next);
+    region->size += grew;
+  }
+}
+
 struct mm_region*
 record_region(struct mm *mm, void *haddr, gaddr_t gaddr, size_t size, int prot, int mm_flags, int mm_fd, int pgoff)
 {

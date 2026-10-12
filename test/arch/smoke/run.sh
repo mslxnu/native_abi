@@ -1758,6 +1758,21 @@ else
     fail=1
 fi
 
+# mergemaptest: a mapping split by mprotect and made whole again. Splitting had
+# no inverse, so a guest that takes a page's write permission away and gives it
+# back kept two regions for good - and the next mremap of the whole mapping was
+# EFAULT, because the region at old_addr was shorter than old_size. Android's CFI
+# shadow flips one page hundreds of times and then grows the buffer. The last
+# case checks that a mapping whose permissions really do differ is still refused.
+cp "$here/mergemaptest" "$root/"; chmod +x "$root/mergemaptest"
+out=$("$NABI" -m "$root" /mergemaptest 2>&1 | tail -1); rc=$?
+if [ "$out" = "ok mergemap" ]; then
+    echo "  ok  mergemaptest -> \"$out\""
+else
+    echo "  FAIL mergemaptest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 # anonzerotest: anonymous memory is zero the second time an arena offset is used.
 # A munmap gives the range back by punching a hole in the arena's backing file,
 # which reads as zeros again - but the punch is best-effort and its result is

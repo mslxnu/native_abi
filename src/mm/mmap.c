@@ -1074,6 +1074,26 @@ DEFINE_SYSCALL(mprotect, gaddr_t, addr, size_t, len, int, prot)
   }
 
 out:
+  /*
+   * Join whatever is now indistinguishable, at both ends of the range. Linux
+   * merges in mprotect_fixup for the same reason: a split the guest has undone
+   * should leave nothing behind, and the only thing that can tell is the next
+   * call to ask about the whole mapping. Both ends, because the range may have
+   * been carved out of the middle of a region and either side of it can be the
+   * piece that now matches.
+   *
+   * Only on success. A partially applied mprotect has regions whose recorded
+   * permission is deliberately not uniform yet, and merging across that would
+   * be merging two things that really do differ.
+   */
+  if (ret == 0) {
+    struct mm_region *r = find_region(addr, proc.mm);
+    if (r != NULL)
+      merge_region(proc.mm, r);
+    r = find_region(end - 1, proc.mm);
+    if (r != NULL)
+      merge_region(proc.mm, r);
+  }
   pthread_rwlock_unlock(&proc.mm->alloc_lock);
 
   return ret;

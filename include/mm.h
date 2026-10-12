@@ -180,6 +180,7 @@ struct mm_region *find_region(gaddr_t gaddr, struct mm *mm);
 struct mm_region *find_region_range(gaddr_t gaddr, size_t size, struct mm *mm);
 struct mm_region *record_region(struct mm *mm, void *haddr, gaddr_t gaddr, size_t size, int prot, int mm_flags, int mm_fd, int pgoff);
 void split_region(struct mm *mm, struct mm_region *region, gaddr_t gaddr);
+void merge_region(struct mm *mm, struct mm_region *region);
 void destroy_mm(struct mm *mm);
 
 bool is_region_private(struct mm_region*);
