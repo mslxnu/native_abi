@@ -181,6 +181,59 @@ main_loop(int return_on_sigret)
                  r ? r->mm_flags : 0,
                  (unsigned long long)(r ? r->gaddr : 0),
                  (unsigned long long)(r ? r->size : 0));
+#ifndef __x86_64__
+          /*
+           * The link register, because a pc on its own does not say who asked.
+           * Twice now a fault has been pinned to a leaf in the guest's libc -
+           * __strchr_aarch64, both times - which names the instruction that
+           * dereferenced the bad pointer and nothing about where the pointer
+           * came from. A leaf keeps its return address in lr, so this is the
+           * caller; x0 is printed beside it because for a one-argument string
+           * routine it is the pointer itself, which says whether the fault
+           * address arrived as an argument or was loaded on the way.
+           *
+           * Subtract the library's load bias to symbolize: find the mmap whose
+           * range covers the address, take the fd from it, and the openat that
+           * returned that fd names the file.
+           *
+           * x19 and x20 are printed because a callee-saved register is where a
+           * pointer being worked on usually still is: the argument registers are
+           * clobbered by the time a nested call faults, and these are not.
+           *
+           * arm64 only. x86-64 has no link register - the return address is on
+           * the stack - and inventing a VREG for it would mean every caller
+           * reading a register one architecture cannot supply.
+           */
+          uint64_t lr = 0, x0 = 0, x1 = 0, x19 = 0, x20 = 0, sp = 0;
+          vmm_arm64_read_reg(HV_REG_LR, &lr);
+          vmm_arm64_read_reg(HV_REG_X0, &x0);
+          vmm_arm64_read_reg(HV_REG_X1, &x1);
+          vmm_arm64_read_reg(HV_REG_X19, &x19);
+          vmm_arm64_read_reg(HV_REG_X20, &x20);
+          vmm_get_reg(VREG_SP, &sp);
+          /*
+           * The frame the faulting function is standing in. An AAPCS64 prologue
+           * stores the caller's frame pointer and return address as a pair at
+           * the bottom of its own frame, so when the fault is in a leaf - which
+           * pushes nothing, so sp still points at its caller's frame - these two
+           * words are that caller's caller. One step further up than lr, which
+           * is as far as this can go without unwind information.
+           */
+          uint64_t fp = 0, ret = 0;
+          if (addr_ok(sp, VERIFY_READ) && addr_ok(sp + 15, VERIFY_READ)) {
+            const uint64_t *frame = guest_to_host(sp);
+            if (frame != NULL) {
+              fp = frame[0];
+              ret = frame[1];
+            }
+          }
+          printk("  lr=0x%llx x0=0x%llx x1=0x%llx x19=0x%llx x20=0x%llx "
+                 "sp=0x%llx [sp]=0x%llx [sp+8]=0x%llx\n",
+                 (unsigned long long) lr, (unsigned long long) x0,
+                 (unsigned long long) x1, (unsigned long long) x19,
+                 (unsigned long long) x20, (unsigned long long) sp,
+                 (unsigned long long) fp, (unsigned long long) ret);
+#endif
           struct list_head *pos = proc.mm->mm_regions.next;
           while (pos != &proc.mm->mm_regions) {
             struct mm_region *walk = list_entry(pos, struct mm_region, list);

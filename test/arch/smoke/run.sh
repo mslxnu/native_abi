@@ -1758,6 +1758,21 @@ else
     fail=1
 fi
 
+# anonzerotest: anonymous memory is zero the second time an arena offset is used.
+# A munmap gives the range back by punching a hole in the arena's backing file,
+# which reads as zeros again - but the punch is best-effort and its result is
+# discarded, so a failure would hand the next guest the previous one's bytes. A
+# stale pointer in supposedly fresh memory cannot be traced back from where it
+# faults, so it is checked from the front.
+cp "$here/anonzerotest" "$root/"; chmod +x "$root/anonzerotest"
+out=$("$NABI" -m "$root" /anonzerotest 2>&1 | tail -1); rc=$?
+if [ "$out" = "ok anonzero" ]; then
+    echo "  ok  anonzerotest -> \"$out\""
+else
+    echo "  FAIL anonzerotest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 # madvisetest: MADV_DONTNEED, which is the one advice that is not advice. madvise
 # was a stub returning 0 for everything, so a page the guest released kept its
 # old contents and the allocator handed them to the next caller - a stale pointer
