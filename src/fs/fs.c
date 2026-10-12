@@ -44,6 +44,7 @@
 #include "linux/ioctl.h"
 #include "linux/termios.h"
 #include "linux/socket.h"
+#include "linux/netlink.h"
 #include "linux/userfaultfd.h"
 
 #include <stddef.h>
@@ -2142,6 +2143,34 @@ darwinfs_ioctl(struct file *file, int cmd, uint64_t val0)
   }
 
   switch (cmd) {
+  case LINUX_SIOCGIFHWADDR: {
+    struct l_ifreq req;
+    if (copy_from_user(&req, val0, sizeof req))
+      return -LINUX_EFAULT;
+    req.ifr_ifrn.ifrn_name[LINUX_IFNAMSIZ - 1] = '\0';
+    struct net_iface interfaces[64];
+    size_t count;
+    if (netns_active()) {
+      interfaces[0] = (struct net_iface) {
+        .name = "lo", .type = LINUX_ARPHRD_LOOPBACK
+      };
+      count = 1;
+    } else {
+      /* Use the same real host interfaces as NABI's netlink implementation. */
+      count = net_iface_list(interfaces, sizeof interfaces / sizeof interfaces[0]);
+    }
+    for (size_t i = 0; i < count; i++) {
+      const struct net_iface *iface = &interfaces[i];
+      if (strcmp(req.ifr_ifrn.ifrn_name, iface->name) != 0)
+        continue;
+      req.ifr_ifru.ifru_hwaddr = (struct l_sockaddr) { .sa_family = iface->type };
+      memcpy(req.ifr_ifru.ifru_hwaddr.sa_data, iface->addr, iface->addr_len);
+      if (copy_to_user(val0, &req, sizeof req))
+        return -LINUX_EFAULT;
+      return 0;
+    }
+    return -LINUX_ENODEV;
+  }
   /*
    * An interface's name from its index, and back. glibc's if_indextoname and
    * if_nametoindex are these two ioctls, and an unhandled ioctl is EPERM here -

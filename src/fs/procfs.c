@@ -70,6 +70,8 @@ int sysctlbyname(const char *, void *, size_t *, void *, size_t);
  * no way from a pthread to that. thread_info takes a port, which is recordable. */
 #include <mach/mach.h>
 #include <mach/thread_act.h>
+#include <ifaddrs.h>
+#include <net/if.h>
 
 /*
  * Record what this process is running, at exec.
@@ -306,10 +308,10 @@ procfs_classify(const char *path, int *fd_out, int depth)
    * /proc/net/dev inside a network namespace, which has one interface and it
    * is down. The host's answer would list the Mac's - and by their Darwin
    * names, lo0 and en0 - which is exactly the thing a process asked to be
-   * isolated from. Outside a namespace this is not ours and mSL/ProcFS answers
-   * it as before.
+   * isolated from. Outside a namespace, read the real host interfaces here
+   * too, so this works without a system-wide mSL/ProcFS installation.
    */
-  if (netns_active() && strcmp(rest, "net/dev") == 0)
+  if (strcmp(rest, "net/dev") == 0)
     return PROCFS_NET_DEV;
 
   if (strcmp(rest, "sysvipc/shm") == 0)
@@ -1533,10 +1535,48 @@ build_status(int host_pid, size_t *len_out)
   return out;
 }
 
-/* One interface, no traffic: what a namespace nobody has configured contains. */
+/* Keep the namespace view. Otherwise take a snapshot of real host counters. */
 static char *
 build_net_dev(size_t *len_out)
 {
+  if (!netns_active()) {
+    struct ifaddrs *list;
+    if (getifaddrs(&list) < 0)
+      return NULL;
+    char *out = NULL;
+    FILE *stream = open_memstream(&out, len_out);
+    if (!stream) {
+      freeifaddrs(list);
+      return NULL;
+    }
+    fputs("Inter-|   Receive | Transmit\n"
+          " face |bytes packets errs drop fifo frame compressed multicast|"
+          "bytes packets errs drop fifo colls carrier compressed\n", stream);
+    for (struct ifaddrs *ifa = list; ifa; ifa = ifa->ifa_next) {
+      if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_LINK || !ifa->ifa_data)
+        continue;
+      const struct if_data *data = ifa->ifa_data;
+      /* Darwin does not supply Linux's fifo/frame/compression counters. */
+      fprintf(stream, "%s: %llu %llu %llu %llu 0 0 0 %llu "
+              "%llu %llu %llu 0 0 %llu 0 0\n", ifa->ifa_name,
+              (unsigned long long) data->ifi_ibytes,
+              (unsigned long long) data->ifi_ipackets,
+              (unsigned long long) data->ifi_ierrors,
+              (unsigned long long) data->ifi_iqdrops,
+              (unsigned long long) data->ifi_imcasts,
+              (unsigned long long) data->ifi_obytes,
+              (unsigned long long) data->ifi_opackets,
+              (unsigned long long) data->ifi_oerrors,
+              (unsigned long long) data->ifi_collisions);
+    }
+    freeifaddrs(list);
+    int failed = ferror(stream);
+    if (fclose(stream) != 0 || failed) {
+      free(out);
+      return NULL;
+    }
+    return out;
+  }
   static const char text[] =
     "Inter-|   Receive                                                |  Transmit\n"
     " face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed\n"
