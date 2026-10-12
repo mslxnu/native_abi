@@ -1008,17 +1008,36 @@ thread_state_letter(int32_t run_state)
  * the guest's own answer here and there is nothing to keep in parallel. A thread
  * that never named itself has none, and the process's comm is what Linux shows
  * for that - a thread inherits the name it was forked with.
+ *
+ * A null pth is a thread Darwin would not talk about, which is answered as an
+ * unnamed one rather than as an error; the fallback is the same name either way.
  */
 static void
 thread_comm(const struct thread_extended_info *pth, char *out, size_t cap)
 {
-  if (pth->pth_name[0]) {
+  if (pth && pth->pth_name[0]) {
     snprintf(out, cap, "%.15s", pth->pth_name);
     return;
   }
   const char *exe = proc.ident.exe;
   const char *base = exe ? strrchr(exe, '/') : NULL;
   snprintf(out, cap, "%.15s", exe ? (base ? base + 1 : exe) : "nabi");
+}
+
+/*
+ * The same answer named by tid, for the callers that have one and no Mach thread
+ * info to go with it: prctl(PR_GET_NAME), which has to hand back what
+ * PR_SET_NAME wrote, and /proc/<pid>/comm, which is the leader's name and used
+ * to be the executable's basename regardless of what the leader had called
+ * itself. Going through here is what keeps the setter, the getter and the three
+ * files from drifting apart - there is one place the name is kept and it is
+ * Darwin's.
+ */
+void
+procfs_thread_comm(int32_t linux_tid, char *out, size_t cap)
+{
+  struct thread_extended_info pth;
+  thread_comm(darwin_thread_info(linux_tid, &pth) ? &pth : NULL, out, cap);
 }
 
 /*
@@ -2037,22 +2056,20 @@ build_boot_id(size_t *len_out)
   return out;
 }
 
-/* comm is the executable's basename and a newline - Linux truncates it to 15
- * characters, and something reading it to compare against a process name will
- * expect that truncation rather than the full one. */
+/* comm is the thread-group leader's name and a newline - Linux truncates it to
+ * 15 characters, and something reading it to compare against a process name will
+ * expect that truncation rather than the full one. The executable's basename is
+ * only the leader's name until the leader renames itself. */
 static char *
 build_comm(size_t *len_out)
 {
-  const char *exe = proc.ident.exe;
-  if (!exe)
-    return NULL;
-  const char *base = strrchr(exe, '/');
-  base = base ? base + 1 : exe;
+  char name[32];
+  procfs_thread_comm((int32_t) getpid(), name, sizeof name);
 
   char *out = malloc(18);
   if (!out)
     return NULL;
-  *len_out = (size_t) snprintf(out, 18, "%.15s\n", base);
+  *len_out = (size_t) snprintf(out, 18, "%.15s\n", name);
   return out;
 }
 

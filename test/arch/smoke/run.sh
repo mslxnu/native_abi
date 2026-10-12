@@ -1786,6 +1786,21 @@ else
     fail=1
 fi
 
+# prctlnametest: prctl(PR_GET_NAME), the read side of a setter that already
+# worked. PR_SET_NAME was implemented and 16 fell through to the default, so a
+# thread could name itself and never be told its own name. The three readers of
+# that name had to be made to agree while it was fixed: /proc/<pid>/comm was
+# built from the executable's basename and ignored the rename, so it already
+# contradicted /proc/<pid>/task/<tid>/comm before there was a getter to add.
+cp "$here/prctlnametest" "$root/"; chmod +x "$root/prctlnametest"
+out=$("$NABI" -m "$root" /prctlnametest 2>&1 | tail -1); rc=$?
+if [ "$out" = "prctlname ok" ]; then
+    echo "  ok  prctlnametest -> \"$out\""
+else
+    echo "  FAIL prctlnametest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 # threadstattest: per-thread accounting in /proc/<pid>/task/<tid>/stat. The
 # per-thread files used to be the process's under another name - the path was
 # rewritten and the tid thrown away - so every row of `ps -L` carried the same id,

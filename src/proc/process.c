@@ -1713,6 +1713,29 @@ DEFINE_SYSCALL(prctl, int, option, unsigned long, arg1, unsigned long, arg2, uns
     pthread_setname_np(buf);
     return 0;
   }
+  /*
+   * The read side of the setter above, which was missing: a name could be set
+   * and never asked for again.
+   *
+   * Linux writes exactly TASK_COMM_LEN bytes into the caller's buffer, so the
+   * whole sixteen go out and the name is NUL-terminated inside them - a caller
+   * reading the buffer as a string sees nothing left over from before the call.
+   * The name comes from where /proc/<pid>/task/<tid>/comm gets it, which is the
+   * one place PR_SET_NAME wrote it, so the setter, the getter and the file
+   * cannot disagree about what this thread is called.
+   *
+   * The unused arguments are not checked, as Linux does not check them here:
+   * prctl is variadic and a caller that asks for nothing leaves whatever was in
+   * those registers.
+   */
+  case LINUX_PR_GET_NAME: {
+    char buf[16] = {0};
+    procfs_thread_comm((int32_t) task.tid, buf, sizeof buf);
+    if (copy_to_user((gaddr_t) arg1, buf, sizeof buf)) {
+      return -LINUX_EFAULT;
+    }
+    return 0;
+  }
   case LINUX_PR_SET_VMA: {
     char name[64] = {0};
     if (arg1 != 0) {

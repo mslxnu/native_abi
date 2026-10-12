@@ -514,6 +514,10 @@ bool procfs_refresh_fddir(int fd);
 int fdtable_open_fds(int *out, int max);
 int guest_to_host_path(const char *name, char *out, size_t outsz);
 int procfs_readlink(const char *path, char *buf, size_t bufsize);
+/* The name of one of our threads, as /proc/<pid>/task/<tid>/comm reports it.
+ * Never fails: a tid that names no thread of ours gets the same fallback an
+ * unnamed thread does. */
+void procfs_thread_comm(int32_t linux_tid, char *out, size_t cap);
 void proc_set_ident(const char *exe, int argc, char *argv[]);
 
 void init_fpu(void);
