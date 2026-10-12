@@ -35,6 +35,7 @@ static long sys6(long n,long a,long b,long c,long d,long e,long f){
 #define SYS_openat 56
 #define SYS_exit_group 94
 #define SYS_readlinkat 78
+#define SYS_getpid 172
 #define SYS_newfstatat 79
 #define AT_FDCWD (-100)
 #define AT_SYMLINK_NOFOLLOW 0x100
@@ -42,6 +43,8 @@ static long sys6(long n,long a,long b,long c,long d,long e,long f){
 #define S_IFMT   0170000
 #define S_IFREG  0100000
 #define S_IFLNK  0120000
+#define EINVAL 22
+#define ENOENT 2
 
 /* struct stat's st_mode sits at offset 16 on arm64. */
 #define ST_MODE(buf) (*(unsigned int *)((char *)(buf) + 16))
@@ -61,6 +64,23 @@ void _start(void)
 {
   char link[512];
   unsigned char st[256];
+
+  /* realpath probes each directory before it reaches the exe link. */
+  char pidpath[64] = "/proc/", digits[16];
+  long pid = sys6(SYS_getpid, 0,0,0,0,0,0);
+  int nd = 0, end = 6;
+  do { digits[nd++] = '0' + pid % 10; pid /= 10; } while (pid);
+  while (nd) pidpath[end++] = digits[--nd];
+  pidpath[end] = 0;
+  want("readlink /proc is not a link",
+       sys6(SYS_readlinkat, AT_FDCWD, (long) "/proc",
+            (long) link, sizeof link, 0, 0), -EINVAL);
+  want("readlink a live process directory is not a link",
+       sys6(SYS_readlinkat, AT_FDCWD, (long) pidpath,
+            (long) link, sizeof link, 0, 0), -EINVAL);
+  want("readlink a missing process directory",
+       sys6(SYS_readlinkat, AT_FDCWD, (long) "/proc/2147483647",
+            (long) link, sizeof link, 0, 0), -ENOENT);
 
   long n = sys6(SYS_readlinkat, AT_FDCWD, (long) "/proc/self/exe",
                 (long) link, sizeof link - 1, 0, 0);

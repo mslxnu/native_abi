@@ -7300,6 +7300,12 @@ DEFINE_SYSCALL(readlinkat, int, dirfd, gstr_t, path_ptr, gaddr_t, buf_ptr, int, 
         return -LINUX_EFAULT;
       return n;
     }
+    /* realpath walks /proc/<pid>/exe one component at a time. A synthetic
+     * directory exists but is not a symlink, so Linux returns EINVAL. */
+    uint32_t mode;
+    uint64_t size, ino;
+    if (procfs_stat(name, true, &mode, &size, &ino) && S_ISDIR(mode))
+      return -LINUX_EINVAL;
   }
 
   int r;

@@ -362,7 +362,7 @@ procfs_classify(const char *path, int *fd_out, int depth)
         return PROCFS_PIDDIR;
       }
       int32_t host = pidns_to_host(want);
-      if (host >= 0) {
+      if (host_task_exists(host)) {
         if (fd_out) *fd_out = (int) host;
         return PROCFS_PIDDIR;
       }
