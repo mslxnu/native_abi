@@ -1758,6 +1758,19 @@ else
     fail=1
 fi
 
+# madvisetest: MADV_DONTNEED, which is the one advice that is not advice. madvise
+# was a stub returning 0 for everything, so a page the guest released kept its
+# old contents and the allocator handed them to the next caller - a stale pointer
+# in a fresh allocation, faulting in a thread with no connection to the free.
+cp "$here/madvisetest" "$root/"; chmod +x "$root/madvisetest"
+out=$("$NABI" -m "$root" /madvisetest 2>&1 | tail -1); rc=$?
+if [ "$out" = "ok madvise" ]; then
+    echo "  ok  madvisetest -> \"$out\""
+else
+    echo "  FAIL madvisetest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 # threadstattest: per-thread accounting in /proc/<pid>/task/<tid>/stat. The
 # per-thread files used to be the process's under another name - the path was
 # rewritten and the tid thrown away - so every row of `ps -L` carried the same id,

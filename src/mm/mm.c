@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <stdbool.h>
 #include <sys/mman.h>
+#include <string.h>
 #include <strings.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -231,11 +232,72 @@ destroy_mm(struct mm *mm)
   INIT_LIST_HEAD(&mm->mm_regions);
 }
 
+#define LINUX_MADV_DONTNEED 4
+
+/*
+ * madvise. Almost all of it is advice about paging that nothing here can act
+ * on, and answering 0 to a hint is the truth - the kernel is allowed to ignore
+ * one. MADV_DONTNEED is the exception, and it had been going the same way: it
+ * is not advice. Linux drops the pages, so an anonymous private mapping reads
+ * back as zero afterwards. That is the whole reason the call exists.
+ *
+ * Returning 0 without dropping anything is worse than refusing. Android's
+ * allocator releases memory this way and then hands the same pages out again,
+ * so the next owner is given a page still holding the last one's bytes - and
+ * reads a pointer out of it. The fault lands wherever that pointer happens to
+ * aim, in a thread that has nothing to do with the free, which is why
+ * hwcomposer died inside libc with a read of 0x51a3a9b000000000 and no trace of
+ * where it came from. Regression test test/arch/smoke/madvisetest.
+ *
+ * Only the anonymous private case is acted on, because its pages belong to this
+ * mapping alone. A shared mapping's contents live in the file or the shm behind
+ * it and come straight back, so dropping them is not observable; a private file
+ * mapping would have to revert to the file's contents, which means re-reading
+ * it, and nothing on this system asks for that. Both are left as they are
+ * rather than guessed at.
+ */
 DEFINE_SYSCALL(madvise, gaddr_t, addr, size_t, length, int, advice)
 {
-  printk("madvise is not implemented\n");
-  return 0;
+  size_t ps = PAGE_SIZEOF(PAGE_4KB);
+  /* Unlike mlock, madvise does refuse an unaligned start - and the length is
+   * what gets rounded up. */
+  if (!is_page_aligned((void *) addr, PAGE_4KB))
+    return -LINUX_EINVAL;
+  if (length == 0)
+    return 0;
+  gaddr_t end = addr + roundup(length, ps);
+  if (end < addr)
+    return -LINUX_EINVAL;
 
+  if (advice != LINUX_MADV_DONTNEED)
+    return 0;
+
+  int ret = 0;
+  pthread_rwlock_rdlock(&proc.mm->alloc_lock);
+  for (gaddr_t p = addr; p < end; ) {
+    struct mm_region *region = find_region(p, proc.mm);
+    if (region == NULL) {
+      /* A range with a hole in it is ENOMEM, the same as mlock's. */
+      ret = -LINUX_ENOMEM;
+      break;
+    }
+    gaddr_t rend = region->gaddr + region->size;
+    gaddr_t stop = rend < end ? rend : end;
+    /*
+     * A reservation has no memory behind it yet and reads as PROT_NONE, so
+     * there is nothing to drop and materializing it to zero it would defeat
+     * what the reservation is for.
+     */
+    if (!region->reserved &&
+        (region->mm_flags & LINUX_MAP_ANON) != 0 &&
+        (region->mm_flags & LINUX_MAP_PRIVATE) != 0) {
+      void *haddr = (char *) region->haddr + (p - region->gaddr);
+      memset(haddr, 0, (size_t) (stop - p));
+    }
+    p = stop;
+  }
+  pthread_rwlock_unlock(&proc.mm->alloc_lock);
+  return ret;
 }
 
 /*
