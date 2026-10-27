@@ -132,6 +132,23 @@ else
     fail=1
 fi
 
+# futexprivtest: a futex without FUTEX_PRIVATE_FLAG is not therefore shared. The
+# flag's absence was taken for the presence of sharing, so a plain FUTEX_WAIT on
+# ordinary private memory took the bounded shared path - which reports a wake
+# when its interval expires, by design, so the caller re-reads the word.
+# Everything libc does passes the flag; bionic's crash handler uses the raw
+# syscall, was told it had been woken 20ms later, and re-raised the fatal signal
+# while its dump thread was still forking. The shared case keeps the bounded
+# wait; what is checked there is that it returns rather than hangs.
+cp "$here/futexprivtest" "$root/"; chmod +x "$root/futexprivtest"
+out=$("$NABI" -m "$root" /futexprivtest 2>&1 | tail -1); rc=$?
+if [ "$out" = "ok futexpriv" ]; then
+    echo "  ok  futexprivtest -> \"$out\""
+else
+    echo "  FAIL futexprivtest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 # pipeszttest: F_SETPIPE_SZ / F_GETPIPE_SZ, which Darwin has no fcntl for. They
 # fell through to the unknown-command EINVAL, and that is where bionic's crash
 # handler died - its dump thread asks for a pipe big enough to hold a tombstone

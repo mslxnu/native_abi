@@ -463,8 +463,22 @@ DEFINE_SYSCALL(futex, gaddr_t, uaddr, int, op, uint32_t, val, gaddr_t, timeout_p
      * the wait is bounded and re-checks the futex word instead of sleeping on
      * it forever: a cross-process wake becomes a short delay rather than a
      * hang, and neither becomes a dead machine.
+     *
+     * Which mapping it is in decides that, and the region looked up here was
+     * not being asked. Every call without FUTEX_PRIVATE_FLAG was called shared,
+     * so a plain FUTEX_WAIT on ordinary private memory took the bounded path -
+     * and that path reports a *wake* when its interval expires, because a
+     * caller that must re-read the word has to be let go to do it.
+     *
+     * The absence of the flag is not the presence of sharing. Everything libc
+     * does passes the flag; what does not is code written against the raw
+     * syscall, and bionic's crash handler is exactly that. It waits on a word in
+     * its own memory for its dump thread to finish, was told it had been woken
+     * twenty milliseconds later, took that for the dump being done, and
+     * re-raised the fatal signal while the dump thread was still forking. So no
+     * tombstone, from a futex that was never shared with anybody.
      */
-    shared = true;
+    shared = (region->mm_flags & LINUX_MAP_SHARED) != 0;
   }
   pthread_mutex_lock(&proc.futex_mutex);
   futex_shared = shared;
