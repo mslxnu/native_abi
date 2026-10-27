@@ -857,7 +857,20 @@ do_execve(const char *elf_path, gaddr_t gargv, gaddr_t genvp)
   size_t argv_rsrv = 1024;
   char **argv = malloc(sizeof(char *) * argv_rsrv);
   size_t argc = 0;
-  while (true) {
+  /*
+   * A null vector is an empty one, not a bad address.
+   *
+   * Linux reads nothing when argv or envp is NULL and the program starts with
+   * an empty array - it does not fault. This read from guest address 0 instead
+   * and answered EFAULT, which is a refusal of something the kernel allows.
+   *
+   * bionic's crash handler is the caller that showed it: having forked, the
+   * child execs crash_dump64 with an argument vector and a **null
+   * environment**, and that exec came back EFAULT. So the child never became
+   * the dumper - it stayed a copy of the crashing process, logged, and exited,
+   * and Android produced no tombstone for anything.
+   */
+  while (gargv != 0) {
     size_t i = argc;
     gaddr_t addr;
     if (copy_from_user(&addr, gargv + sizeof(gaddr_t) * i, sizeof addr)) {
@@ -892,7 +905,8 @@ do_execve(const char *elf_path, gaddr_t gargv, gaddr_t genvp)
   size_t envp_rsrv = 1024;
   char **envp = malloc(sizeof(char *) * envp_rsrv);
   size_t envc = 0;
-  while (true) {
+  /* The same for the environment; see argv above. */
+  while (genvp != 0) {
     size_t i = envc;
     gaddr_t addr;
     if (copy_from_user(&addr, genvp + sizeof(gaddr_t) * i, sizeof addr)) {

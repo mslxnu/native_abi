@@ -132,6 +132,20 @@ else
     fail=1
 fi
 
+# execnullenvtest: execve with a null environment, and with a null argv. Linux
+# reads nothing and starts the program with an empty array; nabi read from guest
+# address 0 and answered EFAULT. bionic's crash handler execs crash_dump64 with
+# a null environment, so the forked child never became the dumper and Android
+# produced no tombstone for anything.
+cp "$here/execnullenvtest" "$root/"; chmod +x "$root/execnullenvtest"
+out=$("$NABI" -m "$root" /execnullenvtest 2>&1 | tail -1); rc=$?
+if [ "$out" = "ok execnullenv" ]; then
+    echo "  ok  execnullenvtest -> \"$out\""
+else
+    echo "  FAIL execnullenvtest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 # futexprivtest: a futex without FUTEX_PRIVATE_FLAG is not therefore shared. The
 # flag's absence was taken for the presence of sharing, so a plain FUTEX_WAIT on
 # ordinary private memory took the bounded shared path - which reports a wake
