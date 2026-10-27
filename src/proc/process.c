@@ -1807,15 +1807,36 @@ DEFINE_SYSCALL(prctl, int, option, unsigned long, arg1, unsigned long, arg2, uns
       return -LINUX_EFAULT;
     return 0;
   }
+  /*
+   * The dumpable pair, and the arguments after the first that are nobody's to
+   * check.
+   *
+   * prctl is variadic, so a caller writing prctl(PR_SET_DUMPABLE, 1) passes two
+   * arguments and leaves x2 to x5 holding whatever was in them. Linux knows
+   * that: its PR_GET_DUMPABLE validates nothing at all and its PR_SET_DUMPABLE
+   * validates only the value. Refusing the call because a register the caller
+   * never set is non-zero is refusing a correct program.
+   *
+   * It is not hypothetical. bionic's crash handler calls both, and the trailing
+   * register happened to hold 0x2f1f64636e621f2b - the tail of a log tag - so
+   * both came back EINVAL inside the path that is supposed to produce a
+   * tombstone. The same reasoning is written above PR_GET_NAME, which does not
+   * check them either; it just had not reached its neighbours.
+   *
+   * The checks on PR_SET/GET_THP_DISABLE below stay, because Linux really does
+   * check those - it is a per-option decision in the kernel and not a
+   * convention, so each one is as strict here as it is there and no stricter.
+   * The remaining options that check are left alone rather than relaxed on the
+   * strength of this one: accepting a call Linux refuses is the same kind of
+   * mistake in the other direction.
+   */
   case LINUX_PR_GET_DUMPABLE:
-    if (arg1 || arg2 || arg3 || arg4)
-      return -LINUX_EINVAL;
     return proc_dumpable;
   case LINUX_PR_SET_DUMPABLE:
     /* 0 and 1 are the only values a process may set. 2 exists - dumpable only
      * for root - but Linux reserves it to the fs.suid_dumpable sysctl and
      * refuses it here, so refusing it is what a caller is prepared for. */
-    if (arg1 > 1 || arg2 || arg3 || arg4)
+    if (arg1 > 1)
       return -LINUX_EINVAL;
     proc_dumpable = (int) arg1;
     return 0;
@@ -2259,6 +2280,51 @@ DEFINE_SYSCALL(getrusage, int, who, gaddr_t, rusage_ptr)
 static int nice_wanted = 0;
 static bool nice_pretended = false;
 
+/*
+ * Which host process a priority call is about, from a `who` in the guest's
+ * terms.
+ *
+ * It was handed to Darwin untranslated, so a guest inside a pid namespace -
+ * which is every Android guest - asking about *itself* was asking about a host
+ * process that does not exist. getpriority(PRIO_PROCESS, 59) answered ESRCH to
+ * a process whose own pid is 59. ART asks four times in a row during zygote's
+ * startup and the "self" case in setpriority below could never match either, so
+ * the nice it remembered was never the one it had been asked for.
+ *
+ * PRIO_PROCESS takes a thread id on Linux, where nice is per-thread. Darwin's
+ * is per-process and there is no per-thread equivalent, so one of this
+ * process's threads is answered for by the process - which is the only honest
+ * answer available and consistent with reporting one CPU and SCHED_OTHER
+ * everywhere else.
+ *
+ * A thread of *another* guest process still cannot be found: each guest process
+ * is its own nabi, and a tid is not a pid that pidns_to_host can translate.
+ * That stays ESRCH, which is what it already was. So does a pgid for PRIO_PGRP,
+ * which arrives in the namespace's terms and is not translated here - signal.c
+ * has the enumeration a process group needs if it ever matters.
+ */
+static int
+prio_who_to_host(int which, int who, bool *self)
+{
+  *self = false;
+  if (which != PRIO_PROCESS)
+    return who;                 /* a pgid or a uid; see above */
+  if (who == 0) {
+    *self = true;
+    return 0;                   /* Darwin reads 0 as "me" too */
+  }
+  if (who == (int) getpid() || host_task_exists((int32_t) who)) {
+    *self = true;
+    return (int) getpid();
+  }
+  int32_t h = pidns_to_host((int32_t) who);
+  if (h < 0)
+    return -1;
+  if (h == (int) getpid())
+    *self = true;
+  return (int) h;
+}
+
 DEFINE_SYSCALL(getpriority, int, which, int, who)
 {
   /*
@@ -2279,14 +2345,19 @@ DEFINE_SYSCALL(getpriority, int, which, int, who)
    * -1 is a legitimate nice value, so failure is distinguished by errno rather
    * than by the return, which is the whole reason the Linux encoding exists.
    */
+  bool self;
+  int host_who = prio_who_to_host(which, who, &self);
+  if (host_who < 0)
+    return -LINUX_ESRCH;
+
   errno = 0;
-  int nice = getpriority(which, who);
+  int nice = getpriority(which, host_who);
   if (nice == -1 && errno != 0)
     return -darwin_to_linux_errno(errno);
   /* What this process asked for, if the host would not take it - see
    * setpriority. Answering with the host's value would contradict the success
    * this already reported. */
-  if (nice_pretended && which == PRIO_PROCESS && (who == 0 || who == getpid()))
+  if (nice_pretended && self)
     nice = nice_wanted;
   return 20 - nice;
 }
@@ -2334,18 +2405,23 @@ guest_may_renice(void)
  */
 DEFINE_SYSCALL(setpriority, int, which, int, who, int, niceval)
 {
+  bool self;
+  int host_who = prio_who_to_host(which, who, &self);
+  if (host_who < 0)
+    return -LINUX_ESRCH;
+
   errno = 0;
-  int r = setpriority(which, who, niceval);
+  int r = setpriority(which, host_who, niceval);
   if (r == 0) {
     /* The host took it, so it is the truth again and any value remembered
      * from a request it would not take is stale. */
-    if (which == PRIO_PROCESS && (who == 0 || who == getpid()))
+    if (self)
       nice_pretended = false;
     return 0;
   }
   int e = errno;
   if ((e == EPERM || e == EACCES) && guest_may_renice()) {
-    if (which == PRIO_PROCESS && (who == 0 || who == getpid())) {
+    if (self) {
       nice_wanted = niceval;
       nice_pretended = true;
     }

@@ -1758,6 +1758,44 @@ else
     fail=1
 fi
 
+# prioselftest: getpriority's `who` was handed to Darwin untranslated, so a guest in
+# a pid namespace asking about itself asked about a host process that does not
+# exist - zygote's pid 59 answered ESRCH four times during ART's startup. Run
+# under --pid1 as well, where the setpriority round trip is what discriminates:
+# namespace pid 1 maps onto the host's launchd, so the ESRCH checks pass even
+# unfixed. See the comment at the top of prioselftest.c. Its neighbour priotest
+# covers the 20 - nice encoding and is a different test.
+cp "$here/prioselftest" "$root/"; chmod +x "$root/prioselftest"
+out=$("$NABI" -m "$root" /prioselftest 2>&1 | tail -1); rc=$?
+if [ "$out" = "ok prioself" ]; then
+    echo "  ok  prioselftest -> \"$out\""
+else
+    echo "  FAIL prioselftest -> \"$out\", exit $rc"
+    fail=1
+fi
+out=$("$NABI" --pid1 -m "$root" /prioselftest 2>&1 | tail -1); rc=$?
+if [ "$out" = "ok prioself" ]; then
+    echo "  ok  prioselftest (pid namespace) -> \"$out\""
+else
+    echo "  FAIL prioselftest (pid namespace) -> \"$out\", exit $rc"
+    fail=1
+fi
+
+# prctljunktest: prctl is variadic, so the arguments an option does not use hold
+# whatever was in those registers. nabi refused PR_GET/SET_DUMPABLE when any were
+# non-zero, which refuses a correct program - Linux validates nothing for the
+# getter and only the value for the setter. bionic's crash handler calls both
+# with the tail of a log tag still in x5. The THP pair is checked in the other
+# direction: Linux does validate its trailing arguments, so those stay refused.
+cp "$here/prctljunktest" "$root/"; chmod +x "$root/prctljunktest"
+out=$("$NABI" -m "$root" /prctljunktest 2>&1 | tail -1); rc=$?
+if [ "$out" = "ok prctljunk" ]; then
+    echo "  ok  prctljunktest -> \"$out\""
+else
+    echo "  FAIL prctljunktest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 # stacklimittest: the stack a guest is promised is the stack it has.
 # getrlimit(RLIMIT_STACK) reported the host process's limit - nabi's own stack -
 # while the guest got a fixed 2MB, so a guest was told 8MB and given 2. bionic
