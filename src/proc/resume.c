@@ -168,6 +168,7 @@ checkpoint_restore(int ckpt_fd, int arena_fd)
   proc.mm->start_brk        = hdr.start_brk;
   proc.mm->current_brk      = hdr.current_brk;
   proc.mm->current_mmap_top = hdr.current_mmap_top;
+  proc.mm->start_stack      = hdr.start_stack;
   for (uint32_t i = 0; i < hdr.nr_regions; i++) {
     struct mm_region *r = record_region(proc.mm, region_hva[i], regions[i].gaddr,
                                         regions[i].size, regions[i].prot,

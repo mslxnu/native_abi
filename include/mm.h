@@ -142,6 +142,14 @@ struct mm {
   struct mm_region_tree mm_region_tree;
   struct list_head mm_regions;
   uint64_t start_brk, current_brk;
+  /*
+   * Where the guest's stack pointer was when the program started, which is the
+   * address argc sits at - Linux's mm->start_stack. Only nabi knows it: Darwin
+   * has no idea this process has a guest stack, let alone where its arguments
+   * were put. /proc/<pid>/stat field 28 is this, and it is the address bionic
+   * hunts for in /proc/<pid>/maps to find the main thread's stack bounds.
+   */
+  uint64_t start_stack;
   uint64_t current_mmap_top;
   pthread_rwlock_t alloc_lock;
 };

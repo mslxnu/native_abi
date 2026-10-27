@@ -1758,6 +1758,28 @@ else
     fail=1
 fi
 
+# mapslabeltest: /proc/self/stat field 28 and the [stack] line in /proc/self/maps,
+# checked as the pair bionic's pthread_attr_getstack walks. Field 28 was a literal
+# zero - the whole tail of stat was - so the hunt through maps found no line and
+# bionic called async_safe_fatal("stack not found in /proc/self/maps"), which is
+# what aborted zygote. Run both ways: with mSL/ProcFS installed, stat used to be
+# the host's answer about nabi rather than nabi's about the guest.
+cp "$here/mapslabeltest" "$root/"; chmod +x "$root/mapslabeltest"
+out=$("$NABI" -m "$root" /mapslabeltest 2>&1 | tail -1); rc=$?
+if [ "$out" = "ok mapslabel" ]; then
+    echo "  ok  mapslabeltest -> \"$out\""
+else
+    echo "  FAIL mapslabeltest -> \"$out\", exit $rc"
+    fail=1
+fi
+out=$(NABI_IGNORE_HOST_FS=1 "$NABI" -m "$root" /mapslabeltest 2>&1 | tail -1); rc=$?
+if [ "$out" = "ok mapslabel" ]; then
+    echo "  ok  mapslabeltest (kext-free) -> \"$out\""
+else
+    echo "  FAIL mapslabeltest (kext-free) -> \"$out\", exit $rc"
+    fail=1
+fi
+
 # mmaphinttest: a non-zero addr without MAP_FIXED is a hint, and a free one is
 # taken. The hint was discarded and the allocator chose every time, so a caller
 # that needs a particular part of the address space could never get it - ART

@@ -658,6 +658,15 @@ init_userstack(int argc, char *argv[], char **envp, uint64_t exe_base,
 
   uint64_t argc64 = argc;
   push(&argc64, sizeof argc64);
+
+  /*
+   * And that is where the program starts, so that is mm->start_stack. Recorded
+   * here rather than computed from STACK_TOP because the two are not the same
+   * address: everything pushed above - the auxiliary vector, the environment
+   * and argument arrays, the strings they point at - sits between them, and how
+   * much of it there is depends on the arguments.
+   */
+  vmm_get_reg(VREG_SP, &proc.mm->start_stack);
 }
 
 static void

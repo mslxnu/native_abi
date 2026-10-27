@@ -26,7 +26,7 @@
 #include "linux/signal.h"
 
 #define CHECKPOINT_MAGIC   0x4E414249434B5031ULL  /* "NABICKP1" */
-#define CHECKPOINT_VERSION 10
+#define CHECKPOINT_VERSION 11
 
 /* One guest memory region, as src/mm/mmap.c tracks it, with the host address
  * replaced by the arena offset that names the same bytes elsewhere. */
@@ -98,6 +98,9 @@ struct checkpoint_header {
 
   /* mm scalars that are not derivable from the region list. */
   uint64_t start_brk, current_brk, current_mmap_top;
+  /* Where the guest's stack pointer started; see struct mm. A child is a
+   * fresh nabi that never ran init_userstack, so it cannot work this out. */
+  uint64_t start_stack;
 
   /* stage-1 allocator */
   uint64_t ipa_brk;

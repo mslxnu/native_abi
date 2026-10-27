@@ -138,16 +138,38 @@ build_maps(size_t *len_out)
   pthread_rwlock_rdlock(&proc.mm->alloc_lock);
   struct mm_region *r;
   list_for_each_entry(r, &proc.mm->mm_regions, list) {
-    char line[128];
+    /*
+     * The two ranges nabi knows the name of. A file-backed mapping's path is
+     * still absent, for the reason above; these are not paths but the kernel's
+     * own labels for regions it placed itself, and nabi placed both.
+     *
+     * [stack] is the region holding the stack pointer the program started at,
+     * not whichever region happens to be highest - a thread stack or a large
+     * mapping can sit above it. [heap] is brk's, which is a range rather than a
+     * region: brk grows by mapping, so the heap can be several regions and the
+     * last of them can reach past current_brk. Anything overlapping the range
+     * belongs to it.
+     */
+    const char *label = "";
+    if (proc.mm->start_stack >= r->gaddr &&
+        proc.mm->start_stack < r->gaddr + r->size)
+      label = "[stack]";
+    else if (proc.mm->current_brk > proc.mm->start_brk &&
+             r->gaddr < proc.mm->current_brk &&
+             r->gaddr + r->size > proc.mm->start_brk)
+      label = "[heap]";
+
+    char line[160];
     int n = snprintf(line, sizeof line,
-                     "%012llx-%012llx %c%c%c%c %08llx 00:00 0 \n",
+                     "%012llx-%012llx %c%c%c%c %08llx 00:00 0 %s\n",
                      (unsigned long long) r->gaddr,
                      (unsigned long long) (r->gaddr + r->size),
                      (r->prot & LINUX_PROT_READ)  ? 'r' : '-',
                      (r->prot & LINUX_PROT_WRITE) ? 'w' : '-',
                      (r->prot & LINUX_PROT_EXEC)  ? 'x' : '-',
                      (r->mm_flags & LINUX_MAP_SHARED) ? 's' : 'p',
-                     (unsigned long long) r->pgoff * PAGE_SIZEOF(PAGE_4KB));
+                     (unsigned long long) r->pgoff * PAGE_SIZEOF(PAGE_4KB),
+                     label);
     if (n < 0)
       continue;
     if (len + (size_t) n + 1 > cap) {
@@ -940,14 +962,25 @@ static void
 proc_comm_paren(int host_pid, const struct proc_taskallinfo *ti, char *out,
                 size_t cap)
 {
+  /*
+   * Our own name comes from the one place the setter, the getter and the two
+   * comm files already agree on. It used to be the executable's basename, which
+   * is the leader's name only until the leader renames itself - so stat was a
+   * fourth reader of a name that had been unified without it, and a process
+   * that had called PR_SET_NAME was one thing in comm and another here.
+   */
+  char self_comm[32];
   const char *name = NULL;
-  if (host_pid == (int) getpid() && proc.ident.exe) {
-    const char *base = strrchr(proc.ident.exe, '/');
-    name = base ? base + 1 : proc.ident.exe;
-  } else if (ti->pbsd.pbi_name[0]) {
-    name = ti->pbsd.pbi_name;
-  } else if (ti->pbsd.pbi_comm[0]) {
-    name = ti->pbsd.pbi_comm;
+  if (host_pid == (int) getpid()) {
+    procfs_thread_comm((int32_t) getpid(), self_comm, sizeof self_comm);
+    if (self_comm[0])
+      name = self_comm;
+  }
+  if (name == NULL) {
+    if (ti->pbsd.pbi_name[0])
+      name = ti->pbsd.pbi_name;
+    else if (ti->pbsd.pbi_comm[0])
+      name = ti->pbsd.pbi_comm;
   }
   snprintf(out, cap, "(%.15s)", name ? name : "nabi");
 }
@@ -1240,11 +1273,27 @@ build_stat_darwin(int host_pid, size_t *len_out)
       "20 %d %d 0 %llu "
       /* 23 vsize  24 rss (in pages)  25 rsslim */
       "%llu %llu 18446744073709551615 "
-      /* 26-52: the addresses of the segments, the signal masks, the exit
-       * signal, the processor, the rt priorities, the delayacct and the fault
-       * addresses. None of them is knowable from Darwin and every one of them
-       * is zero rather than absent, so the field count stays right. */
-      "0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
+      /* 26 startcode  27 endcode */
+      "0 0 "
+      /*
+       * 28 startstack. Not Darwin's to know - it has no idea this process is
+       * running a guest, let alone where that guest's arguments were put - but
+       * nabi put them there, so it is the one thing in this tail that is not a
+       * blank. It matters: bionic's pthread_attr_getstack for the main thread
+       * reads this field and then hunts /proc/<pid>/maps for the mapping that
+       * contains it, and with a zero here it finds nothing and calls
+       * async_safe_fatal("stack not found in /proc/self/maps"). That aborted
+       * zygote on the line after the runtime had finally started.
+       *
+       * Zero for another process, like the rest of this tail: that stack is a
+       * different nabi's business.
+       */
+      "%llu "
+      /* 29-52: the signal masks, the exit signal, the processor, the rt
+       * priorities, the delayacct and the fault addresses. None of them is
+       * knowable from Darwin and every one of them is zero rather than absent,
+       * so the field count stays right. */
+      "0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0\n",
       (int) pidns_to_ns(host_pid), comm,
       darwin_state_letter(ti.pbsd.pbi_status),
       (int) pidns_to_ns((int32_t) ti.pbsd.pbi_ppid),
@@ -1256,7 +1305,9 @@ build_stat_darwin(int host_pid, size_t *len_out)
       ns_to_ticks(ti.ptinfo.pti_total_system),
       (int) ti.pbsd.pbi_nice, nthreads, start_ticks,
       (unsigned long long) ti.ptinfo.pti_virtual_size,
-      (unsigned long long) (ti.ptinfo.pti_resident_size / 4096));
+      (unsigned long long) (ti.ptinfo.pti_resident_size / 4096),
+      (unsigned long long) (host_pid == (int) getpid() && proc.mm != NULL
+                                ? proc.mm->start_stack : 0));
   if (n < 0) {
     free(out);
     return NULL;
@@ -1423,12 +1474,34 @@ build_status_darwin(int host_pid, size_t *len_out)
 static char *
 build_stat(int host_pid, size_t *len_out)
 {
+  /*
+   * Our own pid is answered from nabi's own books, never from the host's /proc.
+   *
+   * The host's version was preferred when mSL/ProcFS is installed, because it
+   * carries the twenty-odd fields Darwin has no equivalent of. The trouble is
+   * whose they are: this process is a nabi running a guest, so those fields
+   * describe nabi. Its comm is "(nabi)", its vsize is the arena's hundreds of
+   * gigabytes, and field 28 - where the stack starts - is either zero or an
+   * address in nabi's own stack, which is not in the guest's maps either way.
+   *
+   * bionic's pthread_attr_getstack for the main thread reads field 28 and then
+   * hunts /proc/<pid>/maps for the mapping containing it. Given nabi's numbers
+   * it finds nothing and calls async_safe_fatal("stack not found in
+   * /proc/self/maps"), which is where zygote died. A rewrite of four fields on
+   * top of another process's twenty-four is not better than an honest account
+   * of this one, and the twenty-four that are blank here say so.
+   *
+   * Another pid is still rewritten rather than invented: it is not ours to
+   * describe, and whatever the host says about it is at least about it.
+   */
+  if (host_pid == (int) getpid())
+    return build_stat_darwin(host_pid, len_out);
+
   size_t hlen;
   char *host = slurp_host_proc(host_pid, "stat", &hlen);
-  /* No host /proc to rewrite, so build it from Darwin instead. Preferred when
-   * mSL/ProcFS is there because its answer carries the twenty-odd fields Darwin
-   * has no equivalent of, but not required for the file to exist - which it was,
-   * and which is why stat said /proc/self/stat was there and the open failed. */
+  /* No host /proc to rewrite, so build it from Darwin instead - the file has to
+   * exist either way, which it did not, and which is why stat said
+   * /proc/self/stat was there and the open failed. */
   if (!host)
     return build_stat_darwin(host_pid, len_out);
 

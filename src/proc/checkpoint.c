@@ -144,6 +144,7 @@ checkpoint_write(int fd)
   hdr.start_brk        = proc.mm->start_brk;
   hdr.current_brk      = proc.mm->current_brk;
   hdr.current_mmap_top = proc.mm->current_mmap_top;
+  hdr.start_stack      = proc.mm->start_stack;
 
   size_t i = 0;
   struct list_head *l;
