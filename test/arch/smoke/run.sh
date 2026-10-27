@@ -1758,6 +1758,21 @@ else
     fail=1
 fi
 
+# mmaphinttest: a non-zero addr without MAP_FIXED is a hint, and a free one is
+# taken. The hint was discarded and the allocator chose every time, so a caller
+# that needs a particular part of the address space could never get it - ART
+# probes for a hole in the low 4GiB with msync, asks for it by hint, is given an
+# address above 4GiB, and tries the next page for ever. The occupied cases matter
+# as much: a hint is not MAP_FIXED and must not unmap anything.
+cp "$here/mmaphinttest" "$root/"; chmod +x "$root/mmaphinttest"
+out=$("$NABI" -m "$root" /mmaphinttest 2>&1 | tail -1); rc=$?
+if [ "$out" = "ok mmaphint" ]; then
+    echo "  ok  mmaphinttest -> \"$out\""
+else
+    echo "  FAIL mmaphinttest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 # mergemaptest: a mapping split by mprotect and made whole again. Splitting had
 # no inverse, so a guest that takes a page's write permission away and gives it
 # back kept two regions for good - and the next mremap of the whole mapping was

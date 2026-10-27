@@ -42,6 +42,13 @@
  * into each other. That is what stopped Android, whose allocator refuses to run
  * with 16KiB pages at all and so has to be told 4KiB.
  */
+/*
+ * The lowest address a hinted mmap may be placed at, which is Linux's default
+ * vm.mmap_min_addr. A hint below it is ignored and the allocator chooses
+ * instead; a MAP_FIXED request is the caller's own business, as on Linux.
+ */
+#define LINUX_MMAP_MIN_ADDR 0x10000
+
 #if defined(__arm64__)
 #include "arm64/vm.h"
 #define GUEST_MMAP_GRANULE PAGE_SIZEOF(PAGE_4KB)

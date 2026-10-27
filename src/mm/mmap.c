@@ -231,7 +231,34 @@ do_mmap(gaddr_t addr, size_t len, int d_prot, int l_prot, int l_flags, int fd, o
     offset = 0;
   }
   if ((l_flags & LINUX_MAP_FIXED) == 0) {
-    addr = alloc_region(len);
+    /*
+     * A non-zero addr without MAP_FIXED is a hint, and Linux honours it when
+     * the range is free - picking somewhere of its own only when it is not.
+     * This threw it away every time and always allocated, which is a correct
+     * mmap and an unsatisfiable one for anybody who needs a particular part of
+     * the address space rather than a particular address.
+     *
+     * ART needs the low 4GiB, for the compressed references its heap and boot
+     * image are built around. It finds a hole by probing with msync - a page
+     * that answers ENOMEM is unmapped - and then asks for it by hint. Getting
+     * an address above 4GiB back, it unmaps and probes the next page. Since the
+     * hint was never going to be taken, the loop has no way to end: zygote
+     * spent an entire boot in it, 3,670,016 msync calls deep, never reaching
+     * the point of forking system_server. It was not killed and it logged
+     * nothing, so from init's side it had simply started and said nothing.
+     *
+     * A hint below mmap_min_addr is ignored rather than honoured, as Linux
+     * ignores it, so a guest cannot have the lowest pages by asking politely.
+     * Everything else is left to the free check: a hint onto something mapped,
+     * including something sealed, falls back to the allocator, which is what
+     * makes this a hint and not a quiet MAP_FIXED.
+     */
+    if (addr >= LINUX_MMAP_MIN_ADDR && addr + len > addr &&
+        find_region_range(addr, len, proc.mm) == NULL) {
+      /* The hint stands. */
+    } else {
+      addr = alloc_region(len);
+    }
   }
 
   void *ptr;
