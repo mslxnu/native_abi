@@ -371,7 +371,15 @@ __start_thread(struct clone_thread_arg *arg)
   init_task(arg->clone_flags, arg->child_tid, arg->tls);
 
   if (arg->clone_flags & LINUX_CLONE_PARENT_SETTID) {
-    if (copy_to_user(arg->parent_tid, &task.tid, sizeof task.tid)) {
+    /*
+     * The number the guest reads back, so through the pid namespace - the same
+     * reason CLONE_CHILD_SETTID goes through guest_tid, and the same place it
+     * was missed. And four bytes: the kernel writes an int here, and this wrote
+     * all eight of task.tid, so the four bytes after the caller's variable were
+     * overwritten with the top half of a host thread id.
+     */
+    int32_t tid = guest_tid();
+    if (copy_to_user(arg->parent_tid, &tid, sizeof tid)) {
       assert(false);
     }
   }
@@ -413,7 +421,29 @@ __do_clone_thread(unsigned long clone_flags, unsigned long newsp, gaddr_t parent
 
   pthread_threadid_np(threadid, &tid);
 
-  return tid;
+  /*
+   * And the tid the *parent* is handed, in the guest's terms like every other
+   * tid it can see.
+   *
+   * This returned the host thread id raw while gettid and CLONE_CHILD_SETTID
+   * both answered in namespace numbers, so clone's return value and the child's
+   * own idea of its tid were two different numbers for one thread - and nothing
+   * a caller does can reconcile them.
+   *
+   * bionic's crash handler is where that showed: it clones its dump thread with
+   * CHILD_SETTID and CHILD_CLEARTID and then waits on that word with
+   * FUTEX_WAIT, using the value clone gave it. The word holds the namespace tid
+   * and the wait is for the host one, so every wait returned EAGAIN at once -
+   * *uaddr != val, the futex's way of saying "that is not what is there". The
+   * handler took it for "the dump has finished", re-raised the fatal signal
+   * while its dump thread was still closing descriptors, and zygote neither
+   * produced a tombstone nor died.
+   *
+   * The process path a few lines up has always done this - pidns_add_child
+   * gives it the namespace pid and it returns that. Threads were the half that
+   * got left.
+   */
+  return pidns_to_ns((int32_t) tid);
 }
 
 int

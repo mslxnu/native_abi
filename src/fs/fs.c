@@ -2473,6 +2473,46 @@ darwinfs_fcntl(struct file *file, unsigned int cmd, unsigned long arg)
      * be worse than saying so: a caller told "unlocked" would proceed. */
     warnk("F_OFD_GETLK: flock() cannot report the holder of a lock\n");
     return -LINUX_EINVAL;
+  /*
+   * The pipe's capacity, which Darwin has no fcntl for and no way to change.
+   *
+   * It was refused with the unknown-command EINVAL, and that is where bionic's
+   * crash handler died. Its dump thread makes a pipe, asks for a buffer big
+   * enough to hold a tombstone, and treats a failure as fatal: it logged and
+   * called exit_group(1), so a crashing Android process produced no tombstone
+   * and the fatal signal it was handling was never re-raised. zygote went that
+   * way on every boot.
+   *
+   * A Darwin pipe holds 65536 bytes - measured by filling one, not assumed -
+   * and that is the whole of what is on offer, so the answer is the truth about
+   * this pipe rather than an echo of the request. A request that fits is
+   * granted at the page-rounded size Linux would report; one that does not is
+   * answered with the capacity there actually is, so a caller that looks at the
+   * return learns the real number instead of being refused. Linux would answer
+   * EPERM for a size past its own maximum, which would put this back where it
+   * started for the one caller that matters.
+   *
+   * Anything that is not a pipe is EINVAL, as on Linux - that part of the
+   * refusal was right and stays.
+   */
+  case LINUX_F_SETPIPE_SZ:
+  case LINUX_F_GETPIPE_SZ: {
+    /* Measured on this host: a pipe accepts exactly 64KiB before it blocks. */
+    const long darwin_pipe_capacity = 65536;
+    struct stat st;
+    if (fstat(file->fd, &st) < 0)
+      return syswrap(-1);
+    if (!S_ISFIFO(st.st_mode))
+      return -LINUX_EINVAL;
+    if (cmd == LINUX_F_GETPIPE_SZ)
+      return (int) darwin_pipe_capacity;
+    if ((long) arg <= 0)
+      return -LINUX_EINVAL;
+    /* The guest's page, which is what Linux rounds this to. */
+    const long page = 4096;
+    long want = ((long) arg + page - 1) & ~(page - 1);
+    return (int) (want > darwin_pipe_capacity ? darwin_pipe_capacity : want);
+  }
   default:
     warnk("unknown fcntl cmd: %d\n", cmd);
     return -LINUX_EINVAL;

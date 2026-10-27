@@ -132,6 +132,43 @@ else
     fail=1
 fi
 
+# pipeszttest: F_SETPIPE_SZ / F_GETPIPE_SZ, which Darwin has no fcntl for. They
+# fell through to the unknown-command EINVAL, and that is where bionic's crash
+# handler died - its dump thread asks for a pipe big enough to hold a tombstone
+# and treats a refusal as fatal, so a crashing Android process produced no
+# tombstone at all. The test fills the pipe, because a reported size that the
+# pipe will not take is no better than the refusal.
+cp "$here/pipeszttest" "$root/"; chmod +x "$root/pipeszttest"
+out=$("$NABI" -m "$root" /pipeszttest 2>&1 | tail -1); rc=$?
+if [ "$out" = "ok pipesz" ]; then
+    echo "  ok  pipeszttest -> \"$out\""
+else
+    echo "  FAIL pipeszttest -> \"$out\", exit $rc"
+    fail=1
+fi
+
+# clonethreadtid: the same flag on a *thread*, read by the parent, in a pid
+# namespace - the shape bionic's crash handler uses. clone returned the raw host
+# thread id while gettid and CHILD_SETTID answered in namespace numbers, so the
+# value clone gave the parent was not the value in the word it then waited on:
+# every FUTEX_WAIT returned EAGAIN at once and debuggerd took that for "the dump
+# has finished". Run under --pid1 too, which is where the two numbers differ.
+cp "$here/clonethreadtid" "$root/"; chmod +x "$root/clonethreadtid"
+out=$("$NABI" -m "$root" /clonethreadtid 2>&1 | tail -1); rc=$?
+if [ "$out" = "ok clonethreadtid" ]; then
+    echo "  ok  clonethreadtid -> \"$out\""
+else
+    echo "  FAIL clonethreadtid -> \"$out\", exit $rc"
+    fail=1
+fi
+out=$("$NABI" --pid1 -m "$root" /clonethreadtid 2>&1 | tail -1); rc=$?
+if [ "$out" = "ok clonethreadtid" ]; then
+    echo "  ok  clonethreadtid (pid namespace) -> \"$out\""
+else
+    echo "  FAIL clonethreadtid (pid namespace) -> \"$out\", exit $rc"
+    fail=1
+fi
+
 # atomic: load/store-exclusive and an LSE atomic. Guards the caches being on
 # (SCTLR_EL1.C/.I) - exclusives are unsupported on Non-cacheable memory.
 cp "$here/atomic" "$root/"; chmod +x "$root/atomic"
