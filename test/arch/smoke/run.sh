@@ -1758,6 +1758,22 @@ else
     fail=1
 fi
 
+# stacklimittest: the stack a guest is promised is the stack it has.
+# getrlimit(RLIMIT_STACK) reported the host process's limit - nabi's own stack -
+# while the guest got a fixed 2MB, so a guest was told 8MB and given 2. bionic
+# believes the limit: it takes the top of the stack from maps, subtracts
+# rlim_cur, and hands ART a range most of which was never mapped. The test ties
+# the limit to the [stack] extent and writes the low half of it, rather than
+# checking for a particular number, which could be changed without fixing it.
+cp "$here/stacklimittest" "$root/"; chmod +x "$root/stacklimittest"
+out=$("$NABI" -m "$root" /stacklimittest 2>&1 | tail -1); rc=$?
+if [ "$out" = "ok stacklimit" ]; then
+    echo "  ok  stacklimittest -> \"$out\""
+else
+    echo "  FAIL stacklimittest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 # mapslabeltest: /proc/self/stat field 28 and the [stack] line in /proc/self/maps,
 # checked as the pair bionic's pthread_attr_getstack walks. Field 28 was a literal
 # zero - the whole tail of stat was - so the hunt through maps found no line and

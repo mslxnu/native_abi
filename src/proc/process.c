@@ -16,6 +16,7 @@
 #include "noah.h"
 #include "vmm.h"
 #include "mm.h"
+#include "x86/vm.h"   /* STACK_SIZE: the stack RLIMIT_STACK is about */
 
 #include "linux/common.h"
 #include "linux/misc.h"
@@ -666,6 +667,15 @@ emulated_rlimit(unsigned int l_resource)
     for (int i = 0; i < LINUX_RLIM_NLIMITS; i++)
       emulated_rlimits[i] = (struct l_rlimit) { LINUX_RLIM_INFINITY,
                                                 LINUX_RLIM_INFINITY };
+    /*
+     * The stack is nabi's to answer for, not Darwin's. It used to map to
+     * RLIMIT_STACK and report the host process's limit, which is the stack
+     * *nabi* runs on and has nothing to do with the guest's - and the guest
+     * acts on what it is told. See STACK_SIZE in include/x86/vm.h for what that
+     * cost. Hard limit the same as the soft one, because there is no more to
+     * give: the mapping is made once, at exec.
+     */
+    emulated_rlimits[LINUX_RLIMIT_STACK]      = (struct l_rlimit) { STACK_SIZE, STACK_SIZE };
     emulated_rlimits[LINUX_RLIMIT_SIGPENDING] = (struct l_rlimit) { 15738, 15738 };
     emulated_rlimits[LINUX_RLIMIT_MSGQUEUE]   = (struct l_rlimit) { 819200, 819200 };
     emulated_rlimits[LINUX_RLIMIT_NICE]       = (struct l_rlimit) { 0, 0 };
@@ -681,7 +691,6 @@ int linux_to_darwin_rlimopts(int l_resource) {
   case LINUX_RLIMIT_CPU: resource = RLIMIT_CPU; break;
   case LINUX_RLIMIT_FSIZE: resource = RLIMIT_FSIZE; break;
   case LINUX_RLIMIT_DATA: resource = RLIMIT_DATA; break;
-  case LINUX_RLIMIT_STACK: resource = RLIMIT_STACK; break;
   case LINUX_RLIMIT_CORE: resource = RLIMIT_CORE; break;
   case LINUX_RLIMIT_RSS: resource = RLIMIT_RSS; break;
   case LINUX_RLIMIT_NPROC: resource = RLIMIT_NPROC; break;
@@ -744,8 +753,26 @@ DEFINE_SYSCALL(prlimit64, int, pid, unsigned int, l_resource, gaddr_t, new_ptr, 
     struct l_rlimit *e = emulated_rlimit(l_resource);
     if (old_ptr && copy_to_user(old_ptr, e, sizeof *e))
       return -LINUX_EFAULT;
-    if (new_ptr && copy_from_user(e, new_ptr, sizeof *e))
-      return -LINUX_EFAULT;
+    if (new_ptr) {
+      struct l_rlimit newl;
+      if (copy_from_user(&newl, new_ptr, sizeof newl))
+        return -LINUX_EFAULT;
+      /*
+       * A guest may lower its stack limit - that is a smaller promise, and
+       * nothing has to move for it - but it may not raise one above the stack
+       * that exists. Clamped rather than refused, which is the choice this file
+       * already makes for RLIMIT_NOFILE and for the same reason: a caller that
+       * stops when setrlimit fails is worse off than one told a smaller number
+       * than it asked for, and the number it is told is one nabi can keep.
+       */
+      if (l_resource == LINUX_RLIMIT_STACK) {
+        if (newl.rlim_cur == LINUX_RLIM_INFINITY || newl.rlim_cur > STACK_SIZE)
+          newl.rlim_cur = STACK_SIZE;
+        if (newl.rlim_max == LINUX_RLIM_INFINITY || newl.rlim_max > STACK_SIZE)
+          newl.rlim_max = STACK_SIZE;
+      }
+      *e = newl;
+    }
     return 0;
   }
 

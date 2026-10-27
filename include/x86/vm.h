@@ -32,7 +32,33 @@ struct gate_desc {
 } __attribute__ ((packed));
 
 /* VM parameter */
-#define STACK_SIZE (1 << 21)
+/*
+ * The guest's main stack, mapped whole at exec. Shared with arm64, which
+ * includes this header for it.
+ *
+ * Eight megabytes because that is Linux's default RLIMIT_STACK, and the number
+ * a guest is told has to be the number it has. It was two, while
+ * getrlimit(RLIMIT_STACK) passed the *host* process's limit through - so a guest
+ * was promised eight megabytes of stack and given two. bionic believes the
+ * limit: pthread_attr_getstack takes the top of the stack from /proc/self/maps
+ * and subtracts rlim_cur, hands ART a range six megabytes of which was never
+ * mapped, and the first deep call in the runtime's startup writes off the
+ * bottom. zygote died of it with the fault address equal to the stack pointer.
+ *
+ * Linux grows the stack vma on demand up to the limit rather than mapping it
+ * all at once; this maps it all at once. The guest cannot tell the two apart by
+ * reading or writing - what it is told, and what it may touch, are the same
+ * either way - only by reading /proc/<pid>/maps, where this shows the whole
+ * reservation where Linux would show how far the stack has actually come down.
+ * Untouched pages cost nothing in either arrangement: the arena is a sparse
+ * file and a page is backed when it is first written.
+ *
+ * Growing on demand would mean extending a region downwards, and the arena
+ * extends upwards only - so it would be a second region, and then the one
+ * growsdown vma Linux reports would be two lines in maps with a seam in the
+ * middle of the stack. Raising the number is the smaller lie.
+ */
+#define STACK_SIZE (8 << 20)
 #define STACK_TOP  0x0000007fc0000000ULL
 
 /* segments */
