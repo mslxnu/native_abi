@@ -120,8 +120,47 @@ static khash_t(seqfd) *seqpacket_fds;
 KHASH_MAP_INIT_INT(passcred, bool)
 static khash_t(passcred) *passcred_fds;
 
+/*
+ * The option belongs to the socket, so it is kept where the socket can be
+ * named from any process: a marker file under the boot tag, named by the
+ * socket's inode.
+ *
+ * A descriptor number means nothing outside the process holding it, and that
+ * is what the per-process table above was keyed by. Android's init sets
+ * SO_PASSCRED on the socket it creates for logd - `socket logdw dgram+passcred`
+ * - and then hands the descriptor over; logd is a different nabi process, found
+ * no flag, and so was sent no credentials at all. It drops any message without
+ * them, so every log line in the guest was discarded: `logcat -g` reported all
+ * eight ring buffers as "0 B consumed" while logd's writer thread was taking
+ * thousands of recvmsg. There was no logging in the guest, at all, ever.
+ *
+ * An inode is the socket's own identity and the same number in every process -
+ * measured: it survives bind and connect, is shared by a dup, and sixty-four
+ * live sockets had no collision between them. The khash stays as a cache in
+ * front of it, because this is asked on every recvmsg; a socket whose flag was
+ * set by some other process costs one stat the first time it is read.
+ *
+ * The marker outlives the descriptor being closed, because another process may
+ * still hold the socket and the flag is the socket's. They are small, there
+ * were six in an entire Android boot, and the directory goes with the boot.
+ */
+#define PASSCRED_DIR_FMT "/tmp/.nabi-passcred-%s"
+
+static bool
+passcred_path(int fd, char *out, size_t outsz)
+{
+  struct stat st;
+  if (fstat(fd, &st) < 0 || !S_ISSOCK(st.st_mode))
+    return false;
+  char dir[64];
+  snprintf(dir, sizeof dir, PASSCRED_DIR_FMT, nabi_boot_tag());
+  mkdir(dir, 0700);
+  snprintf(out, outsz, "%s/%llu", dir, (unsigned long long) st.st_ino);
+  return true;
+}
+
 static void
-passcred_set(int fd, bool on)
+passcred_cache(int fd, bool on)
 {
   if (passcred_fds == NULL)
     passcred_fds = kh_init(passcred);
@@ -130,13 +169,163 @@ passcred_set(int fd, bool on)
   kh_value(passcred_fds, k) = on;
 }
 
+static void
+passcred_set(int fd, bool on)
+{
+  char path[PATH_MAX];
+  if (passcred_path(fd, path, sizeof path)) {
+    if (on) {
+      int f = open(path, O_WRONLY | O_CREAT | O_CLOEXEC, 0600);
+      if (f >= 0)
+        close(f);
+    } else {
+      unlink(path);
+    }
+  }
+  passcred_cache(fd, on);
+}
+
 static bool
 passcred_get(int fd)
 {
-  if (passcred_fds == NULL)
+  if (passcred_fds != NULL) {
+    khiter_t k = kh_get(passcred, passcred_fds, fd);
+    if (k != kh_end(passcred_fds))
+      return kh_value(passcred_fds, k);
+  }
+  char path[PATH_MAX];
+  struct stat st;
+  bool on = passcred_path(fd, path, sizeof path) && stat(path, &st) == 0;
+  passcred_cache(fd, on);
+  return on;
+}
+
+/*
+ * Autobind: giving an unnamed datagram socket a name, so the far end can tell
+ * who sent a message.
+ *
+ * SCM_CREDENTIALS is per *message*, not per connection, and Darwin cannot
+ * supply it in any direction - probed three ways: there is no LOCAL_CREDS
+ * option, nothing arrives unasked, and a sender-attached SCM_CREDS is refused
+ * with EINVAL. peer_ucred below asks LOCAL_PEERCRED, which is a question about
+ * a connected socket's single peer, and a receiver like logd has one bound
+ * socket that every process in the guest sends to. So there is no peer to ask
+ * about and the credentials have to come from somewhere else.
+ *
+ * What Darwin does give the receiver is the sender's address, when the sender
+ * is bound - measured: a bound sender's path arrives in recvmsg's msg_name, an
+ * unbound one leaves it empty. Linux autobinds an unnamed socket for exactly
+ * this reason. So nabi autobinds too, and puts the sender's identity *in the
+ * name*: the receiving side parses it back out, and there is no shared registry
+ * to keep, no lookup, and nothing to go stale.
+ *
+ * The name has to be unforgeable or a process could claim another's
+ * credentials by binding a name that decodes to them, so bind refuses this
+ * prefix to the guest - see the check in the bind syscall. The guest reaches
+ * /tmp directly through the host passthrough, which is what makes that guard
+ * necessary rather than theoretical.
+ *
+ * What this does not do is re-evaluate. Linux reports the credentials the sender
+ * holds when it *sends*; these are the ones it held when it connected, because
+ * that is when the name was fixed. A process that changes uid after connecting
+ * and before writing is reported as it was, and nabi cannot do better from the
+ * receiving side - the sender is a different process and its current
+ * credentials are not readable from here. Nothing seen does it: a logging
+ * client connects once and keeps its identity.
+ *
+ * Done at connect, which is where Linux does it and where every caller that
+ * matters arrives: bionic's liblog opens a datagram socket, connects it to
+ * /dev/socket/logdw once, and writes every log line down it. A sender that
+ * never connects and only ever sendto()s is not named and gets no credentials,
+ * which is what happened before this for everyone.
+ */
+#define AUTOBIND_DIR_FMT "/tmp/.nabi-ab-%s"
+
+static void
+autobind_dir(char *out, size_t outsz)
+{
+  snprintf(out, outsz, AUTOBIND_DIR_FMT, nabi_boot_tag());
+}
+
+static void
+unix_autobind(int fd)
+{
+  struct sockaddr_un sn;
+  socklen_t nl = sizeof sn;
+  if (getsockname(fd, (struct sockaddr *) &sn, &nl) < 0)
+    return;
+  if (sn.sun_family != AF_UNIX)
+    return;
+  /* A socket that already has a name of its own keeps it. */
+  if (nl > (socklen_t) offsetof(struct sockaddr_un, sun_path) &&
+      sn.sun_path[0] != '\0')
+    return;
+  int type = 0;
+  socklen_t tl = sizeof type;
+  if (getsockopt(fd, SOL_SOCKET, SO_TYPE, &type, &tl) < 0 || type != SOCK_DGRAM)
+    return;                     /* a stream has a peer to ask about */
+
+  char dir[64];
+  autobind_dir(dir, sizeof dir);
+  mkdir(dir, 0700);
+
+  uid_t euid;
+  gid_t egid;
+  pthread_rwlock_rdlock(&proc.cred.lock);
+  euid = proc.cred.euid;
+  egid = proc.cred.egid;
+  pthread_rwlock_unlock(&proc.cred.lock);
+
+  /* The host pid is in the name too, because the serial is only unique within
+   * one process and every guest process is a separate one. */
+  static unsigned long serial;
+  struct sockaddr_un ab;
+  memset(&ab, 0, sizeof ab);
+  ab.sun_family = AF_UNIX;
+  snprintf(ab.sun_path, sizeof ab.sun_path, "%s/%d-%u-%u-%d-%lu", dir,
+           (int) pidns_to_ns((int32_t) getpid()), (unsigned) euid,
+           (unsigned) egid, (int) getpid(), serial++);
+  unlink(ab.sun_path);
+  (void) bind(fd, (struct sockaddr *) &ab, sizeof ab);
+}
+
+/* The credentials a message's sender wrote into its own name, if it was one of
+ * ours. Returns false for anything else, which falls back to the peer. */
+static bool
+autobind_ucred(const void *name, socklen_t namelen, struct l_ucred *out)
+{
+  if (name == NULL || namelen <= (socklen_t) offsetof(struct sockaddr_un, sun_path))
     return false;
-  khiter_t k = kh_get(passcred, passcred_fds, fd);
-  return k != kh_end(passcred_fds) && kh_value(passcred_fds, k);
+  const struct sockaddr_un *sa = name;
+  if (sa->sun_family != AF_UNIX || sa->sun_path[0] == '\0')
+    return false;
+  char dir[64];
+  autobind_dir(dir, sizeof dir);
+  size_t dlen = strlen(dir);
+  if (strncmp(sa->sun_path, dir, dlen) != 0 || sa->sun_path[dlen] != '/')
+    return false;
+  int pid;
+  unsigned uid, gid;
+  if (sscanf(sa->sun_path + dlen + 1, "%d-%u-%u-", &pid, &uid, &gid) != 3)
+    return false;
+  out->pid = pid;
+  out->uid = uid;
+  out->gid = gid;
+  return true;
+}
+
+/* Whether a host path is one of nabi's autobind names, which the guest may not
+ * bind itself to. */
+static bool
+autobind_reserved(const struct sockaddr *sa)
+{
+  if (sa == NULL || sa->sa_family != AF_UNIX)
+    return false;
+  const struct sockaddr_un *un = (const struct sockaddr_un *) sa;
+  char dir[64];
+  autobind_dir(dir, sizeof dir);
+  size_t dlen = strlen(dir);
+  return strncmp(un->sun_path, dir, dlen) == 0 && un->sun_path[dlen] == '/';
 }
 
 void
@@ -610,6 +799,9 @@ DEFINE_SYSCALL(connect, int, sockfd, gaddr_t, addr_ptr, uint64_t, addrlen)
     r = -LINUX_EINVAL;
     goto err;
   }
+
+  /* Named before it speaks, so the far end can attribute what it sends. */
+  unix_autobind(sockfd);
 
   r = syswrap(connect(sockfd, sockaddr, sockaddr->sa_len));
 
@@ -1413,9 +1605,15 @@ cmsg_to_guest(int fd, const struct msghdr *hdr, gaddr_t control,
   if (ret == 0 && want_cred) {
     struct l_ucred uc;
     size_t need = L_CMSG_ALIGN(sizeof(struct l_cmsg_wire)) + sizeof uc;
+    /*
+     * The sender of *this message* first, which is what SCM_CREDENTIALS means,
+     * and the connection's peer only as a fallback for a stream where the two
+     * are the same thing anyway.
+     */
     if (outlen + need > controllen) {
       *truncated = true;
-    } else if (peer_ucred(fd, &uc)) {
+    } else if (autobind_ucred(hdr->msg_name, hdr->msg_namelen, &uc) ||
+               peer_ucred(fd, &uc)) {
       struct l_cmsg_wire c = {
         .cmsg_len = sizeof(struct l_cmsg_wire) + sizeof uc,
         .cmsg_level = LINUX_SOL_SOCKET,
@@ -1582,6 +1780,20 @@ do_recvmsg(int sockfd, struct l_msghdr *lmsg, gaddr_t msg_ptr, int flags)
   struct msghdr dmsg;
   dmsg.msg_namelen = lmsg->msg_namelen;
   dmsg.msg_name = lmsg->msg_name == 0 ? 0 : msg_name;
+  /*
+   * A receiver asking for credentials needs the sender's address whether or not
+   * it asked for that too - the credentials are read out of the name. logd is
+   * exactly this caller: it wants to know who sent each line and nothing about
+   * where from, so it passes no name buffer, and without one Darwin reports no
+   * sender and there is nothing to decode. This buffer is nabi's own and is
+   * never copied out; the guest is answered from its own, below, if it asked.
+   */
+  struct sockaddr_un cred_from;
+  if (dmsg.msg_name == 0 && passcred_get(sockfd)) {
+    memset(&cred_from, 0, sizeof cred_from);
+    dmsg.msg_name = &cred_from;
+    dmsg.msg_namelen = sizeof cred_from;
+  }
   dmsg.msg_iov = msg_iov;
   dmsg.msg_iovlen = lmsg->msg_iovlen;
   dmsg.msg_control = msg_control;
@@ -1954,6 +2166,16 @@ DEFINE_SYSCALL(bind, int, sockfd, gaddr_t, addr_ptr, int, addrlen)
   if (linux_to_darwin_sockaddr(&sockaddr, (struct l_sockaddr *) addr, addrlen) < 0) {
     return -LINUX_EINVAL;
   }
+  /*
+   * Not one of nabi's autobind names. They carry the sender's credentials in
+   * the path, so binding one by hand is claiming to be somebody else - and the
+   * guest can reach this directory, because /tmp is a host passthrough.
+   */
+  if (autobind_reserved(sockaddr)) {
+    free(addr);
+    return -LINUX_EACCES;
+  }
+
   /* Whether the guest asked for an abstract name, which is decided by the
    * address it gave and not by the path that came out of the translation. */
   bool abstract = sockaddr->sa_family == AF_UNIX &&

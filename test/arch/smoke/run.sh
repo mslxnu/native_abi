@@ -146,6 +146,22 @@ else
     fail=1
 fi
 
+# passcredtest: SCM_CREDENTIALS on a datagram socket, across a fork - logd's
+# shape. SO_PASSCRED was kept per descriptor in the setting process, so a process
+# that inherited the socket inherited no flag; and the credentials came from
+# LOCAL_PEERCRED, a question about a connected socket's single peer, which a
+# shared datagram socket has not got. logd drops any message without them, so the
+# guest had no logging at all - every ring buffer read "0 B consumed". Run under
+# --pid1, because the pid in the credentials has to be the namespace's.
+cp "$here/passcredtest" "$root/"; chmod +x "$root/passcredtest"
+out=$("$NABI" --pid1 -m "$root" /passcredtest 2>&1 | tail -1); rc=$?
+if [ "$out" = "ok passcred" ]; then
+    echo "  ok  passcredtest -> \"$out\""
+else
+    echo "  FAIL passcredtest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 # futexprivtest: a futex without FUTEX_PRIVATE_FLAG is not therefore shared. The
 # flag's absence was taken for the presence of sharing, so a plain FUTEX_WAIT on
 # ordinary private memory took the bounded shared path - which reports a wake
