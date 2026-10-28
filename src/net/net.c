@@ -2150,7 +2150,32 @@ do_recvmsg(int sockfd, struct l_msghdr *lmsg, gaddr_t msg_ptr, int flags)
     msg_iov[i].iov_len = liov[i].iov_len;
     iov_buf_ptr += liov[i].iov_len;
   }
-  char *msg_control = malloc(lmsg->msg_controllen);
+  /*
+   * The host is given room for whatever it has, not room for the guest's idea
+   * of it - the same reason msg_name is handled that way a few lines down. A
+   * control buffer sized in Linux's terms is not a measure of Darwin's: the two
+   * disagree about the header (sixteen bytes against twelve) and about the
+   * alignment (eight against four), so the same descriptors occupy different
+   * space on each side and the arithmetic does not carry across.
+   *
+   * It was passed straight through, and Darwin answered MSG_CTRUNC for a
+   * message that would have fitted: netd asks for one descriptor with a
+   * twenty-four byte buffer, which is what Linux needs for one, and got
+   * "control message was truncated when receiving file descriptors" and
+   * dropped it. Whether the guest's buffer was really too small is nabi's
+   * question to answer after translating, which cmsg_to_guest already does and
+   * reports through *truncated.
+   *
+   * CONTROL_SLACK is generous rather than computed, because what the host will
+   * hand over is not known until it has: a sender may attach more descriptors
+   * than this receiver expected, and the ones that do not fit have to be seen
+   * in order to be closed rather than leaked.
+   */
+#define CONTROL_SLACK 1024
+  size_t host_controllen = lmsg->msg_controllen;
+  if (host_controllen > 0 && host_controllen < CONTROL_SLACK)
+    host_controllen = CONTROL_SLACK;
+  char *msg_control = malloc(host_controllen);
   struct msghdr dmsg;
   dmsg.msg_namelen = lmsg->msg_namelen;
   dmsg.msg_name = lmsg->msg_name == 0 ? 0 : msg_name;
@@ -2171,7 +2196,7 @@ do_recvmsg(int sockfd, struct l_msghdr *lmsg, gaddr_t msg_ptr, int flags)
   dmsg.msg_iov = msg_iov;
   dmsg.msg_iovlen = lmsg->msg_iovlen;
   dmsg.msg_control = msg_control;
-  dmsg.msg_controllen = lmsg->msg_controllen;
+  dmsg.msg_controllen = host_controllen;
   dmsg.msg_flags = linux_to_darwin_msg_flags(lmsg->msg_flags);
 
   ssize_t whole = -1;
@@ -2267,7 +2292,26 @@ do_recvmsg(int sockfd, struct l_msghdr *lmsg, gaddr_t msg_ptr, int flags)
       r = -LINUX_EFAULT;
       goto out;
     }
-    l_uint mflags = darwin_to_linux_msg_flags(dmsg.msg_flags);
+    /*
+     * Whether the control data fitted is nabi's to say, not the host's.
+     *
+     * nabi does not hand the host's control data to the guest; it reads it,
+     * registers the descriptors in it and builds the Linux form itself, into
+     * the guest's buffer. So the only accounting that means anything is the one
+     * cmsg_to_guest does, which is what *truncated reports. Darwin's own flag
+     * is about Darwin's buffer, and it sets it in cases that are not
+     * truncation: measured, a message carrying one descriptor came back with
+     * MSG_CTRUNC set, sixteen bytes of control delivered, out of a buffer of a
+     * thousand and twenty-four - nothing was dropped and nothing had to be.
+     *
+     * Passed through, it cost netd its descriptors: libbase treats MSG_CTRUNC
+     * as "some of them are missing", logged "control message was truncated when
+     * receiving file descriptors" and threw the message away. The host buffer
+     * above is deliberately generous so that the case this disregards - the
+     * host really running out of room, where nabi would never see the
+     * descriptors it ought to close - stays out of reach.
+     */
+    l_uint mflags = darwin_to_linux_msg_flags(dmsg.msg_flags & ~MSG_CTRUNC);
     if (truncated)
       mflags |= LINUX_MSG_CTRUNC;
     if (whole >= 0 && (size_t) whole > iov_total_len)

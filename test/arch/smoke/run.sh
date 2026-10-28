@@ -146,6 +146,21 @@ else
     fail=1
 fi
 
+# ctruncfdtest: a descriptor that fits is not reported as truncated. nabi builds
+# the Linux control data itself, into the guest's buffer, so whether it fitted is
+# nabi's accounting and not the host's - and Darwin sets MSG_CTRUNC in cases that
+# are not truncation, which cost netd its descriptors on every boot. This guards
+# descriptor passing and the sizing; it does not reproduce Darwin's flag, which
+# could not be provoked from a guest. See the comment in the test.
+cp "$here/ctruncfdtest" "$root/"; chmod +x "$root/ctruncfdtest"
+out=$("$NABI" -m "$root" /ctruncfdtest 2>&1 | tail -1); rc=$?
+if [ "$out" = "ok ctruncfd" ]; then
+    echo "  ok  ctruncfdtest -> \"$out\""
+else
+    echo "  FAIL ctruncfdtest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 # seqboundtest: SOCK_SEQPACKET keeps its message boundaries through
 # bind/listen/accept. Darwin has no AF_UNIX SOCK_SEQPACKET at all, so nabi makes
 # one from a datagram pair where it can and from a stream where it cannot - and a
