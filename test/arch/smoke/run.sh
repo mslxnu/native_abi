@@ -146,6 +146,21 @@ else
     fail=1
 fi
 
+# seqboundtest: SOCK_SEQPACKET keeps its message boundaries through
+# bind/listen/accept. Darwin has no AF_UNIX SOCK_SEQPACKET at all, so nabi makes
+# one from a datagram pair where it can and from a stream where it cannot - and a
+# stream has no boundaries, so three messages were read as one run of bytes. logd
+# writes each log entry as one message and logcat said "Unexpected length" on the
+# first, which is why the guest's log was unreadable.
+cp "$here/seqboundtest" "$root/"; chmod +x "$root/seqboundtest"
+out=$("$NABI" -m "$root" /seqboundtest 2>&1 | tail -1); rc=$?
+if [ "$out" = "ok seqbound" ]; then
+    echo "  ok  seqboundtest -> \"$out\""
+else
+    echo "  FAIL seqboundtest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 # passcredtest: SCM_CREDENTIALS on a datagram socket, across a fork - logd's
 # shape. SO_PASSCRED was kept per descriptor in the setting process, so a process
 # that inherited the socket inherited no flag; and the credentials came from

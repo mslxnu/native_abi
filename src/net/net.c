@@ -5,6 +5,7 @@
 #include "common.h"
 
 #include <sys/socket.h>
+#include <sys/uio.h>
 #include <sys/un.h>
 
 /* Big enough for any address the guest can be handed: two bytes of family and
@@ -144,19 +145,67 @@ static khash_t(passcred) *passcred_fds;
  * still hold the socket and the flag is the socket's. They are small, there
  * were six in an entire Android boot, and the directory goes with the boot.
  */
-#define PASSCRED_DIR_FMT "/tmp/.nabi-passcred-%s"
-
+/*
+ * A property of a socket, written where any process holding that socket can
+ * read it: a marker file under the boot tag, named by the socket's inode.
+ *
+ * Two things need this and both need it for the same reason - the process that
+ * learns the property is not the process that acts on it. Android's init
+ * creates a socket, sets SO_PASSCRED on it or asks for SOCK_SEQPACKET, and
+ * hands the descriptor to the service that will use it. A descriptor number
+ * means nothing to anyone else, so anything remembered against one is lost at
+ * that boundary.
+ *
+ * An inode is the socket's own identity and reads the same in every process -
+ * measured: it survives bind and connect, a dup shares it, and sixty-four live
+ * sockets had no collision between them.
+ */
 static bool
-passcred_path(int fd, char *out, size_t outsz)
+sockmark_path(const char *kind, int fd, char *out, size_t outsz)
 {
   struct stat st;
   if (fstat(fd, &st) < 0 || !S_ISSOCK(st.st_mode))
     return false;
-  char dir[64];
-  snprintf(dir, sizeof dir, PASSCRED_DIR_FMT, nabi_boot_tag());
-  mkdir(dir, 0700);
+  char dir[80];
+  snprintf(dir, sizeof dir, "/tmp/.nabi-%s-%s", kind, nabi_boot_tag());
   snprintf(out, outsz, "%s/%llu", dir, (unsigned long long) st.st_ino);
   return true;
+}
+
+/* The directory, made only where one is about to be written into it - the
+ * lookup path is taken on every socket read and write and must not touch the
+ * filesystem more than the one stat it needs. */
+static void
+sockmark_mkdir(const char *kind)
+{
+  char dir[80];
+  snprintf(dir, sizeof dir, "/tmp/.nabi-%s-%s", kind, nabi_boot_tag());
+  mkdir(dir, 0700);
+}
+
+static void
+sockmark_set(const char *kind, int fd, bool on)
+{
+  char path[PATH_MAX];
+  if (!sockmark_path(kind, fd, path, sizeof path))
+    return;
+  if (on)
+    sockmark_mkdir(kind);
+  if (on) {
+    int f = open(path, O_WRONLY | O_CREAT | O_CLOEXEC, 0600);
+    if (f >= 0)
+      close(f);
+  } else {
+    unlink(path);
+  }
+}
+
+static bool
+sockmark_get(const char *kind, int fd)
+{
+  char path[PATH_MAX];
+  struct stat st;
+  return sockmark_path(kind, fd, path, sizeof path) && stat(path, &st) == 0;
 }
 
 static void
@@ -172,16 +221,7 @@ passcred_cache(int fd, bool on)
 static void
 passcred_set(int fd, bool on)
 {
-  char path[PATH_MAX];
-  if (passcred_path(fd, path, sizeof path)) {
-    if (on) {
-      int f = open(path, O_WRONLY | O_CREAT | O_CLOEXEC, 0600);
-      if (f >= 0)
-        close(f);
-    } else {
-      unlink(path);
-    }
-  }
+  sockmark_set("passcred", fd, on);
   passcred_cache(fd, on);
 }
 
@@ -193,9 +233,7 @@ passcred_get(int fd)
     if (k != kh_end(passcred_fds))
       return kh_value(passcred_fds, k);
   }
-  char path[PATH_MAX];
-  struct stat st;
-  bool on = passcred_path(fd, path, sizeof path) && stat(path, &st) == 0;
+  bool on = sockmark_get("passcred", fd);
   passcred_cache(fd, on);
   return on;
 }
@@ -370,16 +408,309 @@ seqpacket_darwin_type(int family, int dtype, bool pair)
   return dtype;
 }
 
+static void seqframe_mark(int fd);
+static void seqframe_mark_local(int fd);
+
 static void
-seqpacket_note(int fd, int family, int dtype)
+seqpacket_note(int fd, int family, int dtype, bool pair)
 {
   if (family != LINUX_AF_UNIX || dtype != LINUX_SOCK_SEQPACKET)
     return;
+  /* A pair became a datagram pair and keeps its boundaries; anything else
+   * became a stream and has to have them put back. */
+  if (!pair)
+    seqframe_mark(fd);
   if (seqpacket_fds == NULL)
     seqpacket_fds = kh_init(seqfd);
   int ret;
   khiter_t k = kh_put(seqfd, seqpacket_fds, fd, &ret);
   kh_value(seqpacket_fds, k) = false;
+}
+
+/*
+ * SOCK_SEQPACKET over a Darwin stream, with the message boundaries put back.
+ *
+ * Darwin has no AF_UNIX SOCK_SEQPACKET at all - socket and socketpair both
+ * answer "Protocol not supported" - so one has to be built out of something it
+ * does have. A socketpair becomes a datagram pair, which keeps boundaries for
+ * free. A socket that will be bound, listened on and accepted cannot: datagrams
+ * do not listen. It became a stream, and a stream has no boundaries, so a
+ * receiver reading one message at a time got however many happened to have
+ * arrived, run together.
+ *
+ * Android's logging is where that surfaced. logd writes each entry as one
+ * message on /dev/socket/logdr; logcat read three of them as one and said
+ * "Unexpected length", because the length in the first entry's header did not
+ * describe what followed it. So the guest's log was unreadable even once logd
+ * was storing it.
+ *
+ * Each message therefore goes out with a header in front of it - a magic and a
+ * length - and comes back one message per receive. Both ends of such a socket
+ * are nabi and both know the socket was substituted, so they agree about the
+ * framing by construction; there is no negotiation and nothing to detect. The
+ * magic is there for the case that should not happen: a desync becomes an error
+ * on the spot rather than a length read out of somebody's payload.
+ *
+ * A whole message is read into a buffer of nabi's own before any of it is given
+ * to the guest, which is what makes the rest of SOCK_SEQPACKET's behaviour fall
+ * out: MSG_PEEK serves the buffer without consuming it, MSG_TRUNC can report
+ * the real length, and a guest buffer too small for the message gets what fits
+ * while the remainder is discarded rather than left to be read as the next
+ * message. A message interrupted part-way is kept as partial progress, so a
+ * non-blocking receiver is told EAGAIN and resumes where it left off instead of
+ * losing the frame.
+ */
+#define SEQFRAME_MAGIC 0x4b505153u              /* "SQPK" */
+
+struct seqframe {
+  uint32_t hdr[2];              /* magic, length */
+  size_t   hdr_got;
+  char    *buf;
+  size_t   want, got;
+  bool     complete;
+};
+
+KHASH_MAP_INIT_INT(seqframe, struct seqframe *)
+static khash_t(seqframe) *seqframe_fds;
+
+/* The pending-message buffer for a framed socket, or null for anything else -
+ * including a descriptor recorded as "not framed". */
+static struct seqframe *
+seqframe_lookup(int fd)
+{
+  if (seqframe_fds == NULL)
+    return NULL;
+  khiter_t k = kh_get(seqframe, seqframe_fds, fd);
+  return k == kh_end(seqframe_fds) ? NULL : kh_value(seqframe_fds, k);
+}
+
+/*
+ * The framing is a property of the socket, not of this process's descriptor,
+ * for exactly the reason above: init creates the SOCK_SEQPACKET socket and the
+ * service that accepts on it is somebody else. logd inherited logdr knowing
+ * nothing, so it wrote its log entries unframed while logcat - which had made
+ * its own socket and did know - read them expecting headers, and said
+ * "Unexpected length" on the first one.
+ *
+ * The *buffer* stays per process, which is right: it holds a partly-read
+ * message belonging to this process's own stream position.
+ */
+bool
+seqframe_is(int fd)
+{
+  if (seqframe_fds != NULL) {
+    khiter_t k = kh_get(seqframe, seqframe_fds, fd);
+    if (k != kh_end(seqframe_fds))
+      return kh_value(seqframe_fds, k) != NULL;
+  }
+  /*
+   * Not known here yet, so ask the socket. The answer is remembered either
+   * way - a null entry meaning "not framed" - because this is asked on every
+   * socket read and write in the guest and almost none of them are framed. A
+   * stat per log line is affordable; a stat per read is not.
+   */
+  bool on = sockmark_get("seqframe", fd);
+  if (on) {
+    seqframe_mark_local(fd);
+  } else {
+    if (seqframe_fds == NULL)
+      seqframe_fds = kh_init(seqframe);
+    int ret;
+    khiter_t k = kh_put(seqframe, seqframe_fds, fd, &ret);
+    kh_value(seqframe_fds, k) = NULL;
+  }
+  return on;
+}
+
+/* Mark a descriptor as one of these. Called where the substitution is made, and
+ * again for whatever accept() hands back from such a listener. */
+static void
+seqframe_mark_local(int fd)
+{
+  if (seqframe_fds == NULL)
+    seqframe_fds = kh_init(seqframe);
+  int ret;
+  khiter_t k = kh_put(seqframe, seqframe_fds, fd, &ret);
+  if (ret == 0 && kh_value(seqframe_fds, k) != NULL)
+    return;                     /* already known here */
+  struct seqframe *sf = calloc(1, sizeof *sf);
+  kh_value(seqframe_fds, k) = sf;
+}
+
+static void
+seqframe_mark(int fd)
+{
+  sockmark_set("seqframe", fd, true);
+  seqframe_mark_local(fd);
+}
+
+void
+seqframe_close(int fd)
+{
+  if (seqframe_fds == NULL)
+    return;
+  khiter_t k = kh_get(seqframe, seqframe_fds, fd);
+  if (k == kh_end(seqframe_fds))
+    return;
+  struct seqframe *sf = kh_value(seqframe_fds, k);
+  if (sf != NULL) {
+    free(sf->buf);
+    free(sf);
+  }
+  kh_del(seqframe, seqframe_fds, k);
+}
+
+/* Exactly n bytes, or 0 at end of stream, or -errno. Partial progress is the
+ * caller's to keep. */
+static ssize_t
+seqframe_readn(int fd, char *p, size_t n, size_t *got)
+{
+  while (*got < n) {
+    ssize_t r = read(fd, p + *got, n - *got);
+    if (r == 0)
+      return 0;
+    if (r < 0) {
+      if (errno == EINTR)
+        continue;
+      return -1;
+    }
+    *got += (size_t) r;
+  }
+  return 1;
+}
+
+/* One whole message into sf. 1 ready, 0 end of stream, -errno otherwise. */
+static int
+seqframe_fill(int fd, struct seqframe *sf)
+{
+  if (sf->complete)
+    return 1;
+  if (sf->hdr_got < sizeof sf->hdr) {
+    ssize_t r = seqframe_readn(fd, (char *) sf->hdr, sizeof sf->hdr,
+                               &sf->hdr_got);
+    if (r == 0)
+      return 0;
+    if (r < 0)
+      return -darwin_to_linux_errno(errno);
+    if (sf->hdr[0] != SEQFRAME_MAGIC) {
+      /* Not our framing: the stream is out of step and nothing after this can
+       * be trusted. Saying so beats handing the guest a length read out of a
+       * payload. */
+      warnk("seqpacket framing lost on fd %d (magic %08x)\n", fd, sf->hdr[0]);
+      return -LINUX_EPROTO;
+    }
+    sf->want = sf->hdr[1];
+    sf->got = 0;
+    sf->buf = sf->want > 0 ? malloc(sf->want) : NULL;
+    if (sf->want > 0 && sf->buf == NULL)
+      return -LINUX_ENOMEM;
+  }
+  if (sf->got < sf->want) {
+    ssize_t r = seqframe_readn(fd, sf->buf, sf->want, &sf->got);
+    if (r == 0)
+      return -LINUX_ECONNRESET;   /* half a message is not an orderly close */
+    if (r < 0)
+      return -darwin_to_linux_errno(errno);
+  }
+  sf->complete = true;
+  return 1;
+}
+
+static void
+seqframe_take(struct seqframe *sf)
+{
+  free(sf->buf);
+  sf->buf = NULL;
+  sf->hdr_got = sf->want = sf->got = 0;
+  sf->complete = false;
+}
+
+/*
+ * One message out. Returns the bytes handed over, and sets *whole to the
+ * message's real length so a caller asked for MSG_TRUNC can report that
+ * instead.
+ */
+ssize_t
+seqframe_recv(int fd, const struct iovec *iov, int iovcnt, int dflags,
+              size_t *whole)
+{
+  struct seqframe *sf = seqframe_lookup(fd);
+  if (sf == NULL)
+    return -LINUX_EBADF;
+  int r = seqframe_fill(fd, sf);
+  if (r <= 0)
+    return r;                   /* 0 is end of stream, as the guest expects */
+
+  size_t copied = 0;
+  for (int i = 0; i < iovcnt && copied < sf->want; i++) {
+    size_t take = sf->want - copied;
+    if (take > iov[i].iov_len)
+      take = iov[i].iov_len;
+    memcpy(iov[i].iov_base, sf->buf + copied, take);
+    copied += take;
+  }
+  if (whole != NULL)
+    *whole = sf->want;
+  /* A peek leaves it where it is; anything else consumes the whole message,
+   * including the part that did not fit. */
+  if (!(dflags & MSG_PEEK))
+    seqframe_take(sf);
+  return (ssize_t) copied;
+}
+
+/* One message in, header first. */
+ssize_t
+seqframe_send(int fd, const struct iovec *iov, int iovcnt, int dflags)
+{
+  size_t total = 0;
+  for (int i = 0; i < iovcnt; i++)
+    total += iov[i].iov_len;
+  if (total > UINT32_MAX)
+    return -LINUX_EMSGSIZE;
+
+  uint32_t hdr[2] = { SEQFRAME_MAGIC, (uint32_t) total };
+  struct iovec *v = malloc((iovcnt + 1) * sizeof *v);
+  if (v == NULL)
+    return -LINUX_ENOMEM;
+  v[0].iov_base = hdr;
+  v[0].iov_len = sizeof hdr;
+  for (int i = 0; i < iovcnt; i++)
+    v[i + 1] = iov[i];
+
+  /*
+   * A short write cannot be reported as one: the guest asked to send a message
+   * and half a message on the wire is a desync for every message after it. So
+   * the rest is pushed out before returning, which is a blocking write on a
+   * socket the guest may have set non-blocking. The alternative is holding the
+   * tail in nabi and finishing it on the next call, which is more state than
+   * anything here needs - messages on these sockets are log entries and
+   * control packets, well under a pipe's worth.
+   */
+  size_t sent = 0, need = sizeof hdr + total;
+  int first = 0;
+  ssize_t ret = (ssize_t) total;
+  while (sent < need) {
+    ssize_t n = writev(fd, v + first, (iovcnt + 1) - first);
+    if (n < 0) {
+      if (errno == EINTR)
+        continue;
+      ret = sent > 0 ? -LINUX_EPROTO : syswrap(-1);
+      break;
+    }
+    sent += (size_t) n;
+    /* Step over whatever went whole and trim the one it stopped inside. */
+    while (first < iovcnt + 1 && (size_t) n >= v[first].iov_len) {
+      n -= (ssize_t) v[first].iov_len;
+      first++;
+    }
+    if (first < iovcnt + 1 && n > 0) {
+      v[first].iov_base = (char *) v[first].iov_base + n;
+      v[first].iov_len -= (size_t) n;
+    }
+  }
+  free(v);
+  (void) dflags;
+  return ret;
 }
 
 void
@@ -452,7 +783,7 @@ DEFINE_SYSCALL(socket, int, family, int, type, int, protocol)
   bool netfilter = netfilter_wants(family, dtype, protocol);
   if (fd < 0 && netfilter)
     fd = syswrap(socket(AF_UNIX, SOCK_DGRAM, 0));
-  seqpacket_note(fd, family, dtype);
+  seqpacket_note(fd, family, dtype, false);
   ret = fd;
   if (fd < 0) {
     goto err;
@@ -1221,7 +1552,10 @@ DEFINE_SYSCALL(sendto, int, socket, gaddr_t, buf_ptr, int, length, int, flags, g
   }
   if (to_netlink)
     ret = netlink_send(socket, buf, length);
-  else
+  else if (seqframe_is(socket)) {
+    struct iovec one = { buf, (size_t) length };
+    ret = (int) seqframe_send(socket, &one, 1, flags);
+  } else
     ret = syswrap(sendto(socket, buf, length, flags, sockaddr, addrlen));
 
  out:
@@ -1330,6 +1664,14 @@ linux_to_darwin_msg_flags(l_int flags)
 static ssize_t
 peek_datagram_len(int fd, int dflags)
 {
+  /* A framed message's length is known once its header has been read, and
+   * peeking a stream would only count bytes rather than a message. */
+  if (seqframe_is(fd)) {
+    size_t whole = 0;
+    struct iovec none = { NULL, 0 };
+    ssize_t r = seqframe_recv(fd, &none, 1, MSG_PEEK, &whole);
+    return r < 0 ? r : (ssize_t) whole;
+  }
   size_t cap = 8192;
   char *scratch = malloc(cap);
   if (scratch == NULL)
@@ -1383,7 +1725,7 @@ DEFINE_SYSCALL(recvfrom, int, socket, gaddr_t, buf_ptr, int, length, int, flags,
     return dflags;
 
   ssize_t whole = -1;
-  if (flags & LINUX_MSG_TRUNC) {
+  if ((flags & LINUX_MSG_TRUNC) && !seqframe_is(socket)) {
     whole = peek_datagram_len(socket, dflags);
     if (whole < 0)
       return syswrap(-1);
@@ -1391,9 +1733,25 @@ DEFINE_SYSCALL(recvfrom, int, socket, gaddr_t, buf_ptr, int, length, int, flags,
 
   char *buf = alloca(length);
   int ret;
-  if (!seqpacket_gone(socket, &ret))
-    ret = seqpacket_eof(socket,
-          syswrap(recvfrom(socket, buf, length, dflags, sock_ptr, socklen_ptr)));
+  if (!seqpacket_gone(socket, &ret)) {
+    if (seqframe_is(socket)) {
+      /*
+       * recv and recvfrom come through here rather than through recvmsg, and a
+       * framed socket has to be read the same way whichever call asks. Missing
+       * this one was invisible in a test - both ends of a test are the same
+       * code path - and showed up only as logcat reading logd's headers as if
+       * they were log entries.
+       */
+      struct iovec one = { buf, (size_t) length };
+      size_t got = 0;
+      ret = (int) seqframe_recv(socket, &one, 1, dflags, &got);
+      if (ret >= 0 && (flags & LINUX_MSG_TRUNC))
+        whole = (ssize_t) got;
+    } else {
+      ret = seqpacket_eof(socket,
+            syswrap(recvfrom(socket, buf, length, dflags, sock_ptr, socklen_ptr)));
+    }
+  }
   if (ret < 0)
     return ret;
   if (copy_to_user(buf_ptr, buf, ret))
@@ -1707,7 +2065,23 @@ do_sendmsg(int sockfd, const struct l_msghdr *msg, int flags)
     }
   }
 
-  int sr = syswrap(sendmsg(sockfd, &hdr, msg_flags));
+  int sr;
+  if (seqframe_is(sockfd)) {
+    /*
+     * Control data is not carried. Refused rather than dropped: a descriptor
+     * the sender believes it handed over and the receiver never sees is a far
+     * worse answer than being told it cannot be done, and nothing on these
+     * sockets passes one.
+     */
+    if (hdr.msg_controllen > 0) {
+      warnk("seqpacket framing cannot carry control data (fd %d)\n", sockfd);
+      free(ctl);
+      return -LINUX_EOPNOTSUPP;
+    }
+    sr = (int) seqframe_send(sockfd, hdr.msg_iov, (int) hdr.msg_iovlen,
+                             msg_flags);
+  } else
+    sr = syswrap(sendmsg(sockfd, &hdr, msg_flags));
   free(ctl);
   return sr;
 }
@@ -1808,7 +2182,7 @@ do_recvmsg(int sockfd, struct l_msghdr *lmsg, gaddr_t msg_ptr, int flags)
     goto out;
   }
 
-  if (flags & LINUX_MSG_TRUNC) {
+  if ((flags & LINUX_MSG_TRUNC) && !seqframe_is(sockfd)) {
     whole = peek_datagram_len(sockfd, dflags);
     if (whole < 0) {
       r = syswrap(-1);
@@ -1816,8 +2190,37 @@ do_recvmsg(int sockfd, struct l_msghdr *lmsg, gaddr_t msg_ptr, int flags)
     }
   }
 
-  if (!seqpacket_gone(sockfd, &r))
-    r = seqpacket_eof(sockfd, syswrap(recvmsg(sockfd, &dmsg, dflags)));
+  if (!seqpacket_gone(sockfd, &r)) {
+    if (seqframe_is(sockfd)) {
+      /*
+       * One message, out of nabi's own buffer. `whole` is the message's real
+       * length, which is what a caller that asked for MSG_TRUNC is owed and
+       * what the truncation flag below is decided from - the same two uses the
+       * datagram path puts it to.
+       */
+      size_t got = 0;
+      r = (int) seqframe_recv(sockfd, dmsg.msg_iov, (int) dmsg.msg_iovlen,
+                              dflags, &got);
+      if (r >= 0) {
+        dmsg.msg_controllen = 0;        /* the framing carries data only */
+        /*
+         * The flag is owed whenever the message did not fit. The *return* is
+         * the message's real length only when the caller asked for MSG_TRUNC;
+         * otherwise a receive answers with what it handed over, and setting
+         * `whole` unconditionally would have made every framed receive claim
+         * the whole message had been delivered.
+         */
+        if (got > (size_t) r) {
+          dmsg.msg_flags |= MSG_TRUNC;
+        }
+        if (flags & LINUX_MSG_TRUNC) {
+          whole = (ssize_t) got;
+        }
+      }
+    } else {
+      r = seqpacket_eof(sockfd, syswrap(recvmsg(sockfd, &dmsg, dflags)));
+    }
+  }
   if (r < 0) {
     goto out;
   }
@@ -2087,6 +2490,11 @@ do_accept(int sockfd, gaddr_t addr_ptr, gaddr_t addrlen_ptr, int flags)
    * passed the listening socket's flags down. Saying so outright means the
    * answer does not depend on which of those this host turns out to do.
    */
+  /* Whatever a framed listener accepts is framed too: the far end is a guest
+   * socket of the same kind and is already putting headers on. */
+  if (seqframe_is(sockfd))
+    seqframe_mark(ret);
+
   int e = syswrap(fcntl(ret, F_SETFL, (flags & LINUX_SOCK_NONBLOCK) ? O_NONBLOCK : 0));
   if (e < 0) {
     close(ret);
@@ -2347,8 +2755,8 @@ DEFINE_SYSCALL(socketpair, int, family, int, type, int, protocol, gaddr_t, usock
                                seqpacket_darwin_type(family, dtype, true), protocol, fds));
   if (ret < 0)
     goto err;
-  seqpacket_note(fds[0], family, dtype);
-  seqpacket_note(fds[1], family, dtype);
+  seqpacket_note(fds[0], family, dtype, true);
+  seqpacket_note(fds[1], family, dtype, true);
   /*
    * And the flags are then applied, which they never were: a caller asking for
    * a non-blocking pair got a blocking one, and one asking for close-on-exec

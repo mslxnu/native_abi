@@ -977,6 +977,10 @@ darwinfs_writev(struct file *file, const struct iovec *iov, size_t iovcnt)
   struct eventfd_state *ev = eventfd_lookup(file->fd);
   if (ev != NULL)
     return eventfd_do_write(ev, iov, iovcnt);
+  /* A substituted SOCK_SEQPACKET needs its message boundary put on, and
+   * write/writev reach these sockets as readily as sendmsg does. */
+  if (seqframe_is(file->fd))
+    return (int) seqframe_send(file->fd, iov, (int) iovcnt, 0);
   return RETRY_ON_RESTARTABLE_EINTR(writev(file->fd, iov, iovcnt));
 }
 
@@ -990,6 +994,8 @@ darwinfs_readv(struct file *file, struct iovec *iov, size_t iovcnt)
    * are never any, and EAGAIN is how Linux says so. */
   if (mount_is_context_fd(file->fd))
     return -LINUX_EAGAIN;
+  if (seqframe_is(file->fd))
+    return (int) seqframe_recv(file->fd, iov, (int) iovcnt, 0, NULL);
   return RETRY_ON_RESTARTABLE_EINTR(readv(file->fd, iov, iovcnt));
 }
 
@@ -1005,6 +1011,7 @@ darwinfs_close(struct file *file)
   loop_close(file->fd);
   abstract_close(file->fd);
   seqpacket_close(file->fd);
+  seqframe_close(file->fd);
   passcred_close(file->fd);
   kmsg_close(file->fd);
   binder_emul_close(file->fd);

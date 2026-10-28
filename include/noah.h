@@ -404,6 +404,11 @@ void rtsig_init(void);
 /* Abstract unix sockets, which are files here. See src/net/net.c. */
 void abstract_close(int fd);
 void seqpacket_close(int fd);
+struct iovec;
+bool seqframe_is(int fd);
+void seqframe_close(int fd);
+ssize_t seqframe_recv(int fd, const struct iovec *iov, int iovcnt, int dflags, size_t *whole);
+ssize_t seqframe_send(int fd, const struct iovec *iov, int iovcnt, int dflags);
 void passcred_close(int fd);
 bool signalfd_wants(int lsig);
 void signalfd_arm(int lsig);
