@@ -517,6 +517,7 @@ bool procfs_stat(const char *path, bool nofollow, uint32_t *mode,
                  uint64_t *size, uint64_t *ino);
 bool procfs_refresh_fddir(int fd);
 int fdtable_open_fds(int *out, int max);
+bool fdtable_guest_holds(int fd);
 int guest_to_host_path(const char *name, char *out, size_t outsz);
 int procfs_readlink(const char *path, char *buf, size_t bufsize);
 /* The name of one of our threads, as /proc/<pid>/task/<tid>/comm reports it.

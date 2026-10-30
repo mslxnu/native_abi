@@ -2469,6 +2469,17 @@ else
     fail=1
 fi
 
+# arenafdtest: NABI's own descriptors are not listed as the guest's, and
+# /proc/self/fd/<n> answers only for descriptors the guest holds.
+cp "$here/arenafdtest" "$root/"; chmod +x "$root/arenafdtest"
+out=$("$NABI" -m "$root" /arenafdtest); rc=$?
+if [ "$rc" -eq 0 ] && [ "$out" = "arenafdtest ok" ]; then
+    echo "  ok  arenafdtest -> \"$out\", exit 0"
+else
+    echo "  FAIL arenafdtest -> \"$out\", exit $rc"
+    fail=1
+fi
+
 if [ "$fail" -eq 0 ]; then
     echo "smoke: PASS"
 else

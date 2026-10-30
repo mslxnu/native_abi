@@ -2919,7 +2919,10 @@ procfs_open(const char *path, int flags, int *out_fd)
      * offset zero, which is what a real open would give and what dup() would
      * not. The read is by pread so the guest's own offset is left where it was.
      */
-    if (fdno < 0 || fdno >= proc.fileinfo.vkern_fdtable.start)
+    /* Open in the *guest's* table, not merely below the vkern range: the
+     * bound alone let a number the guest does not hold reach whatever the host
+     * has there, which is how the arena was readable as /proc/self/fd/3. */
+    if (!fdtable_guest_holds(fdno))
       return -1;
     struct stat st;
     if (fstat(fdno, &st) < 0)
@@ -3126,10 +3129,14 @@ procfs_readlink(const char *path, char *buf, size_t bufsize)
      * F_GETPATH describes the file it actually refers to. That is not true of
      * a number remembered from earlier, where the fd may have been closed and
      * the number reused, and it is why /proc/self/maps does not carry paths. */
-    /* Guest fds only. NABI keeps its own descriptors at the top of the table,
-     * and those are not the guest's to look at - without this bound a guest
-     * could read the path of the arena, the checkpoint, or the debug sinks. */
-    if (fd < 0 || fd >= proc.fileinfo.vkern_fdtable.start ||
+    /* Guest fds only, and open ones: NABI's own descriptors are not the
+     * guest's to look at, and a number the guest is not holding names nothing
+     * at all. The bound on its own was not enough - it admitted every host
+     * descriptor below the vkern range, the arena among them, so a guest that
+     * had never opened fd 3 could still read back the host path of NABI's
+     * memory. Asking the table whether the guest holds it is the real
+     * question, and it is the one Linux answers here. */
+    if (!fdtable_guest_holds(fd) ||
         fcntl(fd, F_GETPATH, fdpath) < 0 || fdpath[0] == '\0')
       return -1;
     /*

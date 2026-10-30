@@ -33,6 +33,7 @@
 #include "mount.h"
 #include "cgroup.h"
 #include "checkpoint.h"
+#include "mm.h"
 
 #include "linux/common.h"
 #include "linux/time.h"
@@ -238,8 +239,28 @@ init_fileinfo(int rootfd)
   fileinfo->fdtable = (struct fdtable) { 0, 0, NULL, NULL, NULL };
   alloc_fdtable(&fileinfo->fdtable, user_fdtable_initsize);
 
+  /*
+   * The arena is NABI's, not the guest's, and it is open by now: init_mm runs
+   * before this and the page tables take their first arena_alloc there, so the
+   * backing file is already sitting on the lowest free descriptor - 3, every
+   * time. Adopted into the user table like an inherited one, it became a guest
+   * descriptor that no guest ever opened, listed in /proc/self/fd and
+   * readlink-able to the host path of NABI's own memory.
+   *
+   * Android is where that stops being untidy and starts being fatal. Zygote
+   * audits every open descriptor before it forks the system server, because a
+   * descriptor inherited into an app is a sandbox escape; anything it cannot
+   * account for aborts the fork. It read fd 3, found a file nothing had
+   * declared, and called JNI FatalError - "(system_server) Not allowlisted
+   * (3): /tmp/nabi-arena-XXXXXX" - taking zygote down at the last step before
+   * the system server starts.
+   *
+   * Skipped the way rootfd is, rather than moved into the vkern range: the
+   * arena has to survive exec, and this very loop closes anything it finds up
+   * there.
+   */
   for (int i = 0; i < (int) limit.rlim_cur; i++) {
-    if (i == rootfd) {
+    if (i == rootfd || i == arena_fd()) {
       continue;
     }
     int flag = fcntl(i, F_GETFD);
@@ -8741,6 +8762,20 @@ DEFINE_SYSCALL(syncfs, int, fd)
  * answer this question. Writes up to `max` of them and returns how many there
  * are, so a caller can size a buffer by asking with max 0.
  */
+/*
+ * Whether the guest holds this descriptor number.
+ *
+ * /proc/self/fd/<n> needs this and not a range check. The user table's numbers
+ * are host numbers, so a number the guest has never opened still points at
+ * something the host has there - and what the host has at the low numbers is
+ * NABI's.
+ */
+bool
+fdtable_guest_holds(int fd)
+{
+  return get_file(fd) != NULL;
+}
+
 int
 fdtable_open_fds(int *out, int max)
 {
